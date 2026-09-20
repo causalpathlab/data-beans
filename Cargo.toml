@@ -1,0 +1,72 @@
+[package]
+name = "data-beans"
+license = "MIT"
+authors = ["Yongjin Park <ypp@stat.ubc.ca>"]
+description = "Sparse genomics data backends, QC, algorithms, and simulation"
+repository = "https://github.com/causalpathlab/data-beans"
+homepage = "https://github.com/causalpathlab/data-beans"
+edition = "2021"
+readme = "README.md"
+# Own version (decoupled from workspace.version): data-beans evolves its CLI /
+# QC API independently of the shared utility crates.
+version = "0.6.5"
+
+[[bin]]
+name = "data-beans"
+path = "src/main.rs"
+
+[[bin]]
+name = "data-beans-sim"
+path = "src/sim_main.rs"
+required-features = ["sim"]
+
+[features]
+default = ["aux"]
+aux = []
+alg = ["aux"]
+sim = ["alg"]
+cuda = ["legume-numeric/cuda"]
+metal = ["legume-numeric/metal"]
+# Pulls in libhdf5 — opt-in so installs on hosts without HDF5 headers still
+# build. When off, the HDF5 sparse backend and all H5/H5AD readers compile
+# out; .zarr / .zarr.zip remain the supported formats.
+hdf5 = ["dep:hdf5"]
+
+[dependencies]
+legume-numeric = { version = "0.8.10", features = ["matrix", "param", "candle"] }
+
+anyhow = "1.0"
+clap = { version = "4.5.20", features = ["derive"] }
+flate2 = "1.0.34"
+rayon = "1.10.0"
+regex = "1"
+
+hdf5 = { package = "hdf5-metno", version = "0.14.1", features = ["blosc"], optional = true }
+libz-sys = { version = "1.1", features = ["libc"], default-features = false }
+zarrs = { version = "0.23" }
+
+tempfile = "3.2"
+rand = "0.10.1"
+ndarray = { version = "0.17", features = ["rayon", "serde", "approx", "blas"] }
+ndarray-rand = "0.16"
+rand_distr = "0.6"
+approx = "0.5.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+nalgebra = "0.34"
+nalgebra-sparse = "0.11"
+
+indicatif = { version = "^0.18", features = ["rayon"] }
+indicatif-log-bridge = "0.2"
+env_logger = "0.11"
+log = "0.4"
+dashmap = { version = "6.1.0", features = ["rayon"] }
+rustc-hash = "2.1"
+zip = "8"
+zarrs_zip = "0.5"
+petgraph = "0.8"
+fastobo = "0.15"
+special = "0.13"
+num_cpus = "1.16.0"
+statrs = "0.18"
