@@ -9,7 +9,8 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.6.5"
+version = "0.6.6"
+exclude = ["**/.claude/**", "**/.DS_Store"]
 
 [[bin]]
 name = "data-beans"
@@ -69,4 +70,4 @@ petgraph = "0.8"
 fastobo = "0.15"
 special = "0.13"
 num_cpus = "1.16.0"
-statrs = "0.18"
+statrs = { version = "0.18", default-features = false }
