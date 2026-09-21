@@ -3,7 +3,7 @@
 //!
 //! Also provides a convenience function for reading coordinate-style data
 //! (row names + numeric matrix) that returns `MatWithNames<DMatrix<f32>>`,
-//! matching the parquet reader interface in matrix-util.
+//! matching the parquet reader interface in legume_numeric::matrix.
 
 use crate::sparse_io::SparseIoBackend;
 use legume_numeric::matrix::traits::MatWithNames;

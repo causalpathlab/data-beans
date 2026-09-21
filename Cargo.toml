@@ -10,6 +10,7 @@ readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
 version = "0.6.6"
+rust-version = "1.91"
 exclude = ["**/.claude/**", "**/.DS_Store"]
 
 [[bin]]

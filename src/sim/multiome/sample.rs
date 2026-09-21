@@ -19,7 +19,7 @@ pub type Mat = DMatrix<f32>;
 ///
 /// The seeded N(0,1) fill stays scalar (preserves seed reproducibility);
 /// the softmax delegates to `normalize_exp_logits_columns_inplace`
-/// (numerically-stable log-sum-exp from `matrix-util`).
+/// (numerically-stable log-sum-exp from `legume_numeric::matrix`).
 pub fn sample_dictionary(d: usize, k: usize, rng: &mut impl Rng) -> Mat {
     let normal = rand_distr::Normal::new(0.0f32, 1.0).unwrap();
     let buf: Vec<f32> = (0..d * k).map(|_| normal.sample(rng)).collect();

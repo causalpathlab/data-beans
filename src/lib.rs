@@ -13,10 +13,10 @@ pub mod utilities; // shared utility functions (name matching, IO helpers)
 pub mod zarr_io; // read coordinate data from zarr files
 
 #[cfg(feature = "aux")]
-pub mod aux; // cell annotations, ontology, feature metadata (ex auxiliary-data)
+pub mod aux; // cell annotations, ontology, feature metadata (ex data_beans::aux)
 
 #[cfg(feature = "alg")]
-pub mod alg; // projection, collapse, HVG, etc. (ex data-beans-alg)
+pub mod alg; // projection, collapse, HVG, etc. (ex data_beans::alg)
 
 #[cfg(feature = "sim")]
 pub mod sim; // simulation helpers (ex data-beans-sim)

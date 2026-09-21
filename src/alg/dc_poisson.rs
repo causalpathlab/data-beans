@@ -17,7 +17,7 @@
 //! - [`refine_with_candidates`] — lowest-level sweep driver given pre-built candidates.
 //! - [`refine_with_proposer`] — generic driver that first asks a [`CandidateProposer`].
 //!
-//! See the `BbknnProposer` in `refine_multilevel` for the data-beans-alg
+//! See the `BbknnProposer` in `refine_multilevel` for the data_beans::alg
 //! front-end, and pinto's `GraphProposer` for the spatial-graph front-end.
 
 use log::info;

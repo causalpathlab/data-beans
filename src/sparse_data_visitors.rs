@@ -48,7 +48,7 @@ pub trait VisitColumnsOps {
 /// the canonical [`legume_numeric::matrix::progress::new_progress_bar`] (single style,
 /// single `MULTI_PROGRESS`) and keeps the 500 ms steady tick so the bar
 /// animates even when a single block is slow. Exported so downstream crates
-/// (data-beans-alg, senna) can reuse the same look.
+/// (data_beans::alg, senna) can reuse the same look.
 pub fn styled_progress_bar(total: u64, unit_label: &str) -> indicatif::ProgressBar {
     let prog_bar = legume_numeric::matrix::progress::new_progress_bar(total)
         .with_message(unit_label.to_string());
@@ -120,7 +120,7 @@ impl VisitColumnsOps for SparseIoVec {
 }
 
 /// Thin wrapper around [`generate_minibatch_intervals`] kept for in-crate
-/// call sites that predate the matrix-util split.
+/// call sites that predate the legume_numeric::matrix split.
 pub fn create_jobs(
     ntot: usize,
     num_features: usize,

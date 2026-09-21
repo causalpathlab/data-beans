@@ -6,7 +6,7 @@
 //! name so the same gene or locus matches across files that spell it differently
 //! (`FeatureNameKind`). Rows here are built and parsed; names there are matched.
 //!
-//! It lives in `auxiliary-data` rather than beside its producers because the
+//! It lives in `data_beans::aux` rather than beside its producers because the
 //! grammar has readers on both sides of the BAM/model boundary: faba writes these
 //! rows, senna's embedding and association steps split them back apart.
 //!

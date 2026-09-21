@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # `sim` implies `alg` implies `aux`: the widest non-GPU, non-HDF5 build.
+  # `cuda` / `metal` need hardware a hosted runner does not have.
+  FEATURES: sim
+
+jobs:
+  # fmt and clippy are PINNED to the toolchain this crate is developed on,
+  # not floating on `stable`: a new rustfmt can reformat code it used to
+  # accept and a new clippy can add lints, so `--check` / `-D warnings` on a
+  # floating toolchain turns main red with no code change. Bumping the pin
+  # is a deliberate PR that carries the new version's lint fixes with it.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/system-deps
+      - uses: dtolnay/rust-toolchain@1.94
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --all-targets so test and bench code is linted too.
+      - run: cargo clippy --all-targets --features "$FEATURES" -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/system-deps
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features "$FEATURES"
+
+  # The HDF5 backend is opt-in, so a plain build never touches its
+  # `#[cfg(feature = "hdf5")]` code and it can rot indefinitely. This is the
+  # one optional feature a hosted runner can satisfy. Also check the feature
+  # ladder below `sim`, since downstream crates enable subsets.
+  features:
+    name: check --features hdf5 and feature subsets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/system-deps
+        with:
+          hdf5: 'true'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          for f in hdf5 sim,hdf5 "" alg; do
+            echo "::group::--features '$f'"
+            cargo check --all-targets --features "$f"
+            echo "::endgroup::"
+          done
+
+  # `rust-version` is the highest `rust-version` among resolved dependencies
+  # (1.91, from the zarrs stack). That is the floor the dependency graph
+  # imposes; this job checks whether this crate's own sources also build
+  # there. Non-blocking until it has gone green once -- then delete
+  # `continue-on-error` to make it a gate.
+  msrv:
+    name: MSRV (discovery, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/system-deps
+      - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --features "$FEATURES"
