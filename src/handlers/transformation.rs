@@ -207,13 +207,13 @@ pub struct RunSqueezeArgs {
     )]
     pub interactive: bool,
 
-    /// auto cutoff - apply the k-means-suggested cutoff without prompting
+    /// auto cutoff - apply the suggested (trough) cutoff without prompting
     #[arg(
         long,
         default_value_t = false,
-        help = "Apply the k-means-suggested nnz cutoff headlessly (no prompt)",
+        help = "Apply the suggested (histogram trough) nnz cutoff headlessly (no prompt)",
         long_help = "Resolve row and column cutoffs automatically, then squeeze.\n\
-                     The cutoffs come from a 2-means split of log(1+nnz). No prompt is shown.\n\
+                     The cutoffs sit at the trough of the log(1+nnz) histogram. No prompt is shown.\n\
                      \n\
                      Explicit --row-nnz-cutoff and --column-nnz-cutoff still win,\n\
                      per dimension. So you can pin one axis and auto the other.\n\

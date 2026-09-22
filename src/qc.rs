@@ -258,116 +258,162 @@ fn col_stat_visitor(
 // callers that want cell-calling on a per-column nnz vector, e.g. `senna gem`). //
 //////////////////////////////////////////////////////////////////////////////////
 
-/// Suggest a reasonable nnz cutoff by an **exact 1-D 2-means** split of
-/// `log(1+nnz)`, **guarded by a BIC model-selection test** so a cutoff is only
-/// proposed when the data is genuinely bimodal (ambient + real cells).
+/// Bin width of the trough search, in natural-log units (~5% per bin).
+const TROUGH_BIN: f64 = 0.05;
+/// Gaussian smoothing of the binned density, in bins.
+const TROUGH_SMOOTH_BINS: f64 = 3.0;
+/// A cut needs the trough at most this fraction of the lower of its two peaks.
+const TROUGH_MAX_DEPTH: f64 = 0.25;
+/// Ambient and cell peaks sit at least a decade apart; closer modes (a doublet
+/// bump, a low-complexity cell type) are not an empty↔cell boundary.
+const TROUGH_MIN_PEAK_RATIO: f64 = 10.0;
+/// Each side of a cut must hold at least this many columns (or 0.1% of all).
+const TROUGH_MIN_SIDE: usize = 20;
+
+/// Suggest an nnz cutoff at the **deepest trough** of the nnz distribution,
+/// the gap between the ambient (empty barcode) peak and the cell peak.
+/// Columns with `nnz >= cutoff` are kept.
 ///
-/// k-means on a line is always a *contiguous* split, so the global optimum is a
-/// single threshold — found exactly here by a sorted prefix-sum sweep
-/// (O(n log n), **deterministic, no RNG or restarts**). The two clusters' means
-/// then feed a BIC comparison against a single Gaussian. To stay robust on
-/// discrete low-count data, the mixture is **homoscedastic** (both components
-/// share the pooled within-cluster variance): a degenerate near-zero-variance
-/// cluster therefore cannot masquerade as a delta spike and force a split (the
-/// failure mode of a per-component variance floor). The cutoff (smallest nnz in
-/// the higher cluster) is returned only when BIC favors two components. `None`
-/// for degenerate input (n < 4 or all-identical nnz) or a unimodal distribution.
+/// The density lives on the log axis, where ambient and cells form two
+/// peaks decades apart; in linear units the cell peak is spread so thin
+/// that the trough in front of it vanishes. The bins, though, come from
+/// the actual counts: each integer count `v` spreads its mass over its own
+/// interval `[v - 1/2, v + 1/2)` mapped to `ln(1 + ·)`, so small counts,
+/// whose log spacing exceeds a bin, leave no empty bins to pass for troughs.
+///
+/// A cut is proposed only when the smoothed density at the trough is at most
+/// [`TROUGH_MAX_DEPTH`] of the lower of the two peaks it separates, the
+/// peaks are at least [`TROUGH_MIN_PEAK_RATIO`] apart, and each side holds
+/// enough columns. Unimodal data — already-called cells included — gets
+/// `None`, whatever its tails look like. Deterministic, no RNG.
 pub fn suggest_nnz_cutoff(nnz: &[f32]) -> Option<usize> {
     let n = nnz.len();
-    if n < 4 {
+    let min_side = TROUGH_MIN_SIDE.max(n / 1000);
+    if n < 2 * min_side {
         return None;
     }
 
-    // Sort by log(1+nnz) (monotonic in nnz), carrying nnz for the reported cutoff.
-    let mut pairs: Vec<(f64, f32)> = nnz.iter().map(|&x| ((1.0 + x as f64).ln(), x)).collect();
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    if pairs[n - 1].0 <= pairs[0].0 {
-        return None; // all-identical → nothing to split
+    let mut vals: Vec<u64> = nnz.iter().map(|&x| x.max(0.0).round() as u64).collect();
+    vals.sort_unstable();
+    let (vmin, vmax) = (vals[0], vals[n - 1]);
+    if vmin == vmax {
+        return None;
     }
 
-    // Prefix sums of x and x² (x = log1p) for O(1) range mean / variance / SSE.
-    let mut psum = vec![0.0_f64; n + 1];
-    let mut psq = vec![0.0_f64; n + 1];
-    for (i, &(x, _)) in pairs.iter().enumerate() {
-        psum[i + 1] = psum[i] + x;
-        psq[i + 1] = psq[i] + x * x;
-    }
-    // Within-cluster SSE over the sorted half-open range [a, b): Σx² − (Σx)²/cnt.
-    let sse = |a: usize, b: usize| -> f64 {
-        let cnt = (b - a) as f64;
-        if cnt <= 0.0 {
-            return 0.0;
+    // Count `v`'s interval `[v - 1/2, v + 1/2)` on the `ln(1 + ·)` axis.
+    let edge = |v: u64, half: f64| (v as f64 + 1.0 + half).ln();
+    let lo = edge(vmin, -0.5);
+    let nbins = ((edge(vmax, 0.5) - lo) / TROUGH_BIN).ceil() as usize;
+    let mut hist = vec![0.0_f64; nbins];
+    let mut i = 0;
+    while i < n {
+        let v = vals[i];
+        let mut j = i;
+        while j < n && vals[j] == v {
+            j += 1;
         }
-        let s = psum[b] - psum[a];
-        (psq[b] - psq[a] - s * s / cnt).max(0.0)
-    };
-
-    // Exact 2-means: the split k minimizing SSE(0,k) + SSE(k,n).
-    let mut best_k = 1;
-    let mut best_sse = f64::INFINITY;
-    for k in 1..n {
-        let s = sse(0, k) + sse(k, n);
-        if s < best_sse {
-            best_sse = s;
-            best_k = k;
+        let a = (edge(v, -0.5) - lo) / TROUGH_BIN;
+        let b = (edge(v, 0.5) - lo) / TROUGH_BIN;
+        let mass = (j - i) as f64 / (b - a);
+        for (k, h) in hist
+            .iter_mut()
+            .enumerate()
+            .take((b.ceil() as usize).min(nbins))
+            .skip(a.floor() as usize)
+        {
+            let overlap = b.min(k as f64 + 1.0) - a.max(k as f64);
+            if overlap > 0.0 {
+                *h += mass * overlap;
+            }
         }
+        i = j;
     }
 
-    let (n0, n1) = (best_k, n - best_k);
-    let nf = n as f64;
-    let mean0 = psum[best_k] / n0 as f64;
-    let mean1 = (psum[n] - psum[best_k]) / n1 as f64;
-    // Shared (pooled) within-cluster variance — bounded below by the real spread,
-    // so a degenerate single-value cluster can't claim near-infinite density.
-    let pooled_var = (best_sse / nf).max(1e-9);
-    let cutoff = pairs[best_k].1 as usize; // smallest nnz in the higher cluster
-
-    // BIC: homoscedastic 2-Gaussian vs single Gaussian on log(1+nnz).
-    // var_all = SSE(0,n)/n is the variance about the global mean (closed-form ll1).
-    let var_all = (sse(0, n) / nf).max(1e-9);
-    let ll1 = -0.5 * nf * ((2.0 * std::f64::consts::PI * var_all).ln() + 1.0);
-    let bic1 = -2.0 * ll1 + 2.0 * nf.ln(); // params: μ, σ²
-
-    let lpi = [(n0 as f64 / nf).ln(), (n1 as f64 / nf).ln()];
-    let ll2: f64 = pairs
-        .iter()
-        .map(|&(x, _)| {
-            logsumexp2(
-                lpi[0] + gaussian_logpdf(x, mean0, pooled_var),
-                lpi[1] + gaussian_logpdf(x, mean1, pooled_var),
-            )
+    // Gaussian smoothing (finite ±3σ kernel, so a real gap stays exactly 0).
+    let radius = (3.0 * TROUGH_SMOOTH_BINS).ceil() as isize;
+    let kernel: Vec<f64> = (-radius..=radius)
+        .map(|d| (-0.5 * (d as f64 / TROUGH_SMOOTH_BINS).powi(2)).exp())
+        .collect();
+    let smooth: Vec<f64> = (0..nbins as isize)
+        .map(|k| {
+            (-radius..=radius)
+                .filter_map(|d| {
+                    let t = k + d;
+                    (0..nbins as isize)
+                        .contains(&t)
+                        .then(|| hist[t as usize] * kernel[(d + radius) as usize])
+                })
+                .sum()
         })
-        .sum();
-    let bic2 = -2.0 * ll2 + 4.0 * nf.ln(); // params: μ0, μ1, σ² (shared), π
+        .collect();
 
-    let favors_two = bic2 < bic1;
+    // Mass left of each bin, and the running peaks from either end.
+    let mut below = vec![0.0_f64; nbins + 1];
+    for k in 0..nbins {
+        below[k + 1] = below[k] + hist[k];
+    }
+    let mut left_peak = vec![(0.0_f64, 0usize); nbins];
+    for k in 0..nbins {
+        let prev = if k > 0 { left_peak[k - 1] } else { (-1.0, 0) };
+        left_peak[k] = if smooth[k] > prev.0 {
+            (smooth[k], k)
+        } else {
+            prev
+        };
+    }
+    let mut right_peak = vec![(0.0_f64, 0usize); nbins];
+    for k in (0..nbins).rev() {
+        let next = if k + 1 < nbins {
+            right_peak[k + 1]
+        } else {
+            (-1.0, k)
+        };
+        right_peak[k] = if smooth[k] >= next.0 {
+            (smooth[k], k)
+        } else {
+            next
+        };
+    }
+
+    let min_bins_apart = TROUGH_MIN_PEAK_RATIO.ln() / TROUGH_BIN;
+    let total = below[nbins];
+    let mut best: Option<(f64, usize, usize)> = None; // (depth, first, last) of the deepest run
+    for t in 1..nbins.saturating_sub(1) {
+        let (l_mass, r_mass) = (below[t], total - below[t + 1]);
+        if l_mass < min_side as f64 || r_mass < min_side as f64 {
+            continue;
+        }
+        let ((l_h, l_k), (r_h, r_k)) = (left_peak[t - 1], right_peak[t + 1]);
+        if ((r_k - l_k) as f64) < min_bins_apart || l_h <= 0.0 || r_h <= 0.0 {
+            continue;
+        }
+        let depth = smooth[t] / l_h.min(r_h);
+        match best {
+            Some((d, first, last)) if depth == d && last + 1 == t => best = Some((d, first, t)),
+            Some((d, _, _)) if depth >= d => {}
+            _ => best = Some((depth, t, t)),
+        }
+    }
+
+    let Some((depth, first, last)) = best else {
+        log::info!("nnz cell-calling: no two peaks a decade apart → unimodal, no cutoff");
+        return None;
+    };
+    // Middle of the deepest run (an exact-zero gap is a run, not a point).
+    let x = lo + ((first + last) as f64 / 2.0 + 0.5) * TROUGH_BIN;
+    let cutoff = (x.exp() - 1.0).ceil().max(1.0) as usize;
+    let favors_cut = depth <= TROUGH_MAX_DEPTH;
     log::info!(
-        "nnz cell-calling: BIC 1-cluster={:.0}, 2-cluster={:.0} → {}",
-        bic1,
-        bic2,
-        if favors_two {
+        "nnz cell-calling: deepest trough at nnz {} (depth {:.3}) → {}",
+        cutoff,
+        depth,
+        if favors_cut {
             format!("bimodal, cutoff at nnz {cutoff}")
         } else {
             "unimodal, no cutoff".to_string()
         }
     );
-    favors_two.then_some(cutoff)
-}
-
-/// Gaussian log-density at `x` for `N(mu, var)` (variance floored for stability).
-fn gaussian_logpdf(x: f64, mu: f64, var: f64) -> f64 {
-    use std::f64::consts::PI;
-    let var = var.max(1e-9);
-    -0.5 * ((2.0 * PI * var).ln() + (x - mu) * (x - mu) / var)
-}
-
-/// `log(exp(a) + exp(b))`, numerically stable.
-fn logsumexp2(a: f64, b: f64) -> f64 {
-    let m = a.max(b);
-    if m.is_infinite() {
-        return m;
-    }
-    m + ((a - m).exp() + (b - m).exp()).ln()
+    favors_cut.then_some(cutoff)
 }
 
 /// One log10(x+1) histogram bin, carrying the real value range that fell into it
@@ -430,7 +476,7 @@ fn fmt_stat(v: f32) -> String {
 /// Print summary statistics + an ASCII log10(x+1) histogram of a per-row or
 /// per-column statistic vector (`metric` names it, e.g. "nnz", "sum", "mean").
 /// A non-zero `cutoff` marks the cutoff bin and reports how much it removes;
-/// an optional `suggested` value reports the 2-means suggestion.
+/// an optional `suggested` value reports the trough suggestion.
 ///
 /// Used by `data-beans squeeze --show-histogram`, `data-beans histogram`, and
 /// `senna gem --auto-cell-cutoff`.
@@ -493,7 +539,7 @@ pub fn print_nnz_summary(
             0.0
         };
         println!(
-            "  Suggested cutoff (2-means on log1p {}): {} (would remove {} / {} = {:.2}%)",
+            "  Suggested cutoff (histogram trough of {}): {} (would remove {} / {} = {:.2}%)",
             metric, s, below_s, total, pct_s
         );
     }
