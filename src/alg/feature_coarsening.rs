@@ -11,12 +11,20 @@
 //!
 //! What a coarsening fixes is the assignment, not the meaning: a group's
 //! embedding is the mean of its members' and moves at every step.
+//!
+//! A coarsening is built from the finest pseudobulks' counts by
+//! [`coarsen_features`]: features with no grouping evidence form one
+//! background group, and the rest are grouped by k-means on their residual
+//! profiles (see that function for the method).
 
-use crate::alg::random_projection::binary_sort_columns;
 use clap::Args;
 use legume_numeric::matrix::dmatrix_util::build_columns_par;
-use log::debug;
+use legume_numeric::matrix::kmeans::kmeans_centroids_seeded;
+use legume_numeric::matrix::rand_util::mix_seed;
+use legume_numeric::matrix::traits::SampleOps;
+use log::{debug, info};
 use nalgebra::DMatrix;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 type CscMat = nalgebra_sparse::CscMatrix<f32>;
@@ -232,67 +240,244 @@ impl FeatureCoarsening {
     }
 }
 
-/// Build a feature coarsening from a data-dependent sketch.
-///
-/// Uses the collapsed pseudobulk data [D, S] to group co-expressed
-/// features via binary hashing (SVD + binarization).
-///
-/// # Arguments
-/// * `data_ds` - feature sketch matrix [D, S] (e.g. posterior mean of collapsed data)
-/// * `max_features` - target maximum number of coarse features
-pub fn compute_feature_coarsening(
-    data_ds: &DMatrix<f32>,
-    max_features: usize,
-) -> anyhow::Result<FeatureCoarsening> {
-    let d = data_ds.nrows();
-    let s = data_ds.ncols();
+////////////////////////////////////
+// Building a coarsening from counts //
+////////////////////////////////////
 
-    // sort_dim such that 2^sort_dim ≈ max_features
-    let sort_dim = (max_features as f64).log2().ceil() as usize;
-    let sort_dim = sort_dim.min(s); // can't use more dimensions than samples
+/// A feature is informative when its homogeneity deviance exceeds its degrees
+/// of freedom by this many standard deviations (`(D − df)/√(2·df)`).
+const INFORMATIVE_Z: f64 = 5.0;
+/// Lloyd iterations of every k-means here.
+const KMEANS_ITER: usize = 30;
+/// Widest residual profile k-means runs on directly; a wider one is sketched
+/// down to [`SKETCH_DIM`] with a seeded Gaussian first.
+const MAX_PROFILE_DIM: usize = 1024;
+const SKETCH_DIM: usize = 64;
 
-    // Generic helper — also used for cell coarsening etc. Keep at debug;
-    // callers (cell coarsening, multilevel, chickpea topic) emit their own
-    // axis-specific log line.
-    debug!(
-        "binary-sort coarsening: {} items, {} sketch dims, sort_dim={}",
-        d, s, sort_dim
-    );
-
-    // binary_sort_columns expects (feature × items): K × N
-    // We want to sort D features using S-dimensional profiles.
-    // Pass data_ds transposed: S × D (S features describing D items)
-    let data_sd = data_ds.transpose();
-    let codes = binary_sort_columns(&data_sd, sort_dim)?;
-
-    // Group features by binary code
-    let max_code = codes.iter().max().copied().unwrap_or(0);
-    let mut coarse_to_fine: Vec<Vec<usize>> = vec![Vec::new(); max_code + 1];
-    for (f, &code) in codes.iter().enumerate() {
-        coarse_to_fine[code].push(f);
+/// Per feature, whether its counts carry grouping evidence: the Poisson
+/// deviance of row `g` of `counts` against the flat rate `E_gs = T_g·n_s/N`
+/// exceeds its `S − 1` degrees of freedom by [`INFORMATIVE_Z`] standard
+/// deviations. A feature never counted is not informative.
+pub fn informative_features(counts: &DMatrix<f32>, sizes: &[f32]) -> Vec<bool> {
+    let total_size: f64 = sizes.iter().map(|&n| f64::from(n)).sum();
+    let live: Vec<usize> = (0..sizes.len()).filter(|&s| sizes[s] > 0.0).collect();
+    if live.len() < 2 || total_size <= 0.0 {
+        return vec![false; counts.nrows()];
     }
+    let df = (live.len() - 1) as f64;
+    (0..counts.nrows())
+        .into_par_iter()
+        .map(|g| {
+            let t: f64 = live.iter().map(|&s| f64::from(counts[(g, s)])).sum();
+            if t <= 0.0 {
+                return false;
+            }
+            let dev: f64 = live
+                .iter()
+                .map(|&s| {
+                    let n = f64::from(counts[(g, s)]);
+                    let e = t * f64::from(sizes[s]) / total_size;
+                    let log_term = if n > 0.0 { n * (n / e).ln() } else { 0.0 };
+                    2.0 * (log_term - (n - e))
+                })
+                .sum();
+            (dev - df) / (2.0 * df).sqrt() > INFORMATIVE_Z
+        })
+        .collect()
+}
 
-    // Remove empty groups and reindex
-    coarse_to_fine.retain(|v| !v.is_empty());
-    let num_coarse = coarse_to_fine.len();
-
-    let mut fine_to_coarse = vec![0usize; d];
-    for (c, fine_indices) in coarse_to_fine.iter().enumerate() {
-        for &f in fine_indices {
-            fine_to_coarse[f] = c;
+/// Unit-length Pearson residual profiles `(n − E)/√E` of the `rows` of
+/// `counts`, clipped to `±√S`, sketched to [`SKETCH_DIM`] when wider than
+/// [`MAX_PROFILE_DIM`].
+fn residual_profiles(
+    counts: &DMatrix<f32>,
+    sizes: &[f32],
+    rows: &[usize],
+    seed: u64,
+) -> DMatrix<f32> {
+    let n_pb = sizes.len();
+    let total_size: f32 = sizes.iter().sum();
+    let clip = (n_pb as f32).sqrt();
+    let mut z = DMatrix::<f32>::zeros(rows.len(), n_pb);
+    for (i, &g) in rows.iter().enumerate() {
+        let t: f32 = counts.row(g).sum();
+        for s in 0..n_pb {
+            let e = t * sizes[s] / total_size.max(f32::MIN_POSITIVE);
+            if e > 0.0 {
+                z[(i, s)] = ((counts[(g, s)] - e) / e.sqrt()).clamp(-clip, clip);
+            }
         }
     }
+    if n_pb > MAX_PROFILE_DIM {
+        let basis = DMatrix::<f32>::rnorm_seeded(n_pb, SKETCH_DIM, mix_seed(seed, 0x5343_4854));
+        z = (&z * basis) / (SKETCH_DIM as f32).sqrt();
+    }
+    unit_rows(&mut z);
+    z
+}
 
-    debug!(
-        "binary-sort coarsening: {} → {} groups (target {})",
-        d, num_coarse, max_features
+fn unit_rows(z: &mut DMatrix<f32>) {
+    for mut row in z.row_iter_mut() {
+        let norm = row.norm();
+        if norm > 0.0 {
+            row /= norm;
+        }
+    }
+}
+
+/// Nested feature coarsenings of pseudobulk `counts` `[D × S]` with pseudobulk
+/// sizes `sizes` (cells per column), one per entry of `level_targets`
+/// (coarsest → finest, non-decreasing): at most `target` groups each.
+///
+/// # Method
+///
+/// Most features of a real axis carry no grouping evidence: a feature that is
+/// barely detected, or detected at one flat rate everywhere, has counts a
+/// single rate explains, and grouping such features by distance chains them
+/// into one group that drags informative features in with it. So every feature
+/// is first tested for homogeneity ([`informative_features`]); the ones that
+/// fail form ONE background group, numbered last, at every level.
+///
+/// The informative features are grouped by k-means on their Pearson residuals
+/// `(n − E)/√E`, clipped and scaled to unit length, so a feature is placed by
+/// the SHAPE of its deviation from the flat rate with count noise in
+/// proportion; k-means keeps groups balanced by construction. Coarser levels
+/// cluster the finest centroids, so every level nests in the one below.
+/// Each level's group sizes are logged.
+pub fn coarsen_features(
+    counts: &DMatrix<f32>,
+    sizes: &[f32],
+    level_targets: &[usize],
+    seed: u64,
+) -> anyhow::Result<Vec<FeatureCoarsening>> {
+    let d = counts.nrows();
+    anyhow::ensure!(
+        counts.ncols() == sizes.len(),
+        "{} count columns for {} pseudobulk sizes",
+        counts.ncols(),
+        sizes.len()
+    );
+    anyhow::ensure!(!level_targets.is_empty(), "no coarsening level requested");
+    anyhow::ensure!(
+        level_targets.windows(2).all(|w| w[0] <= w[1]),
+        "coarsening levels must run coarsest → finest: {level_targets:?}"
+    );
+    let informative = informative_features(counts, sizes);
+    let rows: Vec<usize> = (0..d).filter(|&g| informative[g]).collect();
+    let has_background = rows.len() < d;
+    let slots = |target: usize| {
+        target
+            .max(1)
+            .saturating_sub(usize::from(has_background))
+            .max(1)
+    };
+    info!(
+        "feature coarsening: {} of {d} features informative, {} in the background group",
+        rows.len(),
+        d - rows.len()
     );
 
-    Ok(FeatureCoarsening {
+    // Finest level: k-means on the informative features' residual profiles.
+    let finest = *level_targets.last().expect("checked non-empty");
+    let (fine_label, centroids) = if rows.is_empty() {
+        (Vec::new(), DMatrix::<f32>::zeros(0, 0))
+    } else {
+        let z = residual_profiles(counts, sizes, &rows, seed);
+        let k = slots(finest).min(rows.len());
+        let (mut c, labels) = kmeans_centroids_seeded(&z, k, KMEANS_ITER, seed);
+        unit_rows(&mut c);
+        (labels, c)
+    };
+    let n_fine = centroids.nrows();
+
+    // Coarser levels: k-means on the finest centroids, so every level nests.
+    let levels = level_targets
+        .iter()
+        .enumerate()
+        .map(|(l, &target)| {
+            let to_level: Vec<usize> = if n_fine == 0 {
+                Vec::new()
+            } else if l + 1 == level_targets.len() || slots(target) >= n_fine {
+                (0..n_fine).collect()
+            } else {
+                kmeans_centroids_seeded(
+                    &centroids,
+                    slots(target),
+                    KMEANS_ITER,
+                    mix_seed(seed, l as u64),
+                )
+                .1
+            };
+            let level = level_from_labels(d, &rows, &fine_label, &to_level, has_background);
+            info!(
+                "feature coarsening level {l} (target {target}): {}",
+                group_sizes(&level, has_background)
+            );
+            level
+        })
+        .collect();
+    Ok(levels)
+}
+
+/// A [`FeatureCoarsening`] from the informative rows' finest labels mapped to
+/// this level, with every other feature in one background group (numbered
+/// last). Group ids are compacted in order of first use.
+fn level_from_labels(
+    d: usize,
+    rows: &[usize],
+    fine_label: &[usize],
+    to_level: &[usize],
+    has_background: bool,
+) -> FeatureCoarsening {
+    let mut in_rows = vec![false; d];
+    let mut compact = std::collections::HashMap::<usize, usize>::new();
+    let mut fine_to_coarse = vec![0usize; d];
+    for (&g, &f) in rows.iter().zip(fine_label) {
+        in_rows[g] = true;
+        let next = compact.len();
+        fine_to_coarse[g] = *compact.entry(to_level[f]).or_insert(next);
+    }
+    let mut num_coarse = compact.len();
+    if has_background {
+        for (g, &inside) in in_rows.iter().enumerate() {
+            if !inside {
+                fine_to_coarse[g] = num_coarse;
+            }
+        }
+        num_coarse += 1;
+    }
+    let mut coarse_to_fine = vec![Vec::new(); num_coarse];
+    for (g, &c) in fine_to_coarse.iter().enumerate() {
+        coarse_to_fine[c].push(g);
+    }
+    FeatureCoarsening {
         fine_to_coarse,
         coarse_to_fine,
         num_coarse,
-    })
+    }
+}
+
+/// The informative groups' sizes, the background (numbered last) reported
+/// apart: `"K informative group(s), sizes min / median / max, N singleton(s);
+/// background B"`.
+fn group_sizes(level: &FeatureCoarsening, has_background: bool) -> String {
+    let n_inf = level.num_coarse - usize::from(has_background);
+    let mut sizes: Vec<usize> = level.coarse_to_fine[..n_inf].iter().map(Vec::len).collect();
+    sizes.sort_unstable();
+    format!(
+        "{} informative group(s), sizes min {} / median {} / max {}, {} singleton(s); \
+         background {}",
+        sizes.len(),
+        sizes.first().copied().unwrap_or(0),
+        sizes.get(sizes.len() / 2).copied().unwrap_or(0),
+        sizes.last().copied().unwrap_or(0),
+        sizes.iter().filter(|&&n| n == 1).count(),
+        if has_background {
+            level.coarse_to_fine[n_inf].len()
+        } else {
+            0
+        }
+    )
 }
 
 /// Shared CLI arg for grouping co-expressed features before training.

@@ -112,84 +112,170 @@ fn test_expand_logits_preserves_probabilities() {
     assert_relative_eq!(expanded[(1, 0)], -1.2 - ln2, epsilon = 1e-6);
 }
 
-#[test]
-fn test_compute_feature_coarsening() {
-    use legume_numeric::matrix::traits::SampleOps;
+////////////////////////////////////////
+// Building a coarsening from counts //
+////////////////////////////////////////
 
-    // Create a D×S matrix with D=500 features, S=50 samples
-    let d = 500;
-    let s = 50;
-    let data = DMatrix::<f32>::rnorm(d, s);
-
-    let fc = compute_feature_coarsening(&data, 50).unwrap();
-
-    // All features should be assigned
-    assert_eq!(fc.fine_to_coarse.len(), d);
-
-    // Coarse features should be reasonable
-    assert!(fc.num_coarse > 0);
-    assert!(fc.num_coarse <= 64); // 2^6 = 64 max for sort_dim=6
-
-    // Every fine feature should appear in exactly one coarse group
-    let mut counts = vec![0usize; d];
-    for group in &fc.coarse_to_fine {
-        for &f in group {
-            counts[f] += 1;
+/// `n_pb` pseudobulks of 6 cells. `n_programs` programs of `per` features,
+/// each raised 8× on its own block of pseudobulks, then `n_flat` features at
+/// one flat rate and `n_empty` never counted — the empty features a real axis
+/// is mostly made of.
+fn planted(
+    n_programs: usize,
+    per: usize,
+    n_flat: usize,
+    n_empty: usize,
+    n_pb: usize,
+    seed: u64,
+) -> (DMatrix<f32>, Vec<f32>) {
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, Poisson};
+    let mut rng = StdRng::seed_from_u64(seed);
+    let sizes = vec![6.0f32; n_pb];
+    let d = n_programs * per + n_flat + n_empty;
+    let mut counts = DMatrix::<f32>::zeros(d, n_pb);
+    let block = (n_pb / n_programs.max(1)).max(1);
+    for p in 0..n_programs {
+        for i in 0..per {
+            let base = 0.5 + (i % 3) as f64 * 0.5;
+            for s in 0..n_pb {
+                let lift = if s / block == p { 8.0 } else { 1.0 };
+                let rate = base * lift * f64::from(sizes[s]);
+                counts[(p * per + i, s)] = Poisson::new(rate).unwrap().sample(&mut rng) as f32;
+            }
         }
     }
-    assert!(counts.iter().all(|&c| c == 1));
-
-    // fine_to_coarse should be consistent with coarse_to_fine
-    for (c, group) in fc.coarse_to_fine.iter().enumerate() {
-        for &f in group {
-            assert_eq!(fc.fine_to_coarse[f], c);
+    for f in 0..n_flat {
+        for s in 0..n_pb {
+            let rate = 0.3 * f64::from(sizes[s]);
+            counts[(n_programs * per + f, s)] = Poisson::new(rate).unwrap().sample(&mut rng) as f32;
         }
+    }
+    (counts, sizes)
+}
+
+fn groups_of(labels: &[usize], rows: std::ops::Range<usize>) -> std::collections::BTreeSet<usize> {
+    rows.map(|i| labels[i]).collect()
+}
+
+#[test]
+fn a_flat_or_empty_feature_carries_no_grouping_evidence() {
+    let (counts, sizes) = planted(2, 5, 5, 5, 20, 11);
+    let informative = informative_features(&counts, &sizes);
+    assert!(
+        informative[..10].iter().all(|&b| b),
+        "programs: {informative:?}"
+    );
+    assert!(
+        informative[10..].iter().all(|&b| !b),
+        "flat/empty: {informative:?}"
+    );
+}
+
+#[test]
+fn programs_are_recovered_and_empty_features_share_the_background() {
+    let (counts, sizes) = planted(3, 10, 20, 20, 24, 7);
+    let fc = coarsen_features(&counts, &sizes, &[4], 3)
+        .unwrap()
+        .remove(0);
+    let l = &fc.fine_to_coarse;
+    for p in 0..3 {
+        assert_eq!(
+            groups_of(l, p * 10..(p + 1) * 10).len(),
+            1,
+            "program {p} split: {l:?}"
+        );
+    }
+    let programs: std::collections::BTreeSet<usize> = (0..3).map(|p| l[p * 10]).collect();
+    assert_eq!(programs.len(), 3, "programs merged: {l:?}");
+    let background = groups_of(l, 30..70);
+    assert_eq!(background.len(), 1, "flat and empty features split: {l:?}");
+    assert!(
+        programs.is_disjoint(&background),
+        "a program joined the background"
+    );
+    assert_eq!(fc.num_coarse, 4);
+}
+
+#[test]
+fn groups_stay_bounded_when_most_features_are_empty() {
+    // 30 programs of 8 among 2,000 empty and flat features: no group may
+    // swallow the informative features, however many empty ones there are.
+    let (counts, sizes) = planted(30, 8, 1000, 1000, 60, 5);
+    let fc = coarsen_features(&counts, &sizes, &[31], 9)
+        .unwrap()
+        .remove(0);
+    let mut size = std::collections::BTreeMap::<usize, usize>::new();
+    for &g in &fc.fine_to_coarse[..240] {
+        *size.entry(g).or_default() += 1;
+    }
+    let largest = size.values().copied().max().unwrap();
+    assert!(
+        largest <= 24,
+        "an informative group holds {largest} of 240: {size:?}"
+    );
+    assert!(
+        size.len() >= 25,
+        "only {} groups for 30 programs",
+        size.len()
+    );
+}
+
+#[test]
+fn coarser_levels_nest_and_keep_the_background_whole() {
+    let (counts, sizes) = planted(6, 6, 10, 10, 36, 13);
+    let levels = coarsen_features(&counts, &sizes, &[3, 5, 7], 21).unwrap();
+    assert_eq!(levels.len(), 3);
+    for w in levels.windows(2) {
+        let mut parent = std::collections::HashMap::<usize, usize>::new();
+        for (g, (&c, &f)) in w[0]
+            .fine_to_coarse
+            .iter()
+            .zip(&w[1].fine_to_coarse)
+            .enumerate()
+        {
+            let p = *parent.entry(f).or_insert(c);
+            assert_eq!(p, c, "feature {g}: fine group {f} spans coarse {p} and {c}");
+        }
+    }
+    for level in &levels {
+        assert_eq!(
+            groups_of(&level.fine_to_coarse, 36..56).len(),
+            1,
+            "background split"
+        );
+        assert!(level.num_coarse <= 7);
     }
 }
 
 #[test]
-fn test_integration_coarsen_expand_roundtrip() {
-    // Simulated data: D=500, N=300, K=5, max_features=50
+fn coarsening_is_reproducible() {
+    let (counts, sizes) = planted(3, 10, 20, 20, 24, 7);
+    let a = coarsen_features(&counts, &sizes, &[4], 3).unwrap();
+    let b = coarsen_features(&counts, &sizes, &[4], 3).unwrap();
+    assert_eq!(a[0].fine_to_coarse, b[0].fine_to_coarse);
+}
+
+#[test]
+fn a_coarsening_expands_back_exactly() {
+    // Within each group, the fine logits exponentiate back to the coarse one.
     use legume_numeric::matrix::traits::SampleOps;
-
-    let d = 500;
-    let s = 100;
+    let (counts, sizes) = planted(4, 8, 20, 20, 32, 17);
+    let d = counts.nrows();
     let k = 5;
-
-    // Create pseudobulk sketch
-    let sketch = DMatrix::<f32>::rnorm(d, s);
-    let fc = compute_feature_coarsening(&sketch, 50).unwrap();
-
-    // Create a fake log-dictionary at coarse resolution
+    let fc = coarsen_features(&counts, &sizes, &[6], 1)
+        .unwrap()
+        .remove(0);
     let coarse_logits = DMatrix::<f32>::rnorm(fc.num_coarse, k);
-
-    // Expand to fine resolution
     let expanded = fc.expand_log_dict_dk(&coarse_logits, d);
-    assert_eq!(expanded.nrows(), d);
-    assert_eq!(expanded.ncols(), k);
-
-    // For each topic, sum of exp(expanded) within each group
-    // should equal exp(coarse logit)
+    assert_eq!((expanded.nrows(), expanded.ncols()), (d, k));
     for kk in 0..k {
         for (c, group) in fc.coarse_to_fine.iter().enumerate() {
-            let coarse_val = coarse_logits[(c, kk)].exp();
             let fine_sum: f32 = group.iter().map(|&f| expanded[(f, kk)].exp()).sum();
-            assert_relative_eq!(fine_sum, coarse_val, epsilon = 1e-4);
+            assert_relative_eq!(fine_sum, coarse_logits[(c, kk)].exp(), epsilon = 1e-4);
         }
     }
-}
-
-#[test]
-fn test_skip_when_d_small() {
-    // If D <= max_features, coarsening should still work but produce ~D groups
-    use legume_numeric::matrix::traits::SampleOps;
-    let d = 30;
-    let s = 20;
-    let data = DMatrix::<f32>::rnorm(d, s);
-    let fc = compute_feature_coarsening(&data, 50).unwrap();
-    // Should produce fewer groups than D (binary hashing)
-    assert!(fc.num_coarse <= d);
-    assert!(fc.num_coarse > 0);
 }
 
 /// Source axis [g0 g1 g2 g3], groups {g0,g1} and {g2,g3}. The new axis is
