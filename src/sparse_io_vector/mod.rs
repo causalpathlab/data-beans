@@ -402,6 +402,14 @@ impl SparseIoVec {
         }
     }
 
+    /// Every backend location of global column `col`: one entry under
+    /// `Disjoint`, one per observing backend under `Union`. Empty when out
+    /// of range.
+    #[must_use]
+    pub fn column_locations(&self, col: usize) -> &[BackendLocation] {
+        self.col_to_data.get(col).map_or(&[], Vec::as_slice)
+    }
+
     pub fn num_non_zeros(&self) -> anyhow::Result<usize> {
         let mut ret = 0;
         for dat in self.data_vec.iter() {

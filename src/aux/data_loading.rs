@@ -53,6 +53,17 @@ pub struct ReadSharedRowsArgs {
     /// output keep-mask is returned in `output_keep_idx`. `None`
     /// (the default) = no QC, i.e. today's behavior.
     pub qc: Option<crate::qc_lib::QcConfig>,
+    /// Opt out of the empty-barcode gate. By default each file's columns
+    /// are cell-called on their own nnz distribution
+    /// ([`crate::qc::suggest_nnz_cutoff`]: the trough between the ambient
+    /// and the cell peak) and a column is dropped when it falls below the
+    /// cut in every file that observes it — so an unfiltered barcode axis
+    /// (e.g. ATAC from a fragments file) loses its empty droplets before any
+    /// projection or collapse, while a cell in two modalities survives on
+    /// either. A no-op on already-called data (no trough). Set `true` where
+    /// every input column must come back, e.g. query cells at inference.
+    /// Files flagged in `qc_exempt_files` are never gated.
+    pub keep_empty_barcodes: bool,
     /// Per-`data_files` entry: `true` exempts that file's columns from QC —
     /// out of the band statistics AND out of every verdict (see
     /// `qc_from_metrics`). For inputs whose columns are not cells (a carried
@@ -326,6 +337,25 @@ pub fn read_data_on_shared_rows(args: ReadSharedRowsArgs) -> anyhow::Result<Spar
         ));
     }
 
+    // Empty-barcode gate: per-file cell calling, before QC and before any
+    // batch/group registration (mask_columns renumbers the cells). Batch
+    // labels were resolved on the full axis above (a unified batch file
+    // lists every barcode), then filtered in lockstep.
+    if !args.keep_empty_barcodes {
+        if let Some(flags) = args.qc_exempt_files.as_ref() {
+            anyhow::ensure!(
+                flags.len() == args.data_files.len(),
+                "qc_exempt_files has {} entries for {} data files",
+                flags.len(),
+                args.data_files.len(),
+            );
+        }
+        if let Some(keep) = empty_barcode_keep(&data_vec, args.qc_exempt_files.as_deref()) {
+            data_vec.mask_columns(&keep)?;
+            batch_membership = crate::qc_lib::filter_by_keep(&batch_membership, &keep);
+        }
+    }
+
     // Optional shared cell QC — applied here (before any batch/group
     // registration, which happens later during projection) so all
     // downstream stages see the QC-reduced axes consistently.
@@ -388,6 +418,58 @@ pub fn read_data_on_shared_rows(args: ReadSharedRowsArgs) -> anyhow::Result<Spar
         batch: batch_membership,
         output_keep_idx,
     })
+}
+
+/// Keep-mask of the empty-barcode gate, or `None` when nothing is dropped.
+///
+/// Each backend is cell-called on its own column nnz (read off the resident
+/// indptr, no I/O): modalities count on different scales, so they are never
+/// pooled. A global column survives when any backend observing it passes
+/// (or is exempt, or has no indptr / no trough to call on).
+fn empty_barcode_keep(data_vec: &SparseIoVec, exempt: Option<&[bool]>) -> Option<Vec<bool>> {
+    let cutoffs: Vec<Option<u64>> = (0..data_vec.len())
+        .map(|b| {
+            if exempt.is_some_and(|e| e[b]) {
+                return None;
+            }
+            let backend = &data_vec[b];
+            let ncol = backend.num_columns().unwrap_or(0);
+            let nnz: Option<Vec<f32>> = (0..ncol)
+                .map(|c| backend.column_nnz(c).map(|x| x as f32))
+                .collect();
+            let cut = crate::qc::suggest_nnz_cutoff(&nnz?)? as u64;
+            Some(cut)
+        })
+        .collect();
+    if cutoffs.iter().all(Option::is_none) {
+        return None;
+    }
+
+    let keep: Vec<bool> = (0..data_vec.num_columns())
+        .map(|c| {
+            data_vec.column_locations(c).iter().any(|loc| {
+                let b = loc.backend as usize;
+                cutoffs[b].is_none_or(|cut| {
+                    data_vec[b]
+                        .column_nnz(loc.local_col as usize)
+                        .is_none_or(|x| x >= cut)
+                })
+            })
+        })
+        .collect();
+    let n_drop = keep.iter().filter(|&&k| !k).count();
+    info!(
+        "Empty-barcode gate: {} / {} columns called empty (per-file nnz cutoffs: {})",
+        n_drop,
+        keep.len(),
+        cutoffs
+            .iter()
+            .map(|c| c.map_or("none".to_string(), |x| x.to_string()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    // Never hand back an empty matrix.
+    (n_drop > 0 && n_drop < keep.len()).then_some(keep)
 }
 
 /// Soft hint when running with `ColumnAlignment::Disjoint` and inputs

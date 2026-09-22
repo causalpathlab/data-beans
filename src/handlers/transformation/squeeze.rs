@@ -67,7 +67,7 @@ pub fn run_squeeze(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
         let row_nnz_vec = row_stat.count_positives();
         let col_nnz_vec = col_stat.count_positives();
 
-        // Suggest cutoffs by 2-means clustering of log(1+nnz)
+        // Suggest cutoffs at the trough of the log(1+nnz) histogram
         let want_hist =
             cmd_args.show_histogram || cmd_args.save_histogram.is_some() || cmd_args.interactive;
         let want_suggest = want_hist || cmd_args.auto_cutoff;
@@ -244,7 +244,7 @@ fn run_squeeze_and_merge(
         let row_nnz_vec = row_stat.count_positives();
         let col_nnz_vec = col_stat.count_positives();
 
-        // Suggest cutoffs by 2-means clustering of log(1+nnz)
+        // Suggest cutoffs at the trough of the log(1+nnz) histogram
         let row_suggest = suggest_nnz_cutoff(&row_nnz_vec);
         let col_suggest = suggest_nnz_cutoff(&col_nnz_vec);
 

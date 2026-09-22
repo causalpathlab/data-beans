@@ -71,13 +71,15 @@ pub struct QcConfig {
     /// near-empty floor (output mask) is computed — used by inference
     /// (predict/impute) so query cells are never silently dropped.
     pub drop_outliers: bool,
-    /// Automatic cell calling: pick the per-cell nnz cutoff by 2-means on
-    /// `log(1+nnz)` (ambient↔real boundary) and **train-drop** every cell below
-    /// it. So called-out ambient is removed up front (via the caller's
-    /// `mask_columns`), not just output-masked — it never shapes the model. The
-    /// 2-means cutoff is authoritative; `min_cell_nnz` does NOT floor it (it only
-    /// drives the separate near-empty output mask). No-op when the BIC guard
-    /// finds no split (unimodal) or when `drop_outliers` is false (inference).
+    /// Automatic cell calling: pick the per-cell nnz cutoff at the trough
+    /// between the ambient and the cell peak ([`crate::qc::suggest_nnz_cutoff`])
+    /// and **train-drop** every cell below it. So called-out ambient is removed
+    /// up front (via the caller's `mask_columns`), not just output-masked — it
+    /// never shapes the model. The cutoff is authoritative; `min_cell_nnz` does
+    /// NOT floor it (it only drives the separate near-empty output mask). No-op
+    /// when there is no trough (unimodal) or when `drop_outliers` is false
+    /// (inference). Unlike the loader's per-file empty-barcode gate, this runs
+    /// on the pooled cell axis.
     pub auto_cell_cutoff: bool,
     /// Print the per-cell nnz histogram + the suggested/applied cutoff (the
     /// same ASCII summary as `data-beans squeeze --show-histogram`).
@@ -444,16 +446,16 @@ fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcR
             outlier[c] = fail;
         }
 
-        // Automatic cell calling: 2-means on n_genes picks the ambient↔real
+        // Automatic cell calling: the trough of n_genes picks the ambient↔real
         // boundary and train-drops every cell below it, so the caller's
-        // `mask_columns(train_keep)` removes ambient up front. The 2-means cutoff
+        // `mask_columns(train_keep)` removes ambient up front. The cutoff
         // is authoritative — there is NO redundant `min_cell_nnz` floor on it.
-        // When the data is unimodal the BIC guard returns `None`, so no auto
+        // When the data is unimodal the trough search returns `None`, so no auto
         // cutoff is applied and the near-empty floor / MAD tiers stand alone.
         // The histogram + cutoff are optionally printed.
         if cfg.auto_cell_cutoff || cfg.qc_histogram {
             let suggested = crate::qc::suggest_nnz_cutoff(&n_genes);
-            // Display cutoff: the 2-means suggestion if found, else the
+            // Display cutoff: the trough suggestion if found, else the
             // near-empty floor (what the non-auto tier would use).
             let shown = suggested.unwrap_or(cfg.min_cell_nnz);
             crate::qc::print_nnz_summary("Cell", "nnz", &n_genes, shown, suggested);
@@ -600,8 +602,8 @@ pub struct QcArgs {
                      - MAD-outlier drops on detected features and total counts\n    \
                      (--qc-mad-on-genes / --qc-mad-on-counts, band --qc-mads).\n\
                      \n\
-                     The bimodal 2-means cut stays OFF unless --qc-auto-cutoff.\n\
-                     So the model or embedding still makes the empty-vs-real call.\n\
+                     Empty barcodes are dropped earlier, per input file, by the loader.\n\
+                     A pooled trough cut on top of that stays OFF unless --qc-auto-cutoff.\n\
                      \n\
                      Outputs may therefore have FEWER ROWS than the input.\n\
                      Join by the cell/barcode name column, never by position.\n\
@@ -685,9 +687,9 @@ pub struct QcArgs {
         long = "qc-histogram",
         hide = true,
         default_value_t = false,
-        help = "Print the per-cell nnz histogram + the (diagnostic) 2-means suggested cutoff",
+        help = "Print the per-cell nnz histogram + the (diagnostic) suggested trough cutoff",
         long_help = "Print an ASCII histogram of the per-cell nnz distribution.\n\
-                     The suggested 2-means cutoff is marked.\n\
+                     The suggested trough cutoff is marked.\n\
                      It is the same summary as `data-beans squeeze --show-histogram`.\n\
                      \n\
                      This is purely diagnostic. The cutoff is shown, not applied.\n\
@@ -726,9 +728,9 @@ pub struct QcArgs {
         long = "qc-auto-cutoff",
         hide = true,
         default_value_t = false,
-        help = "Apply the bimodal 2-means cell-calling cutoff (aggressive upfront cut)",
-        long_help = "Apply the 2-means bimodal cutoff as a hard cell call.\n\
-                     It runs on the per-cell nnz distribution.\n\
+        help = "Apply the nnz trough cell-calling cutoff on the pooled cell axis",
+        long_help = "Apply the ambient/cell trough cutoff as a hard cell call.\n\
+                     It runs on the pooled per-cell nnz distribution, after the loader's per-file gate.\n\
                      Without this flag it is only reported, via --qc-histogram.\n\
                      \n\
                      OFF by default. The intended gate is the conservative near-empty floor,\n\
@@ -792,10 +794,10 @@ mod qc_tests {
 
     #[test]
     fn auto_cutoff_train_drops_ambient() {
-        // Bimodal nnz: 3 ambient (~2) + 3 real (~100). With auto cell calling on
-        // (MAD tiers off so the auto floor is the only decider), the 2-means
+        // Bimodal nnz: 30 ambient (~2) + 30 real (~100). With auto cell calling on
+        // (MAD tiers off so the auto floor is the only decider), the trough
         // cutoff lands between the modes and the ambient cells are train-dropped.
-        let n_genes = vec![2.0, 2.0, 2.0, 100.0, 100.0, 100.0];
+        let n_genes: Vec<f32> = [vec![2.0; 30], vec![100.0; 30]].concat();
         let cfg = QcConfig {
             auto_cell_cutoff: true,
             qc_histogram: false,
@@ -820,9 +822,9 @@ mod qc_tests {
         );
         assert_eq!(
             report.train_keep,
-            vec![false, false, false, true, true, true]
+            [vec![false; 30], vec![true; 30]].concat()
         );
-        assert_eq!(report.n_cells_dropped, 3);
+        assert_eq!(report.n_cells_dropped, 30);
     }
 
     #[test]
