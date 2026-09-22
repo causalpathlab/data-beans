@@ -505,19 +505,7 @@ pub(super) fn refine_and_collect_single_layer(
         num_levels, refined.num_groups_per_level
     );
 
-    // Build per-level cell → pb mapping (finest-first) by walking
-    // refined.pbsamp_to_group[level] through pb_sample_to_cells.
-    let mut cell_to_pb_per_level: Vec<Vec<usize>> = Vec::with_capacity(num_levels);
-    for level in 0..num_levels {
-        let mut c2g = vec![0usize; ncols];
-        for (pbsamp, cells) in pb_sample_to_cells.iter().enumerate() {
-            let g = refined.pbsamp_to_group[level][pbsamp];
-            for &c in cells {
-                c2g[c] = g;
-            }
-        }
-        cell_to_pb_per_level.push(c2g);
-    }
+    let cell_to_pb_per_level = cell_to_pb_per_level(&refined, &pb_sample_to_cells, ncols);
 
     // Tree: attach the finest pb ids behind every leaf code.
     let pb_tree = ctx.pb_tree.map(|tree| {
@@ -544,6 +532,36 @@ pub(super) fn refine_and_collect_single_layer(
     })
 }
 
+/// Per-level cell → pb mapping (finest-first), walking each level's
+/// `pbsamp_to_group` through `pb_sample_to_cells`.
+fn cell_to_pb_per_level(
+    refined: &crate::alg::refine_multilevel::RefinedAssignment,
+    pb_sample_to_cells: &[Vec<usize>],
+    ncols: usize,
+) -> Vec<Vec<usize>> {
+    refined
+        .pbsamp_to_group
+        .iter()
+        .map(|groups| {
+            let mut c2g = vec![0usize; ncols];
+            for (pbsamp, cells) in pb_sample_to_cells.iter().enumerate() {
+                for &c in cells {
+                    c2g[c] = groups[pbsamp];
+                }
+            }
+            c2g
+        })
+        .collect()
+}
+
+/// What the stack collapse returns: per level (finest first), one
+/// `CollapsedOut` per layer, and the per-level cell → pb membership the layers
+/// share.
+pub struct StackCollapseOut {
+    pub levels: Vec<Vec<CollapsedOut>>,
+    pub cell_to_pb_per_level: Vec<Vec<usize>>,
+}
+
 /// Refinement integration path for `SparseIoStack`.
 ///
 /// Shares one `RefinedAssignment` across all layers (first-layer-owns the
@@ -553,7 +571,7 @@ pub(super) fn refine_and_collect_stack(
     stack: &mut SparseIoStack,
     proj_kn: &DMatrix<f32>,
     ctx: &RefineCollectCtx<'_>,
-) -> anyhow::Result<Vec<Vec<CollapsedOut>>> {
+) -> anyhow::Result<StackCollapseOut> {
     let RefineCollectCtx {
         fine_codes,
         group_to_cols_finest,
@@ -568,7 +586,7 @@ pub(super) fn refine_and_collect_stack(
         summary_batches: _,
         bulk_batches: _,
         observe_panels: _,
-        keep_finest_stats: _,
+        keep_finest_stats,
         pb_tree: _,
         cell_to_stratum,
         exclude_unmatched_from_delta,
@@ -716,7 +734,7 @@ pub(super) fn refine_and_collect_stack(
             opt_iter,
             &format!("Fit L1/{} layer {}/{}", num_levels, d + 1, num_layers),
             output_calibration,
-            false,
+            keep_finest_stats,
         )?;
         finest_layer_results.push(out);
         fine_stats.push(stat);
@@ -771,7 +789,10 @@ pub(super) fn refine_and_collect_stack(
         prev_stats = coarse_stats;
     }
 
-    Ok(results)
+    Ok(StackCollapseOut {
+        levels: results,
+        cell_to_pb_per_level: cell_to_pb_per_level(&refined, &pb_sample_to_cells, ncols),
+    })
 }
 
 /// Compute sort dimensions for each level, linearly spaced from

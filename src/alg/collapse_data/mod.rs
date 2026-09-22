@@ -47,6 +47,7 @@ pub use reassign_cells::ReassignCellsParams;
 mod pb_tree;
 pub use pb_tree::{BelowEdge, ContrastGene, PbTree, PbTreeParams, RootRecord, SplitRecord};
 mod refine;
+pub use refine::StackCollapseOut;
 use refine::{
     compute_level_sort_dims, fine_to_coarse_from_refined, pad_numeric_labels,
     refine_and_collect_single_layer, refine_and_collect_stack, split_anchored_finest_groups,
@@ -1187,71 +1188,91 @@ impl MultilevelCollapsingOps for SparseIoStack {
     where
         T: Sync + Send + std::hash::Hash + Eq + Clone + ToString,
     {
-        let num_layers = self.num_types();
-        if num_layers == 0 {
-            return Err(anyhow::anyhow!("empty SparseIoStack"));
-        }
-
-        let sort_dim = params.sort_dim;
-        let knn = params.knn_pb_samples;
-        let opt_iter = params.num_opt_iter;
-
-        self.register_batch_membership(batch_membership);
-
-        // Use first layer for num_batches (all layers share the same columns)
-        let num_batches = self.stack[0].num_batches();
-        if num_batches >= 2 {
-            for layer in self.stack.iter_mut() {
-                layer.build_hnsw_per_batch(proj_kn, batch_membership)?;
-            }
-        }
-
-        let ncols = proj_kn.ncols();
-        let refine_params = &params.refine;
-        let level_dims = compute_level_sort_dims(sort_dim, params.num_levels);
-        let finest_dim = level_dims[0];
-        let kk = proj_kn.nrows().min(finest_dim).min(ncols);
-        let codes = binary_sort_columns(proj_kn, kk)?;
-        let (fine_codes, level_dims, strata_bits) = match params.strata.as_deref() {
-            Some(strata) => {
-                let (c, d, s) = apply_strata_to_codes(&codes, &level_dims, strata)?;
-                (c, d, s)
-            }
-            None => (codes, level_dims, 0),
-        };
-        for layer in self.stack.iter_mut() {
-            layer.assign_groups(&fine_codes, None);
-        }
-        let group_to_cols = self.stack[0]
-            .take_grouped_columns()
-            .ok_or(anyhow::anyhow!("columns not assigned"))?
-            .clone();
-        let num_features = self.stack[0].num_rows();
-        anyhow::ensure!(
-            params.anchor_batches.is_none() && params.bulk_batches.is_none(),
-            "anchor_batches / bulk_batches are not supported on the stack path — nothing \
-             produces a carried reference or bulk input for stacked modalities"
-        );
-        let ctx = RefineCollectCtx {
-            fine_codes: &fine_codes,
-            group_to_cols_finest: &group_to_cols,
-            level_dims: &level_dims,
-            num_features,
-            num_batches,
-            knn,
-            opt_iter,
-            refine_params,
-            output_calibration: params.output_calibration,
-            anchor_batches: None,
-            summary_batches: None,
-            bulk_batches: None,
-            observe_panels: false,
-            keep_finest_stats: false,
-            pb_tree: None,
-            cell_to_stratum: params.strata.as_deref(),
-            exclude_unmatched_from_delta: params.strata.is_some(),
-            strata_bits,
-        };
-        refine_and_collect_stack(self, proj_kn, &ctx)
+        Ok(
+            collapse_stack_multilevel_with_hierarchy(self, proj_kn, batch_membership, params)?
+                .levels,
+        )
     }
+}
+
+/// The `SparseIoStack` collapse, also returning the per-level cell → pb
+/// membership (finest first) the layers share — the stack counterpart of
+/// [`collapse_columns_multilevel_with_hierarchy`]. With
+/// `params.keep_finest_stats` the finest level keeps its sufficient statistics,
+/// which `CollapsedOut::observed_counts` reads.
+pub fn collapse_stack_multilevel_with_hierarchy<T>(
+    stack: &mut SparseIoStack,
+    proj_kn: &DMatrix<f32>,
+    batch_membership: &[T],
+    params: &MultilevelParams,
+) -> anyhow::Result<StackCollapseOut>
+where
+    T: Sync + Send + std::hash::Hash + Eq + Clone + ToString,
+{
+    let num_layers = stack.num_types();
+    if num_layers == 0 {
+        return Err(anyhow::anyhow!("empty SparseIoStack"));
+    }
+
+    let sort_dim = params.sort_dim;
+    let knn = params.knn_pb_samples;
+    let opt_iter = params.num_opt_iter;
+
+    stack.register_batch_membership(batch_membership);
+
+    // Use first layer for num_batches (all layers share the same columns)
+    let num_batches = stack.stack[0].num_batches();
+    if num_batches >= 2 {
+        for layer in stack.stack.iter_mut() {
+            layer.build_hnsw_per_batch(proj_kn, batch_membership)?;
+        }
+    }
+
+    let ncols = proj_kn.ncols();
+    let refine_params = &params.refine;
+    let level_dims = compute_level_sort_dims(sort_dim, params.num_levels);
+    let finest_dim = level_dims[0];
+    let kk = proj_kn.nrows().min(finest_dim).min(ncols);
+    let codes = binary_sort_columns(proj_kn, kk)?;
+    let (fine_codes, level_dims, strata_bits) = match params.strata.as_deref() {
+        Some(strata) => {
+            let (c, d, s) = apply_strata_to_codes(&codes, &level_dims, strata)?;
+            (c, d, s)
+        }
+        None => (codes, level_dims, 0),
+    };
+    for layer in stack.stack.iter_mut() {
+        layer.assign_groups(&fine_codes, None);
+    }
+    let group_to_cols = stack.stack[0]
+        .take_grouped_columns()
+        .ok_or(anyhow::anyhow!("columns not assigned"))?
+        .clone();
+    let num_features = stack.stack[0].num_rows();
+    anyhow::ensure!(
+        params.anchor_batches.is_none() && params.bulk_batches.is_none(),
+        "anchor_batches / bulk_batches are not supported on the stack path — nothing \
+         produces a carried reference or bulk input for stacked modalities"
+    );
+    let ctx = RefineCollectCtx {
+        fine_codes: &fine_codes,
+        group_to_cols_finest: &group_to_cols,
+        level_dims: &level_dims,
+        num_features,
+        num_batches,
+        knn,
+        opt_iter,
+        refine_params,
+        output_calibration: params.output_calibration,
+        anchor_batches: None,
+        summary_batches: None,
+        bulk_batches: None,
+        observe_panels: false,
+        keep_finest_stats: params.keep_finest_stats,
+        pb_tree: None,
+        cell_to_stratum: params.strata.as_deref(),
+        exclude_unmatched_from_delta: params.strata.is_some(),
+        strata_bits,
+    };
+    refine_and_collect_stack(stack, proj_kn, &ctx)
 }

@@ -3,7 +3,6 @@ pub mod cell_pairs;
 pub mod collapse_data;
 pub mod dc_poisson;
 pub mod feature_coarsening;
-pub mod feature_coarsening_multilevel;
 pub mod gene_weighting;
 pub mod hvg;
 pub mod nb_dispersion;

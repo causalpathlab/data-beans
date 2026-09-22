@@ -644,6 +644,25 @@ impl CollapsedOut {
             }
         }
     }
+
+    /// The observed counts `[D × S]` and pseudobulk sizes `[S]` of this level:
+    /// each entry is the prior-free rate `evidence_mean` (data sum over data
+    /// denominator) times the pseudobulk's cell count, and a size is the number
+    /// of cells `cell_to_pb` puts in it. Reads the observed (not batch-adjusted)
+    /// posterior's sufficient statistics, so the collapse must have kept them
+    /// (`MultilevelParams::keep_finest_stats` for the finest level).
+    pub fn observed_counts(&self, cell_to_pb: &[usize]) -> (DMatrix<f32>, Vec<f32>) {
+        let param = &self.mu_observed;
+        let (d, n_pb) = (param.nrows(), param.ncols());
+        let mut sizes = vec![0f32; n_pb];
+        for &pb in cell_to_pb {
+            if pb < n_pb {
+                sizes[pb] += 1.0;
+            }
+        }
+        let counts = DMatrix::<f32>::from_fn(d, n_pb, |g, s| param.evidence_mean(g, s) * sizes[s]);
+        (counts, sizes)
+    }
 }
 
 /// a struct to hold the sufficient statistics for the model
