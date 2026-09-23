@@ -427,6 +427,7 @@ pub fn read_data_on_shared_rows(args: ReadSharedRowsArgs) -> anyhow::Result<Spar
 /// pooled. A global column survives when any backend observing it passes
 /// (or is exempt, or has no indptr / no trough to call on).
 fn empty_barcode_keep(data_vec: &SparseIoVec, exempt: Option<&[bool]>) -> Option<Vec<bool>> {
+    let mut missing_indptr: Vec<usize> = Vec::new();
     let cutoffs: Vec<Option<u64>> = (0..data_vec.len())
         .map(|b| {
             if exempt.is_some_and(|e| e[b]) {
@@ -437,10 +438,24 @@ fn empty_barcode_keep(data_vec: &SparseIoVec, exempt: Option<&[bool]>) -> Option
             let nnz: Option<Vec<f32>> = (0..ncol)
                 .map(|c| backend.column_nnz(c).map(|x| x as f32))
                 .collect();
-            let cut = crate::qc::suggest_nnz_cutoff(&nnz?)? as u64;
-            Some(cut)
+            let Some(nnz) = nnz else {
+                missing_indptr.push(b);
+                return None;
+            };
+            crate::qc::suggest_nnz_cutoff(&nnz).map(|c| c as u64)
         })
         .collect();
+    if !missing_indptr.is_empty() {
+        warn!(
+            "Empty-barcode gate: file index(es) {} have no resident column indptr; \
+             skipping cell call for those backends",
+            missing_indptr
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
     if cutoffs.iter().all(Option::is_none) {
         return None;
     }

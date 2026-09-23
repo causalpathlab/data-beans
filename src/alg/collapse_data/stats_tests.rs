@@ -306,3 +306,47 @@ fn mean_only_vconcat_drops_stats_keeps_means() {
         "sd should be empty under MeanOnly"
     );
 }
+
+#[test]
+fn observed_counts_requires_kept_stats() {
+    let stat = toy_stat(4, 2, 1);
+    let mut out = optimize(
+        &stat,
+        (1.0, 1.0),
+        5,
+        "test",
+        CalibrateTarget::MeanOnly,
+        false,
+    )
+    .unwrap();
+    assert!(!out.stats_kept);
+    let err = out
+        .observed_counts(&[0, 1])
+        .expect_err("released stats must error");
+    assert!(
+        err.to_string().contains("keep_finest_stats"),
+        "unexpected: {err}"
+    );
+
+    // Re-fit with stats kept: membership OOB is a soft error, not a panic.
+    out = optimize(
+        &stat,
+        (1.0, 1.0),
+        5,
+        "test",
+        CalibrateTarget::MeanOnly,
+        true,
+    )
+    .unwrap();
+    assert!(out.stats_kept);
+    let err = out
+        .observed_counts(&[0, 99])
+        .expect_err("OOB membership must error");
+    assert!(
+        err.to_string().contains("out of range"),
+        "unexpected: {err}"
+    );
+    let (counts, sizes) = out.observed_counts(&[0, 0, 1]).unwrap();
+    assert_eq!(counts.nrows(), 4);
+    assert_eq!(sizes, vec![2.0, 1.0]);
+}

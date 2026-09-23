@@ -327,7 +327,8 @@ fn unit_rows(z: &mut DMatrix<f32>) {
 
 /// Nested feature coarsenings of pseudobulk `counts` `[D × S]` with pseudobulk
 /// sizes `sizes` (cells per column), one per entry of `level_targets`
-/// (coarsest → finest, non-decreasing): at most `target` groups each.
+/// (coarsest → finest, non-decreasing): at most `target` groups each,
+/// counting the reserved background group when uninformative features exist.
 ///
 /// # Method
 ///
@@ -344,6 +345,10 @@ fn unit_rows(z: &mut DMatrix<f32>) {
 /// proportion; k-means keeps groups balanced by construction. Coarser levels
 /// cluster the finest centroids, so every level nests in the one below.
 /// Each level's group sizes are logged.
+///
+/// When a background group is reserved, the k-means budget is `target - 1`
+/// informative slots (and may be zero): `target == 1` then yields a single
+/// all-background coarsening rather than forcing an extra informative cluster.
 pub fn coarsen_features(
     counts: &DMatrix<f32>,
     sizes: &[f32],
@@ -365,12 +370,9 @@ pub fn coarsen_features(
     let informative = informative_features(counts, sizes);
     let rows: Vec<usize> = (0..d).filter(|&g| informative[g]).collect();
     let has_background = rows.len() < d;
-    let slots = |target: usize| {
-        target
-            .max(1)
-            .saturating_sub(usize::from(has_background))
-            .max(1)
-    };
+    // `target` is a total group budget; the background (when present) spends
+    // one slot, and the rest are informative k-means clusters (possibly zero).
+    let slots = |target: usize| target.max(1).saturating_sub(usize::from(has_background));
     info!(
         "feature coarsening: {} of {d} features informative, {} in the background group",
         rows.len(),
@@ -379,12 +381,12 @@ pub fn coarsen_features(
 
     // Finest level: k-means on the informative features' residual profiles.
     let finest = *level_targets.last().expect("checked non-empty");
-    let (fine_label, centroids) = if rows.is_empty() {
+    let k_fine = slots(finest).min(rows.len());
+    let (fine_label, centroids) = if rows.is_empty() || k_fine == 0 {
         (Vec::new(), DMatrix::<f32>::zeros(0, 0))
     } else {
         let z = residual_profiles(counts, sizes, &rows, seed);
-        let k = slots(finest).min(rows.len());
-        let (mut c, labels) = kmeans_centroids_seeded(&z, k, KMEANS_ITER, seed);
+        let (mut c, labels) = kmeans_centroids_seeded(&z, k_fine, KMEANS_ITER, seed);
         unit_rows(&mut c);
         (labels, c)
     };
@@ -395,18 +397,13 @@ pub fn coarsen_features(
         .iter()
         .enumerate()
         .map(|(l, &target)| {
-            let to_level: Vec<usize> = if n_fine == 0 {
+            let k = slots(target);
+            let to_level: Vec<usize> = if n_fine == 0 || k == 0 {
                 Vec::new()
-            } else if l + 1 == level_targets.len() || slots(target) >= n_fine {
+            } else if l + 1 == level_targets.len() || k >= n_fine {
                 (0..n_fine).collect()
             } else {
-                kmeans_centroids_seeded(
-                    &centroids,
-                    slots(target),
-                    KMEANS_ITER,
-                    mix_seed(seed, l as u64),
-                )
-                .1
+                kmeans_centroids_seeded(&centroids, k, KMEANS_ITER, mix_seed(seed, l as u64)).1
             };
             let level = level_from_labels(d, &rows, &fine_label, &to_level, has_background);
             info!(

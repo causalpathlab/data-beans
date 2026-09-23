@@ -1,2 +1,5 @@
 target/
 .make-install-status
+
+# Local crates.io path patches (sibling checkouts)
+.cargo/

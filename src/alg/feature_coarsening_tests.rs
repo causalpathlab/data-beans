@@ -258,6 +258,18 @@ fn coarsening_is_reproducible() {
 }
 
 #[test]
+fn target_one_stays_one_group_when_background_is_reserved() {
+    // Informative + empty features: a budget of 1 must not force a second
+    // (informative) cluster on top of the background.
+    let (counts, sizes) = planted(2, 8, 20, 20, 24, 11);
+    let fc = coarsen_features(&counts, &sizes, &[1], 5)
+        .unwrap()
+        .remove(0);
+    assert_eq!(fc.num_coarse, 1, "fine_to_coarse={:?}", fc.fine_to_coarse);
+    assert!(fc.fine_to_coarse.iter().all(|&g| g == 0));
+}
+
+#[test]
 fn a_coarsening_expands_back_exactly() {
     // Within each group, the fine logits exponentiate back to the coarse one.
     use legume_numeric::matrix::traits::SampleOps;

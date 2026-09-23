@@ -452,6 +452,7 @@ fn optimize_block(
             mu_residual: Some(mu_resid_param),
             gamma: Some(gamma_param),
             delta: Some(delta_param),
+            stats_kept: true,
         })
     } else {
         let mut denom_ds = DMatrix::<f32>::zeros(num_genes, num_samples);
@@ -467,6 +468,7 @@ fn optimize_block(
             mu_residual: None,
             gamma: None,
             delta: None,
+            stats_kept: true,
         })
     }
 }
@@ -542,16 +544,22 @@ pub(super) fn optimize(
     if n_blocks <= 1 {
         if batched {
             let prog = styled_progress_bar(total as u64, &msg);
-            let out = optimize_block(stat, hyper, num_iter, out_target, Some(&prog));
+            let mut out = optimize_block(stat, hyper, num_iter, out_target, Some(&prog))?;
             prog.finish_and_clear();
-            return out;
+            if !keep_stats {
+                out.release_stats();
+            }
+            return Ok(out);
         }
         let spin =
             legume_numeric::matrix::progress::new_spinner("{spinner} [{elapsed_precise}] {msg}")
                 .with_message(format!("{label} single gene-block · {dims}"));
-        let out = optimize_block(stat, hyper, num_iter, out_target, None);
+        let mut out = optimize_block(stat, hyper, num_iter, out_target, None)?;
         spin.finish_and_clear();
-        return out;
+        if !keep_stats {
+            out.release_stats();
+        }
+        return Ok(out);
     }
 
     // The gene axis is separable — a block's fit depends only on its own rows
@@ -613,6 +621,7 @@ pub(super) fn optimize(
         mu_residual: join(mu_res),
         gamma: join(gam),
         delta: join(del),
+        stats_kept: keep_stats,
     })
 }
 
@@ -624,6 +633,10 @@ pub struct CollapsedOut {
     pub mu_residual: Option<GammaMatrix>,
     pub gamma: Option<GammaMatrix>,
     pub delta: Option<GammaMatrix>,
+    /// Whether `a_stat`/`b_stat` remain on the parameters. False after
+    /// [`Self::release_stats`] or a `MeanOnly` assemble that dropped them.
+    /// [`Self::observed_counts`] requires this to be true.
+    pub stats_kept: bool,
 }
 
 impl CollapsedOut {
@@ -643,6 +656,7 @@ impl CollapsedOut {
                 g.release_stats();
             }
         }
+        self.stats_kept = false;
     }
 
     /// The observed counts `[D × S]` and pseudobulk sizes `[S]` of this level:
@@ -651,17 +665,39 @@ impl CollapsedOut {
     /// of cells `cell_to_pb` puts in it. Reads the observed (not batch-adjusted)
     /// posterior's sufficient statistics, so the collapse must have kept them
     /// (`MultilevelParams::keep_finest_stats` for the finest level).
-    pub fn observed_counts(&self, cell_to_pb: &[usize]) -> (DMatrix<f32>, Vec<f32>) {
+    ///
+    /// # Errors
+    ///
+    /// - sufficient statistics were released (`keep_finest_stats` was false
+    ///   under `MeanOnly` calibration)
+    /// - a `cell_to_pb` entry is out of range for this level's pseudobulk count
+    pub fn observed_counts(
+        &self,
+        cell_to_pb: &[usize],
+    ) -> anyhow::Result<(DMatrix<f32>, Vec<f32>)> {
+        anyhow::ensure!(
+            self.stats_kept,
+            "CollapsedOut::observed_counts needs kept sufficient statistics; \
+             set MultilevelParams::keep_finest_stats"
+        );
         let param = &self.mu_observed;
         let (d, n_pb) = (param.nrows(), param.ncols());
         let mut sizes = vec![0f32; n_pb];
+        let mut n_oob = 0usize;
         for &pb in cell_to_pb {
             if pb < n_pb {
                 sizes[pb] += 1.0;
+            } else {
+                n_oob += 1;
             }
         }
+        anyhow::ensure!(
+            n_oob == 0,
+            "CollapsedOut::observed_counts: {n_oob} cell→pseudobulk id(s) \
+             are out of range for {n_pb} pseudobulk(s)"
+        );
         let counts = DMatrix::<f32>::from_fn(d, n_pb, |g, s| param.evidence_mean(g, s) * sizes[s]);
-        (counts, sizes)
+        Ok((counts, sizes))
     }
 }
 
