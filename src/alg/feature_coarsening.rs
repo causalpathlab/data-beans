@@ -477,6 +477,250 @@ fn group_sizes(level: &FeatureCoarsening, has_background: bool) -> String {
     )
 }
 
+/// Options of [`partition_features`]; the default is the plain single-level
+/// coarsening.
+#[derive(Clone, Debug, Default)]
+pub struct PartitionOptions {
+    /// Groups of fewer features hold **scattered** features — ones whose
+    /// profile matches no other, which k-means places alone. They join the
+    /// background, and the slots they held split the largest groups in two
+    /// (a split kept only when both halves reach this size). Re-clustering
+    /// without them instead only promotes the next outliers. `0` or `1`: off.
+    pub min_group_size: usize,
+    /// Per feature, a BLOCK no group may cross (e.g. a genomic window);
+    /// `u32::MAX` is an ordinary block id. Each block is partitioned on its
+    /// own with a share of the slots proportional to its informative
+    /// features (at least one). `None`: one block.
+    pub block: Option<Vec<u32>>,
+}
+
+/// A single-level partition of the features (see [`partition_features`]).
+#[derive(Clone, Debug)]
+pub struct FeaturePartition {
+    /// Group of every feature, `0..num_groups`; the background, when there is
+    /// one, is numbered last.
+    pub labels: Vec<usize>,
+    pub num_groups: usize,
+    /// The background group: flat features and scattered ones.
+    pub background: Option<usize>,
+    /// Per feature, [`informative_features`] (not flat), computed once here
+    /// so callers need not run the test again.
+    pub informative: Vec<bool>,
+}
+
+/// Salt of the k-means seed of a group split.
+const SPLIT_SEED_SALT: u64 = 0x5350_4c54;
+
+/// `k` k-means groups of `rows` by their residual profiles, as lists of row
+/// ids in first-use order (empty groups dropped); `k` is clamped to the row
+/// count.
+fn kmeans_groups(
+    counts: &DMatrix<f32>,
+    sizes: &[f32],
+    rows: &[usize],
+    k: usize,
+    seed: u64,
+) -> Vec<Vec<usize>> {
+    let k = k.min(rows.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    let z = residual_profiles(counts, sizes, rows, seed);
+    let (_, labels) = kmeans_centroids_seeded(&z, k, KMEANS_ITER, seed);
+    let mut slot = vec![usize::MAX; k];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (&r, &l) in rows.iter().zip(&labels) {
+        if slot[l] == usize::MAX {
+            slot[l] = groups.len();
+            groups.push(Vec::new());
+        }
+        groups[slot[l]].push(r);
+    }
+    groups
+}
+
+/// The informative groups of `rows` within a budget of `n_groups` (one slot
+/// kept for the background when it has members): the plain k-means, then,
+/// with `min_size > 1`, scattered groups set aside and the freed slots spent
+/// splitting the largest groups. Rows in no returned group are background.
+fn informative_groups(
+    counts: &DMatrix<f32>,
+    sizes: &[f32],
+    rows: &[usize],
+    informative: &[bool],
+    n_groups: usize,
+    seed: u64,
+    min_size: usize,
+) -> Vec<Vec<usize>> {
+    let inf: Vec<usize> = rows.iter().copied().filter(|&r| informative[r]).collect();
+    let has_empty = inf.len() < rows.len();
+    let slots = n_groups.max(1).saturating_sub(usize::from(has_empty));
+    let groups = kmeans_groups(counts, sizes, &inf, slots, seed);
+    if min_size <= 1 {
+        return groups;
+    }
+    let (mut groups, scattered): (Vec<Vec<usize>>, Vec<Vec<usize>>) =
+        groups.into_iter().partition(|g| g.len() >= min_size);
+    let has_bg = has_empty || !scattered.is_empty();
+    let mut free = n_groups.saturating_sub(groups.len() + usize::from(has_bg));
+    let mut heap: std::collections::BinaryHeap<(usize, usize)> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| (g.len(), i))
+        .collect();
+    while free > 0 {
+        let Some((len, i)) = heap.pop() else { break };
+        if len < 2 * min_size {
+            break;
+        }
+        let mut halves = kmeans_groups(
+            counts,
+            sizes,
+            &groups[i],
+            2,
+            mix_seed(seed, SPLIT_SEED_SALT + i as u64),
+        );
+        if halves.len() == 2 && halves.iter().all(|h| h.len() >= min_size) {
+            let b = halves.pop().expect("two halves");
+            groups[i] = halves.pop().expect("two halves");
+            heap.push((groups[i].len(), i));
+            heap.push((b.len(), groups.len()));
+            groups.push(b);
+            free -= 1;
+        }
+    }
+    groups
+}
+
+/// Proportional shares of `budget` slots over blocks with `weight` informative
+/// features each: at least one per block, the remainder to the blocks with the
+/// most features per slot.
+fn block_shares(weight: &[usize], budget: usize) -> Vec<usize> {
+    let total: usize = weight.iter().sum();
+    let mut alloc: Vec<usize> = weight
+        .iter()
+        .map(|&c| (budget * c / total.max(1)).max(1))
+        .collect();
+    while alloc.iter().sum::<usize>() > budget {
+        let i = (0..alloc.len())
+            .max_by_key(|&i| alloc[i])
+            .expect("non-empty");
+        alloc[i] -= 1;
+    }
+    while alloc.iter().sum::<usize>() < budget {
+        let i = (0..alloc.len())
+            .max_by(|&a, &b| (weight[a] * alloc[b]).cmp(&(weight[b] * alloc[a])))
+            .expect("non-empty");
+        alloc[i] += 1;
+    }
+    alloc
+}
+
+/// A single-level partition of `counts` `[D × S]` into at most `n_groups`
+/// groups, the background counted: [`coarsen_features`] at one level, with
+/// the [`PartitionOptions`] applied and the background id and informative
+/// flags returned. Without options the labels are exactly the single-level
+/// coarsening's.
+pub fn partition_features(
+    counts: &DMatrix<f32>,
+    sizes: &[f32],
+    n_groups: usize,
+    seed: u64,
+    opts: &PartitionOptions,
+) -> anyhow::Result<FeaturePartition> {
+    let d = counts.nrows();
+    anyhow::ensure!(
+        counts.ncols() == sizes.len(),
+        "{} count columns for {} pseudobulk sizes",
+        counts.ncols(),
+        sizes.len()
+    );
+    let informative = informative_features(counts, sizes);
+    let min_size = opts.min_group_size;
+    let mut rows_of = std::collections::BTreeMap::<u32, Vec<usize>>::new();
+    match &opts.block {
+        Some(block) => {
+            anyhow::ensure!(
+                block.len() == d,
+                "{} block ids for {d} features",
+                block.len()
+            );
+            for (r, &b) in block.iter().enumerate() {
+                rows_of.entry(b).or_default().push(r);
+            }
+        }
+        None => {
+            rows_of.insert(0, (0..d).collect());
+        }
+    }
+
+    let groups: Vec<Vec<usize>> = if rows_of.len() <= 1 {
+        let rows: Vec<usize> = (0..d).collect();
+        informative_groups(counts, sizes, &rows, &informative, n_groups, seed, min_size)
+    } else {
+        let n_inf = |rows: &[usize]| rows.iter().filter(|&&r| informative[r]).count();
+        let live: Vec<(u32, usize)> = rows_of
+            .iter()
+            .map(|(&b, rows)| (b, n_inf(rows)))
+            .filter(|&(_, c)| c > 0)
+            .collect();
+        let budget = n_groups.saturating_sub(1);
+        anyhow::ensure!(
+            live.len() <= budget,
+            "{} blocks hold informative features but only {budget} group slots: widen the blocks",
+            live.len()
+        );
+        let weight: Vec<usize> = live.iter().map(|&(_, c)| c).collect();
+        let alloc = block_shares(&weight, budget);
+        live.iter()
+            .zip(&alloc)
+            .flat_map(|(&(b, _), &k)| {
+                let rows = &rows_of[&b];
+                // One more slot when the block has near-empty rows: it is spent
+                // on their background, which joins the shared one.
+                let has_empty = rows.len() > n_inf(rows);
+                informative_groups(
+                    counts,
+                    sizes,
+                    rows,
+                    &informative,
+                    k + usize::from(has_empty),
+                    mix_seed(seed, u64::from(b)),
+                    min_size,
+                )
+            })
+            .collect()
+    };
+
+    // Labels: the groups in order, then the background.
+    let bg = groups.len();
+    let mut labels = vec![bg; d];
+    for (i, g) in groups.iter().enumerate() {
+        for &r in g {
+            labels[r] = i;
+        }
+    }
+    let n_bg = d - groups.iter().map(Vec::len).sum::<usize>();
+    let n_flat = informative.iter().filter(|&&i| !i).count();
+    let mut group_sizes: Vec<usize> = groups.iter().map(Vec::len).collect();
+    group_sizes.sort_unstable();
+    info!(
+        "feature partition: {bg} group(s) over {} block(s), sizes min {} / median {} / max {}; \
+         background {n_bg} ({n_flat} flat, {} scattered)",
+        rows_of.len(),
+        group_sizes.first().copied().unwrap_or(0),
+        group_sizes.get(group_sizes.len() / 2).copied().unwrap_or(0),
+        group_sizes.last().copied().unwrap_or(0),
+        n_bg - n_flat,
+    );
+    Ok(FeaturePartition {
+        labels,
+        num_groups: bg + usize::from(n_bg > 0),
+        background: (n_bg > 0).then_some(bg),
+        informative,
+    })
+}
+
 /// Shared CLI arg for grouping co-expressed features before training.
 ///
 /// One declaration, one wording, one default, flattened by every command that

@@ -404,3 +404,124 @@ mod switching_it_off {
         assert!(parse(&["--no-feature-coarsening", "--max-coarse-features", "250"]).is_err());
     }
 }
+
+//////////////////////////////////////
+// Single-level partition, options //
+//////////////////////////////////////
+
+/// `planted` plus `n_scattered` isolated rows: each counted heavily in ONE
+/// pseudobulk and nowhere else, so it is not flat yet shares a profile with
+/// nothing — a feature that arose at random.
+fn planted_with_scattered(n_scattered: usize) -> (DMatrix<f32>, Vec<f32>, usize) {
+    let (base, sizes) = planted(3, 10, 5, 10, 24, 11);
+    let d0 = base.nrows();
+    let mut counts = DMatrix::<f32>::zeros(d0 + n_scattered, base.ncols());
+    counts.rows_mut(0, d0).copy_from(&base);
+    for j in 0..n_scattered {
+        counts[(d0 + j, (7 * j + 3) % base.ncols())] = 40.0;
+    }
+    (counts, sizes, d0)
+}
+
+/// With no options the partition is the single-level coarsening, its
+/// background is the last group and its flags are the homogeneity test.
+#[test]
+fn a_partition_without_options_is_the_single_level_coarsening() {
+    let (counts, sizes) = planted(3, 10, 20, 20, 24, 7);
+    let fc = coarsen_features(&counts, &sizes, &[4], 3)
+        .unwrap()
+        .remove(0);
+    let part = partition_features(&counts, &sizes, 4, 3, &PartitionOptions::default()).unwrap();
+    assert_eq!(part.labels, fc.fine_to_coarse);
+    assert_eq!(part.num_groups, fc.num_coarse);
+    assert_eq!(part.background, Some(fc.num_coarse - 1));
+    assert_eq!(part.informative, informative_features(&counts, &sizes));
+}
+
+/// With a minimum group size, scattered and near-empty rows share the
+/// background, every other group meets the minimum, the budget holds, and no
+/// group mixes two programs.
+#[test]
+fn scattered_features_join_the_background_and_groups_meet_the_minimum() {
+    let (counts, sizes, d0) = planted_with_scattered(4);
+    let opts = PartitionOptions {
+        min_group_size: 4,
+        block: None,
+    };
+    let part = partition_features(&counts, &sizes, 8, 3, &opts).unwrap();
+    let bg = part.background.expect("a background group");
+    assert!(part.num_groups <= 8);
+    assert!(part.labels.iter().all(|&m| m < part.num_groups));
+    for (i, &m) in part.labels.iter().enumerate().skip(d0) {
+        assert_eq!(m, bg, "scattered row {i} left the background");
+    }
+    for (i, &m) in part.labels.iter().enumerate().take(45).skip(35) {
+        assert_eq!(m, bg, "empty row {i} left the background");
+    }
+    let mut size = std::collections::HashMap::<usize, usize>::new();
+    for &m in &part.labels {
+        *size.entry(m).or_default() += 1;
+    }
+    for (&m, &n) in &size {
+        assert!(m == bg || n >= 4, "group {m} holds {n} < 4");
+    }
+    let programs: Vec<_> = (0..3)
+        .map(|p| groups_of(&part.labels, p * 10..(p + 1) * 10))
+        .collect();
+    for a in 0..3 {
+        for b in a + 1..3 {
+            assert!(
+                programs[a].is_disjoint(&programs[b]),
+                "programs {a} and {b} share a group"
+            );
+        }
+    }
+}
+
+/// Two blocks carrying the same programs: without blocks a program's rows in
+/// both blocks share a group; with blocks no group spans two blocks, the
+/// near-empty rows of both share one background, and the budget holds.
+#[test]
+fn a_blocked_partition_never_puts_two_blocks_in_one_group() {
+    let (half, sizes) = planted(3, 10, 5, 10, 24, 13);
+    let h = half.nrows();
+    let mut counts = DMatrix::<f32>::zeros(2 * h, half.ncols());
+    counts.rows_mut(0, h).copy_from(&half);
+    counts.rows_mut(h, h).copy_from(&half);
+    let block: Vec<u32> = (0..2 * h).map(|i| u32::from(i >= h)).collect();
+
+    let plain = partition_features(&counts, &sizes, 8, 3, &PartitionOptions::default()).unwrap();
+    assert!(
+        (0..30).any(|i| plain.labels[i] == plain.labels[i + h]),
+        "the fixture should merge across blocks without them"
+    );
+
+    let opts = PartitionOptions {
+        min_group_size: 0,
+        block: Some(block.clone()),
+    };
+    let part = partition_features(&counts, &sizes, 8, 3, &opts).unwrap();
+    let bg = part.background.expect("a background");
+    assert!(part.num_groups <= 8);
+    for m in (0..part.num_groups).filter(|&m| m != bg) {
+        let blocks: std::collections::BTreeSet<u32> = (0..2 * h)
+            .filter(|&i| part.labels[i] == m)
+            .map(|i| block[i])
+            .collect();
+        assert!(blocks.len() <= 1, "group {m} spans blocks {blocks:?}");
+    }
+    for i in (35..45).chain(h + 35..h + 45) {
+        assert_eq!(part.labels[i], bg, "empty row {i} left the one background");
+    }
+}
+
+/// More blocks with informative features than group slots is refused.
+#[test]
+fn more_blocks_than_slots_is_refused() {
+    let (counts, sizes) = planted(3, 10, 0, 0, 24, 5);
+    let opts = PartitionOptions {
+        min_group_size: 0,
+        block: Some((0..30).map(|i| i as u32).collect()),
+    };
+    assert!(partition_features(&counts, &sizes, 8, 3, &opts).is_err());
+}
