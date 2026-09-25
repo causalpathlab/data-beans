@@ -10,6 +10,7 @@ pub mod nb_dispersion;
 pub mod normalization;
 pub mod pseudobulk;
 pub mod random_projection;
+pub mod refine_mixed;
 pub mod refine_multilevel;
 pub mod retrieval_impute;
 pub mod sparse_streaming;
