@@ -177,22 +177,15 @@ pub trait RandProjOps {
     where
         T: std::hash::Hash + Eq + Clone,
     {
-        let nn = proj_kn.ncols();
-        anyhow::ensure!(
-            batch_membership.len() == nn,
-            "batch membership size {} mismatches the number of columns {}",
-            batch_membership.len(),
-            nn
-        );
-        let kk = proj_kn
-            .nrows()
-            .min(num_features.unwrap_or(proj_kn.nrows()))
-            .min(nn);
         let batch = batch_indices(batch_membership);
         let n_batches = batch.iter().max().map_or(0, |&m| m + 1);
-        let codes = binary_sort_columns(proj_kn, kk)?;
-        let labels =
-            merge_poorly_mixed_bins(&codes, &batch, kk, merge_levels, min_batches.min(n_batches));
+        let (_, labels, kk) = mixed_group_codes(
+            proj_kn,
+            num_features,
+            &batch,
+            min_batches.min(n_batches),
+            merge_levels,
+        )?;
         self.assign_group_labels(&labels);
         let n_groups = labels
             .iter()
@@ -584,6 +577,33 @@ where
     );
     *proj_kn = centre_batches_within_state(proj_kn, &batch, bits)?;
     Ok(())
+}
+
+/// Codes and merged labels of the mixed partition, and the number of code
+/// bits. See [`RandProjOps::partition_columns_to_mixed_groups`].
+///
+/// * `batch` - column to batch index, in `0..n_batches`
+pub fn mixed_group_codes(
+    proj_kn: &nalgebra::DMatrix<f32>,
+    num_features: Option<usize>,
+    batch: &[usize],
+    min_batches: usize,
+    merge_levels: usize,
+) -> anyhow::Result<(Vec<usize>, Vec<usize>, usize)> {
+    let nn = proj_kn.ncols();
+    anyhow::ensure!(
+        batch.len() == nn,
+        "batch membership size {} mismatches the number of columns {}",
+        batch.len(),
+        nn
+    );
+    let kk = proj_kn
+        .nrows()
+        .min(num_features.unwrap_or(proj_kn.nrows()))
+        .min(nn);
+    let codes = binary_sort_columns(proj_kn, kk)?;
+    let labels = merge_poorly_mixed_bins(&codes, batch, kk, merge_levels, min_batches);
+    Ok((codes, labels, kk))
 }
 
 /// Binarize the projection matrix and assign columns to some groups

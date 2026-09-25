@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "data-beans"
-version = "0.6.10"
+version = "0.6.12"
 dependencies = [
  "anyhow",
  "approx",
