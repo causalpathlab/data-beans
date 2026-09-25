@@ -6,16 +6,16 @@
 //! under the Poisson model
 //!
 //! ```text
-//!   y_cg ~ Poisson(s_c mu_gp Lambda_gi)
+//!   y_cg ~ Poisson(s_c mu_gp omega_gi)
 //! ```
 //!
 //! for cell `c` of individual `i` in group `p`: `s_c` is the cell's depth,
-//! `mu` the group's profile and `Lambda` the individual's gene offset. A
-//! cell keeps its `Lambda_gi` in every group, so a move gains only from a
+//! `mu` the group's profile and `omega` the individual's gene offset. A
+//! cell keeps its `omega_gi` in every group, so a move gains only from a
 //! better match of `mu`, the cell state, and not from joining a group rich
 //! in its own individual.
 //!
-//! Each sweep fits `mu` and `Lambda` for the current labels by alternating
+//! Each sweep fits `mu` and `omega` for the current labels by alternating
 //! closed-form updates (concave in their logs), then moves every cell to
 //! its best candidate group with the parameters held fixed. Both steps
 //! raise the same likelihood. Candidates are the groups of the codes one
@@ -38,13 +38,13 @@ use std::sync::Mutex;
 pub struct MixedRefineParams {
     /// most sweeps; stops early once no cell moves
     pub max_sweeps: usize,
-    /// most alternating rounds of the `mu`/`Lambda` fit per sweep
+    /// most alternating rounds of the `mu`/`omega` fit per sweep
     pub max_fit_rounds: usize,
-    /// the fit stops once no `Lambda` changes by more than this ratio
+    /// the fit stops once no `omega` changes by more than this ratio
     pub fit_tol: f64,
     /// highly variable genes scored
     pub num_genes: usize,
-    /// prior weight: pseudo-depth for `mu`, pseudo-count for `Lambda`
+    /// prior weight: pseudo-depth for `mu`, pseudo-count for `omega`
     pub pseudocount: f64,
     /// least log-likelihood gain for a move
     pub min_gain: f64,
@@ -267,14 +267,14 @@ fn accumulate<S: CountBlocks>(
 /////////
 
 /// Fitted parameters for scoring: `ln mu` (K x G) and
-/// `a[p * I + i] = sum_g mu_gp Lambda_gi`.
+/// `a[p * I + i] = sum_g mu_gp omega_gi`.
 struct Scoring {
     ln_mu: Vec<f32>,
     a: Vec<f64>,
 }
 
-/// Fit `mu` and `Lambda` for the current labels by alternating their
-/// closed-form updates. `lambda` (I x G) is updated in place so the next
+/// Fit `mu` and `omega` for the current labels by alternating their
+/// closed-form updates. `omega` (I x G) is updated in place so the next
 /// sweep starts from it.
 #[allow(clippy::too_many_arguments)]
 fn fit(
@@ -284,7 +284,7 @@ fn fit(
     k: usize,
     n_indv: usize,
     ng: usize,
-    lambda: &mut [f64],
+    omega: &mut [f64],
     params: &MixedRefineParams,
 ) -> Scoring {
     let prior = params.pseudocount;
@@ -318,7 +318,7 @@ fn fit(
         mu.par_chunks_mut(ng).enumerate().for_each(|(p, mu_p)| {
             let mut den = vec![0.0f64; ng];
             for &(i, n) in &by_group[p] {
-                for (d, l) in den.iter_mut().zip(&lambda[i * ng..(i + 1) * ng]) {
+                for (d, l) in den.iter_mut().zip(&omega[i * ng..(i + 1) * ng]) {
                     *d += n * l;
                 }
             }
@@ -326,10 +326,10 @@ fn fit(
                 mu_p[g] = (sums.y_pg[p * ng + g] + prior * rate[g]) / (den[g] + prior);
             }
         });
-        let change = lambda
+        let change = omega
             .par_chunks_mut(ng)
             .enumerate()
-            .map(|(i, lambda_i)| {
+            .map(|(i, omega_i)| {
                 let mut den = vec![0.0f64; ng];
                 for &(p, n) in &by_indv[i] {
                     for (d, m) in den.iter_mut().zip(&mu[p * ng..(p + 1) * ng]) {
@@ -339,8 +339,8 @@ fn fit(
                 let mut change = 0.0f64;
                 for g in 0..ng {
                     let next = (sums.y_ig[i * ng + g] + prior) / (den[g] + prior);
-                    change = change.max((next / lambda_i[g]).ln().abs());
-                    lambda_i[g] = next;
+                    change = change.max((next / omega_i[g]).ln().abs());
+                    omega_i[g] = next;
                 }
                 change
             })
@@ -356,7 +356,7 @@ fn fit(
             let (p, i) = (pi / n_indv, pi % n_indv);
             mu[p * ng..(p + 1) * ng]
                 .iter()
-                .zip(&lambda[i * ng..(i + 1) * ng])
+                .zip(&omega[i * ng..(i + 1) * ng])
                 .map(|(m, l)| m * l)
                 .sum()
         })
@@ -412,11 +412,11 @@ pub fn refine_mixed_labels<S: CountBlocks>(
         }
     }
 
-    let mut lambda = vec![1.0f64; n_indv * ng];
+    let mut omega = vec![1.0f64; n_indv * ng];
     let mut total_moves = 0;
     for sweep in 0..params.max_sweeps {
         let sums = accumulate(source, batch, labels, k, n_indv)?;
-        let scoring = fit(&sums, batch, labels, k, n_indv, ng, &mut lambda, params);
+        let scoring = fit(&sums, batch, labels, k, n_indv, ng, &mut omega, params);
 
         // propose each cell's best candidate, parameters held fixed
         let proposals = Mutex::new(Vec::<(usize, usize)>::new());
