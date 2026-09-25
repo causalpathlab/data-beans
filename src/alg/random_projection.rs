@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::alg::batch_mixing::*;
 use crate::sparse_data_visitors::*;
 use crate::sparse_io_stack::SparseIoStack;
 use crate::sparse_io_vector::SparseIoVec;
@@ -8,7 +9,6 @@ use legume_numeric::matrix::rand_util::mix_seed;
 use std::sync::{Arc, Mutex};
 
 use legume_numeric::matrix::traits::*;
-use legume_numeric::matrix::utils::*;
 use log::{info, warn};
 use nalgebra::DVector;
 
@@ -160,6 +160,56 @@ pub trait RandProjOps {
         num_features: Option<usize>,
         ncols_per_group: Option<usize>,
     ) -> anyhow::Result<usize>;
+
+    /// Like [`RandProjOps::partition_columns_to_groups`], but bins that hold
+    /// fewer than `min_batches` batches merge up the code tree, for at most
+    /// `merge_levels` levels (see [`crate::alg::batch_mixing`]).
+    /// `min_batches` is capped by the number of batches. Returns the number
+    /// of groups.
+    fn partition_columns_to_mixed_groups<T>(
+        &mut self,
+        proj_kn: &nalgebra::DMatrix<f32>,
+        num_features: Option<usize>,
+        batch_membership: &[T],
+        min_batches: usize,
+        merge_levels: usize,
+    ) -> anyhow::Result<usize>
+    where
+        T: std::hash::Hash + Eq + Clone,
+    {
+        let nn = proj_kn.ncols();
+        anyhow::ensure!(
+            batch_membership.len() == nn,
+            "batch membership size {} mismatches the number of columns {}",
+            batch_membership.len(),
+            nn
+        );
+        let kk = proj_kn
+            .nrows()
+            .min(num_features.unwrap_or(proj_kn.nrows()))
+            .min(nn);
+        let batch = batch_indices(batch_membership);
+        let n_batches = batch.iter().max().map_or(0, |&m| m + 1);
+        let codes = binary_sort_columns(proj_kn, kk)?;
+        let labels =
+            merge_poorly_mixed_bins(&codes, &batch, kk, merge_levels, min_batches.min(n_batches));
+        self.assign_group_labels(&labels);
+        let n_groups = labels
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        info!(
+            "partitioned columns into {} groups ({} bits, bins with fewer than {} batches merged up to {} levels)",
+            n_groups,
+            kk,
+            min_batches.min(n_batches),
+            merge_levels
+        );
+        Ok(n_groups)
+    }
+
+    /// Assign each column to the group of its label.
+    fn assign_group_labels(&mut self, labels: &[usize]);
 
     // Take samples assigned
     // fn groups_assigned(&self) -> anyhow::Result<&Vec<usize>>;
@@ -336,6 +386,12 @@ impl RandProjOps for SparseIoStack {
 
         Ok(max_group + 1)
     }
+
+    fn assign_group_labels(&mut self, labels: &[usize]) {
+        for x in self.stack.iter_mut() {
+            x.assign_groups(labels, None);
+        }
+    }
 }
 
 impl RandProjOps for SparseIoVec {
@@ -376,23 +432,7 @@ impl RandProjOps for SparseIoVec {
         info!("finished random projection loop");
 
         if let Some(col_to_batch) = batch_membership {
-            if col_to_batch.len() == ncols {
-                let batches = partition_by_membership(col_to_batch, None);
-                info!("adjusting batch biases ({} batches) ...", batches.len());
-                for (_, cols) in batches.iter() {
-                    let xx = subset_columns(&proj_kn, cols.iter().cloned())?
-                        .transpose() // n x k
-                        .centre_columns() // adjust the mean
-                        .transpose(); // k x n
-                    assign_columns(&xx, cols.iter().cloned(), &mut proj_kn);
-                }
-            } else {
-                warn!(
-                    "The batch membership size {} mismatches with the number of columns {} ...",
-                    col_to_batch.len(),
-                    ncols
-                );
-            }
+            adjust_batch_biases(&mut proj_kn, col_to_batch)?;
         }
 
         let (lb, ub) = (-4., 4.);
@@ -461,23 +501,7 @@ impl RandProjOps for SparseIoVec {
         info!("finished random projection loop");
 
         if let Some(col_to_batch) = batch_membership {
-            if col_to_batch.len() == ncols {
-                let batches = partition_by_membership(col_to_batch, None);
-                info!("adjusting batch biases ({} batches) ...", batches.len());
-                for (_, cols) in batches.iter() {
-                    let xx = subset_columns(&proj_kn, cols.iter().cloned())?
-                        .transpose()
-                        .centre_columns()
-                        .transpose();
-                    assign_columns(&xx, cols.iter().cloned(), &mut proj_kn);
-                }
-            } else {
-                warn!(
-                    "row_weights projection: batch size {} != ncols {}",
-                    col_to_batch.len(),
-                    ncols
-                );
-            }
+            adjust_batch_biases(&mut proj_kn, col_to_batch)?;
         }
 
         let (lb, ub) = (-4., 4.);
@@ -525,6 +549,41 @@ impl RandProjOps for SparseIoVec {
         self.assign_groups(&binary_codes, ncols_per_group);
         Ok(max_group + 1)
     }
+
+    fn assign_group_labels(&mut self, labels: &[usize]) {
+        self.assign_groups(labels, None);
+    }
+}
+
+/// Remove batch shifts from a projection, keeping each batch's cell-state
+/// composition: batches are centred within cell state (see
+/// [`crate::alg::batch_mixing`]), not by their plain means. A membership of
+/// the wrong length is ignored with a warning.
+fn adjust_batch_biases<T>(
+    proj_kn: &mut nalgebra::DMatrix<f32>,
+    col_to_batch: &[T],
+) -> anyhow::Result<()>
+where
+    T: std::hash::Hash + Eq + Clone,
+{
+    let ncols = proj_kn.ncols();
+    if col_to_batch.len() != ncols {
+        warn!(
+            "The batch membership size {} mismatches with the number of columns {} ...",
+            col_to_batch.len(),
+            ncols
+        );
+        return Ok(());
+    }
+    let batch = batch_indices(col_to_batch);
+    let n_batches = batch.iter().max().map_or(0, |&m| m + 1);
+    let bits = default_state_bits(ncols, n_batches, proj_kn.nrows());
+    info!(
+        "adjusting batch biases within cell state ({} batches, {} state bits) ...",
+        n_batches, bits
+    );
+    *proj_kn = centre_batches_within_state(proj_kn, &batch, bits)?;
+    Ok(())
 }
 
 /// Binarize the projection matrix and assign columns to some groups
