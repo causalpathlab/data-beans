@@ -1,3 +1,4 @@
+pub mod batch_mixing;
 pub mod bhc;
 pub mod cell_pairs;
 pub mod collapse_data;
