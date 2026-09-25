@@ -177,28 +177,15 @@ pub trait RandProjOps {
     where
         T: std::hash::Hash + Eq + Clone,
     {
-        let batch = batch_indices(batch_membership);
-        let n_batches = batch.iter().max().map_or(0, |&m| m + 1);
-        let (_, labels, kk) = mixed_group_codes(
+        let part = mixed_partition(
             proj_kn,
             num_features,
-            &batch,
-            min_batches.min(n_batches),
+            batch_membership,
+            min_batches,
             merge_levels,
         )?;
-        self.assign_group_labels(&labels);
-        let n_groups = labels
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        info!(
-            "partitioned columns into {} groups ({} bits, bins with fewer than {} batches merged up to {} levels)",
-            n_groups,
-            kk,
-            min_batches.min(n_batches),
-            merge_levels
-        );
-        Ok(n_groups)
+        self.assign_group_labels(&part.labels);
+        Ok(part.num_groups)
     }
 
     /// Assign each column to the group of its label.
@@ -579,31 +566,67 @@ where
     Ok(())
 }
 
-/// Codes and merged labels of the mixed partition, and the number of code
-/// bits. See [`RandProjOps::partition_columns_to_mixed_groups`].
-///
-/// * `batch` - column to batch index, in `0..n_batches`
-pub fn mixed_group_codes(
+/// The mixed partition of [`RandProjOps::partition_columns_to_mixed_groups`]
+/// before it is assigned: codes, merged labels and batches of the columns.
+pub struct MixedPartition {
+    /// binary code of each column
+    pub codes: Vec<usize>,
+    /// merged group label of each column
+    pub labels: Vec<usize>,
+    pub num_groups: usize,
+    /// bits of the codes
+    pub bits: usize,
+    /// batch of each column, in `0..n_batches`
+    pub batch: Vec<usize>,
+    /// batches a group needs, capped by the number of batches
+    pub min_batches: usize,
+}
+
+/// Bin columns by the sign codes of `proj_kn` and merge bins holding fewer
+/// than `min_batches` batches up the code tree, for at most `merge_levels`
+/// levels.
+pub fn mixed_partition<T>(
     proj_kn: &nalgebra::DMatrix<f32>,
     num_features: Option<usize>,
-    batch: &[usize],
+    batch_membership: &[T],
     min_batches: usize,
     merge_levels: usize,
-) -> anyhow::Result<(Vec<usize>, Vec<usize>, usize)> {
+) -> anyhow::Result<MixedPartition>
+where
+    T: std::hash::Hash + Eq + Clone,
+{
     let nn = proj_kn.ncols();
     anyhow::ensure!(
-        batch.len() == nn,
+        batch_membership.len() == nn,
         "batch membership size {} mismatches the number of columns {}",
-        batch.len(),
+        batch_membership.len(),
         nn
     );
-    let kk = proj_kn
+    let batch = batch_indices(batch_membership);
+    let n_batches = batch.iter().max().map_or(0, |&m| m + 1);
+    let min_batches = min_batches.min(n_batches);
+    let bits = proj_kn
         .nrows()
         .min(num_features.unwrap_or(proj_kn.nrows()))
         .min(nn);
-    let codes = binary_sort_columns(proj_kn, kk)?;
-    let labels = merge_poorly_mixed_bins(&codes, batch, kk, merge_levels, min_batches);
-    Ok((codes, labels, kk))
+    let codes = binary_sort_columns(proj_kn, bits)?;
+    let labels = merge_poorly_mixed_bins(&codes, &batch, bits, merge_levels, min_batches);
+    let num_groups = labels
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    info!(
+        "partitioned columns into {} groups ({} bits, bins with fewer than {} batches merged up to {} levels)",
+        num_groups, bits, min_batches, merge_levels
+    );
+    Ok(MixedPartition {
+        codes,
+        labels,
+        num_groups,
+        bits,
+        batch,
+        min_batches,
+    })
 }
 
 /// Binarize the projection matrix and assign columns to some groups

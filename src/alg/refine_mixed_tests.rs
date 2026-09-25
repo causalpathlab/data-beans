@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 /// Counts of one cell: `(gene, count)` pairs.
 type Cell = Vec<(usize, f32)>;
@@ -41,18 +42,15 @@ fn params() -> MixedRefineParams {
     }
 }
 
-/// One-bit neighbours map through merged labels; unoccupied codes drop out;
-/// the current label is always a candidate.
+/// One-bit neighbours map through merged labels; unoccupied codes drop out.
 #[test]
 fn code_neighbours_follow_merged_labels() {
     // codes 0 and 1 merged into one label, code 2 on its own, code 3 empty
     let codes = vec![0, 1, 2, 2];
     let labels = vec![0, 0, 1, 1];
-    let nb = CodeNeighbours::new(&codes, &labels, 2);
-    assert_eq!(nb.candidates(0, 0), vec![0, 1]);
-    assert_eq!(nb.candidates(2, 1), vec![0, 1]);
-    // a cell that has moved keeps its current group as a candidate
-    assert_eq!(nb.candidates(0, 7), vec![0, 1, 7]);
+    let nb = CodeNeighbours::new(codes, &labels, 2);
+    assert_eq!(nb.candidates(0), &[0, 1]);
+    assert_eq!(nb.candidates(2), &[0, 1]);
 }
 
 /// Two states across four individuals, a quarter of each group swapped:
@@ -77,7 +75,7 @@ fn mixed_groups_become_state_pure() {
         labels[c] = 1 - labels[c];
     }
     let codes = labels.clone();
-    let nb = CodeNeighbours::new(&codes, &labels, 1);
+    let nb = CodeNeighbours::new(codes, &labels, 1);
     let csc = csc_of(&cells, NGENES);
 
     let moves = refine_mixed_labels(&csc, &batch, &mut labels, &nb, 2, &params()).unwrap();
@@ -113,7 +111,7 @@ fn individual_offsets_do_not_move_cells() {
         }
     }
     let before = labels.clone();
-    let nb = CodeNeighbours::new(&labels.clone(), &labels, 1);
+    let nb = CodeNeighbours::new(labels.clone(), &labels, 1);
     let csc = csc_of(&cells, NGENES);
 
     let moves = refine_mixed_labels(&csc, &batch, &mut labels, &nb, 1, &params()).unwrap();
@@ -150,7 +148,7 @@ fn guard_keeps_min_batches() {
     let start = labels.clone();
 
     let mut guarded = start.clone();
-    let nb = CodeNeighbours::new(&start, &start, 1);
+    let nb = CodeNeighbours::new(start.clone(), &start, 1);
     let moves = refine_mixed_labels(&csc, &batch, &mut guarded, &nb, 3, &params()).unwrap();
     assert_eq!(moves, 2, "two of three leave; the last keeps group 0 at 3");
     let indvs: HashSet<usize> = (0..cells.len())
@@ -170,7 +168,7 @@ fn zero_sweeps_is_identity() {
     let cells: Vec<Cell> = (0..4).map(|c| cell(c % 2, c / 2, 0.0)).collect();
     let batch = vec![0, 0, 1, 1];
     let mut labels = vec![0, 0, 1, 1];
-    let nb = CodeNeighbours::new(&labels.clone(), &labels, 1);
+    let nb = CodeNeighbours::new(labels.clone(), &labels, 1);
     let p = MixedRefineParams {
         max_sweeps: 0,
         ..MixedRefineParams::default()
@@ -179,17 +177,6 @@ fn zero_sweeps_is_identity() {
         refine_mixed_labels(&csc_of(&cells, NGENES), &batch, &mut labels, &nb, 1, &p).unwrap();
     assert_eq!(moves, 0);
     assert_eq!(labels, vec![0, 0, 1, 1]);
-}
-
-/// Rows outside the subset drop out; kept rows are renumbered in order.
-#[test]
-fn restrict_rows_keeps_subset() {
-    let csc = csc_of(&[vec![(0, 1.0), (2, 2.0), (3, 3.0)], vec![(1, 4.0)]], 4);
-    let sub = restrict_rows(&csc, &[Some(0), None, Some(1), None], 2);
-    assert_eq!(sub.nrows(), 2);
-    assert_eq!(sub.col(0).row_indices(), &[0, 1]);
-    assert_eq!(sub.col(0).values(), &[1.0, 2.0]);
-    assert_eq!(sub.col(1).nnz(), 0);
 }
 
 /// Two states across four individuals, written to a small Zarr.
