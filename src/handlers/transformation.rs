@@ -31,6 +31,17 @@ pub struct ReorderRowsArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct SubsetArgs {
+    /// data file -- `.zarr`, `.zarr.zip`, or `.h5`
+    pub data_file: Box<str>,
+
+    /// output file, in the input's format unless the name gives `.zarr` or
+    /// `.zarr.zip`
+    #[arg(short, long, required = true)]
+    pub output: Box<str>,
+}
+
+#[derive(Args, Debug)]
 pub struct SubsetColumnsArgs {
     /// data file -- either `.zarr` or `.h5`
     pub data_file: Box<str>,
