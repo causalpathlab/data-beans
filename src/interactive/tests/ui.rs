@@ -57,3 +57,61 @@ fn whole_number_data_gets_whole_count_bins() {
     let fractional = Binned::new(&[0.0, 0.25, 1.5], Scale::Linear);
     assert!(fractional.counts.len() > 2);
 }
+
+#[test]
+fn unit_width_bins_are_one_bar_per_index() {
+    let b = Binning::with_width(Scale::Linear, 1.0);
+    for k in 0..500 {
+        assert_eq!(b.key(k as f64), k);
+    }
+}
+
+fn axis_rows(plot: &HistPlot, width: u16, height: u16) -> (String, String) {
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    plot.render(&mut buf, area);
+    let row = |y: u16| -> String { (0..width).map(|x| buf[(x, y)].symbol()).collect() };
+    (row(height - 2), row(height - 1))
+}
+
+#[test]
+fn custom_labels_and_tick_spacing() {
+    let counts = vec![3usize; 12];
+    let label = |k: i32| (k % 4 == 0).then(|| format!("L{k}"));
+    let plot = HistPlot {
+        bins: Binning::with_width(Scale::Linear, 1.0),
+        kmin: 0,
+        counts: &counts,
+        style: &|_| PLAIN,
+        subset: None,
+        y_scale: Scale::Linear,
+        pointer: None,
+        marks: Vec::new(),
+        x_label: Some(&label),
+        tick_every: Some(2),
+    };
+    let (axis, labels) = axis_rows(&plot, 6 + 24, 8);
+    // Ticks every 2 bins (2 columns per bar), labels only where asked.
+    assert_eq!(axis.matches('┴').count(), 6, "{axis}");
+    assert!(labels.contains("L0") && labels.contains("L4") && labels.contains("L8"));
+    assert!(!labels.contains("L2") && !labels.contains("L6"), "{labels}");
+}
+
+#[test]
+fn default_labels_are_unchanged() {
+    let counts = vec![1usize; 10];
+    let base = |x_label, tick_every| HistPlot {
+        bins: Binning::with_width(Scale::Linear, 1.0),
+        kmin: 0,
+        counts: &counts,
+        style: &|_| PLAIN,
+        subset: None,
+        y_scale: Scale::Linear,
+        pointer: None,
+        marks: Vec::new(),
+        x_label,
+        tick_every,
+    };
+    let (_, labels) = axis_rows(&base(None, None), 26, 8);
+    assert!(labels.trim_start().starts_with('0'), "{labels}");
+}

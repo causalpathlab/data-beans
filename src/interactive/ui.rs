@@ -192,6 +192,16 @@ impl Binning {
         }
     }
 
+    /// Bins of an explicit `width` on the scaled axis. On the linear scale
+    /// with width 1, bin `k` holds exactly the value `k`, so a histogram of
+    /// bin indices draws one bar per category.
+    pub fn with_width(scale: Scale, width: f64) -> Self {
+        Self {
+            scale,
+            width: width.max(f64::MIN_POSITIVE),
+        }
+    }
+
     pub fn key(&self, x: f64) -> i32 {
         match self.scale {
             Scale::Log => log_bin_key(x),
@@ -324,6 +334,11 @@ pub struct HistPlot<'a> {
     pub pointer: Option<i32>,
     /// Other symbols on the x axis, by key.
     pub marks: Vec<(i32, &'static str, Style)>,
+    /// Tick label at bin `k` in place of the bin's value; `None` from it
+    /// leaves that tick unlabelled. Unset, ticks show the value.
+    pub x_label: Option<&'a dyn Fn(i32) -> Option<String>>,
+    /// Ticks every this many bins, in place of the scale's default.
+    pub tick_every: Option<i32>,
 }
 
 const EIGHTHS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
@@ -433,13 +448,22 @@ impl HistPlot<'_> {
             };
             put(buf, x, axis.y, sym, DIM);
         }
-        let every = self.bins.tick_every(nbins);
+        let every = self
+            .tick_every
+            .unwrap_or_else(|| self.bins.tick_every(nbins))
+            .max(1);
         let mut next_free = labels.x;
         let kmax = self.kmin + nbins as i32 - 1;
         for k in (self.kmin..=kmax).filter(|k| k % every == 0) {
             let Some(x) = x_of(k) else { continue };
             put(buf, x, axis.y, "┴", DIM);
-            let s = compact(self.bins.tick_value(k));
+            let s = match self.x_label {
+                Some(label) => match label(k) {
+                    Some(s) => s,
+                    None => continue,
+                },
+                None => compact(self.bins.tick_value(k)),
+            };
             if x >= next_free && x + (s.len() as u16) <= labels.right() {
                 buf.set_string(x, labels.y, &s, DIM);
                 next_free = x + s.len() as u16 + 1;
