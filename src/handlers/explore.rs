@@ -3,7 +3,7 @@
 
 use crate::hdf5_io::resolve_backend_file;
 use crate::interactive::stat_tui::{
-    explore, Dataset, Purpose, Side, StatExplorer, Values, ValuesReader,
+    explore, Dataset, Picked, Purpose, Side, StatExplorer, Values, ValuesReader,
 };
 use crate::interactive::tui_available;
 use crate::qc::*;
@@ -115,9 +115,43 @@ pub fn pick_entries(
         Some(values_reader(&data)),
         Purpose::Pick { verb },
     );
-    let picked = explore(explorer)?;
+    let picked = explore(explorer)?.map(|p| p.side(side));
     match &picked {
         Some(entries) => info!("picked {} entries", entries.len()),
+        None => info!("nothing picked; cancelled"),
+    }
+    Ok(picked)
+}
+
+/// Let the user mark rows and columns of `data_file` in the explorer (Tab
+/// switches sides; the rows are computed on first use), for a command
+/// labelled `verb`. Returns the marks of both sides, or `None` when the user
+/// quits without finishing.
+pub fn pick_rows_and_columns(
+    data_file: &str,
+    verb: &'static str,
+) -> anyhow::Result<Option<Picked>> {
+    if !tui_available() {
+        anyhow::bail!("this command needs a terminal");
+    }
+    let data = open_data(&[data_file.into()], false)?;
+    let first = side_stats(&data, Side::Columns, None, None, None)?;
+    let data = &data;
+    let loader = Box::new(move |side| side_stats(data, side, None, None, None));
+    let picked = explore(StatExplorer::new(
+        data_file,
+        Side::Columns,
+        first,
+        Some(loader),
+        Some(values_reader(data)),
+        Purpose::PickBoth { verb },
+    ))?;
+    match &picked {
+        Some(p) => info!(
+            "picked {} rows and {} columns",
+            p.rows.len(),
+            p.columns.len()
+        ),
         None => info!("nothing picked; cancelled"),
     }
     Ok(picked)

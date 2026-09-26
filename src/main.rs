@@ -34,9 +34,9 @@ use crate::handlers::merging::{
     align_backends, run_merge_backend, run_merge_mtx, AlignDataArgs, MergeBackendArgs, MergeMtxArgs,
 };
 use crate::handlers::transformation::{
-    reorder_rows, run_convert, run_split, run_squeeze, run_subsample, subset_columns, subset_rows,
-    ConvertArgs, ReorderRowsArgs, RunSqueezeArgs, SplitArgs, SubsampleArgs, SubsetColumnsArgs,
-    SubsetRowsArgs,
+    reorder_rows, run_convert, run_split, run_squeeze, run_subsample, subset, subset_columns,
+    subset_rows, ConvertArgs, ReorderRowsArgs, RunSqueezeArgs, SplitArgs, SubsampleArgs,
+    SubsetArgs, SubsetColumnsArgs, SubsetRowsArgs,
 };
 
 use clap::{Parser, Subcommand};
@@ -146,6 +146,9 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         }
         Commands::RowNames(args) => {
             take_row_names(args)?;
+        }
+        Commands::Subset(args) => {
+            subset(args)?;
         }
         Commands::SubsetColumns(args) => {
             subset_columns(args)?;
@@ -388,6 +391,15 @@ enum Commands {
                       Useful for inspecting available samples or observations."
     )]
     RowNames(TakeRowNamesArgs),
+
+    #[command(
+        about = "Pick rows and columns in a full-screen table and subset to them",
+        long_about = "Open the statistics explorer on the columns (Tab switches to the rows).\n\
+                      Mark what to keep with Space (`a` marks everything a filter shows),\n\
+                      then press Enter to write a new backend in the input's format.\n\
+                      A side with nothing marked is kept whole; q quits without writing."
+    )]
+    Subset(SubsetArgs),
 
     #[command(
         about = "Subset columns and create new backend",

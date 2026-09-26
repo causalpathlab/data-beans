@@ -1,6 +1,6 @@
 use super::{run_squeeze, ReorderRowsArgs, RowAlignMode, RunSqueezeArgs};
-use super::{SubsetColumnsArgs, SubsetRowsArgs};
-use crate::handlers::explore::pick_entries;
+use super::{SubsetArgs, SubsetColumnsArgs, SubsetRowsArgs};
+use crate::handlers::explore::{pick_entries, pick_rows_and_columns};
 use crate::hdf5_io::*;
 use crate::interactive::stat_tui::Side;
 use crate::sparse_io::*;
@@ -49,6 +49,14 @@ fn stage_for_edit(input: &str, output: &str, zip: bool) -> anyhow::Result<EditSt
     Ok((backend, effective_output, output_file, data))
 }
 
+/// Interactive runs write the same container as the input: a `.zarr`
+/// directory stays a directory, a `.zarr.zip` stays zipped, and HDF5 stays
+/// HDF5 (which [`stage_for_edit`] already keeps). An explicit `.zarr` or
+/// `.zarr.zip` output name still wins.
+fn zip_like_input(input: &str, output: &str) -> bool {
+    input.ends_with(".zarr.zip") && !output.ends_with(".zarr")
+}
+
 fn build_squeeze_args(output_file: Box<str>, args_cols: usize, args_rows: usize) -> RunSqueezeArgs {
     RunSqueezeArgs {
         data_files: vec![output_file],
@@ -86,8 +94,13 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
     };
     let column_name_file = args.name_file.clone();
 
+    let zip = if args.interactive {
+        zip_like_input(&args.data_file, &args.output)
+    } else {
+        args.zip
+    };
     let (_backend, effective_output, output_file, mut data) =
-        stage_for_edit(&args.data_file, &args.output, args.zip)?;
+        stage_for_edit(&args.data_file, &args.output, zip)?;
 
     let original_ncol = data.num_columns().unwrap_or(0);
     info!("original data: {} columns", original_ncol);
@@ -187,8 +200,13 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
     };
     let row_name_file = args.name_file.clone();
 
+    let zip = if args.interactive {
+        zip_like_input(&args.data_file, &args.output)
+    } else {
+        args.zip
+    };
     let (_backend, effective_output, output_file, mut data) =
-        stage_for_edit(&args.data_file, &args.output, args.zip)?;
+        stage_for_edit(&args.data_file, &args.output, zip)?;
 
     let original_nrow = data.num_rows().unwrap_or(0);
     info!("original data: {} rows", original_nrow);
@@ -260,6 +278,39 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
         );
         run_squeeze(&squeeze_args)?;
     }
+
+    finalize_zarr_output(&output_file, &effective_output)?;
+    info!("done");
+    Ok(())
+}
+
+/// Subset rows and columns picked in the explorer
+///
+/// Opens the explorer on the columns (Tab for the rows); the user marks the
+/// entries to keep on either side, and Enter writes a new backend of the
+/// same format as the input with just those. A side with nothing marked is
+/// kept whole.
+pub fn subset(args: &SubsetArgs) -> anyhow::Result<()> {
+    // Pick before staging, so cancelling copies nothing.
+    let Some(picked) = pick_rows_and_columns(&args.data_file, "subset")? else {
+        return Ok(());
+    };
+    let zip = zip_like_input(&args.data_file, &args.output);
+    let (_backend, effective_output, output_file, mut data) =
+        stage_for_edit(&args.data_file, &args.output, zip)?;
+
+    let rows = (!picked.rows.is_empty()).then_some(picked.rows);
+    let columns = (!picked.columns.is_empty()).then_some(picked.columns);
+    info!(
+        "subsetting to {} rows x {} columns",
+        rows.as_ref()
+            .map_or(data.num_rows().unwrap_or(0), |r| r.len()),
+        columns
+            .as_ref()
+            .map_or(data.num_columns().unwrap_or(0), |c| c.len())
+    );
+    data.subset_columns_rows(columns.as_ref(), rows.as_ref())?;
+    drop(data);
 
     finalize_zarr_output(&output_file, &effective_output)?;
     info!("done");

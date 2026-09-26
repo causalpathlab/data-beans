@@ -87,8 +87,38 @@ pub type ValuesReader<'a> = Box<dyn FnMut(Side, &[usize]) -> anyhow::Result<Valu
 pub enum Purpose {
     /// Look around (`stat --interactive`); Tab switches sides.
     Explore,
-    /// Mark entries for a command; Enter returns them, labelled `verb`.
+    /// Mark entries of the starting side for a command labelled `verb`;
+    /// Enter returns them.
     Pick { verb: &'static str },
+    /// Mark rows and columns for a command labelled `verb` (Tab switches
+    /// sides, each keeping its marks); Enter returns both.
+    PickBoth { verb: &'static str },
+}
+
+impl Purpose {
+    fn verb(self) -> Option<&'static str> {
+        match self {
+            Purpose::Explore => None,
+            Purpose::Pick { verb } | Purpose::PickBoth { verb } => Some(verb),
+        }
+    }
+}
+
+/// Entries marked when picking, by side, in original order (empty when a
+/// side has none marked).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Picked {
+    pub rows: Vec<usize>,
+    pub columns: Vec<usize>,
+}
+
+impl Picked {
+    pub fn side(self, side: Side) -> Vec<usize> {
+        match side {
+            Side::Rows => self.rows,
+            Side::Columns => self.columns,
+        }
+    }
 }
 
 /// The side not on screen.
@@ -213,7 +243,7 @@ pub struct StatExplorer<'a> {
     mode: Mode,
     quit: bool,
     /// Marked entries handed back by Enter when picking.
-    picked: Option<Vec<usize>>,
+    picked: Option<Picked>,
 }
 
 impl<'a> StatExplorer<'a> {
@@ -230,7 +260,7 @@ impl<'a> StatExplorer<'a> {
     ) -> Self {
         let sorted = sorted_copy(&data.values[0]);
         let other = match (purpose, other) {
-            (Purpose::Explore, Some(loader)) => Other::Lazy(loader),
+            (Purpose::Explore | Purpose::PickBoth { .. }, Some(loader)) => Other::Lazy(loader),
             _ => Other::Unavailable,
         };
         let mut explorer = Self {
@@ -467,12 +497,32 @@ impl<'a> StatExplorer<'a> {
         self.cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
     }
 
+    /// Marked entries of both sides (the side not on screen only once it
+    /// has been computed).
+    fn marks_by_side(&self) -> Picked {
+        let here = self.marked_entries();
+        let there = match &self.other {
+            Other::Ready(_, marks) => (0..marks.len()).filter(|&i| marks[i]).collect(),
+            _ => Vec::new(),
+        };
+        match self.side {
+            Side::Rows => Picked {
+                rows: here,
+                columns: there,
+            },
+            Side::Columns => Picked {
+                rows: there,
+                columns: here,
+            },
+        }
+    }
+
     fn finish_pick(&mut self) {
-        let marked = self.marked_entries();
-        if marked.is_empty() {
+        let picked = self.marks_by_side();
+        if picked.rows.is_empty() && picked.columns.is_empty() {
             self.status = Some("mark entries first (Space)".into());
         } else {
-            self.picked = Some(marked);
+            self.picked = Some(picked);
             self.quit = true;
         }
     }
@@ -542,7 +592,7 @@ impl<'a> StatExplorer<'a> {
             }
             KeyCode::Char('y') => self.y_scale = self.y_scale.next(),
             KeyCode::Enter => {
-                if let Purpose::Pick { .. } = self.purpose {
+                if self.purpose != Purpose::Explore {
                     self.finish_pick();
                 }
             }
@@ -787,9 +837,16 @@ impl<'a> StatExplorer<'a> {
             Mode::Browse => {
                 let other = self.side.other().name();
                 let lazy = format!("{other} (computed on first use)");
-                let n_marked = self.marked.iter().filter(|&&m| m).count();
+                let marks = self.marks_by_side();
                 let finish = match self.purpose {
-                    Purpose::Pick { verb } => format!("{verb} {n_marked} marked"),
+                    Purpose::Pick { verb } => {
+                        format!("{verb} {} marked", marks.clone().side(self.side).len())
+                    }
+                    Purpose::PickBoth { verb } => format!(
+                        "{verb} {} rows × {} columns (unmarked: all)",
+                        marks.rows.len(),
+                        marks.columns.len()
+                    ),
                     Purpose::Explore => String::new(),
                 };
                 let mut keys = vec![
@@ -810,7 +867,7 @@ impl<'a> StatExplorer<'a> {
                     Other::Lazy(_) => keys.push(("Tab", &lazy)),
                     Other::Unavailable => {}
                 }
-                if let Purpose::Pick { .. } = self.purpose {
+                if self.purpose != Purpose::Explore {
                     keys.push(("Enter", &finish));
                 }
                 keys.push(("q", "quit"));
@@ -918,10 +975,7 @@ impl Screen for StatExplorer<'_> {
             self.x_scale.name(),
             self.y_scale.name()
         );
-        let badge = match self.purpose {
-            Purpose::Explore => "stat",
-            Purpose::Pick { verb } => verb,
-        };
+        let badge = self.purpose.verb().unwrap_or("stat");
         frame.render_widget(header(badge, &self.title, &extra), top);
 
         let in_values = matches!(self.mode, Mode::Values | Mode::Typing(Input::SaveValues, _));
@@ -964,7 +1018,7 @@ fn sorted_copy(values: &[f32]) -> Vec<f32> {
 
 /// Run the explorer full screen until the user quits. When picking, returns
 /// the marked entries if the user finished with Enter.
-pub fn explore(mut explorer: StatExplorer<'_>) -> anyhow::Result<Option<Vec<usize>>> {
+pub fn explore(mut explorer: StatExplorer<'_>) -> anyhow::Result<Option<Picked>> {
     run_screen(&mut explorer)?;
     Ok(explorer.picked)
 }

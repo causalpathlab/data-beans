@@ -203,9 +203,9 @@ fn enter_hands_back_the_marked_entries_when_picking() {
     press(&mut e, KeyCode::Char(' '));
     press(&mut e, KeyCode::Enter);
     assert!(e.done());
-    let mut picked = e.picked.clone().unwrap();
-    picked.sort_unstable();
-    assert_eq!(picked, [10, 11], "CT3 and CT2, in original order");
+    let picked = e.picked.clone().unwrap();
+    assert_eq!(picked.rows, [10, 11], "CT3 and CT2, in original order");
+    assert!(picked.columns.is_empty());
 }
 
 #[test]
@@ -372,4 +372,59 @@ fn a_failed_load_stays_put_and_says_why() {
     e.do_work();
     assert_eq!(e.side, Side::Rows);
     assert!(e.status.as_deref().unwrap().contains("no data"));
+}
+
+#[test]
+fn picking_both_sides_keeps_each_sides_marks_and_returns_both() {
+    let loader: Loader<'_> = Box::new(|side| {
+        assert_eq!(side, Side::Rows);
+        Ok(rows())
+    });
+    let mut e = StatExplorer::new(
+        "input",
+        Side::Columns,
+        columns(),
+        Some(loader),
+        None,
+        Purpose::PickBoth { verb: "subset" },
+    );
+    press(&mut e, KeyCode::Enter);
+    assert!(!e.done(), "nothing marked on either side");
+
+    // Columns sort by nnz descending: CELL5 first.
+    press(&mut e, KeyCode::Char(' '));
+    press(&mut e, KeyCode::Tab);
+    e.do_work();
+    assert_eq!(e.side, Side::Rows);
+    press(&mut e, KeyCode::Char(' ')); // CT3 (entry 11)
+    press(&mut e, KeyCode::Char(' ')); // CT2 (entry 10)
+    assert!(screen_text(&mut e, 160, 30).contains("subset 2 rows × 1 columns"));
+
+    press(&mut e, KeyCode::Enter);
+    assert!(e.done());
+    assert_eq!(
+        e.picked.clone().unwrap(),
+        Picked {
+            rows: vec![10, 11],
+            columns: vec![4],
+        }
+    );
+}
+
+#[test]
+fn picking_both_sides_allows_marks_on_one_side_only() {
+    let loader: Loader<'_> = Box::new(|_| Ok(rows()));
+    let mut e = StatExplorer::new(
+        "input",
+        Side::Columns,
+        columns(),
+        Some(loader),
+        None,
+        Purpose::PickBoth { verb: "subset" },
+    );
+    press(&mut e, KeyCode::Char(' '));
+    press(&mut e, KeyCode::Enter);
+    let picked = e.picked.clone().unwrap();
+    assert_eq!(picked.columns, [4]);
+    assert!(picked.rows.is_empty(), "rows never shown, so kept whole");
 }

@@ -54,3 +54,18 @@ fn no_zip_still_asks_for_a_directory() {
             .zip
     );
 }
+
+#[test]
+fn interactive_output_keeps_the_input_container() {
+    use super::zip_like_input;
+    assert!(
+        !zip_like_input("in.zarr", "out"),
+        "a directory stays a directory"
+    );
+    assert!(zip_like_input("in.zarr.zip", "out"), "a zip stays a zip");
+    assert!(!zip_like_input("in.h5", "out"), "HDF5 is never zipped");
+    assert!(
+        !zip_like_input("in.zarr.zip", "out.zarr"),
+        "an explicit .zarr output wins"
+    );
+}
