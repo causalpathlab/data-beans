@@ -11,7 +11,19 @@ readme = "README.md"
 # QC API independently of the shared utility crates.
 version = "0.6.13"
 rust-version = "1.91"
-exclude = ["**/.claude/**", "**/.DS_Store"]
+# Data stores and matrices never ship, even if one is lying around the tree.
+exclude = [
+    "**/.claude/**",
+    "**/.DS_Store",
+    "*.zarr",
+    "*.zarr.zip",
+    "*.h5",
+    "*.h5ad",
+    "*.hdf5",
+    "*.mtx",
+    "*.mtx.gz",
+    "*.parquet",
+]
 
 [[bin]]
 name = "data-beans"
