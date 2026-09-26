@@ -1,7 +1,9 @@
 mod column_subset;
 mod handlers;
 mod hdf5_io;
-mod interactive;
+// The interactive views live in the library (feature "tui") so downstream
+// crates can build on them; the CLI uses the same module.
+use data_beans::interactive;
 mod qc;
 mod sparse_backend;
 mod sparse_data_visitors;

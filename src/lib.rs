@@ -1,6 +1,8 @@
 pub mod column_subset; // stream a column/row selection into a new backend
 pub mod convert; // data format conversion (h5/zarr → backend)
 pub mod hdf5_io; // HDF5/h5ad reading helpers
+#[cfg(feature = "tui")]
+pub mod interactive; // full-screen terminal views (ratatui): screens, histograms, pickers
 pub mod qc; // QC primitives: squeeze + streaming stat collectors (CLI + faba)
 pub mod qc_lib; // cell-axis QC (MAD outliers + near-empty floor); lib-only, senna/pinto
 pub mod sparse_backend; // storage backends (zarr, hdf5)
