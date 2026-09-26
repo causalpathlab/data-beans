@@ -198,6 +198,8 @@ impl AxisView {
                 .map(|s| (bins.key(s as f64), "◆", PLAIN.bold()))
                 .into_iter()
                 .collect(),
+            x_label: None,
+            tick_every: None,
         }
         .render(frame.buffer_mut(), plot);
     }
