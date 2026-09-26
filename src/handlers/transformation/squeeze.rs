@@ -3,7 +3,8 @@ use crate::handlers::merging::{
     find_aligned_rows, generate_unique_batch_names, run_merge_backend, MergeBackendArgs,
 };
 use crate::hdf5_io::*;
-use crate::interactive::{confirm, prompt_user_action, UserAction};
+use crate::interactive::cutoff_tui::{choose_cutoffs, AxisView, CutoffPicker, Decision};
+use crate::interactive::{confirm, prompt_user_action, tui_available, UserAction};
 use crate::qc::*;
 use crate::sparse_io::*;
 use crate::zarr_io::{apply_zip_flag, finalize_zarr_output, materialize_writable_backend};
@@ -17,12 +18,9 @@ use log::info;
 /// If --output is specified: Squeezes all files and merges into single output file.
 /// Otherwise, modifies files in-place (with confirmation in interactive mode).
 pub fn run_squeeze(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
-    let mut row_nnz_cutoff = cmd_args.row_nnz_cutoff;
-    let mut col_nnz_cutoff = cmd_args.column_nnz_cutoff;
-
     // If output specified with multiple files, squeeze to temp and merge
     if cmd_args.output.is_some() && cmd_args.data_files.len() > 1 {
-        return run_squeeze_and_merge(cmd_args, row_nnz_cutoff, col_nnz_cutoff);
+        return run_squeeze_and_merge(cmd_args);
     }
 
     for data_file_arg in &cmd_args.data_files {
@@ -60,121 +58,13 @@ pub fn run_squeeze(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
 
         info!("before squeeze -- data: {} rows x {} columns", nrow, ncol);
 
-        // Collect statistics for histogram
-        let col_stat = collect_column_stat(data.as_ref(), cmd_args.block_size)?;
-        let row_stat = collect_row_stat(data.as_ref(), cmd_args.block_size)?;
-
-        let row_nnz_vec = row_stat.count_positives();
-        let col_nnz_vec = col_stat.count_positives();
-
-        // Suggest cutoffs at the trough of the log(1+nnz) histogram
-        let want_hist =
-            cmd_args.show_histogram || cmd_args.save_histogram.is_some() || cmd_args.interactive;
-        let want_suggest = want_hist || cmd_args.auto_cutoff;
-        let row_suggest = if want_suggest {
-            suggest_nnz_cutoff(&row_nnz_vec)
-        } else {
-            None
+        let in_place = cmd_args.output.is_none().then_some(data_file_arg.as_ref());
+        let Some((row_nnz_cutoff, col_nnz_cutoff)) =
+            settle_cutoffs(cmd_args, data.as_ref(), &data_file, in_place)?
+        else {
+            info!("Skipping {}", data_file_arg);
+            continue;
         };
-        let col_suggest = if want_suggest {
-            suggest_nnz_cutoff(&col_nnz_vec)
-        } else {
-            None
-        };
-
-        // Interactive or auto: derive the cutoff from the suggestion when the
-        // user left it unset (explicit non-zero values always win, per dimension)
-        if cmd_args.interactive || cmd_args.auto_cutoff {
-            row_nnz_cutoff = resolve_cutoff(cmd_args.row_nnz_cutoff, row_suggest, "row");
-            col_nnz_cutoff = resolve_cutoff(cmd_args.column_nnz_cutoff, col_suggest, "column");
-        }
-
-        // Headless auto mode (no histogram shown): report what was applied
-        if cmd_args.auto_cutoff && !want_hist {
-            report_resolved_cutoff("row", &row_nnz_vec, row_nnz_cutoff);
-            report_resolved_cutoff("column", &col_nnz_vec, col_nnz_cutoff);
-        }
-
-        // Show/save histogram if requested or in interactive mode
-        if want_hist {
-            display_nnz_histogram(
-                &data_file,
-                NnzAxis {
-                    nnz: &row_nnz_vec,
-                    cutoff: row_nnz_cutoff,
-                    suggest: row_suggest,
-                },
-                NnzAxis {
-                    nnz: &col_nnz_vec,
-                    cutoff: col_nnz_cutoff,
-                    suggest: col_suggest,
-                },
-                cmd_args.show_histogram || cmd_args.interactive,
-                cmd_args.save_histogram.as_deref(),
-            )?;
-        }
-
-        // Interactive mode: prompt user for action
-        if cmd_args.interactive {
-            let proceed = loop {
-                match prompt_user_action(
-                    &row_nnz_vec,
-                    &col_nnz_vec,
-                    row_nnz_cutoff,
-                    col_nnz_cutoff,
-                )? {
-                    UserAction::Proceed => {
-                        info!("Proceeding with squeeze operation...");
-                        break true;
-                    }
-                    UserAction::AdjustCutoffs(new_row, new_col) => {
-                        row_nnz_cutoff = new_row;
-                        col_nnz_cutoff = new_col;
-                        info!(
-                            "Updated cutoffs: row={}, column={}",
-                            row_nnz_cutoff, col_nnz_cutoff
-                        );
-
-                        // Show updated histogram with new cutoffs
-                        display_nnz_histogram(
-                            &data_file,
-                            NnzAxis {
-                                nnz: &row_nnz_vec,
-                                cutoff: row_nnz_cutoff,
-                                suggest: row_suggest,
-                            },
-                            NnzAxis {
-                                nnz: &col_nnz_vec,
-                                cutoff: col_nnz_cutoff,
-                                suggest: col_suggest,
-                            },
-                            true,
-                            None,
-                        )?;
-                    }
-                    UserAction::Cancel => {
-                        info!("Cancelled squeeze operation");
-                        break false;
-                    }
-                }
-            };
-
-            if !proceed {
-                continue;
-            }
-
-            // Confirm in-place modification if no output
-            if cmd_args.output.is_none() {
-                let msg = format!(
-                    "Modify {} in-place? This will permanently alter the file",
-                    data_file_arg
-                );
-                if !confirm(&msg)? {
-                    info!("Skipping in-place modification of {}", data_file_arg);
-                    continue;
-                }
-            }
-        }
 
         // Skip actual squeeze if dry run
         if cmd_args.dry_run {
@@ -222,11 +112,7 @@ pub fn run_squeeze(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
 ///
 /// For Common mode: Squeeze each file first, then find common rows, subset, and merge.
 /// For Union mode: Merge first with union of all rows, then squeeze the merged result.
-fn run_squeeze_and_merge(
-    cmd_args: &RunSqueezeArgs,
-    mut row_nnz_cutoff: usize,
-    mut col_nnz_cutoff: usize,
-) -> anyhow::Result<()> {
+fn run_squeeze_and_merge(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
     let output_prefix = cmd_args.output.as_ref().unwrap();
     info!(
         "Squeeze and merge mode: {} files -> {}",
@@ -234,96 +120,16 @@ fn run_squeeze_and_merge(
         output_prefix
     );
 
-    // Handle interactive / histogram / auto-cutoff for the first file to get cutoffs
-    if cmd_args.interactive || cmd_args.show_histogram || cmd_args.auto_cutoff {
-        let (backend, data_file) = resolve_backend_file(&cmd_args.data_files[0], None)?;
-        let data = open_sparse_matrix(&data_file, &backend)?;
-
-        let col_stat = collect_column_stat(data.as_ref(), cmd_args.block_size)?;
-        let row_stat = collect_row_stat(data.as_ref(), cmd_args.block_size)?;
-        let row_nnz_vec = row_stat.count_positives();
-        let col_nnz_vec = col_stat.count_positives();
-
-        // Suggest cutoffs at the trough of the log(1+nnz) histogram
-        let row_suggest = suggest_nnz_cutoff(&row_nnz_vec);
-        let col_suggest = suggest_nnz_cutoff(&col_nnz_vec);
-
-        // Interactive or auto: derive the cutoff from the suggestion when the
-        // user left it unset (explicit non-zero values always win, per dimension)
-        if cmd_args.interactive || cmd_args.auto_cutoff {
-            row_nnz_cutoff = resolve_cutoff(cmd_args.row_nnz_cutoff, row_suggest, "row");
-            col_nnz_cutoff = resolve_cutoff(cmd_args.column_nnz_cutoff, col_suggest, "column");
-        }
-
-        let show_hist = cmd_args.show_histogram || cmd_args.interactive;
-        if show_hist || cmd_args.save_histogram.is_some() {
-            display_nnz_histogram(
-                &data_file,
-                NnzAxis {
-                    nnz: &row_nnz_vec,
-                    cutoff: row_nnz_cutoff,
-                    suggest: row_suggest,
-                },
-                NnzAxis {
-                    nnz: &col_nnz_vec,
-                    cutoff: col_nnz_cutoff,
-                    suggest: col_suggest,
-                },
-                show_hist,
-                cmd_args.save_histogram.as_deref(),
-            )?;
-        }
-
-        // Headless auto mode (no histogram shown): report what was applied
-        if cmd_args.auto_cutoff && !show_hist {
-            report_resolved_cutoff("row", &row_nnz_vec, row_nnz_cutoff);
-            report_resolved_cutoff("column", &col_nnz_vec, col_nnz_cutoff);
-        }
-
-        if cmd_args.interactive {
-            loop {
-                match prompt_user_action(
-                    &row_nnz_vec,
-                    &col_nnz_vec,
-                    row_nnz_cutoff,
-                    col_nnz_cutoff,
-                )? {
-                    UserAction::Proceed => {
-                        info!("Proceeding with squeeze and merge...");
-                        break;
-                    }
-                    UserAction::AdjustCutoffs(new_row, new_col) => {
-                        row_nnz_cutoff = new_row;
-                        col_nnz_cutoff = new_col;
-                        info!(
-                            "Updated cutoffs: row={}, column={}",
-                            row_nnz_cutoff, col_nnz_cutoff
-                        );
-
-                        display_nnz_histogram(
-                            &data_file,
-                            NnzAxis {
-                                nnz: &row_nnz_vec,
-                                cutoff: row_nnz_cutoff,
-                                suggest: row_suggest,
-                            },
-                            NnzAxis {
-                                nnz: &col_nnz_vec,
-                                cutoff: col_nnz_cutoff,
-                                suggest: col_suggest,
-                            },
-                            true,
-                            None,
-                        )?;
-                    }
-                    UserAction::Cancel => {
-                        info!("Operation cancelled");
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
+    // Cutoffs come from the first file's histogram when one is asked for
+    let (backend, data_file) = resolve_backend_file(&cmd_args.data_files[0], None)?;
+    let data = open_sparse_matrix(&data_file, &backend)?;
+    let Some((row_nnz_cutoff, col_nnz_cutoff)) =
+        settle_cutoffs(cmd_args, data.as_ref(), &data_file, None)?
+    else {
+        info!("Operation cancelled");
+        return Ok(());
+    };
+    drop(data);
 
     if cmd_args.dry_run {
         info!("Dry run complete");
@@ -670,7 +476,8 @@ fn run_squeeze_then_merge(
     Ok(())
 }
 
-/// Per-axis nnz state passed to [`display_nnz_histogram`].
+/// Per-axis nnz state passed to [`display_nnz_histogram`] and [`pick_cutoffs`].
+#[derive(Clone, Copy)]
 struct NnzAxis<'a> {
     nnz: &'a [f32],
     cutoff: usize,
@@ -715,6 +522,123 @@ fn display_nnz_histogram(
     }
 
     Ok(())
+}
+
+/// Decide the row and column cutoffs for `data`, or `None` if the user
+/// cancels. Without `--interactive`, `--auto-cutoff`, or a histogram flag
+/// these are the explicit cutoffs as given. Otherwise the nnz statistics are
+/// collected, auto/interactive fill unset cutoffs from the histogram trough,
+/// the histogram is printed/saved as asked, and `--interactive` lets the user
+/// adjust (confirming first when squeezing `in_place`).
+fn settle_cutoffs(
+    cmd_args: &RunSqueezeArgs,
+    data: &dyn SparseIo<IndexIter = Vec<usize>>,
+    data_file: &str,
+    in_place: Option<&str>,
+) -> anyhow::Result<Option<(usize, usize)>> {
+    let (mut row_cutoff, mut col_cutoff) = (cmd_args.row_nnz_cutoff, cmd_args.column_nnz_cutoff);
+    let save = cmd_args.save_histogram.as_deref();
+    if !(cmd_args.interactive || cmd_args.auto_cutoff || cmd_args.show_histogram || save.is_some())
+    {
+        return Ok(Some((row_cutoff, col_cutoff)));
+    }
+
+    let row_nnz = collect_row_stat(data, cmd_args.block_size)?.count_positives();
+    let col_nnz = collect_column_stat(data, cmd_args.block_size)?.count_positives();
+
+    // Suggest cutoffs at the trough of the log(1+nnz) histogram
+    let row_suggest = suggest_nnz_cutoff(&row_nnz);
+    let col_suggest = suggest_nnz_cutoff(&col_nnz);
+
+    // Interactive or auto: derive the cutoff from the suggestion when the
+    // user left it unset (explicit non-zero values always win, per dimension)
+    if cmd_args.interactive || cmd_args.auto_cutoff {
+        row_cutoff = resolve_cutoff(cmd_args.row_nnz_cutoff, row_suggest, "row");
+        col_cutoff = resolve_cutoff(cmd_args.column_nnz_cutoff, col_suggest, "column");
+    }
+
+    let row = NnzAxis {
+        nnz: &row_nnz,
+        cutoff: row_cutoff,
+        suggest: row_suggest,
+    };
+    let col = NnzAxis {
+        nnz: &col_nnz,
+        cutoff: col_cutoff,
+        suggest: col_suggest,
+    };
+
+    if cmd_args.show_histogram || save.is_some() {
+        display_nnz_histogram(data_file, row, col, cmd_args.show_histogram, save)?;
+    }
+
+    if cmd_args.interactive {
+        return pick_cutoffs(data_file, row, col, in_place);
+    }
+
+    // Headless auto mode (no histogram shown): report what was applied
+    if cmd_args.auto_cutoff && !cmd_args.show_histogram {
+        report_resolved_cutoff("row", &row_nnz, row_cutoff);
+        report_resolved_cutoff("column", &col_nnz, col_cutoff);
+    }
+    Ok(Some((row_cutoff, col_cutoff)))
+}
+
+/// Let the user settle both cutoffs: a full-screen picker on a terminal,
+/// else the printed histogram and line prompts. `in_place` names the file an
+/// in-place squeeze would overwrite, so the user confirms that first.
+/// `None` means cancel.
+fn pick_cutoffs(
+    data_file: &str,
+    row: NnzAxis<'_>,
+    col: NnzAxis<'_>,
+    in_place: Option<&str>,
+) -> anyhow::Result<Option<(usize, usize)>> {
+    let picked = if tui_available() {
+        let picker = CutoffPicker::new(
+            data_file,
+            AxisView::new("Rows", row.nnz, row.cutoff, row.suggest),
+            AxisView::new("Columns", col.nnz, col.cutoff, col.suggest),
+            in_place,
+        );
+        match choose_cutoffs(picker)? {
+            Decision::Proceed { row, column } => Some((row, column)),
+            Decision::Cancel => None,
+        }
+    } else {
+        prompt_cutoffs(data_file, row, col, in_place)?
+    };
+    if let Some((row, column)) = picked {
+        info!("Proceeding with cutoffs: row={row}, column={column}");
+    }
+    Ok(picked)
+}
+
+/// Line-prompt fallback for [`pick_cutoffs`] when there is no terminal.
+fn prompt_cutoffs(
+    data_file: &str,
+    mut row: NnzAxis<'_>,
+    mut col: NnzAxis<'_>,
+    in_place: Option<&str>,
+) -> anyhow::Result<Option<(usize, usize)>> {
+    loop {
+        display_nnz_histogram(data_file, row, col, true, None)?;
+        match prompt_user_action(row.cutoff, col.cutoff)? {
+            UserAction::Proceed => break,
+            UserAction::AdjustCutoffs(new_row, new_col) => {
+                row.cutoff = new_row;
+                col.cutoff = new_col;
+            }
+            UserAction::Cancel => return Ok(None),
+        }
+    }
+    if let Some(target) = in_place {
+        let msg = format!("Modify {target} in-place? This will permanently alter the file");
+        if !confirm(&msg)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some((row.cutoff, col.cutoff)))
 }
 
 /// Resolve the effective cutoff for one dimension. An explicit user value

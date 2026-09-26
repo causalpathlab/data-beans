@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.6.12"
+version = "0.6.13"
 rust-version = "1.91"
 exclude = ["**/.claude/**", "**/.DS_Store"]
 
@@ -72,3 +72,4 @@ fastobo = "0.15"
 special = "0.13"
 num_cpus = "1.16.0"
 statrs = { version = "0.18", default-features = false }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

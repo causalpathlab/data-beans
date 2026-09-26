@@ -18,6 +18,13 @@ pub struct SqueezeCutoffs {
     pub column: usize,
 }
 
+/// Whether a row or column with `nnz` non-zeros falls below `cutoff` and is
+/// squeezed out. Every preview of a cutoff counts with this rule, so what it
+/// reports matches what [`squeeze_by_nnz`] removes.
+pub fn below_nnz_cutoff(nnz: f32, cutoff: usize) -> bool {
+    (nnz as usize) < cutoff
+}
+
 /// squeeze out rows and columns with excessive zero values
 pub fn squeeze_by_nnz(
     data: &dyn SparseIo<IndexIter = Vec<usize>>,
@@ -40,7 +47,7 @@ pub fn squeeze_by_nnz(
         let ret: Vec<usize> = nnz
             .iter()
             .enumerate()
-            .filter(|&(_, &x)| (x as usize) >= cutoff)
+            .filter(|&(_, &x)| !below_nnz_cutoff(x, cutoff))
             .map(|(i, _)| i)
             .collect();
 
@@ -416,6 +423,27 @@ pub fn suggest_nnz_cutoff(nnz: &[f32]) -> Option<usize> {
     favors_cut.then_some(cutoff)
 }
 
+/// Key of the log10(x+1) histogram bin holding `x`: `round(10 * log10(x + 1))`,
+/// so bins are a tenth of a decade wide.
+pub fn log_bin_key(x: f64) -> i32 {
+    ((x + 1.0).log10() * 10.0).round() as i32
+}
+
+/// Smallest non-negative integer whose [`log_bin_key`] is at least `k`: the
+/// first count in bin `k`, and the cutoff that drops every bin below it.
+pub fn log_bin_lower_edge(k: i32) -> usize {
+    if k <= 0 {
+        return 0;
+    }
+    let x = (10f64.powf((k as f64 - 0.5) / 10.0) - 1.0).ceil().max(0.0) as usize;
+    // Guard against rounding at the boundary.
+    if log_bin_key(x as f64) >= k {
+        x
+    } else {
+        x + 1
+    }
+}
+
 /// One log10(x+1) histogram bin, carrying the real value range that fell into it
 struct HistBin {
     val_min: f32,
@@ -429,14 +457,14 @@ struct HistBin {
 /// bin. Works on any non-negative statistic (nnz, sum, mean, sd); the ranges
 /// stay exact `f32` so count-like stats still print as integers.
 fn create_log_histogram(values: &[f32], cutoff: usize) -> Vec<HistBin> {
-    let cutoff_log = ((cutoff as f64 + 1.0).log10() * 10.0).round() as i32;
+    let cutoff_log = log_bin_key(cutoff as f64);
 
     // Bin key represents log10(x+1)*10 as integer; value is (count, min, max)
     let mut bins: std::collections::BTreeMap<i32, (usize, f32, f32)> =
         std::collections::BTreeMap::new();
 
     for &val in values {
-        let log_val = ((val as f64 + 1.0).log10() * 10.0).round() as i32;
+        let log_val = log_bin_key(val as f64);
         let entry = bins
             .entry(log_val)
             .or_insert((0, f32::INFINITY, f32::NEG_INFINITY));
@@ -490,7 +518,10 @@ pub fn print_nnz_summary(
     const MAX_BAR_WIDTH: usize = 50; // Maximum width for histogram bars
 
     let total = values.len();
-    let below_cutoff = values.iter().filter(|&&x| (x as usize) < cutoff).count();
+    let below_cutoff = values
+        .iter()
+        .filter(|&&x| below_nnz_cutoff(x, cutoff))
+        .count();
     let pct_removed = if total > 0 {
         100.0 * below_cutoff as f64 / total as f64
     } else {
@@ -532,7 +563,7 @@ pub fn print_nnz_summary(
         );
     }
     if let Some(s) = suggested {
-        let below_s = values.iter().filter(|&&x| (x as usize) < s).count();
+        let below_s = values.iter().filter(|&&x| below_nnz_cutoff(x, s)).count();
         let pct_s = if total > 0 {
             100.0 * below_s as f64 / total as f64
         } else {

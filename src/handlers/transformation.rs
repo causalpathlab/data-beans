@@ -201,9 +201,12 @@ pub struct RunSqueezeArgs {
         short,
         long,
         default_value_t = false,
-        help = "Interactive mode - ask for confirmation after showing histogram",
-        long_help = "Show histogram and prompt user to proceed, adjust cutoffs, or cancel.\n\
-                     Automatically enables --show-histogram."
+        help = "Interactive mode - pick cutoffs on a live histogram before squeezing",
+        long_help = "On a terminal, opens a full-screen view of the row and column nnz histograms.\n\
+                     Move each cutoff with the arrow keys (or type a value) and watch what it drops,\n\
+                     then press Enter to squeeze or q to cancel.\n\
+                     Without a terminal (piped input), falls back to text prompts\n\
+                     and prints the histogram (as --show-histogram)."
     )]
     pub interactive: bool,
 

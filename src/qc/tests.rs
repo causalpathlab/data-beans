@@ -190,3 +190,14 @@ fn log_histogram_marks_cutoff_bin_when_positive() {
         "a positive cutoff should mark exactly the first bin at/above it"
     );
 }
+
+#[test]
+fn lower_edges_are_the_first_value_of_each_bin() {
+    for k in 0..60 {
+        let e = log_bin_lower_edge(k);
+        assert!(log_bin_key(e as f64) >= k, "k={k} e={e}");
+        if e > 0 {
+            assert!(log_bin_key((e - 1) as f64) < k, "k={k} e={e}");
+        }
+    }
+}
