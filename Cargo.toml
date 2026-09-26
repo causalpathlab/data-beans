@@ -9,25 +9,17 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.6.14"
+version = "0.6.15"
 rust-version = "1.91"
-# Data stores and matrices never ship, even if one is lying around the tree.
-exclude = [
-    "**/.claude/**",
-    "**/.DS_Store",
-    "*.zarr",
-    "*.zarr.zip",
-    "*.h5",
-    "*.h5ad",
-    "*.hdf5",
-    "*.mtx",
-    "*.mtx.gz",
-    "*.parquet",
-]
+# Ship only the sources, README and license: nothing else in the working tree
+# (data stores, saved name lists, scratch files) can end up on crates.io.
+include = ["src/**/*.rs", "tests/**/*.rs", "README.md", "LICENSE"]
 
 [[bin]]
 name = "data-beans"
 path = "src/main.rs"
+# The CLI's interactive views need the terminal UI.
+required-features = ["tui"]
 
 [[bin]]
 name = "data-beans-sim"
@@ -35,8 +27,11 @@ path = "src/sim_main.rs"
 required-features = ["sim"]
 
 [features]
-default = ["aux"]
+default = ["aux", "tui"]
 aux = []
+# Full-screen terminal views (ratatui): the CLI's interactive sessions, and
+# `data_beans::interactive` for downstream crates building their own.
+tui = ["dep:ratatui"]
 alg = ["aux"]
 sim = ["alg"]
 cuda = ["legume-numeric/cuda"]
@@ -84,4 +79,4 @@ fastobo = "0.15"
 special = "0.13"
 num_cpus = "1.16.0"
 statrs = { version = "0.18", default-features = false }
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }

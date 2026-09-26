@@ -1,5 +1,16 @@
-//! Interactive user input: a full-screen cutoff picker on a terminal, and
-//! line prompts when there is none.
+//! Full-screen terminal views (feature `tui`), and line prompts for when
+//! there is no terminal.
+//!
+//! - [`ui`]: the shared pieces for building a view. The palette (terminal
+//!   foreground plus one accent), [`ui::panel`], [`ui::header`],
+//!   [`ui::help_line`], [`ui::input_line`], the [`ui::Screen`] trait driven by
+//!   [`ui::run_screen`], and histograms: [`ui::Scale`], [`ui::Binning`],
+//!   [`ui::Binned`], [`ui::HistPlot`].
+//! - [`cutoff_tui`]: row and column nnz cutoff picker over plain nnz vectors.
+//! - [`stat_tui`]: table-and-histogram explorer over plain name and value
+//!   columns, optionally marking entries and handing them back.
+//!
+//! Open a view only when [`tui_available`]; otherwise fall back to text.
 
 pub mod cutoff_tui;
 pub mod stat_tui;
