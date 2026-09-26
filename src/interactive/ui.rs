@@ -335,7 +335,9 @@ pub struct HistPlot<'a> {
     /// Other symbols on the x axis, by key.
     pub marks: Vec<(i32, &'static str, Style)>,
     /// Tick label at bin `k` in place of the bin's value; `None` from it
-    /// leaves that tick unlabelled. Unset, ticks show the value.
+    /// drops that tick, so the labels decide where ticks go (e.g. at
+    /// category boundaries with `tick_every: Some(1)`). Unset, every tick
+    /// shows its value.
     pub x_label: Option<&'a dyn Fn(i32) -> Option<String>>,
     /// Ticks every this many bins, in place of the scale's default.
     pub tick_every: Option<i32>,
@@ -456,7 +458,6 @@ impl HistPlot<'_> {
         let kmax = self.kmin + nbins as i32 - 1;
         for k in (self.kmin..=kmax).filter(|k| k % every == 0) {
             let Some(x) = x_of(k) else { continue };
-            put(buf, x, axis.y, "┴", DIM);
             let s = match self.x_label {
                 Some(label) => match label(k) {
                     Some(s) => s,
@@ -464,6 +465,7 @@ impl HistPlot<'_> {
                 },
                 None => compact(self.bins.tick_value(k)),
             };
+            put(buf, x, axis.y, "┴", DIM);
             if x >= next_free && x + (s.len() as u16) <= labels.right() {
                 buf.set_string(x, labels.y, &s, DIM);
                 next_free = x + s.len() as u16 + 1;

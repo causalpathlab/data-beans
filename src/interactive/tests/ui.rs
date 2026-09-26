@@ -91,8 +91,8 @@ fn custom_labels_and_tick_spacing() {
         tick_every: Some(2),
     };
     let (axis, labels) = axis_rows(&plot, 6 + 24, 8);
-    // Ticks every 2 bins (2 columns per bar), labels only where asked.
-    assert_eq!(axis.matches('┴').count(), 6, "{axis}");
+    // Ticks every 2 bins, kept only where a label is given.
+    assert_eq!(axis.matches('┴').count(), 3, "{axis}");
     assert!(labels.contains("L0") && labels.contains("L4") && labels.contains("L8"));
     assert!(!labels.contains("L2") && !labels.contains("L6"), "{labels}");
 }
