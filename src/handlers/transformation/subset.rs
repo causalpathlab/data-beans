@@ -1,6 +1,8 @@
 use super::{run_squeeze, ReorderRowsArgs, RowAlignMode, RunSqueezeArgs};
 use super::{SubsetColumnsArgs, SubsetRowsArgs};
+use crate::handlers::explore::pick_entries;
 use crate::hdf5_io::*;
+use crate::interactive::stat_tui::Side;
 use crate::sparse_io::*;
 use crate::utilities::io_helpers::{
     read_col_names, read_row_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
@@ -73,7 +75,15 @@ fn build_squeeze_args(output_file: Box<str>, args_cols: usize, args_rows: usize)
 /// a file containing column names. Optionally, the output can be squeezed to
 /// remove rows/columns with too few non-zero entries.
 pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
-    let columns_indices = args.column_indices.clone();
+    // Pick before staging, so cancelling copies nothing.
+    let columns_indices = if args.interactive {
+        match pick_entries(&args.data_file, Side::Columns, "subset")? {
+            Some(picked) => Some(picked),
+            None => return Ok(()),
+        }
+    } else {
+        args.column_indices.clone()
+    };
     let column_name_file = args.name_file.clone();
 
     let (_backend, effective_output, output_file, mut data) =
@@ -136,7 +146,7 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
         idx
     } else {
         return Err(anyhow::anyhow!(
-            "either `column-indices` or `name-file` must be provided"
+            "either `column-indices`, `name-file`, or `--interactive` must be provided"
         ));
     };
 
@@ -166,7 +176,15 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
 /// a file containing row names. Optionally, the output can be squeezed to
 /// remove rows/columns with too few non-zero entries.
 pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
-    let row_indices = args.row_indices.clone();
+    // Pick before staging, so cancelling copies nothing.
+    let row_indices = if args.interactive {
+        match pick_entries(&args.data_file, Side::Rows, "subset")? {
+            Some(picked) => Some(picked),
+            None => return Ok(()),
+        }
+    } else {
+        args.row_indices.clone()
+    };
     let row_name_file = args.name_file.clone();
 
     let (_backend, effective_output, output_file, mut data) =
@@ -225,7 +243,7 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
         idx
     } else {
         return Err(anyhow::anyhow!(
-            "either `row-indices` or `name-file` must be provided"
+            "either `row-indices`, `name-file`, or `--interactive` must be provided"
         ));
     };
 

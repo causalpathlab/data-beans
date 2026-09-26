@@ -1,4 +1,6 @@
+use crate::handlers::explore::pick_entries;
 use crate::hdf5_io::*;
+use crate::interactive::stat_tui::Side;
 use crate::sparse_io::*;
 use crate::utilities::io_helpers::{
     parse_index_spec, read_col_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
@@ -38,6 +40,10 @@ pub struct TakeColumnsArgs {
     #[arg(short = 'n', long, value_delimiter = ',')]
     pub column_names: Option<Vec<Box<str>>>,
 
+    /// pick the columns in a full-screen table: mark with Space, Enter to finish
+    #[arg(short = 'I', long, default_value_t = false)]
+    pub interactive: bool,
+
     /// output `parquet` file
     #[arg(short, long, default_value = "stdout")]
     pub output: Box<str>,
@@ -59,6 +65,10 @@ pub struct TakeRowsArgs {
     /// row names to take: e.g., `gene1,gene2,gene3` (supports substring matching)
     #[arg(short = 'n', long, value_delimiter = ',')]
     pub row_names: Option<Vec<Box<str>>>,
+
+    /// pick the rows in a full-screen table: mark with Space, Enter to finish
+    #[arg(short = 'I', long, default_value_t = false)]
+    pub interactive: bool,
 
     /// output `parquet` file
     #[arg(short, long, default_value = "stdout")]
@@ -182,10 +192,23 @@ pub fn take_columns(args: &TakeColumnsArgs) -> anyhow::Result<()> {
 
     let output = args.output.clone();
 
+    let picked = if args.interactive {
+        match pick_entries(&args.data_file, Side::Columns, "take")? {
+            Some(picked) => Some(picked),
+            None => return Ok(()),
+        }
+    } else {
+        None
+    };
+
     let data = open_sparse_matrix(&data_file, &backend)?;
     let row_names = data.row_names()?;
 
-    let (data, column_names) = if let Some(columns) = columns {
+    let (data, column_names) = if let Some(columns) = picked {
+        let names = data.column_names()?;
+        let column_names: Vec<Box<str>> = columns.iter().map(|&i| names[i].clone()).collect();
+        (data.read_columns_ndarray(columns)?, column_names)
+    } else if let Some(columns) = columns {
         let columns = parse_index_spec(&columns)?;
         let n_columns = data.num_columns().unwrap_or(0);
         let columns: Vec<usize> = columns.into_iter().filter(|&i| i < n_columns).collect();
@@ -211,7 +234,7 @@ pub fn take_columns(args: &TakeColumnsArgs) -> anyhow::Result<()> {
         (data.read_columns_ndarray(matched_indices)?, column_names)
     } else {
         return Err(anyhow::anyhow!(
-            "either `column-indices`, `name-file`, or `column-names` must be provided"
+            "either `column-indices`, `name-file`, `column-names`, or `--interactive` must be provided"
         ));
     };
 
@@ -245,9 +268,22 @@ pub fn take_rows(args: &TakeRowsArgs) -> anyhow::Result<()> {
 
     let output = args.output.clone();
 
+    let picked = if args.interactive {
+        match pick_entries(&args.data_file, Side::Rows, "take")? {
+            Some(picked) => Some(picked),
+            None => return Ok(()),
+        }
+    } else {
+        None
+    };
+
     let data_backend = open_sparse_matrix(&data_file, &backend)?;
 
-    let (data, row_names) = if let Some(rows) = rows {
+    let (data, row_names) = if let Some(rows) = picked {
+        let names = data_backend.row_names()?;
+        let row_names: Vec<Box<str>> = rows.iter().map(|&i| names[i].clone()).collect();
+        (data_backend.read_rows_ndarray(rows)?, row_names)
+    } else if let Some(rows) = rows {
         let rows = parse_index_spec(&rows)?;
         let n_rows = data_backend.num_rows().unwrap_or(0);
         let rows: Vec<usize> = rows.into_iter().filter(|&i| i < n_rows).collect();
@@ -273,7 +309,7 @@ pub fn take_rows(args: &TakeRowsArgs) -> anyhow::Result<()> {
         (data_backend.read_rows_ndarray(matched_indices)?, row_names)
     } else {
         return Err(anyhow::anyhow!(
-            "either `row-indices`, `name-file`, or `row-names` must be provided"
+            "either `row-indices`, `name-file`, `row-names`, or `--interactive` must be provided"
         ));
     };
 

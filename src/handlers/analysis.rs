@@ -1,5 +1,6 @@
+use crate::handlers::explore::{open_data, side_stats, values_reader};
 use crate::hdf5_io::*;
-use crate::interactive::stat_tui::{explore, Dataset, Side, StatExplorer};
+use crate::interactive::stat_tui::{explore, Purpose, Side, StatExplorer};
 use crate::interactive::tui_available;
 use crate::qc::*;
 use crate::sparse_io::*;
@@ -11,7 +12,6 @@ use legume_numeric::matrix::membership::Membership;
 use legume_numeric::matrix::traits::RunningStatOps;
 use log::{info, warn};
 use regex::Regex;
-use std::sync::Arc;
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 #[clap(rename_all = "lowercase")]
@@ -126,21 +126,8 @@ pub fn run_stat(cmd_args: &RunStatArgs) -> anyhow::Result<()> {
     let output = cmd_args.output.clone();
     dirname(&output).as_deref().map(mkdir).transpose()?;
 
-    // to avoid duplicate barcodes in the column names
-    let attach_data_name = cmd_args.data_files.len() > 1;
-
-    let mut data = SparseIoVec::new();
-    for data_file in cmd_args.data_files.iter() {
-        let (backend, data_file) = resolve_backend_file(data_file, None)?;
-
-        let mut this_data = open_sparse_matrix(&data_file, &backend)?;
-        if cmd_args.preload {
-            info!("Preloading data from {} ...", data_file);
-            this_data.preload_columns()?;
-        }
-        let data_name = attach_data_name.then(|| basename(&data_file)).transpose()?;
-        data.push(Arc::from(this_data), data_name)?;
-    }
+    // Several files keep their column (barcode) names distinct.
+    let data = open_data(&cmd_args.data_files, cmd_args.preload)?;
 
     // Only --interactive may leave it out; it starts on columns.
     let dim = cmd_args.stat_dim.clone().unwrap_or(StatDim::Column);
@@ -223,12 +210,28 @@ pub fn run_stat(cmd_args: &RunStatArgs) -> anyhow::Result<()> {
     let explore_after = wants_explorer(cmd_args);
     // The explorer replaces printing to stdout; a file output is still written.
     let save = !(explore_after && cmd_args.output.eq_ignore_ascii_case("stdout"));
-    let first = collect_side(cmd_args, &data, side, save)?;
+    let select_rows = rows_matching(cmd_args, &data)?;
+    let select_rows = select_rows.as_deref();
+    let first = side_stats(
+        &data,
+        side,
+        select_rows,
+        cmd_args.block_size,
+        save.then_some(&*cmd_args.output),
+    )?;
     if explore_after {
         let title = cmd_args.data_files.join(", ");
         let data = &data;
-        let loader = Box::new(move |side| collect_side(cmd_args, data, side, false));
-        explore(StatExplorer::new(&title, side, first, Some(loader)))?;
+        let loader =
+            Box::new(move |side| side_stats(data, side, select_rows, cmd_args.block_size, None));
+        explore(StatExplorer::new(
+            &title,
+            side,
+            first,
+            Some(loader),
+            Some(values_reader(data)),
+            Purpose::Explore,
+        ))?;
     }
     Ok(())
 }
@@ -262,43 +265,6 @@ fn rows_matching(cmd_args: &RunStatArgs, data: &SparseIoVec) -> anyhow::Result<O
         row_names.len()
     );
     Ok(Some(selected))
-}
-
-fn dataset<S: RunningStatOps<f32, Output = Vec<f32>>>(names: Vec<Box<str>>, stat: &S) -> Dataset {
-    Dataset {
-        names,
-        values: [stat.count_positives(), stat.sum(), stat.mean(), stat.std()],
-    }
-}
-
-/// Collect one side's statistics, saving them to `--output` when `save`.
-fn collect_side(
-    cmd_args: &RunStatArgs,
-    data: &SparseIoVec,
-    side: Side,
-    save: bool,
-) -> anyhow::Result<Dataset> {
-    let output = &cmd_args.output;
-    Ok(match side {
-        Side::Rows => {
-            let stat = collect_row_stat_across_vec(data, cmd_args.block_size)?;
-            let names = data.row_names()?;
-            if save {
-                stat.save(output, &names, "\t")?;
-            }
-            dataset(names, &stat)
-        }
-        Side::Columns => {
-            let select_rows = rows_matching(cmd_args, data)?;
-            let stat =
-                collect_column_stat_across_vec(data, select_rows.as_deref(), cmd_args.block_size)?;
-            let names = data.column_names()?;
-            if save {
-                stat.save(output, &names, "\t")?;
-            }
-            dataset(names, &stat)
-        }
-    })
 }
 
 /// Which per-row/per-column statistic to histogram.

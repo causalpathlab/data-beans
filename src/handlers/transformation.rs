@@ -43,6 +43,10 @@ pub struct SubsetColumnsArgs {
     #[arg(short = 'f', long)]
     pub name_file: Option<Box<str>>,
 
+    /// pick the columns in a full-screen table: mark with Space, Enter to finish
+    #[arg(short = 'I', long, default_value_t = false)]
+    pub interactive: bool,
+
     /// delimiter for base-key extraction (e.g., '@' to match "ACGT-1@batch" with "ACGT-1")
     #[arg(short = 'd', long, default_value = "@")]
     pub delimiter: char,
@@ -92,6 +96,10 @@ pub struct SubsetRowsArgs {
     /// row name file where each line is a row name
     #[arg(short = 'f', long)]
     pub name_file: Option<Box<str>>,
+
+    /// pick the rows in a full-screen table: mark with Space, Enter to finish
+    #[arg(short = 'I', long, default_value_t = false)]
+    pub interactive: bool,
 
     /// delimiter for base-key extraction (e.g., '@' to match "gene@batch" with "gene")
     #[arg(short = 'd', long, default_value = "@")]
