@@ -429,18 +429,22 @@ pub fn log_bin_key(x: f64) -> i32 {
     ((x + 1.0).log10() * 10.0).round() as i32
 }
 
-/// Smallest non-negative integer whose [`log_bin_key`] is at least `k`: the
-/// first count in bin `k`, and the cutoff that drops every bin below it.
-pub fn log_bin_lower_edge(k: i32) -> usize {
-    if k <= 0 {
-        return 0;
-    }
-    let x = (10f64.powf((k as f64 - 0.5) / 10.0) - 1.0).ceil().max(0.0) as usize;
-    // Guard against rounding at the boundary.
-    if log_bin_key(x as f64) >= k {
-        x
+/// `part` as a percentage of `total` (0 when there is nothing).
+pub fn pct(part: usize, total: usize) -> f64 {
+    if total > 0 {
+        100.0 * part as f64 / total as f64
     } else {
-        x + 1
+        0.0
+    }
+}
+
+/// Median of an ascending slice (0 when empty).
+pub fn median_of_sorted(sorted: &[f32]) -> f32 {
+    let n = sorted.len();
+    match n {
+        0 => 0.0,
+        _ if n.is_multiple_of(2) => (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0,
+        _ => sorted[n / 2],
     }
 }
 
@@ -492,12 +496,13 @@ fn create_log_histogram(values: &[f32], cutoff: usize) -> Vec<HistBin> {
 }
 
 /// Format a statistic value compactly: whole numbers (nnz, integer counts)
-/// print without a decimal point; fractional values (mean, sd) get 2 decimals.
-fn fmt_stat(v: f32) -> String {
+/// print without a decimal point; fractional values (mean, sd) get
+/// `decimals` places.
+pub fn fmt_stat(v: f32, decimals: usize) -> String {
     if v.fract() == 0.0 {
         (v as i64).to_string()
     } else {
-        format!("{:.2}", v)
+        format!("{:.*}", decimals, v)
     }
 }
 
@@ -522,11 +527,7 @@ pub fn print_nnz_summary(
         .iter()
         .filter(|&&x| below_nnz_cutoff(x, cutoff))
         .count();
-    let pct_removed = if total > 0 {
-        100.0 * below_cutoff as f64 / total as f64
-    } else {
-        0.0
-    };
+    let pct_removed = pct(below_cutoff, total);
 
     // Calculate basic statistics
     let min = values.iter().copied().fold(f32::INFINITY, f32::min);
@@ -534,25 +535,16 @@ pub fn print_nnz_summary(
     let sum: f32 = values.iter().sum();
     let mean = if total > 0 { sum / total as f32 } else { 0.0 };
 
-    // Calculate median
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let median = if total > 0 {
-        if total.is_multiple_of(2) {
-            (sorted[total / 2 - 1] + sorted[total / 2]) / 2.0
-        } else {
-            sorted[total / 2]
-        }
-    } else {
-        0.0
-    };
+    sorted.sort_unstable_by(f32::total_cmp);
+    let median = median_of_sorted(&sorted);
 
     println!("{} {} distribution:", label, metric);
     println!("  Total: {}", total);
     println!(
         "  Min: {}, Max: {}, Mean: {:.2}, Median: {:.2}",
-        fmt_stat(min),
-        fmt_stat(max),
+        fmt_stat(min, 2),
+        fmt_stat(max, 2),
         mean,
         median
     );
@@ -564,11 +556,7 @@ pub fn print_nnz_summary(
     }
     if let Some(s) = suggested {
         let below_s = values.iter().filter(|&&x| below_nnz_cutoff(x, s)).count();
-        let pct_s = if total > 0 {
-            100.0 * below_s as f64 / total as f64
-        } else {
-            0.0
-        };
+        let pct_s = pct(below_s, total);
         println!(
             "  Suggested cutoff (histogram trough of {}): {} (would remove {} / {} = {:.2}%)",
             metric, s, below_s, total, pct_s
@@ -596,9 +584,9 @@ pub fn print_nnz_summary(
         let bar_width = if b.count > 0 { bar_width.max(1) } else { 0 };
         let bar = "█".repeat(bar_width);
         let range = if b.val_min == b.val_max {
-            fmt_stat(b.val_min)
+            fmt_stat(b.val_min, 2)
         } else {
-            format!("{}-{}", fmt_stat(b.val_min), fmt_stat(b.val_max))
+            format!("{}-{}", fmt_stat(b.val_min, 2), fmt_stat(b.val_max, 2))
         };
         println!(
             "    {:>9} [{:>4.2}]: {:>6} {}{}",

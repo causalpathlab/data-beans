@@ -1,5 +1,5 @@
 use super::*;
-use crate::interactive::ui::Scale;
+use crate::interactive::ui::{Scale, Screen};
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
@@ -84,46 +84,37 @@ fn keys_edit_the_focused_axis_and_proceed() {
     press(&mut p, KeyCode::Enter);
     assert_eq!(p.axes[1].cutoff, 42);
     assert!(
-        p.decision.as_ref().is_none(),
+        p.decision.is_none(),
         "Enter in edit mode only sets the value"
     );
 
     press(&mut p, KeyCode::Enter);
     let row = p.axes[0].cutoff;
-    assert_eq!(
-        p.decision.as_ref(),
-        Some(&Decision::Proceed { row, column: 42 })
-    );
+    assert_eq!(p.decision, Some(Some((row, 42))));
 }
 
 #[test]
 fn in_place_asks_first_and_n_goes_back() {
     let mut p = picker(Some("target"));
     press(&mut p, KeyCode::Enter);
-    assert!(p.decision.as_ref().is_none());
+    assert!(p.decision.is_none());
     press(&mut p, KeyCode::Char('n'));
-    assert!(p.decision.as_ref().is_none());
+    assert!(p.decision.is_none());
     press(&mut p, KeyCode::Enter);
     press(&mut p, KeyCode::Char('y'));
-    assert_eq!(
-        p.decision.as_ref(),
-        Some(&Decision::Proceed {
-            row: 0,
-            column: 100
-        })
-    );
+    assert_eq!(p.decision, Some(Some((0, 100))));
 }
 
 #[test]
 fn q_cancels() {
     let mut p = picker(None);
     press(&mut p, KeyCode::Char('q'));
-    assert_eq!(p.decision.as_ref(), Some(&Decision::Cancel));
+    assert_eq!(p.decision, Some(None));
 }
 
 #[test]
 fn renders_both_axes_with_stats_and_markers() {
-    let p = picker(Some("target"));
+    let mut p = picker(Some("target"));
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
     term.draw(|f| p.render(f)).unwrap();
     let text: String = term
@@ -158,7 +149,7 @@ fn first_bin_step_drops_the_first_bar() {
     let mut a = AxisView::new("x", &nnz, 0, None);
     a.step_bin(1);
     assert!(a.removed() > 0, "cutoff {} drops nothing", a.cutoff);
-    assert_eq!(a.removed(), a.counts[0]);
+    assert_eq!(a.removed(), a.hist.counts[0]);
     a.step_bin(-1);
     assert_eq!(a.cutoff, 0);
 }
@@ -169,12 +160,12 @@ fn every_scale_bins_all_entries_and_steps_by_bar() {
     let mut a = AxisView::new("x", &nnz, 0, None);
     for scale in [Scale::Log, Scale::Sqrt, Scale::Linear] {
         a.set_scale(scale);
-        assert_eq!(a.counts.iter().sum::<usize>(), nnz.len(), "{scale:?}");
+        assert_eq!(a.hist.counts.iter().sum::<usize>(), nnz.len(), "{scale:?}");
         assert!(a.stops.windows(2).all(|w| w[0] < w[1]), "{scale:?}");
         // Each stop drops exactly the bars left of the bin it opens.
         for &stop in &a.stops[1..a.stops.len() - 1] {
-            let k = a.bins.key(stop as f64);
-            let left: usize = a.counts[..(k - a.kmin) as usize].iter().sum();
+            let k = a.hist.bins.key(stop as f64);
+            let left: usize = a.hist.counts[..(k - a.hist.kmin) as usize].iter().sum();
             assert_eq!(a.removed_at(stop), left, "{scale:?} stop {stop}");
         }
     }
@@ -185,7 +176,7 @@ fn x_and_y_cycle_scales_for_both_axes() {
     let mut p = picker(None);
     press(&mut p, KeyCode::Char('x'));
     assert_eq!(p.x_scale, Scale::Sqrt);
-    assert!(p.axes.iter().all(|a| a.bins.scale == Scale::Sqrt));
+    assert!(p.axes.iter().all(|a| a.hist.bins.scale == Scale::Sqrt));
     press(&mut p, KeyCode::Char('y'));
     press(&mut p, KeyCode::Char('y'));
     assert_eq!(p.y_scale, Scale::Linear);

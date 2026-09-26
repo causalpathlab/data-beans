@@ -1,5 +1,7 @@
 use super::*;
+use crate::interactive::ui::Screen;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::KeyModifiers;
 use ratatui::Terminal;
 
 fn press(e: &mut StatExplorer<'_>, code: KeyCode) {
@@ -37,7 +39,7 @@ fn shown_names<'e>(e: &'e StatExplorer<'_>) -> Vec<&'e str> {
 fn starts_sorted_by_nnz_descending() {
     let e = explorer();
     assert_eq!(shown_names(&e)[..2], ["CT3", "CT2"]);
-    assert_eq!(e.hist.all.iter().sum::<usize>(), 12);
+    assert_eq!(e.hist.counts.iter().sum::<usize>(), 12);
 }
 
 #[test]
@@ -60,7 +62,7 @@ fn filter_is_a_case_insensitive_regex_with_literal_fallback() {
         press(&mut e, KeyCode::Char(c));
     }
     assert_eq!(e.view.len(), 3);
-    let shown: usize = e.hist.shown.as_ref().unwrap().iter().sum();
+    let shown: usize = e.shown.as_ref().unwrap().iter().sum();
     assert_eq!(shown, 3, "the subset is binned over the same bins");
 
     // An invalid regex matches literally rather than hiding everything.
@@ -70,7 +72,7 @@ fn filter_is_a_case_insensitive_regex_with_literal_fallback() {
     assert!(e.view.is_empty());
     press(&mut e, KeyCode::Esc);
     assert_eq!(e.view.len(), 12);
-    assert!(e.hist.shown.is_none());
+    assert!(e.shown.is_none());
 }
 
 #[test]
@@ -90,7 +92,7 @@ fn scales_rebin_every_statistic() {
         for _ in 0..3 {
             press(&mut e, KeyCode::Char('x'));
             assert_eq!(
-                e.hist.all.iter().sum::<usize>(),
+                e.hist.counts.iter().sum::<usize>(),
                 12,
                 "stat {s} {:?}",
                 e.x_scale

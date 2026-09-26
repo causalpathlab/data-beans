@@ -153,11 +153,11 @@ fn cutoff_is_deterministic() {
 #[test]
 fn fmt_stat_is_integer_for_whole_values() {
     // nnz / sum are whole -> no decimal point; mean / sd keep 2 decimals.
-    assert_eq!(fmt_stat(0.0), "0");
-    assert_eq!(fmt_stat(5.0), "5");
-    assert_eq!(fmt_stat(900.0), "900");
-    assert_eq!(fmt_stat(0.3), "0.30");
-    assert_eq!(fmt_stat(12.53), "12.53");
+    assert_eq!(fmt_stat(0.0, 2), "0");
+    assert_eq!(fmt_stat(5.0, 2), "5");
+    assert_eq!(fmt_stat(900.0, 2), "900");
+    assert_eq!(fmt_stat(0.3, 2), "0.30");
+    assert_eq!(fmt_stat(12.53, 2), "12.53");
 }
 
 #[test]
@@ -189,15 +189,4 @@ fn log_histogram_marks_cutoff_bin_when_positive() {
         hist.iter().any(|b| b.is_cutoff),
         "a positive cutoff should mark exactly the first bin at/above it"
     );
-}
-
-#[test]
-fn lower_edges_are_the_first_value_of_each_bin() {
-    for k in 0..60 {
-        let e = log_bin_lower_edge(k);
-        assert!(log_bin_key(e as f64) >= k, "k={k} e={e}");
-        if e > 0 {
-            assert!(log_bin_key((e - 1) as f64) < k, "k={k} e={e}");
-        }
-    }
 }

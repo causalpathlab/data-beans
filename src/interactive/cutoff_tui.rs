@@ -6,27 +6,25 @@
 //! log scale the bins are the printed histogram's (`qc`), and drop counts
 //! always use the squeeze's own rule, so all views agree.
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, LineGauge, Paragraph, Wrap};
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::Frame;
 
 use super::ui::{
-    header, help_line, title, Binning, HistPlot, Layer, Scale, ACCENTED, DIM, HIGHLIGHT, PLAIN,
+    header, help_line, input_line, median, panel, run_screen, Binned, HistPlot, Scale, Screen,
+    ACCENTED, DIM, HIGHLIGHT, PLAIN,
 };
-use crate::qc::below_nnz_cutoff;
+use crate::qc::{below_nnz_cutoff, pct};
 
 /// One axis (rows or columns): the sorted nnz counts, their histogram, and
 /// the cutoff being edited.
 pub struct AxisView {
     label: String,
     sorted: Vec<f32>,
-    bins: Binning,
-    /// Counts per bin key, indexed from `kmin`.
-    counts: Vec<usize>,
-    kmin: i32,
+    hist: Binned,
     /// Cutoffs the bin steps visit, ascending: 0, the first count of every
     /// bin past the lowest (the cutoff that drops the bars left of it), and
     /// one past the max (drops everything).
@@ -40,41 +38,33 @@ impl AxisView {
     pub fn new(label: &str, nnz: &[f32], cutoff: usize, suggest: Option<usize>) -> Self {
         let mut sorted = nnz.to_vec();
         sorted.sort_unstable_by(f32::total_cmp);
-        let mut view = Self {
+        let hist = Binned::new(&sorted, Scale::Log);
+        let stops = Self::stops(&hist, &sorted);
+        Self {
             label: label.to_string(),
-            bins: Binning::new(Scale::Log, 0.0, true),
             sorted,
-            counts: Vec::new(),
-            kmin: 0,
-            stops: Vec::new(),
+            hist,
+            stops,
             cutoff,
             initial: cutoff,
             suggest,
-        };
-        view.set_scale(Scale::Log);
-        view
+        }
+    }
+
+    fn stops(hist: &Binned, sorted: &[f32]) -> Vec<usize> {
+        let max = sorted.last().map_or(0, |&x| x as usize);
+        let mut stops: Vec<usize> = std::iter::once(0)
+            .chain((hist.kmin + 1..=hist.kmax()).map(|k| hist.bins.lower_edge(k)))
+            .chain(std::iter::once(max + 1))
+            .collect();
+        stops.dedup();
+        stops
     }
 
     /// Re-bin the histogram on `scale`.
     fn set_scale(&mut self, scale: Scale) {
-        let min = self.sorted.first().map_or(0, |&x| x as usize);
-        let max = self.max_value();
-        self.bins = Binning::new(scale, max as f64, true);
-        let (kmin, kmax) = (self.bins.key(min as f64), self.bins.key(max as f64));
-        self.kmin = kmin;
-        self.stops = std::iter::once(0)
-            .chain((kmin + 1..=kmax).map(|k| self.bins.lower_edge(k)))
-            .chain(std::iter::once(max + 1))
-            .collect();
-        self.stops.dedup();
-        // nnz are whole counts, so bin `k` holds exactly the values between
-        // its lower edge and the next one: two binary searches per bin.
-        self.counts = (kmin..=kmax)
-            .map(|k| {
-                self.removed_at(self.bins.lower_edge(k + 1))
-                    - self.removed_at(self.bins.lower_edge(k))
-            })
-            .collect();
+        self.hist = Binned::new(&self.sorted, scale);
+        self.stops = Self::stops(&self.hist, &self.sorted);
     }
 
     fn total(&self) -> usize {
@@ -93,15 +83,6 @@ impl AxisView {
 
     fn max_value(&self) -> usize {
         self.sorted.last().map_or(0, |&x| x as usize)
-    }
-
-    fn median(&self) -> f32 {
-        let n = self.sorted.len();
-        match n {
-            0 => 0.0,
-            _ if n.is_multiple_of(2) => (self.sorted[n / 2 - 1] + self.sorted[n / 2]) / 2.0,
-            _ => self.sorted[n / 2],
-        }
     }
 
     /// Move the cutoff to the next (`dir > 0`) or previous stop, so one
@@ -132,13 +113,6 @@ impl AxisView {
         self.cutoff = self.initial;
     }
 
-    fn pct(&self, removed: usize) -> f64 {
-        match self.total() {
-            0 => 0.0,
-            n => 100.0 * removed as f64 / n as f64,
-        }
-    }
-
     fn stats_lines(&self) -> Vec<Line<'static>> {
         let dim = |t: &str| Span::styled(t.to_string(), DIM);
         let removed = self.removed();
@@ -146,7 +120,7 @@ impl AxisView {
             Some(s) => dim(&format!(
                 "   ◆ suggested {} (drops {:.2}%)",
                 s,
-                self.pct(self.removed_at(s))
+                pct(self.removed_at(s), self.total())
             )),
             None => dim("   no trough suggestion"),
         };
@@ -157,7 +131,7 @@ impl AxisView {
                 dim("   min "),
                 Span::raw(self.sorted.first().map_or(0, |&x| x as usize).to_string()),
                 dim("   median "),
-                Span::raw(self.median().to_string()),
+                Span::raw(median(&self.sorted).to_string()),
                 dim("   max "),
                 Span::raw(self.max_value().to_string()),
             ]),
@@ -166,7 +140,12 @@ impl AxisView {
                 Span::styled(self.cutoff.to_string(), HIGHLIGHT),
                 dim("   drops "),
                 Span::styled(
-                    format!("{} / {} ({:.2}%)", removed, self.total(), self.pct(removed)),
+                    format!(
+                        "{} / {} ({:.2}%)",
+                        removed,
+                        self.total(),
+                        pct(removed, self.total())
+                    ),
                     ACCENTED,
                 ),
                 suggestion,
@@ -175,13 +154,7 @@ impl AxisView {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, focused: bool, y_scale: Scale) {
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(if focused { PLAIN } else { DIM })
-            .title(title(
-                format!(" {} nnz ", self.label),
-                if focused { HIGHLIGHT } else { DIM },
-            ));
+        let block = panel(format!(" {} nnz ", self.label), focused);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -193,11 +166,7 @@ impl AxisView {
         .areas(inner);
         frame.render_widget(Paragraph::new(self.stats_lines()), stats);
 
-        let kept = self.total() - self.removed();
-        let ratio = match self.total() {
-            0 => 1.0,
-            n => kept as f64 / n as f64,
-        };
+        let ratio = 1.0 - pct(self.removed(), self.total()) / 100.0;
         frame.render_widget(
             LineGauge::default()
                 .ratio(ratio)
@@ -210,38 +179,28 @@ impl AxisView {
         );
 
         // Bars left of the cutoff's bin are what it drops.
-        let cut_key = (self.cutoff > 0).then(|| self.bins.key(self.cutoff as f64));
+        let bins = self.hist.bins;
+        let cut_key = (self.cutoff > 0).then(|| bins.key(self.cutoff as f64));
         let style = |k: i32| match cut_key {
             Some(c) if k < c => ACCENTED,
             _ => PLAIN,
         };
-        let mut marks = Vec::new();
-        if let Some(s) = self.suggest {
-            marks.push((self.bins.key(s as f64), "◆", PLAIN.bold()));
-        }
-        if let Some(c) = cut_key {
-            marks.push((c, "▲", HIGHLIGHT));
-        }
         HistPlot {
-            bins: self.bins,
-            kmin: self.kmin,
-            layers: vec![Layer {
-                counts: &self.counts,
-                style: &style,
-            }],
+            bins,
+            kmin: self.hist.kmin,
+            counts: &self.hist.counts,
+            style: &style,
+            subset: None,
             y_scale,
-            rule: cut_key.map(|c| (c, ACCENTED)),
-            marks,
+            pointer: cut_key,
+            marks: self
+                .suggest
+                .map(|s| (bins.key(s as f64), "◆", PLAIN.bold()))
+                .into_iter()
+                .collect(),
         }
         .render(frame.buffer_mut(), plot);
     }
-}
-
-/// What the user decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Decision {
-    Proceed { row: usize, column: usize },
-    Cancel,
 }
 
 enum Mode {
@@ -262,7 +221,9 @@ pub struct CutoffPicker {
     /// When set, Enter asks before squeezing this file in place.
     in_place_target: Option<String>,
     mode: Mode,
-    decision: Option<Decision>,
+    /// Set once the user is done: the row and column cutoffs, or `None` to
+    /// cancel.
+    decision: Option<Option<(usize, usize)>>,
 }
 
 impl CutoffPicker {
@@ -285,20 +246,56 @@ impl CutoffPicker {
     }
 
     fn proceed(&mut self) {
-        self.decision = Some(Decision::Proceed {
-            row: self.axes[0].cutoff,
-            column: self.axes[1].cutoff,
-        });
+        self.decision = Some(Some((self.axes[0].cutoff, self.axes[1].cutoff)));
+    }
+
+    fn render_confirm(&self, frame: &mut Frame, target: &str) {
+        let area = frame.area();
+        let width = (target.len() as u16 + 6).max(44).min(area.width);
+        // Long paths wrap onto extra lines rather than getting cut off.
+        let path_lines = (target.len() as u16).div_ceil(width.saturating_sub(2).max(1));
+        let [popup] = Layout::horizontal([Constraint::Length(width)])
+            .flex(Flex::Center)
+            .areas(area);
+        let [popup] = Layout::vertical([Constraint::Length(6 + path_lines)])
+            .flex(Flex::Center)
+            .areas(popup);
+        let text = vec![
+            Line::from("Squeeze in place? This permanently alters"),
+            Line::from(target.to_string()).bold(),
+            Line::from(format!(
+                "row cutoff {}, column cutoff {}",
+                self.axes[0].cutoff, self.axes[1].cutoff
+            ))
+            .style(DIM),
+            help_line(&[("y", "yes"), ("n", "back")]),
+        ];
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(text)
+                .centered()
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Double)
+                        .border_style(ACCENTED)
+                        .title(Line::from(" confirm ").style(HIGHLIGHT).centered()),
+                ),
+            popup,
+        );
+    }
+}
+
+impl Screen for CutoffPicker {
+    fn done(&self) -> bool {
+        self.decision.is_some()
+    }
+
+    fn interrupt(&mut self) {
+        self.decision = Some(None);
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.decision = Some(Decision::Cancel);
-            return;
-        }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let f = self.focus;
         match &mut self.mode {
@@ -351,13 +348,13 @@ impl CutoffPicker {
                         self.proceed();
                     }
                 }
-                KeyCode::Char('q') | KeyCode::Esc => self.decision = Some(Decision::Cancel),
+                KeyCode::Char('q') | KeyCode::Esc => self.decision = Some(None),
                 _ => {}
             },
         }
     }
 
-    fn render(&self, frame: &mut Frame) {
+    fn render(&mut self, frame: &mut Frame) {
         let [top, row_area, col_area, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
@@ -368,19 +365,16 @@ impl CutoffPicker {
 
         let scales = format!("x {} · y {}", self.x_scale.name(), self.y_scale.name());
         frame.render_widget(header("squeeze", &self.title, &scales), top);
-        self.axes[0].render(frame, row_area, self.focus == 0, self.y_scale);
-        self.axes[1].render(frame, col_area, self.focus == 1, self.y_scale);
+        for (i, area) in [row_area, col_area].into_iter().enumerate() {
+            self.axes[i].render(frame, area, self.focus == i, self.y_scale);
+        }
 
         let help = match &self.mode {
-            Mode::Edit(buf) => {
-                let mut spans = vec![
-                    Span::raw(format!(" {} cutoff: ", self.axes[self.focus].label)),
-                    Span::styled(format!("{}▏", buf), HIGHLIGHT),
-                    Span::raw("  "),
-                ];
-                spans.extend(help_line(&[("Enter", "set"), ("Esc", "back")]).spans);
-                Line::from(spans)
-            }
+            Mode::Edit(buf) => input_line(
+                &format!("{} cutoff: ", self.axes[self.focus].label),
+                buf,
+                &[("Enter", "set"), ("Esc", "back")],
+            ),
             _ => help_line(&[
                 ("←/→", "bin"),
                 ("-/+", "±1"),
@@ -399,65 +393,13 @@ impl CutoffPicker {
             self.render_confirm(frame, target);
         }
     }
-
-    fn render_confirm(&self, frame: &mut Frame, target: &str) {
-        let area = frame.area();
-        let width = (target.len() as u16 + 6).max(44).min(area.width);
-        // Long paths wrap onto extra lines rather than getting cut off.
-        let path_lines = (target.len() as u16).div_ceil(width.saturating_sub(2).max(1));
-        let [popup] = Layout::horizontal([Constraint::Length(width)])
-            .flex(Flex::Center)
-            .areas(area);
-        let [popup] = Layout::vertical([Constraint::Length(6 + path_lines)])
-            .flex(Flex::Center)
-            .areas(popup);
-        let text = vec![
-            Line::from("Squeeze in place? This permanently alters"),
-            Line::from(target.to_string()).bold(),
-            Line::from(format!(
-                "row cutoff {}, column cutoff {}",
-                self.axes[0].cutoff, self.axes[1].cutoff
-            ))
-            .style(DIM),
-            Line::from(vec![
-                Span::styled("y", HIGHLIGHT),
-                Span::raw(" yes   "),
-                Span::styled("n", HIGHLIGHT),
-                Span::raw(" back"),
-            ]),
-        ];
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(text)
-                .centered()
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::bordered()
-                        .border_type(BorderType::Double)
-                        .border_style(ACCENTED)
-                        .title(Line::from(" confirm ").style(HIGHLIGHT).centered()),
-                ),
-            popup,
-        );
-    }
-
-    fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<Decision> {
-        loop {
-            terminal.draw(|f| self.render(f))?;
-            if let Event::Key(key) = event::read()? {
-                self.handle_key(key);
-            }
-            if let Some(d) = self.decision.take() {
-                return Ok(d);
-            }
-        }
-    }
 }
 
-/// Run the picker full screen until the user proceeds or cancels. The
-/// terminal is restored on return and on panic.
-pub fn choose_cutoffs(mut picker: CutoffPicker) -> anyhow::Result<Decision> {
-    ratatui::run(|terminal| picker.run(terminal))
+/// Run the picker full screen until the user proceeds (the row and column
+/// cutoffs) or cancels (`None`).
+pub fn choose_cutoffs(mut picker: CutoffPicker) -> anyhow::Result<Option<(usize, usize)>> {
+    run_screen(&mut picker)?;
+    Ok(picker.decision.flatten())
 }
 
 #[cfg(test)]

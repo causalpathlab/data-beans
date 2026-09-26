@@ -143,104 +143,102 @@ pub fn run_stat(cmd_args: &RunStatArgs) -> anyhow::Result<()> {
     }
 
     // Only --interactive may leave it out; it starts on columns.
-    match cmd_args.stat_dim.clone().unwrap_or(StatDim::Column) {
-        StatDim::Row => {
-            if let Some(column_group_file) = &cmd_args.column_group_file {
-                let cols = data.column_names()?;
+    let dim = cmd_args.stat_dim.clone().unwrap_or(StatDim::Column);
+    if dim == StatDim::Row {
+        if let Some(column_group_file) = &cmd_args.column_group_file {
+            let cols = data.column_names()?;
 
-                // Load membership and match to data columns
-                // Use delimiter to extract base barcode for matching
-                let membership = Membership::from_file(column_group_file, 0, 1, true)?
-                    .with_delimiter(cmd_args.delimiter);
-                let (column_membership, stats) = membership.match_keys(&cols);
+            // Load membership and match to data columns
+            // Use delimiter to extract base barcode for matching
+            let membership = Membership::from_file(column_group_file, 0, 1, true)?
+                .with_delimiter(cmd_args.delimiter);
+            let (column_membership, stats) = membership.match_keys(&cols);
 
-                info!(
-                    "Column matching: {} exact + {} base_key + {} prefix = {}/{} matched",
-                    stats.exact,
-                    stats.base_key,
-                    stats.prefix,
-                    stats.total_matched(),
-                    stats.total()
-                );
+            info!(
+                "Column matching: {} exact + {} base_key + {} prefix = {}/{} matched",
+                stats.exact,
+                stats.base_key,
+                stats.prefix,
+                stats.total_matched(),
+                stats.total()
+            );
 
-                if column_membership.is_empty() {
-                    let data_sample: Vec<_> = cols.iter().take(3).collect();
-                    let memb_sample = membership.sample_keys(3);
-                    info!("Data columns sample: {:?}", data_sample);
-                    info!("Membership keys sample: {:?}", memb_sample);
-                }
+            if column_membership.is_empty() {
+                let data_sample: Vec<_> = cols.iter().take(3).collect();
+                let memb_sample = membership.sample_keys(3);
+                info!("Data columns sample: {:?}", data_sample);
+                info!("Membership keys sample: {:?}", memb_sample);
+            }
 
-                let unique_groups = membership.unique_groups();
-                info!(
-                    "Will collect stats for {} groups: {:?}",
-                    unique_groups.len(),
-                    unique_groups
-                );
+            let unique_groups = membership.unique_groups();
+            info!(
+                "Will collect stats for {} groups: {:?}",
+                unique_groups.len(),
+                unique_groups
+            );
 
-                let (group_names, group_stats) = collect_stratified_row_stat_across_vec(
-                    &data,
-                    &column_membership,
-                    cmd_args.block_size,
-                )?;
+            let (group_names, group_stats) = collect_stratified_row_stat_across_vec(
+                &data,
+                &column_membership,
+                cmd_args.block_size,
+            )?;
 
-                info!(
-                    "Collected {} group stats: {:?}",
-                    group_names.len(),
-                    group_names
-                );
+            info!(
+                "Collected {} group stats: {:?}",
+                group_names.len(),
+                group_names
+            );
 
-                if cmd_args.interactive {
-                    warn!("--interactive is not available with --column-group-file; skipping it");
-                }
-                if cmd_args.output.eq_ignore_ascii_case("stdout") {
-                    for (g, row_stat) in group_names.iter().zip(group_stats.iter()) {
-                        let out: Vec<Box<str>> = row_stat
-                            .to_string_vec(&data.row_names()?, "\t")?
-                            .into_iter()
-                            .map(|s| format!("{}\t{}", g, s).into_boxed_str())
-                            .collect();
-                        write_lines(&out, &cmd_args.output)?;
-                    }
-                } else {
-                    use legume_numeric::matrix::sparse_stat::save_grouped_stats_parquet;
-
-                    info!("writing out: {}", cmd_args.output);
-                    save_grouped_stats_parquet(
-                        &cmd_args.output,
-                        &data.row_names()?,
-                        &group_names,
-                        &group_stats,
-                    )?;
+            if cmd_args.interactive {
+                warn!("--interactive is not available with --column-group-file; skipping it");
+            }
+            if cmd_args.output.eq_ignore_ascii_case("stdout") {
+                for (g, row_stat) in group_names.iter().zip(group_stats.iter()) {
+                    let out: Vec<Box<str>> = row_stat
+                        .to_string_vec(&data.row_names()?, "\t")?
+                        .into_iter()
+                        .map(|s| format!("{}\t{}", g, s).into_boxed_str())
+                        .collect();
+                    write_lines(&out, &cmd_args.output)?;
                 }
             } else {
-                let row_stat = collect_row_stat_across_vec(&data, cmd_args.block_size)?;
-                let names = data.row_names()?;
-                if !explores_instead_of_printing(cmd_args) {
-                    row_stat.save(&cmd_args.output, &names, "\t")?;
-                }
-                explore_stats(cmd_args, &data, Side::Rows, dataset(names, &row_stat))?;
-            }
-        }
-        StatDim::Column => {
-            let select_rows = rows_matching(cmd_args, &data)?;
-            let col_stat =
-                collect_column_stat_across_vec(&data, select_rows.as_deref(), cmd_args.block_size)?;
+                use legume_numeric::matrix::sparse_stat::save_grouped_stats_parquet;
 
-            let names = data.column_names()?;
-            if !explores_instead_of_printing(cmd_args) {
-                col_stat.save(&cmd_args.output, &names, "\t")?;
+                info!("writing out: {}", cmd_args.output);
+                save_grouped_stats_parquet(
+                    &cmd_args.output,
+                    &data.row_names()?,
+                    &group_names,
+                    &group_stats,
+                )?;
             }
-            explore_stats(cmd_args, &data, Side::Columns, dataset(names, &col_stat))?;
+            return Ok(());
         }
+    }
+
+    let side = match dim {
+        StatDim::Row => Side::Rows,
+        StatDim::Column => Side::Columns,
     };
-
+    let explore_after = wants_explorer(cmd_args);
+    // The explorer replaces printing to stdout; a file output is still written.
+    let save = !(explore_after && cmd_args.output.eq_ignore_ascii_case("stdout"));
+    let first = collect_side(cmd_args, &data, side, save)?;
+    if explore_after {
+        let title = cmd_args.data_files.join(", ");
+        let data = &data;
+        let loader = Box::new(move |side| collect_side(cmd_args, data, side, false));
+        explore(StatExplorer::new(&title, side, first, Some(loader)))?;
+    }
     Ok(())
 }
 
-/// With `--interactive` on a terminal, the explorer replaces printing to
-/// stdout (a file output is still written).
-fn explores_instead_of_printing(cmd_args: &RunStatArgs) -> bool {
-    cmd_args.interactive && tui_available() && cmd_args.output.eq_ignore_ascii_case("stdout")
+/// Whether to open the explorer: `--interactive`, on a terminal.
+fn wants_explorer(cmd_args: &RunStatArgs) -> bool {
+    if cmd_args.interactive && !tui_available() {
+        warn!("--interactive needs a terminal; skipping the explorer");
+    }
+    cmd_args.interactive && tui_available()
 }
 
 /// Rows whose names match `--row-name-pattern` (case-insensitive), if given;
@@ -273,41 +271,34 @@ fn dataset<S: RunningStatOps<f32, Output = Vec<f32>>>(names: Vec<Box<str>>, stat
     }
 }
 
-/// Collect one side's statistics for the explorer.
-fn stat_side(cmd_args: &RunStatArgs, data: &SparseIoVec, side: Side) -> anyhow::Result<Dataset> {
-    Ok(match side {
-        Side::Rows => dataset(
-            data.row_names()?,
-            &collect_row_stat_across_vec(data, cmd_args.block_size)?,
-        ),
-        Side::Columns => {
-            let select_rows = rows_matching(cmd_args, data)?;
-            dataset(
-                data.column_names()?,
-                &collect_column_stat_across_vec(data, select_rows.as_deref(), cmd_args.block_size)?,
-            )
-        }
-    })
-}
-
-/// Open the explorer on the collected statistics when `--interactive` asks.
-/// Tab computes the other side from the same data on first use.
-fn explore_stats(
+/// Collect one side's statistics, saving them to `--output` when `save`.
+fn collect_side(
     cmd_args: &RunStatArgs,
     data: &SparseIoVec,
     side: Side,
-    first: Dataset,
-) -> anyhow::Result<()> {
-    if !cmd_args.interactive {
-        return Ok(());
-    }
-    if !tui_available() {
-        warn!("--interactive needs a terminal; skipping the explorer");
-        return Ok(());
-    }
-    let title = cmd_args.data_files.join(", ");
-    let loader = Box::new(move |side| stat_side(cmd_args, data, side));
-    explore(StatExplorer::new(&title, side, first, Some(loader)))
+    save: bool,
+) -> anyhow::Result<Dataset> {
+    let output = &cmd_args.output;
+    Ok(match side {
+        Side::Rows => {
+            let stat = collect_row_stat_across_vec(data, cmd_args.block_size)?;
+            let names = data.row_names()?;
+            if save {
+                stat.save(output, &names, "\t")?;
+            }
+            dataset(names, &stat)
+        }
+        Side::Columns => {
+            let select_rows = rows_matching(cmd_args, data)?;
+            let stat =
+                collect_column_stat_across_vec(data, select_rows.as_deref(), cmd_args.block_size)?;
+            let names = data.column_names()?;
+            if save {
+                stat.save(output, &names, "\t")?;
+            }
+            dataset(names, &stat)
+        }
+    })
 }
 
 /// Which per-row/per-column statistic to histogram.

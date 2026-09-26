@@ -6,18 +6,19 @@
 //! selected entry is marked on the histogram with its rank. Tab switches
 //! between rows and columns, computing the other side the first time.
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState};
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
+use ratatui::Frame;
 use regex::{Regex, RegexBuilder};
 
 use super::ui::{
-    bin_counts, header, help_line, title as ui_title, Binning, HistPlot, Layer, Scale, ACCENTED,
-    DIM, HIGHLIGHT, PLAIN,
+    header, help_line, input_line, median, panel, run_screen, Binned, HistPlot, Scale, Screen,
+    ACCENTED, DIM, HIGHLIGHT, PLAIN,
 };
+use crate::qc::fmt_stat;
 
 /// Statistics in table order.
 const STATS: [&str; 4] = ["nnz", "sum", "mean", "sd"];
@@ -25,16 +26,8 @@ const STATS: [&str; 4] = ["nnz", "sum", "mean", "sd"];
 /// Rows the table moves on PageUp / PageDown.
 const PAGE: usize = 20;
 
-/// Histogram of one statistic: the whole population, and the filtered subset
-/// when a filter is on.
-struct Hist {
-    bins: Binning,
-    kmin: i32,
-    all: Vec<usize>,
-    shown: Option<Vec<usize>>,
-    /// The statistic, sorted, for ranks and the summary line.
-    sorted: Vec<f32>,
-}
+/// Decimals for fractional values in the table and summary.
+const DECIMALS: usize = 3;
 
 /// Which margin the explorer shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +61,15 @@ pub struct Dataset {
 /// Computes a side's statistics the first time it is shown.
 pub type Loader<'a> = Box<dyn FnMut(Side) -> anyhow::Result<Dataset> + 'a>;
 
+/// The side not on screen.
+enum Other<'a> {
+    /// No other side (Tab does nothing).
+    Unavailable,
+    /// Computed by the loader on first use.
+    Lazy(Loader<'a>),
+    Ready(Dataset),
+}
+
 enum Mode {
     Browse,
     /// Typing a name filter (a case-insensitive regex).
@@ -82,10 +84,8 @@ pub struct StatExplorer<'a> {
     names: Vec<Box<str>>,
     /// Per statistic in [`STATS`] order, one value per entry.
     values: [Vec<f32>; 4],
-    /// The other side, once computed.
-    parked: Option<Dataset>,
-    loader: Option<Loader<'a>>,
-    /// A switch is waiting for the other side to be computed.
+    other: Other<'a>,
+    /// A Tab is waiting for the other side to be computed.
     loading: bool,
     /// Why the last switch failed, shown in the footer.
     status: Option<String>,
@@ -93,13 +93,21 @@ pub struct StatExplorer<'a> {
     stat: usize,
     by_name: bool,
     descending: bool,
+    /// Every entry in sort order; the filter only picks from it.
+    order: Vec<usize>,
     filter: String,
-    /// Entries passing the filter, in display order.
+    /// Entries passing the filter, in sort order.
     view: Vec<usize>,
-    table: TableState,
+    /// Position of the selection in `view`, and the first row on screen.
+    cursor: usize,
+    offset: usize,
+    /// The statistic, sorted, for ranks and the summary line.
+    sorted: Vec<f32>,
     x_scale: Scale,
     y_scale: Scale,
-    hist: Hist,
+    hist: Binned,
+    /// Histogram of the filtered entries, when a filter hides some.
+    shown: Option<Vec<usize>>,
     mode: Mode,
     quit: bool,
 }
@@ -108,43 +116,38 @@ impl<'a> StatExplorer<'a> {
     /// Show `data` for `side`; `loader`, if any, computes the other side on
     /// the first Tab.
     pub fn new(title: &str, side: Side, data: Dataset, loader: Option<Loader<'a>>) -> Self {
+        let sorted = sorted_copy(&data.values[0]);
         let mut explorer = Self {
             title: title.to_string(),
             side,
-            view: (0..data.names.len()).collect(),
+            hist: Binned::new(&sorted, Scale::Log),
+            sorted,
             names: data.names,
             values: data.values,
-            parked: None,
-            loader,
+            other: loader.map_or(Other::Unavailable, Other::Lazy),
             loading: false,
             status: None,
             stat: 0,
             by_name: false,
             descending: true,
+            order: Vec::new(),
             filter: String::new(),
-            table: TableState::default().with_selected(Some(0)),
+            view: Vec::new(),
+            cursor: 0,
+            offset: 0,
             x_scale: Scale::Log,
             y_scale: Scale::Log,
-            hist: Hist {
-                bins: Binning::new(Scale::Log, 0.0, true),
-                kmin: 0,
-                all: Vec::new(),
-                shown: None,
-                sorted: Vec::new(),
-            },
+            shown: None,
             mode: Mode::Browse,
             quit: false,
         };
-        explorer.resort();
-        explorer.table.select(Some(0));
-        explorer.rebin();
+        explorer.reorder();
+        explorer.refilter(None);
         explorer
     }
 
     fn selected(&self) -> Option<usize> {
-        self.table
-            .selected()
-            .and_then(|i| self.view.get(i).copied())
+        self.view.get(self.cursor).copied()
     }
 
     /// The filter as a case-insensitive regex; text that is not a valid
@@ -159,111 +162,113 @@ impl<'a> StatExplorer<'a> {
             .ok()
     }
 
-    fn refilter(&mut self) {
-        let re = self.filter_regex();
-        self.view = (0..self.names.len())
-            .filter(|&i| re.as_ref().is_none_or(|re| re.is_match(&self.names[i])))
-            .collect();
-        self.resort();
-        self.rebin_shown();
-    }
-
-    fn resort(&mut self) {
-        let keep = self.selected();
+    /// Sort every entry by the current key and direction.
+    fn reorder(&mut self) {
         let (names, vals) = (&self.names, &self.values[self.stat]);
+        let mut order: Vec<usize> = (0..names.len()).collect();
         if self.by_name {
-            self.view.sort_by(|&a, &b| names[a].cmp(&names[b]));
+            order.sort_unstable_by(|&a, &b| names[a].cmp(&names[b]));
         } else {
-            self.view
-                .sort_by(|&a, &b| vals[a].total_cmp(&vals[b]).then(names[a].cmp(&names[b])));
+            order.sort_unstable_by(|&a, &b| {
+                vals[a].total_cmp(&vals[b]).then(names[a].cmp(&names[b]))
+            });
         }
         if self.descending {
-            self.view.reverse();
+            order.reverse();
         }
-        // Keep the same entry selected when it is still shown.
-        let at = keep.and_then(|k| self.view.iter().position(|&i| i == k));
-        self.table
-            .select(at.or((!self.view.is_empty()).then_some(0)));
+        self.order = order;
     }
 
-    fn rebin(&mut self) {
-        let vals = &self.values[self.stat];
-        let mut sorted = vals.clone();
-        sorted.sort_unstable_by(f32::total_cmp);
-        let (min, max) = match (sorted.first(), sorted.last()) {
-            (Some(&lo), Some(&hi)) => (lo as f64, hi as f64),
-            _ => (0.0, 0.0),
+    /// Pick the entries passing the filter from the sorted order, keeping
+    /// `keep` selected when it is still shown.
+    fn refilter(&mut self, keep: Option<usize>) {
+        let re = self.filter_regex();
+        self.view = match &re {
+            None => self.order.clone(),
+            Some(re) => self
+                .order
+                .iter()
+                .copied()
+                .filter(|&i| re.is_match(&self.names[i]))
+                .collect(),
         };
-        let bins = Binning::new(self.x_scale, max, self.stat == 0);
-        let kmin = bins.key(min);
-        let nbins = (bins.key(max) - kmin + 1).max(1) as usize;
-        self.hist = Hist {
-            bins,
-            kmin,
-            all: bin_counts(vals.iter().copied(), &bins, kmin, nbins),
-            shown: None,
-            sorted,
-        };
+        self.cursor = keep
+            .and_then(|k| self.view.iter().position(|&i| i == k))
+            .unwrap_or(0);
         self.rebin_shown();
+    }
+
+    /// Sort, sorted values, and histogram for a new statistic or side.
+    fn restat(&mut self) {
+        self.sorted = sorted_copy(&self.values[self.stat]);
+        self.hist = Binned::new(&self.sorted, self.x_scale);
     }
 
     fn rebin_shown(&mut self) {
-        let h = &self.hist;
-        self.hist.shown = (self.view.len() < self.names.len()).then(|| {
-            let vals = &self.values[self.stat];
-            bin_counts(
-                self.view.iter().map(|&i| vals[i]),
-                &h.bins,
-                h.kmin,
-                h.all.len(),
-            )
-        });
+        let vals = &self.values[self.stat];
+        self.shown = (self.view.len() < self.names.len())
+            .then(|| self.hist.count(self.view.iter().map(|&i| vals[i])));
+    }
+
+    /// Reverse the order in place, keeping the same entry selected.
+    fn flip(&mut self) {
+        self.descending = !self.descending;
+        self.order.reverse();
+        self.view.reverse();
+        self.cursor = self.view.len().saturating_sub(1 + self.cursor);
     }
 
     /// Sort and plot statistic `s`; pressing the current one flips the order.
     fn choose_stat(&mut self, s: usize) {
         if !self.by_name && self.stat == s {
-            self.descending = !self.descending;
-        } else {
-            self.descending = true;
+            return self.flip();
         }
+        let keep = self.selected();
         self.by_name = false;
-        let replot = self.stat != s;
-        self.stat = s;
-        self.resort();
-        if replot {
-            self.rebin();
+        self.descending = true;
+        if self.stat != s {
+            self.stat = s;
+            self.restat();
         }
+        self.reorder();
+        self.refilter(keep);
     }
 
     fn sort_by_name(&mut self) {
-        self.descending = self.by_name && !self.descending;
+        if self.by_name {
+            return self.flip();
+        }
+        let keep = self.selected();
         self.by_name = true;
-        self.resort();
+        self.descending = false;
+        self.reorder();
+        self.refilter(keep);
     }
 
-    fn can_switch(&self) -> bool {
-        self.parked.is_some() || self.loader.is_some()
+    fn set_filter(&mut self, filter: String) {
+        let keep = self.selected();
+        self.filter = filter;
+        self.refilter(keep);
     }
 
     /// Show the other side now if it is computed, else ask for it.
     fn request_switch(&mut self) {
-        if self.parked.is_some() {
-            self.switch();
-        } else if self.loader.is_some() {
-            self.loading = true;
+        match self.other {
+            Other::Ready(_) => self.switch(),
+            Other::Lazy(_) => self.loading = true,
+            Other::Unavailable => {}
         }
     }
 
     /// Compute the other side (blocking), then show it.
     fn finish_loading(&mut self) {
         self.loading = false;
-        let Some(loader) = self.loader.as_mut() else {
+        let Other::Lazy(loader) = &mut self.other else {
             return;
         };
         match loader(self.side.other()) {
             Ok(data) => {
-                self.parked = Some(data);
+                self.other = Other::Ready(data);
                 self.switch();
             }
             Err(e) => {
@@ -275,173 +280,45 @@ impl<'a> StatExplorer<'a> {
         }
     }
 
-    /// Swap in the parked side, keeping the sort, filter, and scales.
+    /// Swap in the other side, keeping the sort, filter, and scales.
     fn switch(&mut self) {
-        let Some(data) = self.parked.take() else {
+        let Other::Ready(data) = std::mem::replace(&mut self.other, Other::Unavailable) else {
             return;
         };
         let names = std::mem::replace(&mut self.names, data.names);
         let values = std::mem::replace(&mut self.values, data.values);
-        self.parked = Some(Dataset { names, values });
+        self.other = Other::Ready(Dataset { names, values });
         self.side = self.side.other();
         self.status = None;
-        self.table.select(None);
-        *self.table.offset_mut() = 0;
-        self.refilter();
-        self.table.select((!self.view.is_empty()).then_some(0));
-        self.rebin();
+        self.offset = 0;
+        self.restat();
+        self.reorder();
+        self.refilter(None);
     }
 
     fn step(&mut self, delta: isize) {
-        if self.view.is_empty() {
-            return;
-        }
-        let at = self.table.selected().unwrap_or(0) as isize + delta;
-        self.table
-            .select(Some(at.clamp(0, self.view.len() as isize - 1) as usize));
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) {
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.quit = true;
-            return;
-        }
-        match self.mode {
-            Mode::Filter => match key.code {
-                KeyCode::Enter => self.mode = Mode::Browse,
-                KeyCode::Esc => {
-                    self.filter.clear();
-                    self.refilter();
-                    self.mode = Mode::Browse;
-                }
-                KeyCode::Backspace => {
-                    self.filter.pop();
-                    self.refilter();
-                }
-                KeyCode::Char(c) => {
-                    self.filter.push(c);
-                    self.refilter();
-                }
-                _ => {}
-            },
-            Mode::Browse => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.step(1),
-                KeyCode::Up | KeyCode::Char('k') => self.step(-1),
-                KeyCode::PageDown => self.step(PAGE as isize),
-                KeyCode::PageUp => self.step(-(PAGE as isize)),
-                KeyCode::Home | KeyCode::Char('g') => self.step(isize::MIN / 2),
-                KeyCode::End | KeyCode::Char('G') => self.step(isize::MAX / 2),
-                KeyCode::Char(c @ '1'..='4') => self.choose_stat(c as usize - '1' as usize),
-                KeyCode::Char('0' | 'n') => self.sort_by_name(),
-                KeyCode::Char('/') => self.mode = Mode::Filter,
-                KeyCode::Tab | KeyCode::BackTab => self.request_switch(),
-                KeyCode::Char('x') => {
-                    self.x_scale = self.x_scale.next();
-                    self.rebin();
-                }
-                KeyCode::Char('y') => self.y_scale = self.y_scale.next(),
-                KeyCode::Esc if !self.filter.is_empty() => {
-                    self.filter.clear();
-                    self.refilter();
-                }
-                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-                _ => {}
-            },
-        }
-    }
-
-    fn render(&mut self, frame: &mut Frame) {
-        let [top, body, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
-
-        let extra = format!(
-            "{} {} · x {} · y {}",
-            self.names.len(),
-            self.side.name(),
-            self.x_scale.name(),
-            self.y_scale.name()
-        );
-        frame.render_widget(header("stat", &self.title, &extra), top);
-
-        // Side by side when there is room, else the table above the plot.
-        let [left, right] = if body.width >= 110 {
-            Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).areas(body)
-        } else {
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body)
-        };
-        self.render_table(frame, left);
-        self.render_hist(frame, right);
-
-        let help = match self.mode {
-            Mode::Filter => {
-                let mut spans = vec![
-                    Span::raw(" filter /"),
-                    Span::styled(format!("{}▏", self.filter), HIGHLIGHT),
-                    Span::raw("  "),
-                ];
-                spans.extend(help_line(&[("Enter", "keep"), ("Esc", "clear")]).spans);
-                Line::from(spans)
-            }
-            Mode::Browse => {
-                let mut keys = vec![
-                    ("↑/↓", "move"),
-                    ("1-4", "nnz/sum/mean/sd"),
-                    ("0", "name"),
-                    ("/", "filter"),
-                    ("x/y", "scale"),
-                ];
-                let other = format!("{} (computed on first use)", self.side.other().name());
-                if self.can_switch() {
-                    keys.push((
-                        "Tab",
-                        if self.parked.is_some() {
-                            self.side.other().name()
-                        } else {
-                            &other
-                        },
-                    ));
-                }
-                keys.push(("q", "quit"));
-                let mut line = help_line(&keys);
-                if let Some(status) = &self.status {
-                    line.spans.push(Span::styled(status.clone(), ACCENTED));
-                }
-                line
-            }
-        };
-        frame.render_widget(help, footer);
+        let last = self.view.len().saturating_sub(1) as isize;
+        self.cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
     }
 
     fn render_table(&mut self, frame: &mut Frame, area: Rect) {
         let arrow = if self.descending { " ▼" } else { " ▲" };
-        let head = |i: Option<usize>, name: &str| {
-            let sorted = match i {
+        let head = |col: Option<usize>, name: &str| {
+            let sorted = match col {
                 Some(s) => !self.by_name && self.stat == s,
                 None => self.by_name,
             };
-            let text = if sorted {
+            let line = Line::from(if sorted {
                 format!("{name}{arrow}")
             } else {
                 name.to_string()
-            };
-            let line = Line::from(text);
-            let cell = Cell::from(if i.is_some() {
+            });
+            let line = if col.is_some() {
                 line.right_aligned()
             } else {
                 line
-            });
-            if sorted {
-                cell.style(HIGHLIGHT)
-            } else {
-                cell.style(DIM)
-            }
+            };
+            Cell::from(line).style(if sorted { HIGHLIGHT } else { DIM })
         };
         let mut header_cells = vec![head(None, "name")];
         header_cells.extend((0..4).map(|s| head(Some(s), STATS[s])));
@@ -449,19 +326,16 @@ impl<'a> StatExplorer<'a> {
         // Build only the rows on screen (there can be millions), scrolling
         // just enough to keep the selection in view.
         let height = area.height.saturating_sub(3).max(1) as usize;
-        let selected = self.table.selected().unwrap_or(0);
-        let mut offset = self.table.offset();
-        if selected < offset {
-            offset = selected;
-        } else if selected >= offset + height {
-            offset = selected + 1 - height;
+        if self.cursor < self.offset {
+            self.offset = self.cursor;
+        } else if self.cursor >= self.offset + height {
+            self.offset = self.cursor + 1 - height;
         }
-        *self.table.offset_mut() = offset;
-        let rows = self.view.iter().skip(offset).take(height).map(|&i| {
+        let rows = self.view.iter().skip(self.offset).take(height).map(|&i| {
             let mut cells = vec![Cell::from(self.names[i].to_string())];
             cells.extend((0..4).map(|s| {
-                let text = fmt_value(self.values[s][i]);
-                let cell = Cell::from(Line::from(text).right_aligned());
+                let cell =
+                    Cell::from(Line::from(fmt_stat(self.values[s][i], DECIMALS)).right_aligned());
                 if !self.by_name && self.stat == s {
                     cell
                 } else {
@@ -493,115 +367,188 @@ impl<'a> StatExplorer<'a> {
             .header(Row::new(header_cells))
             .row_highlight_style(PLAIN.add_modifier(Modifier::REVERSED))
             .highlight_symbol(Line::from("▶ ").style(ACCENTED))
-            .block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .border_style(DIM)
-                    .title(ui_title(title, HIGHLIGHT)),
-            );
-
+            .block(panel(title, false));
         // The table sees only the visible slice, so select relative to it.
-        let mut state =
-            TableState::default().with_selected(self.table.selected().map(|s| s - offset));
+        let mut state = TableState::default()
+            .with_selected((!self.view.is_empty()).then(|| self.cursor - self.offset));
         frame.render_stateful_widget(table, area, &mut state);
     }
 
     fn render_hist(&self, frame: &mut Frame, area: Rect) {
         let stat = STATS[self.stat];
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(DIM)
-            .title(ui_title(format!(" {stat} "), HIGHLIGHT));
+        let block = panel(format!(" {stat} "), false);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let [summary, plot] =
             Layout::vertical([Constraint::Length(2), Constraint::Min(5)]).areas(inner);
 
-        let h = &self.hist;
-        let n = h.sorted.len();
+        let n = self.sorted.len();
+        let fmt = |v: f32| fmt_stat(v, DECIMALS);
         let dim = |t: &str| Span::styled(t.to_string(), DIM);
-        let median = match n {
-            0 => 0.0,
-            _ if n.is_multiple_of(2) => (h.sorted[n / 2 - 1] + h.sorted[n / 2]) / 2.0,
-            _ => h.sorted[n / 2],
-        };
         let mut lines = vec![Line::from(vec![
             dim("min "),
-            Span::raw(fmt_value(h.sorted.first().copied().unwrap_or(0.0))),
+            Span::raw(fmt(self.sorted.first().copied().unwrap_or(0.0))),
             dim("   median "),
-            Span::raw(fmt_value(median)),
+            Span::raw(fmt(median(&self.sorted))),
             dim("   max "),
-            Span::raw(fmt_value(h.sorted.last().copied().unwrap_or(0.0))),
+            Span::raw(fmt(self.sorted.last().copied().unwrap_or(0.0))),
         ])];
         let selected = self.selected();
         if let Some(i) = selected {
             let v = self.values[self.stat][i];
-            let above = n - h.sorted.partition_point(|&x| x <= v);
+            let above = n - self.sorted.partition_point(|&x| x <= v);
             lines.push(Line::from(vec![
                 Span::styled(format!("▲ {}", self.names[i]), HIGHLIGHT),
                 dim(&format!(" {stat} ")),
-                Span::raw(fmt_value(v)),
+                Span::raw(fmt(v)),
                 dim(&format!("   rank {} of {}", above + 1, n)),
             ]));
         }
         frame.render_widget(Paragraph::new(lines), summary);
 
-        let all_style = |_: i32| if h.shown.is_some() { DIM } else { PLAIN };
-        let shown_style = |_: i32| PLAIN;
-        let mut layers = vec![Layer {
-            counts: &h.all,
-            style: &all_style,
-        }];
-        if let Some(shown) = &h.shown {
-            layers.push(Layer {
-                counts: shown,
-                style: &shown_style,
-            });
-        }
-        let pick = selected.map(|i| h.bins.key(self.values[self.stat][i] as f64));
+        let bins = self.hist.bins;
         HistPlot {
-            bins: h.bins,
-            kmin: h.kmin,
-            layers,
+            bins,
+            kmin: self.hist.kmin,
+            counts: &self.hist.counts,
+            style: &|_| PLAIN,
+            subset: self.shown.as_deref(),
             y_scale: self.y_scale,
-            rule: pick.map(|k| (k, ACCENTED)),
-            marks: pick.map(|k| (k, "▲", HIGHLIGHT)).into_iter().collect(),
+            pointer: selected.map(|i| bins.key(self.values[self.stat][i] as f64)),
+            marks: Vec::new(),
         }
         .render(frame.buffer_mut(), plot);
     }
 
-    fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
-        while !self.quit {
-            terminal.draw(|f| self.render(f))?;
-            if let Event::Key(key) = event::read()? {
-                self.handle_key(key);
-            }
-            if self.loading {
-                // Compute on the normal screen, where the progress bars
-                // belong, then come back.
-                ratatui::restore();
-                eprintln!("computing {} statistics ...", self.side.other().name());
-                self.finish_loading();
-                *terminal = ratatui::try_init()?;
-            }
+    fn help(&self) -> Line<'static> {
+        if let Mode::Filter = self.mode {
+            return input_line(
+                "filter /",
+                &self.filter,
+                &[("Enter", "keep"), ("Esc", "clear")],
+            );
         }
-        Ok(())
+        let other = self.side.other().name();
+        let lazy = format!("{other} (computed on first use)");
+        let mut keys = vec![
+            ("↑/↓", "move"),
+            ("1-4", "nnz/sum/mean/sd"),
+            ("0", "name"),
+            ("/", "filter"),
+            ("x/y", "scale"),
+        ];
+        match self.other {
+            Other::Ready(_) => keys.push(("Tab", other)),
+            Other::Lazy(_) => keys.push(("Tab", &lazy)),
+            Other::Unavailable => {}
+        }
+        keys.push(("q", "quit"));
+        let mut line = help_line(&keys);
+        if let Some(status) = &self.status {
+            line.spans.push(Span::styled(status.clone(), ACCENTED));
+        }
+        line
     }
 }
 
-/// Whole numbers print as integers; fractions keep three decimals.
-fn fmt_value(v: f32) -> String {
-    if v.fract() == 0.0 {
-        format!("{}", v as i64)
-    } else {
-        format!("{:.3}", v)
+impl Screen for StatExplorer<'_> {
+    fn done(&self) -> bool {
+        self.quit
+    }
+
+    fn interrupt(&mut self) {
+        self.quit = true;
+    }
+
+    fn pending_work(&self) -> Option<String> {
+        self.loading
+            .then(|| format!("computing {} statistics ...", self.side.other().name()))
+    }
+
+    fn do_work(&mut self) {
+        self.finish_loading();
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        match self.mode {
+            Mode::Filter => match key.code {
+                KeyCode::Enter => self.mode = Mode::Browse,
+                KeyCode::Esc => {
+                    self.set_filter(String::new());
+                    self.mode = Mode::Browse;
+                }
+                KeyCode::Backspace => {
+                    let mut filter = self.filter.clone();
+                    filter.pop();
+                    self.set_filter(filter);
+                }
+                KeyCode::Char(c) => self.set_filter(format!("{}{c}", self.filter)),
+                _ => {}
+            },
+            Mode::Browse => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.step(1),
+                KeyCode::Up | KeyCode::Char('k') => self.step(-1),
+                KeyCode::PageDown => self.step(PAGE as isize),
+                KeyCode::PageUp => self.step(-(PAGE as isize)),
+                KeyCode::Home | KeyCode::Char('g') => self.cursor = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.cursor = self.view.len().saturating_sub(1)
+                }
+                KeyCode::Char(c @ '1'..='4') => self.choose_stat(c as usize - '1' as usize),
+                KeyCode::Char('0' | 'n') => self.sort_by_name(),
+                KeyCode::Char('/') => self.mode = Mode::Filter,
+                KeyCode::Tab | KeyCode::BackTab => self.request_switch(),
+                KeyCode::Char('x') => {
+                    self.x_scale = self.x_scale.next();
+                    self.hist = Binned::new(&self.sorted, self.x_scale);
+                    self.rebin_shown();
+                }
+                KeyCode::Char('y') => self.y_scale = self.y_scale.next(),
+                KeyCode::Esc if !self.filter.is_empty() => self.set_filter(String::new()),
+                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+                _ => {}
+            },
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame) {
+        let [top, body, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        let extra = format!(
+            "{} {} · x {} · y {}",
+            self.names.len(),
+            self.side.name(),
+            self.x_scale.name(),
+            self.y_scale.name()
+        );
+        frame.render_widget(header("stat", &self.title, &extra), top);
+
+        // Side by side when there is room, else the table above the plot.
+        let [left, right] = if body.width >= 110 {
+            Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).areas(body)
+        } else {
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body)
+        };
+        self.render_table(frame, left);
+        self.render_hist(frame, right);
+        frame.render_widget(self.help(), footer);
     }
 }
 
-/// Run the explorer full screen until the user quits. The terminal is
-/// restored on return and on panic.
+fn sorted_copy(values: &[f32]) -> Vec<f32> {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable_by(f32::total_cmp);
+    sorted
+}
+
+/// Run the explorer full screen until the user quits.
 pub fn explore(mut explorer: StatExplorer<'_>) -> anyhow::Result<()> {
-    ratatui::run(|terminal| explorer.run(terminal))
+    run_screen(&mut explorer)
 }
 
 #[cfg(test)]

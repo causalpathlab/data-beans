@@ -3,7 +3,7 @@ use crate::handlers::merging::{
     find_aligned_rows, generate_unique_batch_names, run_merge_backend, MergeBackendArgs,
 };
 use crate::hdf5_io::*;
-use crate::interactive::cutoff_tui::{choose_cutoffs, AxisView, CutoffPicker, Decision};
+use crate::interactive::cutoff_tui::{choose_cutoffs, AxisView, CutoffPicker};
 use crate::interactive::{confirm, prompt_user_action, tui_available, UserAction};
 use crate::qc::*;
 use crate::sparse_io::*;
@@ -121,15 +121,17 @@ fn run_squeeze_and_merge(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
     );
 
     // Cutoffs come from the first file's histogram when one is asked for
-    let (backend, data_file) = resolve_backend_file(&cmd_args.data_files[0], None)?;
-    let data = open_sparse_matrix(&data_file, &backend)?;
-    let Some((row_nnz_cutoff, col_nnz_cutoff)) =
-        settle_cutoffs(cmd_args, data.as_ref(), &data_file, None)?
-    else {
-        info!("Operation cancelled");
-        return Ok(());
+    let (row_nnz_cutoff, col_nnz_cutoff) = if needs_stats(cmd_args) {
+        let (backend, data_file) = resolve_backend_file(&cmd_args.data_files[0], None)?;
+        let data = open_sparse_matrix(&data_file, &backend)?;
+        let Some(cutoffs) = settle_cutoffs(cmd_args, data.as_ref(), &data_file, None)? else {
+            info!("Operation cancelled");
+            return Ok(());
+        };
+        cutoffs
+    } else {
+        (cmd_args.row_nnz_cutoff, cmd_args.column_nnz_cutoff)
     };
-    drop(data);
 
     if cmd_args.dry_run {
         info!("Dry run complete");
@@ -524,6 +526,15 @@ fn display_nnz_histogram(
     Ok(())
 }
 
+/// Whether any option asks for the nnz statistics: a histogram, the trough
+/// suggestion, or the interactive picker.
+fn needs_stats(cmd_args: &RunSqueezeArgs) -> bool {
+    cmd_args.interactive
+        || cmd_args.auto_cutoff
+        || cmd_args.show_histogram
+        || cmd_args.save_histogram.is_some()
+}
+
 /// Decide the row and column cutoffs for `data`, or `None` if the user
 /// cancels. Without `--interactive`, `--auto-cutoff`, or a histogram flag
 /// these are the explicit cutoffs as given. Otherwise the nnz statistics are
@@ -536,11 +547,9 @@ fn settle_cutoffs(
     data_file: &str,
     in_place: Option<&str>,
 ) -> anyhow::Result<Option<(usize, usize)>> {
-    let (mut row_cutoff, mut col_cutoff) = (cmd_args.row_nnz_cutoff, cmd_args.column_nnz_cutoff);
     let save = cmd_args.save_histogram.as_deref();
-    if !(cmd_args.interactive || cmd_args.auto_cutoff || cmd_args.show_histogram || save.is_some())
-    {
-        return Ok(Some((row_cutoff, col_cutoff)));
+    if !needs_stats(cmd_args) {
+        return Ok(Some((cmd_args.row_nnz_cutoff, cmd_args.column_nnz_cutoff)));
     }
 
     let row_nnz = collect_row_stat(data, cmd_args.block_size)?.count_positives();
@@ -552,10 +561,14 @@ fn settle_cutoffs(
 
     // Interactive or auto: derive the cutoff from the suggestion when the
     // user left it unset (explicit non-zero values always win, per dimension)
-    if cmd_args.interactive || cmd_args.auto_cutoff {
-        row_cutoff = resolve_cutoff(cmd_args.row_nnz_cutoff, row_suggest, "row");
-        col_cutoff = resolve_cutoff(cmd_args.column_nnz_cutoff, col_suggest, "column");
-    }
+    let (row_cutoff, col_cutoff) = if cmd_args.interactive || cmd_args.auto_cutoff {
+        (
+            resolve_cutoff(cmd_args.row_nnz_cutoff, row_suggest, "row"),
+            resolve_cutoff(cmd_args.column_nnz_cutoff, col_suggest, "column"),
+        )
+    } else {
+        (cmd_args.row_nnz_cutoff, cmd_args.column_nnz_cutoff)
+    };
 
     let row = NnzAxis {
         nnz: &row_nnz,
@@ -601,10 +614,7 @@ fn pick_cutoffs(
             AxisView::new("Columns", col.nnz, col.cutoff, col.suggest),
             in_place,
         );
-        match choose_cutoffs(picker)? {
-            Decision::Proceed { row, column } => Some((row, column)),
-            Decision::Cancel => None,
-        }
+        choose_cutoffs(picker)?
     } else {
         prompt_cutoffs(data_file, row, col, in_place)?
     };
@@ -660,11 +670,7 @@ fn resolve_cutoff(explicit: usize, suggested: Option<usize>, label: &str) -> usi
 /// Print the resolved cutoff and how much it drops (headless `--auto-cutoff` mode)
 fn report_resolved_cutoff(label: &str, nnz: &[f32], cutoff: usize) {
     let total = nnz.len();
-    let removed = nnz.iter().filter(|&&x| (x as usize) < cutoff).count();
-    let pct = if total > 0 {
-        100.0 * removed as f64 / total as f64
-    } else {
-        0.0
-    };
+    let removed = nnz.iter().filter(|&&x| below_nnz_cutoff(x, cutoff)).count();
+    let pct = pct(removed, total);
     println!("auto {label} cutoff: {cutoff} (removes {removed} / {total} = {pct:.2}%)");
 }
