@@ -153,11 +153,11 @@ fn cutoff_is_deterministic() {
 #[test]
 fn fmt_stat_is_integer_for_whole_values() {
     // nnz / sum are whole -> no decimal point; mean / sd keep 2 decimals.
-    assert_eq!(fmt_stat(0.0), "0");
-    assert_eq!(fmt_stat(5.0), "5");
-    assert_eq!(fmt_stat(900.0), "900");
-    assert_eq!(fmt_stat(0.3), "0.30");
-    assert_eq!(fmt_stat(12.53), "12.53");
+    assert_eq!(fmt_stat(0.0, 2), "0");
+    assert_eq!(fmt_stat(5.0, 2), "5");
+    assert_eq!(fmt_stat(900.0, 2), "900");
+    assert_eq!(fmt_stat(0.3, 2), "0.30");
+    assert_eq!(fmt_stat(12.53, 2), "12.53");
 }
 
 #[test]

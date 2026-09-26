@@ -1,11 +1,17 @@
-//! Interactive user input utilities for command-line prompts
-//!
-//! This module provides reusable functions for interactive CLI operations
-//! including confirmations, option selection, and numeric input.
+//! Interactive user input: a full-screen cutoff picker on a terminal, and
+//! line prompts when there is none.
 
-#![allow(dead_code)] // Utility functions for future use
+pub mod cutoff_tui;
+pub mod stat_tui;
+pub mod ui;
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+
+/// Whether a full-screen session can run: both stdin and stdout are a terminal.
+/// Otherwise callers fall back to the line prompts below.
+pub fn tui_available() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
 
 /// User action after viewing histogram or other interactive prompts
 #[derive(Debug, Clone)]
@@ -17,8 +23,6 @@ pub enum UserAction {
 
 /// Prompt user for action in interactive mode after showing histogram
 pub fn prompt_user_action(
-    _row_nnz: &[f32],
-    _col_nnz: &[f32],
     current_row_cutoff: usize,
     current_col_cutoff: usize,
 ) -> anyhow::Result<UserAction> {
@@ -49,7 +53,7 @@ pub fn prompt_user_action(
 }
 
 /// Prompt user for a single cutoff value
-pub fn prompt_cutoff_value(label: &str, current: usize) -> anyhow::Result<usize> {
+fn prompt_cutoff_value(label: &str, current: usize) -> anyhow::Result<usize> {
     print!("\nEnter new {} nnz cutoff (current: {}): ", label, current);
     io::stdout().flush()?;
 
@@ -70,56 +74,4 @@ pub fn confirm(message: &str) -> anyhow::Result<bool> {
     let choice = input.trim().to_lowercase();
 
     Ok(matches!(choice.as_str(), "y" | "yes"))
-}
-
-/// Prompt user to select from a list of options
-pub fn select_option(prompt: &str, options: &[&str]) -> anyhow::Result<usize> {
-    println!("\n{}", prompt);
-    for (i, opt) in options.iter().enumerate() {
-        println!("  [{}] {}", i + 1, opt);
-    }
-    print!("\nSelect option (1-{}): ", options.len());
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-
-    if let Ok(choice) = input.trim().parse::<usize>() {
-        if choice > 0 && choice <= options.len() {
-            return Ok(choice - 1);
-        }
-    }
-
-    Err(anyhow::anyhow!("Invalid selection"))
-}
-
-/// Prompt for a numeric value with validation
-pub fn prompt_number<T>(prompt: &str, default: T) -> anyhow::Result<T>
-where
-    T: std::str::FromStr + std::fmt::Display + Copy,
-{
-    print!("{} [default: {}]: ", prompt, default);
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-
-    if input.trim().is_empty() {
-        return Ok(default);
-    }
-
-    input
-        .trim()
-        .parse::<T>()
-        .map_err(|_| anyhow::anyhow!("Invalid number format"))
-}
-
-/// Read a line of text from user
-pub fn read_line(prompt: &str) -> anyhow::Result<String> {
-    print!("{}: ", prompt);
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(input.trim().to_string())
 }

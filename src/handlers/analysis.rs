@@ -1,4 +1,7 @@
+use crate::handlers::explore::{open_data, side_stats, values_reader};
 use crate::hdf5_io::*;
+use crate::interactive::stat_tui::{explore, Purpose, Side, StatExplorer};
+use crate::interactive::tui_available;
 use crate::qc::*;
 use crate::sparse_io::*;
 use crate::sparse_io_vector::*;
@@ -7,9 +10,8 @@ use clap::{Args, ValueEnum};
 use legume_numeric::matrix::common_io::*;
 use legume_numeric::matrix::membership::Membership;
 use legume_numeric::matrix::traits::RunningStatOps;
-use log::info;
+use log::{info, warn};
 use regex::Regex;
-use std::sync::Arc;
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 #[clap(rename_all = "lowercase")]
@@ -33,10 +35,12 @@ pub struct RunStatArgs {
         short,
         long,
         value_enum,
+        required_unless_present = "interactive",
         help = "Statistics dimension (row or column)",
-        long_help = "Choose whether to compute statistics over rows or columns."
+        long_help = "Choose whether to compute statistics over rows or columns.\n\
+                     Optional with --interactive, which starts on columns (Tab switches)."
     )]
-    pub stat_dim: StatDim,
+    pub stat_dim: Option<StatDim>,
 
     #[arg(
         short,
@@ -99,6 +103,18 @@ pub struct RunStatArgs {
                      or use 'stdout' to print results to the console."
     )]
     pub output: Box<str>,
+
+    #[arg(
+        short,
+        long,
+        default_value_t = false,
+        help = "Explore the statistics in a full-screen table and histogram",
+        long_help = "After computing, open a sortable, filterable table of every row or column\n\
+                     beside a histogram of nnz, sum, mean, or sd (log, sqrt, or linear scales).\n\
+                     A file --output is still written; printing to stdout is skipped.\n\
+                     Not available with --column-group-file."
+    )]
+    pub interactive: bool,
 }
 
 /// Compute statistics across sparse matrix data
@@ -110,120 +126,145 @@ pub fn run_stat(cmd_args: &RunStatArgs) -> anyhow::Result<()> {
     let output = cmd_args.output.clone();
     dirname(&output).as_deref().map(mkdir).transpose()?;
 
-    // to avoid duplicate barcodes in the column names
-    let attach_data_name = cmd_args.data_files.len() > 1;
+    // Several files keep their column (barcode) names distinct.
+    let data = open_data(&cmd_args.data_files, cmd_args.preload)?;
 
-    let mut data = SparseIoVec::new();
-    for data_file in cmd_args.data_files.iter() {
-        let (backend, data_file) = resolve_backend_file(data_file, None)?;
+    // Only --interactive may leave it out; it starts on columns.
+    let dim = cmd_args.stat_dim.clone().unwrap_or(StatDim::Column);
+    if dim == StatDim::Row {
+        if let Some(column_group_file) = &cmd_args.column_group_file {
+            let cols = data.column_names()?;
 
-        let mut this_data = open_sparse_matrix(&data_file, &backend)?;
-        if cmd_args.preload {
-            info!("Preloading data from {} ...", data_file);
-            this_data.preload_columns()?;
-        }
-        let data_name = attach_data_name.then(|| basename(&data_file)).transpose()?;
-        data.push(Arc::from(this_data), data_name)?;
-    }
+            // Load membership and match to data columns
+            // Use delimiter to extract base barcode for matching
+            let membership = Membership::from_file(column_group_file, 0, 1, true)?
+                .with_delimiter(cmd_args.delimiter);
+            let (column_membership, stats) = membership.match_keys(&cols);
 
-    match cmd_args.stat_dim {
-        StatDim::Row => {
-            if let Some(column_group_file) = &cmd_args.column_group_file {
-                let cols = data.column_names()?;
+            info!(
+                "Column matching: {} exact + {} base_key + {} prefix = {}/{} matched",
+                stats.exact,
+                stats.base_key,
+                stats.prefix,
+                stats.total_matched(),
+                stats.total()
+            );
 
-                // Load membership and match to data columns
-                // Use delimiter to extract base barcode for matching
-                let membership = Membership::from_file(column_group_file, 0, 1, true)?
-                    .with_delimiter(cmd_args.delimiter);
-                let (column_membership, stats) = membership.match_keys(&cols);
+            if column_membership.is_empty() {
+                let data_sample: Vec<_> = cols.iter().take(3).collect();
+                let memb_sample = membership.sample_keys(3);
+                info!("Data columns sample: {:?}", data_sample);
+                info!("Membership keys sample: {:?}", memb_sample);
+            }
 
-                info!(
-                    "Column matching: {} exact + {} base_key + {} prefix = {}/{} matched",
-                    stats.exact,
-                    stats.base_key,
-                    stats.prefix,
-                    stats.total_matched(),
-                    stats.total()
-                );
+            let unique_groups = membership.unique_groups();
+            info!(
+                "Will collect stats for {} groups: {:?}",
+                unique_groups.len(),
+                unique_groups
+            );
 
-                if column_membership.is_empty() {
-                    let data_sample: Vec<_> = cols.iter().take(3).collect();
-                    let memb_sample = membership.sample_keys(3);
-                    info!("Data columns sample: {:?}", data_sample);
-                    info!("Membership keys sample: {:?}", memb_sample);
-                }
+            let (group_names, group_stats) = collect_stratified_row_stat_across_vec(
+                &data,
+                &column_membership,
+                cmd_args.block_size,
+            )?;
 
-                let unique_groups = membership.unique_groups();
-                info!(
-                    "Will collect stats for {} groups: {:?}",
-                    unique_groups.len(),
-                    unique_groups
-                );
+            info!(
+                "Collected {} group stats: {:?}",
+                group_names.len(),
+                group_names
+            );
 
-                let (group_names, group_stats) = collect_stratified_row_stat_across_vec(
-                    &data,
-                    &column_membership,
-                    cmd_args.block_size,
-                )?;
-
-                info!(
-                    "Collected {} group stats: {:?}",
-                    group_names.len(),
-                    group_names
-                );
-
-                if cmd_args.output.eq_ignore_ascii_case("stdout") {
-                    for (g, row_stat) in group_names.iter().zip(group_stats.iter()) {
-                        let out: Vec<Box<str>> = row_stat
-                            .to_string_vec(&data.row_names()?, "\t")?
-                            .into_iter()
-                            .map(|s| format!("{}\t{}", g, s).into_boxed_str())
-                            .collect();
-                        write_lines(&out, &cmd_args.output)?;
-                    }
-                } else {
-                    use legume_numeric::matrix::sparse_stat::save_grouped_stats_parquet;
-
-                    info!("writing out: {}", cmd_args.output);
-                    save_grouped_stats_parquet(
-                        &cmd_args.output,
-                        &data.row_names()?,
-                        &group_names,
-                        &group_stats,
-                    )?;
+            if cmd_args.interactive {
+                warn!("--interactive is not available with --column-group-file; skipping it");
+            }
+            if cmd_args.output.eq_ignore_ascii_case("stdout") {
+                for (g, row_stat) in group_names.iter().zip(group_stats.iter()) {
+                    let out: Vec<Box<str>> = row_stat
+                        .to_string_vec(&data.row_names()?, "\t")?
+                        .into_iter()
+                        .map(|s| format!("{}\t{}", g, s).into_boxed_str())
+                        .collect();
+                    write_lines(&out, &cmd_args.output)?;
                 }
             } else {
-                let row_stat = collect_row_stat_across_vec(&data, cmd_args.block_size)?;
-                row_stat.save(&cmd_args.output, &data.row_names()?, "\t")?;
+                use legume_numeric::matrix::sparse_stat::save_grouped_stats_parquet;
+
+                info!("writing out: {}", cmd_args.output);
+                save_grouped_stats_parquet(
+                    &cmd_args.output,
+                    &data.row_names()?,
+                    &group_names,
+                    &group_stats,
+                )?;
             }
+            return Ok(());
         }
-        StatDim::Column => {
-            let select_rows = cmd_args.row_name_pattern.as_ref().map(|pattern| {
-                let re = Regex::new(&format!("(?i){}", pattern))
-                    .expect("Invalid regex pattern for --row-name-pattern");
-                let row_names = data.row_names().expect("couldn't get the row names");
-                let selected: Vec<_> = row_names
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, name)| if re.is_match(name) { Some(i) } else { None })
-                    .collect();
-                info!(
-                    "Row pattern '{}' matched {}/{} rows",
-                    pattern,
-                    selected.len(),
-                    row_names.len()
-                );
-                selected
-            });
+    }
 
-            let col_stat =
-                collect_column_stat_across_vec(&data, select_rows.as_deref(), cmd_args.block_size)?;
-
-            col_stat.save(&cmd_args.output, &data.column_names()?, "\t")?;
-        }
+    let side = match dim {
+        StatDim::Row => Side::Rows,
+        StatDim::Column => Side::Columns,
     };
-
+    let explore_after = wants_explorer(cmd_args);
+    // The explorer replaces printing to stdout; a file output is still written.
+    let save = !(explore_after && cmd_args.output.eq_ignore_ascii_case("stdout"));
+    let select_rows = rows_matching(cmd_args, &data)?;
+    let select_rows = select_rows.as_deref();
+    let first = side_stats(
+        &data,
+        side,
+        select_rows,
+        cmd_args.block_size,
+        save.then_some(&*cmd_args.output),
+    )?;
+    if explore_after {
+        let title = cmd_args.data_files.join(", ");
+        let data = &data;
+        let loader =
+            Box::new(move |side| side_stats(data, side, select_rows, cmd_args.block_size, None));
+        explore(StatExplorer::new(
+            &title,
+            side,
+            first,
+            Some(loader),
+            Some(values_reader(data)),
+            Purpose::Explore,
+        ))?;
+    }
     Ok(())
+}
+
+/// Whether to open the explorer: `--interactive`, on a terminal.
+fn wants_explorer(cmd_args: &RunStatArgs) -> bool {
+    if cmd_args.interactive && !tui_available() {
+        warn!("--interactive needs a terminal; skipping the explorer");
+    }
+    cmd_args.interactive && tui_available()
+}
+
+/// Rows whose names match `--row-name-pattern` (case-insensitive), if given;
+/// column statistics count only these rows.
+fn rows_matching(cmd_args: &RunStatArgs, data: &SparseIoVec) -> anyhow::Result<Option<Vec<usize>>> {
+    let Some(pattern) = &cmd_args.row_name_pattern else {
+        return Ok(None);
+    };
+    let re = Regex::new(&format!("(?i){}", pattern))
+        .map_err(|e| anyhow::anyhow!("invalid --row-name-pattern: {e}"))?;
+    let row_names = data.row_names()?;
+    let selected: Vec<usize> = row_names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| re.is_match(name).then_some(i))
+        .collect();
+    info!(
+        "Row pattern '{}' matched {}/{} rows",
+        pattern,
+        selected.len(),
+        row_names.len()
+    );
+    Ok(Some(selected))
 }
 
 /// Which per-row/per-column statistic to histogram.
