@@ -320,15 +320,33 @@ pub fn compact(v: f64) -> String {
 }
 
 /// A histogram of `counts` over bins `kmin..`, scaled to them.
-pub struct HistPlot<'a> {
+/// A bar height [`HistPlot`] can draw: whole counts, or any non-negative
+/// real value (a summed signal, a log statistic).
+pub trait BarValue: Copy {
+    fn bar(self) -> f64;
+}
+
+impl BarValue for usize {
+    fn bar(self) -> f64 {
+        self as f64
+    }
+}
+
+impl BarValue for f64 {
+    fn bar(self) -> f64 {
+        self
+    }
+}
+
+pub struct HistPlot<'a, T: BarValue = usize> {
     pub bins: Binning,
     pub kmin: i32,
-    pub counts: &'a [usize],
+    pub counts: &'a [T],
     /// Style of each bin's bar, by key.
     pub style: &'a dyn Fn(i32) -> Style,
     /// A subset drawn in front, in the bar style; `counts` then draw dimmed
     /// behind it.
-    pub subset: Option<&'a [usize]>,
+    pub subset: Option<&'a [T]>,
     pub y_scale: Scale,
     /// Bin under the accent rule and ▲.
     pub pointer: Option<i32>,
@@ -345,7 +363,7 @@ pub struct HistPlot<'a> {
 
 const EIGHTHS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
-impl HistPlot<'_> {
+impl<T: BarValue> HistPlot<'_, T> {
     /// Draw into `area`: bars over the rows above the last two, which hold
     /// the x axis and its labels; the left [`GUTTER`] columns hold the y axis.
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
@@ -369,11 +387,11 @@ impl HistPlot<'_> {
                 .filter(|&x| x < chart.right())
         };
 
-        let height = |c: usize| self.y_scale.apply(c as f64);
+        let height = |c: T| self.y_scale.apply(c.bar().max(0.0));
         let max_h = self.counts.iter().map(|&c| height(c)).fold(0.0, f64::max);
         let cells = chart.height as usize * 8;
-        let eighths = |c: usize| {
-            if c == 0 || max_h <= 0.0 {
+        let eighths = |c: T| {
+            if c.bar() <= 0.0 || max_h <= 0.0 {
                 0
             } else {
                 ((height(c) / max_h * cells as f64).round() as usize).clamp(1, cells)
@@ -386,7 +404,7 @@ impl HistPlot<'_> {
             }
         }
 
-        let mut bars = |counts: &[usize], behind: Option<&[usize]>, dim: bool| {
+        let mut bars = |counts: &[T], behind: Option<&[T]>, dim: bool| {
             for (i, &c) in counts.iter().enumerate() {
                 let x0 = chart.x + i as u16 * bw;
                 if x0 >= chart.right() {

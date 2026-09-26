@@ -115,3 +115,35 @@ fn default_labels_are_unchanged() {
     let (_, labels) = axis_rows(&base(None, None), 26, 8);
     assert!(labels.trim_start().starts_with('0'), "{labels}");
 }
+
+/// The bar cells of a plot of `counts`, with no x labels.
+fn bar_cells<T: BarValue>(counts: &[T]) -> String {
+    let area = Rect::new(0, 0, 6 + counts.len() as u16 * 2, 10);
+    let mut buf = Buffer::empty(area);
+    HistPlot {
+        bins: Binning::with_width(Scale::Linear, 1.0),
+        kmin: 0,
+        counts,
+        style: &|_| PLAIN,
+        subset: None,
+        y_scale: Scale::Linear,
+        pointer: None,
+        marks: Vec::new(),
+        x_label: Some(&|_| None),
+        tick_every: None,
+    }
+    .render(&mut buf, area);
+    (0..area.height - 2)
+        .flat_map(|y| (6..area.width).map(move |x| (x, y)))
+        .map(|(x, y)| buf[(x, y)].symbol().to_string())
+        .collect()
+}
+
+#[test]
+fn real_valued_bars_draw_like_counts() {
+    // Same shapes; only the y labels in the gutter differ.
+    assert_eq!(
+        bar_cells(&[0usize, 2, 4, 8]),
+        bar_cells(&[0.0f64, 0.2, 0.4, 0.8])
+    );
+}
