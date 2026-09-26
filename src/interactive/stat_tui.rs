@@ -745,6 +745,8 @@ impl<'a> StatExplorer<'a> {
             y_scale: self.y_scale,
             pointer: selected.map(|i| bins.key(self.values[self.stat][i] as f64)),
             marks: Vec::new(),
+            x_label: None,
+            tick_every: None,
         }
         .render(frame.buffer_mut(), plot);
     }

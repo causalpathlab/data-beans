@@ -192,6 +192,16 @@ impl Binning {
         }
     }
 
+    /// Bins of an explicit `width` on the scaled axis. On the linear scale
+    /// with width 1, bin `k` holds exactly the value `k`, so a histogram of
+    /// bin indices draws one bar per category.
+    pub fn with_width(scale: Scale, width: f64) -> Self {
+        Self {
+            scale,
+            width: width.max(f64::MIN_POSITIVE),
+        }
+    }
+
     pub fn key(&self, x: f64) -> i32 {
         match self.scale {
             Scale::Log => log_bin_key(x),
@@ -310,25 +320,50 @@ pub fn compact(v: f64) -> String {
 }
 
 /// A histogram of `counts` over bins `kmin..`, scaled to them.
-pub struct HistPlot<'a> {
+/// A bar height [`HistPlot`] can draw: whole counts, or any non-negative
+/// real value (a summed signal, a log statistic).
+pub trait BarValue: Copy {
+    fn bar(self) -> f64;
+}
+
+impl BarValue for usize {
+    fn bar(self) -> f64 {
+        self as f64
+    }
+}
+
+impl BarValue for f64 {
+    fn bar(self) -> f64 {
+        self
+    }
+}
+
+pub struct HistPlot<'a, T: BarValue = usize> {
     pub bins: Binning,
     pub kmin: i32,
-    pub counts: &'a [usize],
+    pub counts: &'a [T],
     /// Style of each bin's bar, by key.
     pub style: &'a dyn Fn(i32) -> Style,
     /// A subset drawn in front, in the bar style; `counts` then draw dimmed
     /// behind it.
-    pub subset: Option<&'a [usize]>,
+    pub subset: Option<&'a [T]>,
     pub y_scale: Scale,
     /// Bin under the accent rule and ▲.
     pub pointer: Option<i32>,
     /// Other symbols on the x axis, by key.
     pub marks: Vec<(i32, &'static str, Style)>,
+    /// Tick label at bin `k` in place of the bin's value; `None` from it
+    /// drops that tick, so the labels decide where ticks go (e.g. at
+    /// category boundaries with `tick_every: Some(1)`). Unset, every tick
+    /// shows its value.
+    pub x_label: Option<&'a dyn Fn(i32) -> Option<String>>,
+    /// Ticks every this many bins, in place of the scale's default.
+    pub tick_every: Option<i32>,
 }
 
 const EIGHTHS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
-impl HistPlot<'_> {
+impl<T: BarValue> HistPlot<'_, T> {
     /// Draw into `area`: bars over the rows above the last two, which hold
     /// the x axis and its labels; the left [`GUTTER`] columns hold the y axis.
     pub fn render(&self, buf: &mut Buffer, area: Rect) {
@@ -352,11 +387,11 @@ impl HistPlot<'_> {
                 .filter(|&x| x < chart.right())
         };
 
-        let height = |c: usize| self.y_scale.apply(c as f64);
+        let height = |c: T| self.y_scale.apply(c.bar().max(0.0));
         let max_h = self.counts.iter().map(|&c| height(c)).fold(0.0, f64::max);
         let cells = chart.height as usize * 8;
-        let eighths = |c: usize| {
-            if c == 0 || max_h <= 0.0 {
+        let eighths = |c: T| {
+            if c.bar() <= 0.0 || max_h <= 0.0 {
                 0
             } else {
                 ((height(c) / max_h * cells as f64).round() as usize).clamp(1, cells)
@@ -369,7 +404,7 @@ impl HistPlot<'_> {
             }
         }
 
-        let mut bars = |counts: &[usize], behind: Option<&[usize]>, dim: bool| {
+        let mut bars = |counts: &[T], behind: Option<&[T]>, dim: bool| {
             for (i, &c) in counts.iter().enumerate() {
                 let x0 = chart.x + i as u16 * bw;
                 if x0 >= chart.right() {
@@ -433,13 +468,22 @@ impl HistPlot<'_> {
             };
             put(buf, x, axis.y, sym, DIM);
         }
-        let every = self.bins.tick_every(nbins);
+        let every = self
+            .tick_every
+            .unwrap_or_else(|| self.bins.tick_every(nbins))
+            .max(1);
         let mut next_free = labels.x;
         let kmax = self.kmin + nbins as i32 - 1;
         for k in (self.kmin..=kmax).filter(|k| k % every == 0) {
             let Some(x) = x_of(k) else { continue };
+            let s = match self.x_label {
+                Some(label) => match label(k) {
+                    Some(s) => s,
+                    None => continue,
+                },
+                None => compact(self.bins.tick_value(k)),
+            };
             put(buf, x, axis.y, "┴", DIM);
-            let s = compact(self.bins.tick_value(k));
             if x >= next_free && x + (s.len() as u16) <= labels.right() {
                 buf.set_string(x, labels.y, &s, DIM);
                 next_free = x + s.len() as u16 + 1;
