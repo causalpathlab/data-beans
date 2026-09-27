@@ -85,6 +85,7 @@ fn custom_labels_and_tick_spacing() {
         style: &|_| PLAIN,
         subset: None,
         y_scale: Scale::Linear,
+        y_max: None,
         pointer: None,
         marks: Vec::new(),
         x_label: Some(&label),
@@ -107,6 +108,7 @@ fn default_labels_are_unchanged() {
         style: &|_| PLAIN,
         subset: None,
         y_scale: Scale::Linear,
+        y_max: None,
         pointer: None,
         marks: Vec::new(),
         x_label,
@@ -127,6 +129,7 @@ fn bar_cells<T: BarValue>(counts: &[T]) -> String {
         style: &|_| PLAIN,
         subset: None,
         y_scale: Scale::Linear,
+        y_max: None,
         pointer: None,
         marks: Vec::new(),
         x_label: Some(&|_| None),
@@ -146,4 +149,31 @@ fn real_valued_bars_draw_like_counts() {
         bar_cells(&[0usize, 2, 4, 8]),
         bar_cells(&[0.0f64, 0.2, 0.4, 0.8])
     );
+}
+
+#[test]
+fn a_fixed_y_max_shares_the_scale() {
+    // The same bars under a higher ceiling draw shorter.
+    let draw = |y_max| {
+        let counts = [2usize, 4];
+        let area = Rect::new(0, 0, 6 + 4, 12);
+        let mut buf = Buffer::empty(area);
+        HistPlot {
+            bins: Binning::with_width(Scale::Linear, 1.0),
+            kmin: 0,
+            counts: &counts,
+            style: &|_| PLAIN,
+            subset: None,
+            y_scale: Scale::Linear,
+            y_max,
+            pointer: None,
+            marks: Vec::new(),
+            x_label: Some(&|_| None),
+            tick_every: None,
+        }
+        .render(&mut buf, area);
+        (0..10).filter(|&y| buf[(8, y)].symbol() == "█").count()
+    };
+    assert!(draw(Some(8.0)) < draw(None));
+    assert_eq!(draw(Some(1.0)), draw(None), "never below the tallest bar");
 }

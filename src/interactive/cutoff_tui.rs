@@ -192,6 +192,7 @@ impl AxisView {
             style: &style,
             subset: None,
             y_scale,
+            y_max: None,
             pointer: cut_key,
             marks: self
                 .suggest
