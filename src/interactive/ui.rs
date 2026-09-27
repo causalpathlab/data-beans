@@ -348,6 +348,9 @@ pub struct HistPlot<'a, T: BarValue = usize> {
     /// behind it.
     pub subset: Option<&'a [T]>,
     pub y_scale: Scale,
+    /// Top of the y axis in count units; `None` scales to the tallest bar.
+    /// Set it to put several plots on one scale.
+    pub y_max: Option<f64>,
     /// Bin under the accent rule and ▲.
     pub pointer: Option<i32>,
     /// Other symbols on the x axis, by key.
@@ -388,7 +391,10 @@ impl<T: BarValue> HistPlot<'_, T> {
         };
 
         let height = |c: T| self.y_scale.apply(c.bar().max(0.0));
-        let max_h = self.counts.iter().map(|&c| height(c)).fold(0.0, f64::max);
+        let tallest = self.counts.iter().map(|&c| height(c)).fold(0.0, f64::max);
+        let max_h = self
+            .y_max
+            .map_or(tallest, |m| self.y_scale.apply(m.max(0.0)).max(tallest));
         let cells = chart.height as usize * 8;
         let eighths = |c: T| {
             if c.bar() <= 0.0 || max_h <= 0.0 {
