@@ -272,3 +272,11 @@ fn an_unknown_modality_falls_back_to_the_positional_rule() {
     // ...and so is a five-field row whose only known token sits too far left.
     assert!(parse_feature_row("GENE/count/7/x/spliced").is_none());
 }
+
+#[test]
+fn each_modality_names_its_two_channels() {
+    assert_eq!(channels(M6A), Some((METHYLATED, UNMETHYLATED)));
+    assert_eq!(channels(ATOI), Some((EDITED, UNEDITED)));
+    assert_eq!(channels(BAF), Some((ALT, DEPTH)));
+    assert_eq!(channels("mod1"), None);
+}
