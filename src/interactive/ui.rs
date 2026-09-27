@@ -39,15 +39,50 @@ pub trait Screen {
         None
     }
     fn do_work(&mut self) {}
+    /// Called about every [`TICK`] while no key comes: true redraws, for a
+    /// view waiting on work in the background.
+    fn tick(&mut self) -> bool {
+        false
+    }
+}
+
+/// How long [`run_screen`] waits for a key before asking [`Screen::tick`].
+pub const TICK: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Holds log records back while alive, writing them when dropped.
+struct HeldLogs;
+
+impl HeldLogs {
+    fn new() -> Self {
+        crate::aux::logging::hold_logs(true);
+        HeldLogs
+    }
+}
+
+impl Drop for HeldLogs {
+    fn drop(&mut self) {
+        crate::aux::logging::hold_logs(false);
+    }
 }
 
 /// Run `screen` full screen until it is done. The terminal is restored on
-/// return and on panic. Blocking work runs on the normal screen, where its
-/// own progress output belongs, and the view comes back after it.
+/// return and on panic. Log records raised meanwhile are held back and
+/// written once the normal screen is back. Blocking work runs on the normal
+/// screen, where its own progress output belongs, and the view comes back
+/// after it.
 pub fn run_screen(screen: &mut impl Screen) -> anyhow::Result<()> {
     ratatui::run(|terminal| -> anyhow::Result<()> {
+        let held = HeldLogs::new();
+        let mut redraw = true;
         while !screen.done() {
-            terminal.draw(|f| screen.render(f))?;
+            if redraw {
+                terminal.draw(|f| screen.render(f))?;
+            }
+            if !event::poll(TICK)? {
+                redraw = screen.tick();
+                continue;
+            }
+            redraw = true;
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -60,11 +95,16 @@ pub fn run_screen(screen: &mut impl Screen) -> anyhow::Result<()> {
             }
             if let Some(message) = screen.pending_work() {
                 ratatui::restore();
+                crate::aux::logging::hold_logs(false);
                 eprintln!("{message}");
                 screen.do_work();
+                crate::aux::logging::hold_logs(true);
                 *terminal = ratatui::try_init()?;
             }
         }
+        // Restore before writing what was held, not after.
+        ratatui::restore();
+        drop(held);
         Ok(())
     })
 }
@@ -348,6 +388,9 @@ pub struct HistPlot<'a, T: BarValue = usize> {
     /// behind it.
     pub subset: Option<&'a [T]>,
     pub y_scale: Scale,
+    /// Top of the y axis in count units; `None` scales to the tallest bar.
+    /// Set it to put several plots on one scale.
+    pub y_max: Option<f64>,
     /// Bin under the accent rule and ▲.
     pub pointer: Option<i32>,
     /// Other symbols on the x axis, by key.
@@ -388,7 +431,10 @@ impl<T: BarValue> HistPlot<'_, T> {
         };
 
         let height = |c: T| self.y_scale.apply(c.bar().max(0.0));
-        let max_h = self.counts.iter().map(|&c| height(c)).fold(0.0, f64::max);
+        let tallest = self.counts.iter().map(|&c| height(c)).fold(0.0, f64::max);
+        let max_h = self
+            .y_max
+            .map_or(tallest, |m| self.y_scale.apply(m.max(0.0)).max(tallest));
         let cells = chart.height as usize * 8;
         let eighths = |c: T| {
             if c.bar() <= 0.0 || max_h <= 0.0 {
@@ -494,6 +540,157 @@ impl<T: BarValue> HistPlot<'_, T> {
             if let Some(x) = x_of(k) {
                 put(buf, x, axis.y, sym, style);
             }
+        }
+    }
+}
+
+/// One side of a [`MirrorPlot`].
+pub struct MirrorSide<'a, T: BarValue = f64> {
+    pub counts: &'a [T],
+    /// A subset drawn in front, in `style`; `counts` then draw dimmed
+    /// behind it.
+    pub subset: Option<&'a [T]>,
+    pub style: Style,
+    /// Named in the side's outer corner; empty for none.
+    pub name: &'a str,
+}
+
+/// Two bar series on one scale around a zero line, one growing up and the
+/// other down, as a Miami plot, in half cells. Signed values are a mirror of
+/// their positive and negative parts. Axes as [`HistPlot`]'s, one column
+/// per bar.
+pub struct MirrorPlot<'a, T: BarValue = f64> {
+    pub up: MirrorSide<'a, T>,
+    pub down: MirrorSide<'a, T>,
+    pub y_scale: Scale,
+    /// Top of either side in count units; `None` scales to the tallest bar.
+    pub y_max: Option<f64>,
+    /// Labels at the top, the zero line and the bottom, in place of the
+    /// scale's own.
+    pub y_labels: Option<[String; 3]>,
+    /// Bar under the accent rule and ▲.
+    pub pointer: Option<usize>,
+    /// Tick label at bar `i`; `None` from it drops that tick. Unset, there
+    /// are no ticks.
+    pub x_label: Option<&'a dyn Fn(usize) -> Option<String>>,
+}
+
+impl<T: BarValue> MirrorPlot<'_, T> {
+    /// Draw into `area`: the halves over the rows above the last two, which
+    /// hold the x axis and its labels; the left [`GUTTER`] columns hold the
+    /// y axis.
+    pub fn render(&self, buf: &mut Buffer, area: Rect) {
+        let [plot, axis, labels] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        let [gutter, chart] =
+            Layout::horizontal([Constraint::Length(GUTTER), Constraint::Min(1)]).areas(plot);
+        if chart.width == 0 || chart.height < 3 {
+            return;
+        }
+        let half = (chart.height - 1) / 2;
+        let zero = chart.top() + half;
+        let x_of = |i: usize| Some(chart.x + i as u16).filter(|&x| x < chart.right());
+
+        let height = |c: T| self.y_scale.apply(c.bar().max(0.0));
+        let all = self.up.counts.iter().chain(self.down.counts);
+        let tallest = all.map(|&c| height(c)).fold(0.0, f64::max);
+        let max_h = self
+            .y_max
+            .map_or(tallest, |m| self.y_scale.apply(m.max(0.0)).max(tallest));
+        let cells = half as usize * 2;
+        let halves = |c: T| {
+            if c.bar() <= 0.0 || max_h <= 0.0 {
+                0
+            } else {
+                ((height(c) / max_h * cells as f64).round() as usize).clamp(1, cells)
+            }
+        };
+
+        if let Some(x) = self.pointer.and_then(x_of) {
+            for y in chart.top()..chart.top() + 2 * half + 1 {
+                put(buf, x, y, "┊", ACCENTED);
+            }
+        }
+        for x in chart.left()..chart.right() {
+            put(buf, x, zero, "─", DIM);
+        }
+        for (side, up) in [(&self.up, true), (&self.down, false)] {
+            let (whole, part) = if up { ("█", "▄") } else { ("█", "▀") };
+            let mut bars = |counts: &[T], behind: Option<&[T]>, style: Style| {
+                for (i, &c) in counts.iter().enumerate() {
+                    let Some(x) = x_of(i) else { break };
+                    let (top, under) = (halves(c), behind.map_or(0, |b| halves(b[i])));
+                    for k in 0..top.div_ceil(2) {
+                        let y = if up {
+                            zero - 1 - k as u16
+                        } else {
+                            zero + 1 + k as u16
+                        };
+                        // As in HistPlot, a partial end in front of a longer
+                        // bar rounds up to a whole cell.
+                        let full = 2 * k + 2 <= top || under >= 2 * k + 2;
+                        put(buf, x, y, if full { whole } else { part }, style);
+                    }
+                }
+            };
+            match side.subset {
+                Some(subset) => {
+                    bars(side.counts, None, DIM);
+                    bars(subset, Some(side.counts), side.style);
+                }
+                None => bars(side.counts, None, side.style),
+            }
+        }
+        buf.set_string(chart.x, chart.top(), self.up.name, DIM);
+        buf.set_string(chart.x, chart.top() + 2 * half, self.down.name, DIM);
+
+        // y axis: the scale's top on both sides of the zero line.
+        let gx = gutter.right() - 1;
+        for y in gutter.top()..gutter.bottom() {
+            put(buf, gx, y, "│", DIM);
+        }
+        let own = || {
+            let top = compact(self.y_scale.invert(max_h));
+            [top.clone(), "0".to_string(), top]
+        };
+        let ys = [chart.top(), zero, chart.top() + 2 * half];
+        for (y, s) in ys
+            .into_iter()
+            .zip(self.y_labels.clone().unwrap_or_else(own))
+        {
+            let x = gx.saturating_sub(1 + s.len() as u16).max(gutter.x);
+            buf.set_string(x, y, &s, DIM);
+            put(buf, gx, y, "┤", DIM);
+        }
+
+        // x axis: baseline with ticks, labels below, then the pointer.
+        for x in axis.left()..axis.right() {
+            let sym = match x.cmp(&gx) {
+                std::cmp::Ordering::Less => " ",
+                std::cmp::Ordering::Equal => "└",
+                std::cmp::Ordering::Greater => "─",
+            };
+            put(buf, x, axis.y, sym, DIM);
+        }
+        let n = self.up.counts.len().max(self.down.counts.len());
+        let mut next_free = labels.x;
+        for i in 0..n {
+            let Some(x) = x_of(i) else { break };
+            let Some(s) = self.x_label.and_then(|label| label(i)) else {
+                continue;
+            };
+            put(buf, x, axis.y, "┴", DIM);
+            if x >= next_free && x + (s.len() as u16) <= labels.right() {
+                buf.set_string(x, labels.y, &s, DIM);
+                next_free = x + s.len() as u16 + 1;
+            }
+        }
+        if let Some(x) = self.pointer.and_then(x_of) {
+            put(buf, x, axis.y, "▲", HIGHLIGHT);
         }
     }
 }

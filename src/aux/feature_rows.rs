@@ -105,6 +105,20 @@ pub const ALT: &str = "alt";
 /// pair that nests rather than partitions — see the module docs.
 pub const DEPTH: &str = "depth";
 
+/// A modality's two channels, in the order the module docs list them: the
+/// state the modality counts first ([`METHYLATED`], [`EDITED`], [`ALT`]),
+/// then its counterpart. `None` for a token outside the vocabulary.
+pub fn channels(modality: &str) -> Option<(&'static str, &'static str)> {
+    match modality {
+        COUNT => Some((SPLICED, UNSPLICED)),
+        M6A => Some((METHYLATED, UNMETHYLATED)),
+        ATOI => Some((EDITED, UNEDITED)),
+        APA => Some((PROXIMAL, DISTAL)),
+        BAF => Some((ALT, DEPTH)),
+        _ => None,
+    }
+}
+
 /// Format a feature row. Pass `subunit = None` for a gene-level (pooled) row
 /// `{gene}/{modality}/{channel}`, or `Some(site_or_component)` for a sub-gene row
 /// `{gene}/{modality}/{subunit}/{channel}` (channel innermost). The `subunit` must

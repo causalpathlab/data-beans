@@ -85,6 +85,7 @@ fn custom_labels_and_tick_spacing() {
         style: &|_| PLAIN,
         subset: None,
         y_scale: Scale::Linear,
+        y_max: None,
         pointer: None,
         marks: Vec::new(),
         x_label: Some(&label),
@@ -107,6 +108,7 @@ fn default_labels_are_unchanged() {
         style: &|_| PLAIN,
         subset: None,
         y_scale: Scale::Linear,
+        y_max: None,
         pointer: None,
         marks: Vec::new(),
         x_label,
@@ -127,6 +129,7 @@ fn bar_cells<T: BarValue>(counts: &[T]) -> String {
         style: &|_| PLAIN,
         subset: None,
         y_scale: Scale::Linear,
+        y_max: None,
         pointer: None,
         marks: Vec::new(),
         x_label: Some(&|_| None),
@@ -146,4 +149,80 @@ fn real_valued_bars_draw_like_counts() {
         bar_cells(&[0usize, 2, 4, 8]),
         bar_cells(&[0.0f64, 0.2, 0.4, 0.8])
     );
+}
+
+#[test]
+fn a_fixed_y_max_shares_the_scale() {
+    // The same bars under a higher ceiling draw shorter.
+    let draw = |y_max| {
+        let counts = [2usize, 4];
+        let area = Rect::new(0, 0, 6 + 4, 12);
+        let mut buf = Buffer::empty(area);
+        HistPlot {
+            bins: Binning::with_width(Scale::Linear, 1.0),
+            kmin: 0,
+            counts: &counts,
+            style: &|_| PLAIN,
+            subset: None,
+            y_scale: Scale::Linear,
+            y_max,
+            pointer: None,
+            marks: Vec::new(),
+            x_label: Some(&|_| None),
+            tick_every: None,
+        }
+        .render(&mut buf, area);
+        (0..10).filter(|&y| buf[(8, y)].symbol() == "█").count()
+    };
+    assert!(draw(Some(8.0)) < draw(None));
+    assert_eq!(draw(Some(1.0)), draw(None), "never below the tallest bar");
+}
+
+fn draw_mirror(plot: &MirrorPlot<'_, f64>, w: u16, h: u16) -> Vec<String> {
+    let area = Rect::new(0, 0, w, h);
+    let mut buf = Buffer::empty(area);
+    plot.render(&mut buf, area);
+    (0..h)
+        .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+        .collect()
+}
+
+#[test]
+fn a_mirror_grows_one_side_up_and_the_other_down() {
+    let (up, down) = ([4.0, 0.0, 2.0], [0.0, 4.0, 1.0]);
+    let side = |counts| MirrorSide {
+        counts,
+        subset: None,
+        style: PLAIN,
+        name: "",
+    };
+    let label = |i: usize| (i == 0).then(|| "A".to_string());
+    let plot = MirrorPlot {
+        up: side(&up),
+        down: side(&down),
+        y_scale: Scale::Linear,
+        y_max: None,
+        y_labels: None,
+        pointer: Some(1),
+        x_label: Some(&label),
+    };
+    // 7 chart rows: 3 above the zero line, the line, 3 below.
+    let rows = draw_mirror(&plot, 10, 9);
+    let col = |x: usize| -> String {
+        rows.iter()
+            .take(7)
+            .map(|r| r.chars().nth(x).unwrap())
+            .collect()
+    };
+    assert_eq!(col(GUTTER as usize), "███─   ", "tallest up fills its side");
+    assert_eq!(
+        col(GUTTER as usize + 1),
+        "┊┊┊─███",
+        "down, under the pointer"
+    );
+    assert_eq!(col(GUTTER as usize + 2), " ▄█─█  ", "halves round to cells");
+    assert!(rows[0].trim_start().starts_with('4'), "{rows:?}");
+    assert!(rows[6].trim_start().starts_with('4'), "{rows:?}");
+    assert!(rows[8].contains('A'));
+    assert!(rows[7].contains('▲'));
 }

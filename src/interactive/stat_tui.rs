@@ -743,6 +743,7 @@ impl<'a> StatExplorer<'a> {
             style: &|_| PLAIN,
             subset: self.shown.as_deref(),
             y_scale: self.y_scale,
+            y_max: None,
             pointer: selected.map(|i| bins.key(self.values[self.stat][i] as f64)),
             marks: Vec::new(),
             x_label: None,
