@@ -5,7 +5,8 @@
 //!   foreground plus one accent), [`ui::panel`], [`ui::header`],
 //!   [`ui::help_line`], [`ui::input_line`], the [`ui::Screen`] trait driven by
 //!   [`ui::run_screen`], and histograms: [`ui::Scale`], [`ui::Binning`],
-//!   [`ui::Binned`], [`ui::HistPlot`].
+//!   [`ui::Binned`], [`ui::HistPlot`], and [`ui::MirrorPlot`] for two series
+//!   around one zero line.
 //! - [`cutoff_tui`]: row and column nnz cutoff picker over plain nnz vectors.
 //! - [`stat_tui`]: table-and-histogram explorer over plain name and value
 //!   columns, optionally marking entries and handing them back.
