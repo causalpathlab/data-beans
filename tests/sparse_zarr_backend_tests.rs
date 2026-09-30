@@ -379,3 +379,21 @@ fn from_mtx_file_tiles_empty_rows_and_columns_in_both_orientations() -> anyhow::
     assert_triplets_match(by_row, dense_to_triplets_by_rows(&raw, &all_rows));
     Ok(())
 }
+
+/// A matrix whose row-major arrays span many zarr chunks (1 MiB each), so a
+/// read of many rows fuses ranges across more chunks than the decoded-chunk
+/// cache holds. Each read, from a fresh handle, must match the matrix.
+#[test]
+fn rows_spanning_many_chunks_read_back_exactly() -> anyhow::Result<()> {
+    let (nrow, ncol) = (240, 20_000);
+    let mut raw = Array2::<f32>::runif(nrow, ncol);
+    raw.mapv_inplace(|v| if v < 0.7 { 0.0 } else { (v * 100.0).round() });
+    let rows: Vec<usize> = (0..nrow).step_by(3).collect();
+    let expected = dense_to_triplets_by_rows(&raw, &rows);
+    for _ in 0..3 {
+        let sp = make_sparse_no_preload(&raw);
+        let (_, _, triplets) = sp.read_triplets_by_rows(rows.clone())?;
+        assert_triplets_match(triplets, expected.clone());
+    }
+    Ok(())
+}
