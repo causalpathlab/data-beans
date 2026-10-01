@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.6.18"
+version = "0.6.19"
 rust-version = "1.91"
 # Ship only the sources, README and license: nothing else in the working tree
 # (data stores, saved name lists, scratch files) can end up on crates.io.
@@ -27,7 +27,10 @@ path = "src/sim_main.rs"
 required-features = ["sim"]
 
 [features]
-default = ["aux", "tui"]
+default = ["aux", "tui", "tensor"]
+# Read sparse data into dense candle `Tensor`s (`read_*_tensor`). Off, no
+# candle is linked: for crates that only need matrices.
+tensor = ["legume-numeric/tensor"]
 aux = []
 # Full-screen terminal views (ratatui): the CLI's interactive sessions, and
 # `data_beans::interactive` for downstream crates building their own.
@@ -42,7 +45,7 @@ metal = ["legume-numeric/metal"]
 hdf5 = ["dep:hdf5"]
 
 [dependencies]
-legume-numeric = { version = "0.8.12", features = ["matrix", "param", "candle"] }
+legume-numeric = { version = "0.8.13", default-features = false, features = ["matrix", "param"] }
 
 anyhow = "1.0"
 clap = { version = "4.5.20", features = ["derive"] }
