@@ -207,9 +207,7 @@ pub use genomic_data::coordinates::locus_key;
 /// Per-name rule of [`FeatureNameKind::Mixed`]: locus key, else the gene
 /// rule for gene-style names, else the name unchanged.
 fn mixed_canonicalize(name: &str) -> Box<str> {
-    locus_key(name)
-        .or_else(|| gene_symbol(name, '_').map(Into::into))
-        .unwrap_or_else(|| name.into())
+    locus_key(name).unwrap_or_else(|| gene_canonicalize(name, '_'))
 }
 
 /// Build the overlap-merge canonical map from a flat list of row names
@@ -342,26 +340,41 @@ pub fn build_mixed_kind_canonicalizer(names: &[Box<str>]) -> RowNameCanonicalize
 /// row intersection to one global key. Strip the known tag suffix
 /// first so the actual symbol becomes the rsplit target.
 fn gene_canonicalize(name: &str, delim: char) -> Box<str> {
-    gene_symbol(name, delim).unwrap_or(name).into()
+    let (head, rest) = gene_part(name);
+    match gene_symbol(head, delim) {
+        Some(symbol) if rest.is_empty() => symbol.into(),
+        Some(symbol) => format!("{symbol}{rest}").into_boxed_str(),
+        None => name.into(),
+    }
 }
 
 /// The gene rule applies: see [`gene_symbol`].
 fn is_gene_like(name: &str, delim: char) -> bool {
-    gene_symbol(name, delim).is_some()
+    gene_symbol(gene_part(name).0, delim).is_some()
 }
 
-/// The symbol the gene rule keys `name` on: its last `delim` component once
-/// a Cell Ranger feature-type tag is stripped. `None` (the name is kept
-/// whole) for a locus, a name without `delim`, or a symbol that is all
-/// digits: cutting `chrUn_CTG1v1:0-100` would key it on `CTG1v1:0-100`, and
+/// A row name's gene part, its first `/`-segment, and the rest from the
+/// first `/` on (`ENSG_GENE1/m6a/chr1:100/methylated` gives `ENSG_GENE1`
+/// and `/m6a/chr1:100/methylated`). The gene rule reads only the first;
+/// the rest is kept as written.
+fn gene_part(name: &str) -> (&str, &str) {
+    name.find('/').map_or((name, ""), |i| name.split_at(i))
+}
+
+/// The symbol the gene rule keys a gene part on: its last `delim` component
+/// once a Cell Ranger feature-type tag is stripped. `None` (the name is kept
+/// whole) when there is no `delim`, when the part is a coordinate (a locus
+/// `chr:start-end` or a position `chr:pos`, see [`coordinates::is_region`]),
+/// or when the symbol is all digits: cutting `chrUn_CTG1v1:0-100` or
+/// `chr1_CTG1v1_random:12345` would key it on its contig tail, and
 /// `chr1_100_200` or `chr1_100_200_Peaks` (not colon form, so not loci)
 /// would collapse onto `200`.
-fn gene_symbol(name: &str, delim: char) -> Option<&str> {
-    if !name.contains(delim) {
+fn gene_symbol(head: &str, delim: char) -> Option<&str> {
+    if !head.contains(delim) {
         return None;
     }
-    let stripped = strip_feature_type_suffix(name, delim);
-    if coordinates::is_locus(stripped) {
+    let stripped = strip_feature_type_suffix(head, delim);
+    if coordinates::is_region(stripped) {
         return None;
     }
     let symbol = stripped.rsplit(delim).next().unwrap_or(stripped);
@@ -715,6 +728,22 @@ mod tests {
         assert_eq!(
             gene.canonicalize("chr2_100_200_Peaks").as_ref(),
             "chr2_100_200_Peaks"
+        );
+        // Only the gene part (first `/`-segment) is read, and a position
+        // there is a coordinate, not a gene.
+        assert_eq!(
+            gene.canonicalize("chr1_CTG1v1_random:12345/baf/alt")
+                .as_ref(),
+            "chr1_CTG1v1_random:12345/baf/alt"
+        );
+        assert_eq!(
+            gene.canonicalize("ENSG000_GENE1/m6a/chr1_CTG1v1_random:123/methylated")
+                .as_ref(),
+            "GENE1/m6a/chr1_CTG1v1_random:123/methylated"
+        );
+        assert_eq!(
+            gene.canonicalize("ENSG000_GENE1/count/spliced").as_ref(),
+            "GENE1/count/spliced"
         );
         // A locus is never cut at `_`, even when its contig name has one or
         // it carries a feature-type tag.
