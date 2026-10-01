@@ -989,6 +989,6 @@ pub fn align_backends(args: &AlignDataArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ndarray"))]
 #[path = "merging_tests.rs"]
 mod tests;

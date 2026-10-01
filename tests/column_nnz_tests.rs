@@ -1,3 +1,5 @@
+#![cfg(feature = "ndarray")]
+
 //! Per-column nnz from the resident indptr — the accessor that makes streaming
 //! writes of column subsets possible without a counting pass.
 //!

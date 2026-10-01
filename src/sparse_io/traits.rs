@@ -4,6 +4,7 @@
 pub use legume_numeric::candle_core::Tensor;
 pub use nalgebra::DMatrix;
 pub use nalgebra_sparse::{csc::CscMatrix, csr::CsrMatrix};
+#[cfg(feature = "ndarray")]
 pub use ndarray::prelude::*;
 
 pub const MAX_ROW_NAME_IDX: usize = 3;
@@ -86,6 +87,7 @@ pub trait SparseIo: Sync + Send {
     // default implementation //
     ////////////////////////////
 
+    #[cfg(feature = "ndarray")]
     /// Read columns within the range and return dense `ndarray::Array2`
     /// * `columns` : range e.g., 0..3 -> [0, 1, 2] or vec![0, 1, 2]
     ///
@@ -136,6 +138,7 @@ pub trait SparseIo: Sync + Send {
         None
     }
 
+    #[cfg(feature = "ndarray")]
     /// Read rows within the range and return dense `ndarray::Array2`
     /// * `rows` : range e.g., 0..3 -> [0, 1, 2] or vec![0, 1, 2]
     ///
@@ -230,6 +233,7 @@ pub trait SparseIo: Sync + Send {
     // `ndarray` related functions //
     /////////////////////////////////
 
+    #[cfg(feature = "ndarray")]
     /// Add ndarray to zarr backend by row (CSR format)
     /// * `array` - 2D array to be added to the backend
     fn import_ndarray_by_row(&mut self, array: &Array2<f32>) -> anyhow::Result<()> {
@@ -248,6 +252,7 @@ pub trait SparseIo: Sync + Send {
         self.record_triplets_by_row(&mut mtx_triplets)
     }
 
+    #[cfg(feature = "ndarray")]
     /// Add ndarray to zarr backend by column (CSC format)
     /// * `array` - 2D array to be added to the backend
     fn import_ndarray_by_col(&mut self, array: &Array2<f32>) -> anyhow::Result<()> {

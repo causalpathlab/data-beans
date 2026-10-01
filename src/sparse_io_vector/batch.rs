@@ -13,6 +13,7 @@ impl SparseIoVec {
     /// # Arguments
     /// * `feature_matrix` - A feature matrix where each column corresponds to a cell.
     /// * `batch_membership` - A vector of batch membership information for each cell.
+    #[cfg(feature = "ndarray")]
     pub fn register_batches_ndarray<T>(
         &mut self,
         feature_matrix: &ndarray::Array2<f32>,

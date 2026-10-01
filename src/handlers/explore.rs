@@ -76,18 +76,21 @@ pub fn values_reader(data: &SparseIoVec) -> ValuesReader<'_> {
         Ok(match side {
             Side::Rows => {
                 // entries x columns
-                let m = data.read_rows_ndarray(entries.iter().copied())?;
+                let m = data.read_rows_dmatrix(entries.iter().copied())?;
                 Values {
                     names: data.column_names()?,
-                    columns: m.rows().into_iter().map(|r| r.to_vec()).collect(),
+                    columns: m.row_iter().map(|r| r.iter().copied().collect()).collect(),
                 }
             }
             Side::Columns => {
                 // rows x entries
-                let m = data.read_columns_ndarray(entries.iter().copied())?;
+                let m = data.read_columns_dmatrix(entries.iter().copied())?;
                 Values {
                     names: data.row_names()?,
-                    columns: m.columns().into_iter().map(|c| c.to_vec()).collect(),
+                    columns: m
+                        .column_iter()
+                        .map(|c| c.iter().copied().collect())
+                        .collect(),
                 }
             }
         })

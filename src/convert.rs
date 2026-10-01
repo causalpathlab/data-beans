@@ -256,11 +256,14 @@ pub fn convert_zarr_to_backend(zarr_file: &str, output: &str) -> anyhow::Result<
     }
     assert_eq!(nrows, row_types.len());
 
-    let mut column_names =
-        parse_10x_cell_id(read_zarr_ndarray::<u32>(store.clone(), column_name_field)?.view())
-            .or_else(|_| read_zarr_group_attr::<Vec<Box<str>>>(store.clone(), column_name_field))
-            .or_else(|_| read_zarr_strings(store.clone(), column_name_field))
-            .unwrap_or_else(|_| (0..ncols).map(|x| x.to_string().into_boxed_str()).collect());
+    let mut column_names = read_zarr_flat_u32(store.clone(), column_name_field)
+        .and_then(|(ids, shape)| {
+            anyhow::ensure!(shape.len() == 2 && shape[1] == 2, "cell_id must be [N, 2]");
+            parse_10x_cell_id_flat(&ids, shape[0] as usize)
+        })
+        .or_else(|_| read_zarr_group_attr::<Vec<Box<str>>>(store.clone(), column_name_field))
+        .or_else(|_| read_zarr_strings(store.clone(), column_name_field))
+        .unwrap_or_else(|_| (0..ncols).map(|x| x.to_string().into_boxed_str()).collect());
 
     if ncols < column_names.len() {
         column_names.truncate(ncols);

@@ -1,3 +1,5 @@
+#![cfg(feature = "ndarray")]
+
 use data_beans::sparse_io::*;
 use data_beans::sparse_io_vector::{ColumnAlignment, RowAlignment, SparseIoVec};
 use legume_numeric::matrix::traits::SampleOps;
