@@ -1,4 +1,8 @@
 mod column_subset;
+// The library's converters; `from-zarr` reads through the same function as
+// the open-or-convert fallback.
+#[allow(dead_code)]
+mod convert;
 mod handlers;
 mod hdf5_io;
 // The interactive views live in the library (feature "tui") so downstream

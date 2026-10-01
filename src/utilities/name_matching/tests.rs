@@ -70,3 +70,10 @@ fn gene_index_tiers_and_idf() {
     assert_eq!(idf_weight(4, 4), 0.0);
     assert!(idf_weight(4, 1) > 1.38 && idf_weight(4, 1) < 1.39);
 }
+
+#[test]
+fn a_row_is_named_by_id_alone_when_its_name_adds_nothing() {
+    assert_eq!(id_name("FID1", "GENE1"), Box::from("FID1_GENE1"));
+    assert_eq!(id_name("FID2", "FID2"), Box::from("FID2"));
+    assert_eq!(id_name("FID3", ""), Box::from("FID3"));
+}

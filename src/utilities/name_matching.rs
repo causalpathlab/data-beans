@@ -27,20 +27,22 @@ pub fn make_names_unique(names: &mut [Box<str>]) -> usize {
     num_duped
 }
 
-/// Combine feature IDs and names into composite `id_name` strings.
-/// If a name is empty or already equals the ID (e.g. 10x ATAC peaks where
-/// both `features/id` and `features/name` are `chr1:1000-2000`), the ID is
-/// used as-is to avoid `chr1:1000-2000_chr1:1000-2000` duplication.
+/// The composite name of one row: `id{ROW_SEP}name`, or the ID alone when
+/// the name is empty or already equals it (e.g. 10x ATAC peaks, where both
+/// `features/id` and `features/name` are `chr1:1000-2000`).
+pub fn id_name(id: &str, name: &str) -> Box<str> {
+    if name.is_empty() || name == id {
+        id.into()
+    } else {
+        format!("{id}{ROW_SEP}{name}").into_boxed_str()
+    }
+}
+
+/// [`id_name`] of each row.
 pub fn compose_id_name(ids: Vec<Box<str>>, names: Vec<Box<str>>) -> Vec<Box<str>> {
-    ids.into_iter()
-        .zip(names)
-        .map(|(id, name)| {
-            if name.is_empty() || name.as_ref() == id.as_ref() {
-                id
-            } else {
-                format!("{}_{}", id, name).into_boxed_str()
-            }
-        })
+    ids.iter()
+        .zip(&names)
+        .map(|(id, name)| id_name(id, name))
         .collect()
 }
 
