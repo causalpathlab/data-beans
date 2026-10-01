@@ -340,6 +340,7 @@ pub fn read_zarr_flat_u32(
 
 // ── Generic array/attribute readers (moved from misc.rs) ────────────────
 
+#[cfg(feature = "ndarray")]
 /// Read a full ndarray from zarr storage.
 pub fn read_zarr_ndarray<T>(
     store: Arc<dyn ZReadStorageTraits>,
@@ -501,6 +502,7 @@ fn encode_10x_cell_id(
     Ok(format!("{}-{}", barcode, suffix).into_boxed_str())
 }
 
+#[cfg(feature = "ndarray")]
 /// Parse a 10x Xenium `[N, 2]` u32 cell_id ndarray into string barcodes.
 ///
 /// See [10x docs](https://www.10xgenomics.com/support/software/xenium-onboard-analysis/3.4/advanced/xoa-output-zarr#cellID).
@@ -520,7 +522,7 @@ pub fn parse_10x_cell_id(
 
 /// Parse a flat row-major `[N, 2]` u32 buffer into 10x Xenium cell-ID strings.
 ///
-/// Same encoding as [`parse_10x_cell_id`] but works on a flat slice.
+/// Same encoding as `parse_10x_cell_id` but works on a flat slice.
 pub fn parse_10x_cell_id_flat(data: &[u32], nrows: usize) -> anyhow::Result<Vec<Box<str>>> {
     anyhow::ensure!(data.len() == nrows * 2, "cell_id buffer size mismatch");
     let lookup = hex_to_shifted_lookup();

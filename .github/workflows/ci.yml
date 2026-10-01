@@ -72,7 +72,7 @@ jobs:
             cargo check --all-targets --features "$f"
             echo "::endgroup::"
           done
-          # Matrices without candle (no `tensor`): what faba builds.
+          # DMatrix only, no candle or ndarray (no `tensor`, `ndarray`): what faba builds.
           echo "::group::--no-default-features --features aux,tui"
           cargo check --all-targets --no-default-features --features aux,tui
           echo "::endgroup::"

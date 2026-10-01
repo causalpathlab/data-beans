@@ -1,3 +1,4 @@
+#[cfg(feature = "ndarray")]
 use ndarray::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -53,6 +54,7 @@ pub fn take_subset_indices_names_if_needed(
     }
 }
 
+#[cfg(feature = "ndarray")]
 pub fn ndarray_to_triplets(array: &Array2<f32>) -> Vec<(u64, u64, f32)> {
     let eps = 1e-6;
     array

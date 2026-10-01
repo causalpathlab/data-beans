@@ -151,5 +151,5 @@ fn sample_sorted(rng: &mut SmallRng, total: usize, target: Option<usize>) -> Vec
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ndarray"))]
 mod tests;

@@ -351,6 +351,7 @@ impl SparseIoVec {
         ))
     }
 
+    #[cfg(feature = "ndarray")]
     /// Take columns neighbouring with the given `cells`
     ///
     /// # Arguments
@@ -473,6 +474,7 @@ impl SparseIoVec {
         ))
     }
 
+    #[cfg(feature = "ndarray")]
     /// Take columns matched with the given `cells`
     ///
     /// # Arguments
@@ -580,6 +582,7 @@ impl SparseIoVec {
         ))
     }
 
+    #[cfg(feature = "ndarray")]
     /// Query columns with projection data
     ///
     /// # Arguments

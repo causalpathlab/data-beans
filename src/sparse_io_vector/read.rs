@@ -143,6 +143,7 @@ impl SparseIoVec {
         Ok((dims, triplets))
     }
 
+    #[cfg(feature = "ndarray")]
     pub fn read_columns_ndarray<I>(&self, cells: I) -> anyhow::Result<ndarray::Array2<f32>>
     where
         I: Iterator<Item = usize>,
@@ -362,6 +363,7 @@ impl SparseIoVec {
         Ok(((nrow_out, ncol_out), triplets))
     }
 
+    #[cfg(feature = "ndarray")]
     pub fn read_rows_ndarray<I>(&self, rows: I) -> anyhow::Result<ndarray::Array2<f32>>
     where
         I: Iterator<Item = usize>,

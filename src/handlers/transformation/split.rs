@@ -488,5 +488,5 @@ fn partition_groups(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ndarray"))]
 mod tests;
