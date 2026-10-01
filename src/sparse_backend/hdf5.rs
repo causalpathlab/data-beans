@@ -277,6 +277,39 @@ impl SparseIo for SparseMtxData {
         &self.by_column_indptr
     }
 
+    fn metadata(&self) -> Metadata {
+        use hdf5::types::VarLenUnicode;
+        self.backend
+            .attr(meta::ATTR)
+            .and_then(|a| a.read_scalar::<VarLenUnicode>())
+            .ok()
+            .and_then(|json| serde_json::from_str(json.as_str()).ok())
+            .unwrap_or_default()
+    }
+
+    fn set_metadata(&mut self, values: &Metadata) -> anyhow::Result<()> {
+        use hdf5::types::VarLenUnicode;
+        anyhow::ensure!(
+            !self.backend.is_read_only(),
+            "{} is open for reading only: set its metadata while creating it",
+            self.file_name
+        );
+        if self.backend.attr(meta::ATTR).is_ok() {
+            self.backend.delete_attr(meta::ATTR)?;
+        }
+        if !values.is_empty() {
+            let json: VarLenUnicode = serde_json::to_string(values)?
+                .parse()
+                .map_err(|e| anyhow!("metadata: {e}"))?;
+            self.backend
+                .new_attr::<VarLenUnicode>()
+                .create(meta::ATTR)?
+                .write_scalar(&json)?;
+        }
+        self.backend.flush()?;
+        Ok(())
+    }
+
     fn reopen_backend(&mut self) -> anyhow::Result<()> {
         // The open handle points at the deleted inode after the swap; reopen on
         // the path and refresh the resident indptrs.

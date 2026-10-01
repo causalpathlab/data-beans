@@ -66,6 +66,7 @@ pub fn run_convert(args: &ConvertArgs) -> anyhow::Result<()> {
         )?;
         out.register_row_names_vec(&data.row_names()?);
         out.register_column_names_vec(&data.column_names()?);
+        out.set_metadata(&data.metadata())?;
         drop(out);
         info!("re-encoded {} non-zeros in {} x {}", nnz, nrow, ncol);
     }

@@ -64,6 +64,32 @@ fn a_clean_merge_round_trips() -> anyhow::Result<()> {
 }
 
 #[test]
+fn a_merge_keeps_the_metadata_its_inputs_share() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (a, b) = (dir.path().join("a.zarr"), dir.path().join("b.zarr"));
+    for (path, sample) in [(&a, "s1"), (&b, "s2")] {
+        let path = path.to_str().expect("utf8");
+        write_fixture(path, 2, 1.0)?;
+        let mut data = open_sparse_matrix(path, &SparseIoBackend::Zarr)?;
+        data.set_meta(meta::SAMPLE, sample)?;
+        data.set_meta(meta::PRODUCER, "p1")?;
+    }
+    let out = dir.path().join("m");
+    run_merge_backend(&merge_args(
+        &[a.to_str().expect("utf8"), b.to_str().expect("utf8")],
+        out.to_str().expect("utf8"),
+    ))?;
+    let merged = open_sparse_matrix(
+        &format!("{}.zarr", out.to_str().expect("utf8")),
+        &SparseIoBackend::Zarr,
+    )?;
+    // Samples differ, so `sample` goes; the producer is the same.
+    assert_eq!(merged.meta(meta::SAMPLE), None);
+    assert_eq!(merged.meta(meta::PRODUCER).as_deref(), Some("p1"));
+    Ok(())
+}
+
+#[test]
 fn a_corrupted_input_fails_instead_of_shipping_a_short_matrix() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let a = dir.path().join("a.zarr");

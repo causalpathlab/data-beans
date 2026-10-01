@@ -279,6 +279,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
     let mut column_batch_names: Vec<Box<str>> = vec![];
     let mut col_offset: u64 = 0;
     let mut nnz_offset: u64 = 0;
+    let mut metas: Vec<Metadata> = Vec::with_capacity(num_batches);
 
     for (batch_idx, data_file) in args.data_files.iter().enumerate() {
         info!("inventorying data file: {}", data_file);
@@ -290,6 +291,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         };
 
         let data = open_sparse_matrix(data_file, &backend)?;
+        metas.push(data.metadata());
         let ncol = data
             .num_columns()
             .ok_or_else(|| anyhow::anyhow!("missing ncol in {}", data_file))?;
@@ -390,6 +392,8 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
 
     out.register_row_names_vec(&row_names);
     out.register_column_names_vec(&column_names);
+    // What every batch says alike: a merge of samples keeps no `sample`.
+    out.set_metadata(&meta::common_metadata(&metas))?;
     drop(out);
 
     info!(
