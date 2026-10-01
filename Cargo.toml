@@ -42,7 +42,7 @@ metal = ["legume-numeric/metal"]
 hdf5 = ["dep:hdf5"]
 
 [dependencies]
-legume-numeric = { version = "0.8.10", features = ["matrix", "param", "candle"] }
+legume-numeric = { version = "0.8.12", features = ["matrix", "param", "candle"] }
 
 anyhow = "1.0"
 clap = { version = "4.5.20", features = ["derive"] }
