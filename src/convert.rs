@@ -356,35 +356,11 @@ pub fn convert_zarr_to_backend(zarr_file: &str, output: &str) -> anyhow::Result<
     Ok(())
 }
 
-/// What conversion writes, as stamped on the caches it leaves: bumped
-/// whenever that changes, so a cache an older conversion wrote is converted
-/// again rather than read.
-const CONVERSION: u64 = 2;
-const CONVERSION_ATTR: &str = "data_beans_conversion";
-
-/// Whether the cache at `path` was written by this conversion or a later one.
-fn conversion_is_current(path: &str) -> bool {
-    open_zarr_store(path)
-        .and_then(|store| read_zarr_group_attr::<u64>(store, CONVERSION_ATTR))
-        .is_ok_and(|v| v >= CONVERSION)
-}
-
-fn stamp_conversion(path: &str) -> anyhow::Result<()> {
-    let store = std::sync::Arc::new(zarrs::filesystem::FilesystemStore::new(path)?);
-    let mut group = zarrs::group::Group::open(store, "/")?;
-    group
-        .attributes_mut()
-        .insert(CONVERSION_ATTR.into(), CONVERSION.into());
-    group.store_metadata()?;
-    Ok(())
-}
-
 /// Try to open a data file directly; if that fails, attempt automatic
 /// conversion from raw 10x formats (h5/h5ad, zarr/zarr.zip).
 ///
 /// Converted backends are cached as `{data_file}.db.zarr` next to
-/// the original file so subsequent calls skip conversion; a cache an older
-/// conversion wrote is converted again.
+/// the original file so subsequent calls skip conversion.
 pub fn try_open_or_convert(
     data_file: &str,
 ) -> anyhow::Result<Box<dyn SparseIo<IndexIter = Vec<usize>>>> {
@@ -401,11 +377,8 @@ pub fn try_open_or_convert(
             let converted = format!("{}.db.zarr", base);
 
             if std::path::Path::new(&converted).exists() {
-                if conversion_is_current(&converted) {
-                    info!("Using cached conversion: {}", converted);
-                    return open_sparse_matrix(&converted, &SparseIoBackend::Zarr);
-                }
-                info!("Converting again: {converted} was written by an older conversion");
+                info!("Using cached conversion: {}", converted);
+                return open_sparse_matrix(&converted, &SparseIoBackend::Zarr);
             }
 
             match ext.as_ref() {
@@ -435,7 +408,6 @@ pub fn try_open_or_convert(
                 _ => return Err(original_err),
             }
 
-            stamp_conversion(&converted)?;
             open_sparse_matrix(&converted, &SparseIoBackend::Zarr)
         }
     }
@@ -552,39 +524,6 @@ mod tests {
             m.row(2).iter().sum::<f32>() + m.column(2).iter().sum::<f32>(),
             0.
         );
-    }
-
-    #[test]
-    fn a_cache_from_an_older_conversion_is_converted_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = dir.path().join("matrix.zarr");
-        xenium_like_store(&store);
-        let store = store.to_str().unwrap();
-        // As an older conversion left it: unstamped, its row named by index.
-        let cache = dir.path().join("matrix.db.zarr");
-        let stale = TenxMatrix {
-            triplets: vec![(0, 0, 1.0)],
-            reach: (1, 1),
-            row_ids: None,
-            row_names: None,
-            row_types: None,
-            column_names: None,
-        };
-        write_10x_matrix(
-            stale,
-            "gene",
-            "",
-            cache.to_str().unwrap(),
-            &SparseIoBackend::Zarr,
-        )
-        .unwrap();
-
-        let genes = names(&["FID1_GENE1", "FID2_GENE2"]).unwrap();
-        let rows = |store| try_open_or_convert(store).unwrap().row_names().unwrap();
-        assert_eq!(rows(store), genes);
-        // Current now, the cache is read even with the store gone.
-        std::fs::remove_dir_all(store).unwrap();
-        assert_eq!(rows(store), genes);
     }
 
     #[test]
