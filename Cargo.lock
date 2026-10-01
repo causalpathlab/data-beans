@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "data-beans"
-version = "0.6.18"
+version = "0.6.19"
 dependencies = [
  "anyhow",
  "approx",
@@ -2409,9 +2409,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "legume-numeric"
-version = "0.8.12"
+version = "0.8.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80ece5ddba84db43f818b4e42a42343dc29db4106a356b11eb5beb9c40e0ae93"
+checksum = "cff17fea4f8fb514445dbe2559e20aba7c7e9bd5d26bd7029b6e6bf03d31cfa1"
 dependencies = [
  "anyhow",
  "approx",

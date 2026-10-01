@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_imports)]
 
-pub use legume_numeric::candle::candle_core::Tensor;
+#[cfg(feature = "tensor")]
+pub use legume_numeric::candle_core::Tensor;
 pub use nalgebra::DMatrix;
 pub use nalgebra_sparse::{csc::CscMatrix, csr::CsrMatrix};
 pub use ndarray::prelude::*;
@@ -93,6 +94,7 @@ pub trait SparseIo: Sync + Send {
         Array2::<f32>::from_nonzero_triplets(nrow, ncol, &triplets)
     }
 
+    #[cfg(feature = "tensor")]
     /// Read columns within the range and return dense `candle_core::Tensor`
     /// * `columns` : range e.g., 0..3 -> [0, 1, 2] or vec![0, 1, 2]
     ///
@@ -142,6 +144,7 @@ pub trait SparseIo: Sync + Send {
         Array2::<f32>::from_nonzero_triplets(nrow, ncol, &triplets)
     }
 
+    #[cfg(feature = "tensor")]
     /// Read rows within the range and return dense `candle_core::Tensor`
     /// * `rows` : range e.g., 0..3 -> [0, 1, 2] or vec![0, 1, 2]
     ///
