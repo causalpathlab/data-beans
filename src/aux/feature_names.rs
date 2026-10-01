@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use crate::sparse_io_vector::RowNameCanonicalizer;
-use legume_numeric::matrix::membership::canon_locus;
+use genomic_data::coordinates::{self, chr_stripped, PeakCoord};
 use rustc_hash::FxHashMap as HashMap;
 
 /// Per-name canonicalization rule for cross-backend row alignment.
@@ -71,16 +71,8 @@ impl FeatureNameKind {
         match self {
             FeatureNameKind::Exact => name.into(),
             FeatureNameKind::Gene { delim } => gene_canonicalize(name, *delim),
-            FeatureNameKind::Locus { .. } => canon_locus(name),
-            FeatureNameKind::Mixed => {
-                if parse_locus(name).is_some() {
-                    canon_locus(name)
-                } else if name.contains('_') {
-                    gene_canonicalize(name, '_')
-                } else {
-                    name.into()
-                }
-            }
+            FeatureNameKind::Locus { .. } => locus_key(name).unwrap_or_else(|| name.into()),
+            FeatureNameKind::Mixed => mixed_canonicalize(name),
         }
     }
 
@@ -181,28 +173,34 @@ impl FeatureNameKind {
     }
 }
 
-/// Parse a row name as `(chr, start, end)`. Accepts either
-/// `chr1:1000-2000`, `1:1000-2000`, `chr1_1000_2000`, or `1_1000_2000`.
-/// Returns `None` for anything that doesn't match — those names pass
-/// through the overlap pass untouched.
+/// Parse a row name as `(chr, start, end)` under the shared locus grammar
+/// ([`coordinates::parse_interval`]): `chr1:1000-2000`, `chr1_1000_2000`,
+/// `chr1-1000-2000`, `1_1000_2000`. The chromosome comes back with its
+/// `chr` prefix dropped and its case kept (`chrX` and `X` match, `x` does
+/// not), and contig names carrying `_` or `-` stay whole. Returns `None`
+/// for anything that doesn't match; those names pass through the overlap
+/// pass untouched.
 pub fn parse_locus(name: &str) -> Option<(Box<str>, u64, u64)> {
-    let lower = name.to_ascii_lowercase();
-    let stripped = lower
-        .strip_prefix("chr")
-        .map(str::to_string)
-        .unwrap_or(lower);
-    // Try canonical `_` form first: chr_start_end → ["chr", "start", "end"].
-    let parts: Vec<&str> = stripped.splitn(3, [':', '-', '_']).collect();
-    if parts.len() != 3 {
-        return None;
+    let l = coordinates::parse_interval(name)?;
+    Some((chr_stripped(&l.chr).into(), l.start as u64, l.end as u64))
+}
+
+/// Canonical key of one locus (`chrX:0-100` becomes `X_0_100`), or
+/// `None` when `name` is not a locus.
+fn locus_key(name: &str) -> Option<Box<str>> {
+    coordinates::parse_interval(name).map(|l| l.locus_key())
+}
+
+/// Per-name rule of [`FeatureNameKind::Mixed`]: locus key, else the gene
+/// rule for `_` names, else the name unchanged.
+fn mixed_canonicalize(name: &str) -> Box<str> {
+    if let Some(key) = locus_key(name) {
+        key
+    } else if name.contains('_') {
+        gene_canonicalize(name, '_')
+    } else {
+        name.into()
     }
-    let chr = parts[0];
-    let start: u64 = parts[1].parse().ok()?;
-    let end: u64 = parts[2].parse().ok()?;
-    if end < start {
-        return None;
-    }
-    Some((chr.to_string().into_boxed_str(), start, end))
 }
 
 /// Build the overlap-merge canonical map from a flat list of row names
@@ -210,11 +208,11 @@ pub fn parse_locus(name: &str) -> Option<(Box<str>, u64, u64)> {
 /// are grouped per chromosome, sorted by start, and clustered by
 /// transitive overlap (any interval whose start falls before the
 /// running cluster's max end). The cluster canonical is
-/// `_{chr}_{min_start}_{max_end}` so every member name maps to a single
+/// `{chr}_{min_start}_{max_end}` so every member name maps to a single
 /// well-defined string.
 ///
 /// Names that fail to parse are not entered into the map; the caller
-/// falls back to per-name `canon_locus` for those.
+/// falls back to the per-name rule for those.
 pub fn build_locus_overlap_canonical_map(names: &[Box<str>]) -> HashMap<Box<str>, Box<str>> {
     let n = names.len();
     let parsed: Vec<Option<(Box<str>, u64, u64)>> = names.iter().map(|n| parse_locus(n)).collect();
@@ -268,15 +266,18 @@ pub fn build_locus_overlap_canonical_map(names: &[Box<str>]) -> HashMap<Box<str>
         }
     }
 
-    // Build name → canonical map. Canonical = `_{chr}_{min_start}_{max_end}`
-    // — matches canon_locus's `chr` strip + `_` separator convention.
+    // Build name → canonical map: the cluster extent under `locus_key`.
     let mut out: HashMap<Box<str>, Box<str>> = HashMap::default();
     for (i, p) in parsed.iter().enumerate() {
         if let Some((chr, _, _)) = p {
             let root = find(&mut parent, i);
             let (mn, mx) = cluster_extent.get(&root).copied().unwrap_or((0, 0));
-            let canonical = format!("{}_{}_{}", chr, mn, mx).into_boxed_str();
-            out.insert(names[i].clone(), canonical);
+            let cluster = PeakCoord {
+                chr: chr.clone(),
+                start: mn as i64,
+                end: mx as i64,
+            };
+            out.insert(names[i].clone(), cluster.locus_key());
         }
     }
     out
@@ -286,10 +287,15 @@ pub fn build_locus_overlap_canonical_map(names: &[Box<str>]) -> HashMap<Box<str>
 /// `names` should be the concatenation of every input backend's row
 /// names (in any order). The returned canonicalizer does
 /// `map.get(name).cloned()` first, falling back to per-name
-/// `canon_locus` for names that didn't parse as a locus.
+/// locus canonical for names outside the map.
 pub fn build_locus_overlap_canonicalizer(names: &[Box<str>]) -> RowNameCanonicalizer {
     let map = Arc::new(build_locus_overlap_canonical_map(names));
-    Arc::new(move |name: &str| map.get(name).cloned().unwrap_or_else(|| canon_locus(name)))
+    Arc::new(move |name: &str| {
+        map.get(name)
+            .cloned()
+            .or_else(|| locus_key(name))
+            .unwrap_or_else(|| name.into())
+    })
 }
 
 /// Per-name dispatcher for **mixed-kind** axes (e.g. multiome with peaks
@@ -304,15 +310,9 @@ pub fn build_locus_overlap_canonicalizer(names: &[Box<str>]) -> RowNameCanonical
 pub fn build_mixed_kind_canonicalizer(names: &[Box<str>]) -> RowNameCanonicalizer {
     let map = Arc::new(build_locus_overlap_canonical_map(names));
     Arc::new(move |name: &str| {
-        if let Some(c) = map.get(name) {
-            c.clone()
-        } else if parse_locus(name).is_some() {
-            canon_locus(name)
-        } else if name.contains('_') {
-            gene_canonicalize(name, '_')
-        } else {
-            name.into()
-        }
+        map.get(name)
+            .cloned()
+            .unwrap_or_else(|| mixed_canonicalize(name))
     })
 }
 
@@ -488,9 +488,61 @@ mod tests {
         );
         assert_eq!(
             parse_locus("chrX:5000-6000"),
-            Some(("x".into(), 5000, 6000))
+            Some(("X".into(), 5000, 6000))
         );
-        assert_eq!(parse_locus("chrMT:1-100"), Some(("mt".into(), 1, 100)));
+        assert_eq!(parse_locus("chrMT:1-100"), Some(("MT".into(), 1, 100)));
+        assert_eq!(
+            parse_locus("chr1-1000-2000"),
+            Some(("1".into(), 1000, 2000))
+        );
+    }
+
+    #[test]
+    fn parse_locus_keeps_contig_names_with_separators() {
+        assert_eq!(
+            parse_locus("chrUn_CTG1v1:0-100"),
+            Some(("Un_CTG1v1".into(), 0, 100))
+        );
+        assert_eq!(
+            parse_locus("chr1_CTG2_random_5_10"),
+            Some(("1_CTG2_random".into(), 5, 10))
+        );
+        // The canonical key parses back to the same locus.
+        assert_eq!(
+            parse_locus("Un_CTG1v1_0_100"),
+            Some(("Un_CTG1v1".into(), 0, 100))
+        );
+    }
+
+    #[test]
+    fn contig_peaks_stay_loci_on_a_mixed_axis() {
+        let names: Vec<Box<str>> = vec![
+            "chr1_CTG1v1_random:5-10".into(),
+            "chr4_CTG2v2_random:5-10".into(),
+            "ENSG000_GENE1".into(),
+        ];
+        let canon = build_mixed_kind_canonicalizer(&names);
+        assert_eq!(canon(&names[0]).as_ref(), "1_CTG1v1_random_5_10");
+        assert_eq!(canon(&names[1]).as_ref(), "4_CTG2v2_random_5_10");
+        assert_eq!(canon(&names[2]).as_ref(), "GENE1");
+    }
+
+    #[test]
+    fn locus_canonical_keeps_case_on_every_path() {
+        let names: Vec<Box<str>> = vec!["chrX:0-100".into(), "chr1:0-100".into()];
+        let map = build_locus_overlap_canonical_map(&names);
+        assert_eq!(map.get(&names[0]).unwrap().as_ref(), "X_0_100");
+        assert_eq!(map.get(&names[1]).unwrap().as_ref(), "1_0_100");
+        // Names outside the map land on the same key.
+        let canon = build_locus_overlap_canonicalizer(&names);
+        assert_eq!(canon("chrX:200-300").as_ref(), "X_200_300");
+        let mixed = build_mixed_kind_canonicalizer(&names);
+        assert_eq!(mixed("chrX:0-100").as_ref(), "X_0_100");
+        assert_eq!(mixed("chrM:200-300").as_ref(), "M_200_300");
+        let k = FeatureNameKind::Locus {
+            merge_overlapping: false,
+        };
+        assert_eq!(k.canonicalize("chrM:0-100").as_ref(), "M_0_100");
     }
 
     #[test]
@@ -502,6 +554,9 @@ mod tests {
         assert!(parse_locus("chr1:2000-1000").is_none()); // end < start
         assert!(parse_locus("").is_none()); // empty
         assert!(parse_locus("chr1").is_none()); // chr-only
+        assert!(parse_locus("chr:1-2").is_none()); // empty chromosome
+        assert!(parse_locus("ENSG000_GENE1").is_none()); // gene-style
+        assert!(parse_locus("GENE1-AS1").is_none()); // antisense symbol
     }
 
     #[test]
@@ -606,7 +661,7 @@ mod tests {
     #[test]
     fn overlap_map_ignores_non_locus_names() {
         // Non-locus names should not appear in the map; caller falls
-        // back to canon_locus (the default Locus rule).
+        // back to the per-name rule.
         let names = vec![
             "TGFB1".to_string().into_boxed_str(),
             "chr1:1-20".to_string().into_boxed_str(),
@@ -617,26 +672,23 @@ mod tests {
     }
 
     #[test]
-    fn overlap_map_handles_zero_length_interval() {
-        // chr1:1000-1000 — degenerate but valid; should be its own cluster.
+    fn overlap_map_skips_empty_intervals() {
+        // chr1:1000-1000 holds no base, so it is not a locus.
         let names = vec!["chr1:1000-1000".to_string().into_boxed_str()];
         let map = build_locus_overlap_canonical_map(&names);
-        assert_eq!(map.get(&names[0]).unwrap().as_ref(), "1_1000_1000");
+        assert!(map.is_empty());
     }
 
     #[test]
-    fn overlap_canonicalizer_falls_back_to_canon_locus_for_unmatched() {
+    fn overlap_canonicalizer_falls_back_for_unmatched() {
         let names = vec!["chr1:1-20".to_string().into_boxed_str()];
         let canon = build_locus_overlap_canonicalizer(&names);
         // In-cluster name → cluster canonical.
         assert_eq!(canon("chr1:1-20").as_ref(), "1_1_20");
-        // Unrelated locus not in the map → canon_locus normalization.
+        // Unrelated locus not in the map → its own key.
         assert_eq!(canon("chr2:500-600").as_ref(), "2_500_600");
-        // Non-locus → canon_locus passes through unchanged.
-        // (canon_locus for "TGFB1" likely strips no separators and returns
-        // the lowercase form — accept whatever the helper returns.)
-        let g = canon("TGFB1");
-        assert!(!g.is_empty());
+        // Non-locus → unchanged.
+        assert_eq!(canon("GENE1").as_ref(), "GENE1");
     }
 
     // -- Auto-detect & Mixed dispatcher -------------------------------------

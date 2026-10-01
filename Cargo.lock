@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "data-beans"
-version = "0.6.23"
+version = "0.6.24"
 dependencies = [
  "anyhow",
  "approx",
@@ -942,6 +942,7 @@ dependencies = [
  "hdf5-metno",
  "indicatif",
  "indicatif-log-bridge",
+ "legume-genomic-types",
  "legume-numeric",
  "libz-sys",
  "log",
@@ -2054,6 +2055,21 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "legume-genomic-types"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "afa0a202928d3e34a16811aa0ec94c101608f9d7c5134f2980999d58a90b7575"
+dependencies = [
+ "anyhow",
+ "dashmap",
+ "legume-numeric",
+ "log",
+ "nalgebra",
+ "rayon",
+ "rustc-hash",
+]
 
 [[package]]
 name = "legume-numeric"

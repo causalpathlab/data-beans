@@ -50,6 +50,21 @@ fn overlapping_loci_across_files_still_merge() {
     assert_eq!(load_rows(vec![a, b]), 3);
 }
 
+#[test]
+fn locus_rows_keep_chromosome_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = backend(dir.path(), "a", &["chrX:0-100", "chr1:0-100"]);
+    let b = backend(dir.path(), "b", &["chrX:0-100", "chr1:0-100"]);
+    let loaded = read_data_on_shared_rows(ReadSharedRowsArgs {
+        data_files: vec![a, b],
+        ..Default::default()
+    })
+    .expect("load");
+    let mut rows = loaded.data.row_names().unwrap();
+    rows.sort();
+    assert_eq!(rows, vec![Box::<str>::from("1_0_100"), "X_0_100".into()]);
+}
+
 ////////////////////////////////////////////////////////////////////
 // empty-barcode gate                                              //
 ////////////////////////////////////////////////////////////////////
