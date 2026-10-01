@@ -16,7 +16,7 @@
 //! Name resolution goes through [`FeatureNameKind`] so `TGFB1` and
 //! `ENSG00000105329_TGFB1` resolve to the same row.
 
-use crate::aux::feature_names::{folded_locus_key, FeatureNameKind};
+use crate::aux::feature_names::FeatureNameKind;
 use legume_numeric::matrix::traits::IoOps;
 use nalgebra::DMatrix;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -139,33 +139,15 @@ pub fn load_frozen_feature_host(args: FrozenLoadArgs) -> anyhow::Result<FrozenFe
         );
     }
 
-    let target_canon: Vec<Box<str>> = args
-        .target_feature_names
-        .iter()
-        .map(|n| args.name_kind.canonicalize(n))
-        .collect();
-    let mut matched: Vec<Option<usize>> = target_canon
-        .iter()
-        .map(|c| src_by_canon.get(c).copied())
-        .collect();
-    let n_legacy = if args.name_kind.is_exact() {
-        0
-    } else {
-        match_legacy_locus_case(&src_names, &target_canon, &mut matched)
-    };
-    if n_legacy > 0 {
-        log::info!(
-            "{}: {} locus rows matched only with the chromosome case ignored \
-             (a dictionary saved with lowercased locus names)",
-            args.dictionary_path,
-            n_legacy
-        );
+    let mut keep_target_indices = Vec::new();
+    let mut keep_src_indices = Vec::new();
+    for (target_i, name) in args.target_feature_names.iter().enumerate() {
+        let canon = args.name_kind.canonicalize(name);
+        if let Some(&src_i) = src_by_canon.get(&canon) {
+            keep_target_indices.push(target_i);
+            keep_src_indices.push(src_i);
+        }
     }
-    let (keep_target_indices, keep_src_indices): (Vec<usize>, Vec<usize>) = matched
-        .iter()
-        .enumerate()
-        .filter_map(|(t, m)| m.map(|s| (t, s)))
-        .unzip();
     anyhow::ensure!(
         !keep_target_indices.is_empty(),
         "No feature names matched between {} (n={}) and target axis (n={}) under {:?} \
@@ -226,70 +208,6 @@ pub fn load_frozen_feature_host(args: FrozenLoadArgs) -> anyhow::Result<FrozenFe
         n_src,
         h,
     })
-}
-
-/// Second pass for dictionaries whose locus rows were saved lowercased
-/// (`x_0_100` for `chrX:0-100`; data-beans 0.6.5 to 0.6.23 wrote them that
-/// way). A target row left unmatched by the exact pass takes the unused
-/// source row whose [`folded_locus_key`] equals its own, provided the key
-/// names exactly one such source row and one case-kept spelling among the
-/// unmatched target rows; any other key is left unmatched and reported.
-/// Only names that parse as loci take part. Returns how many target rows
-/// this pass matched.
-fn match_legacy_locus_case(
-    src_names: &[Box<str>],
-    target_canon: &[Box<str>],
-    matched: &mut [Option<usize>],
-) -> usize {
-    // Folded key -> the unmatched target rows with their case-kept spelling.
-    let mut targets: FxHashMap<Box<str>, Vec<(usize, Box<str>)>> = FxHashMap::default();
-    for (t, canon) in target_canon.iter().enumerate() {
-        if matched[t].is_none() {
-            if let Some(folded) = folded_locus_key(canon) {
-                targets.entry(folded).or_default().push((t, canon.clone()));
-            }
-        }
-    }
-    if targets.is_empty() {
-        return 0;
-    }
-    let mut used = vec![false; src_names.len()];
-    for &s in matched.iter().flatten() {
-        used[s] = true;
-    }
-    // Folded key -> unused source rows, for keys some target row needs.
-    let mut src: FxHashMap<Box<str>, Vec<usize>> = FxHashMap::default();
-    for (i, name) in src_names.iter().enumerate() {
-        if !used[i] {
-            if let Some(folded) = folded_locus_key(name).filter(|k| targets.contains_key(k)) {
-                src.entry(folded).or_default().push(i);
-            }
-        }
-    }
-    let (mut n_matched, mut n_ambiguous) = (0usize, 0usize);
-    for (folded, rows) in &targets {
-        let Some(src_rows) = src.get(folded) else {
-            continue;
-        };
-        // Any number of target rows may share one spelling, as in the exact pass.
-        let one_spelling = rows.iter().all(|(_, k)| *k == rows[0].1);
-        match src_rows.as_slice() {
-            &[s] if one_spelling => {
-                for &(t, _) in rows {
-                    matched[t] = Some(s);
-                    n_matched += 1;
-                }
-            }
-            _ => n_ambiguous += 1,
-        }
-    }
-    if n_ambiguous > 0 {
-        log::warn!(
-            "{n_ambiguous} locus keys fold onto more than one source row or target spelling \
-             once the chromosome case is ignored; left unmatched rather than guessed"
-        );
-    }
-    n_matched
 }
 
 #[cfg(test)]
@@ -466,83 +384,6 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("No feature names matched"));
-    }
-
-    /// Load a one-column dictionary with rows `dict` onto `target`.
-    fn load_onto(dict: &[&str], target: &[&str], kind: FeatureNameKind) -> FrozenFeatureHost {
-        let dir = tempfile::tempdir().unwrap();
-        let dict_path = dir.path().join("d.parquet").to_str().unwrap().to_string();
-        let src = DMatrix::<f32>::from_fn(dict.len(), 1, |i, _| i as f32);
-        write_test_parquet(&dict_path, dict, "peak", &["h0"], &src);
-        let target: Vec<Box<str>> = target.iter().map(|s| (*s).into()).collect();
-        load_frozen_feature_host(FrozenLoadArgs {
-            dictionary_path: &dict_path,
-            bias_path: None,
-            target_feature_names: &target,
-            name_kind: kind,
-            source_name_map: None,
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn lowercased_locus_dictionary_matches_case_kept_rows() {
-        let host = load_onto(
-            &["x_0_100", "1_0_100", "m_0_50", "un_ctg1v1_0_10", "y_0_100"],
-            &[
-                "chrM:0-50",
-                "chrX:0-100",
-                "chr1:0-100",
-                "chrUn_CTG1v1:0-10",
-                "GENE1",
-                "chrY:0-100",
-                "Y_0_100",
-            ],
-            FeatureNameKind::Mixed,
-        );
-        // chr1 matches exactly; M, X and the contig match with case ignored;
-        // both spellings of chrY share one key, so both take `y_0_100`.
-        assert_eq!(host.keep_target_indices, vec![0, 1, 2, 3, 5, 6]);
-        assert_eq!(host.keep_src_indices, vec![2, 0, 1, 3, 4, 4]);
-    }
-
-    #[test]
-    fn a_key_with_two_case_spellings_is_not_guessed() {
-        let locus = FeatureNameKind::Locus {
-            merge_overlapping: false,
-        };
-        // Two target spellings fold onto one source row.
-        let host = load_onto(
-            &["un_ctg_0_10", "A"],
-            &["chrUn_CTG:0-10", "UN_ctg_0_10", "A"],
-            locus.clone(),
-        );
-        assert_eq!(host.keep_target_indices, vec![2]);
-        // Two source spellings fold onto one target row.
-        let host = load_onto(
-            &["Un_ctg_0_10", "un_CTG_0_10", "A"],
-            &["chrUn_CTG:0-10", "A"],
-            locus,
-        );
-        assert_eq!(host.keep_target_indices, vec![1]);
-    }
-
-    #[test]
-    fn an_exact_match_is_never_replaced_by_the_case_fallback() {
-        let host = load_onto(
-            &["X_0_100", "x_0_100"],
-            &["chrX:0-100"],
-            FeatureNameKind::Locus {
-                merge_overlapping: false,
-            },
-        );
-        assert_eq!(host.keep_src_indices, vec![0]);
-    }
-
-    #[test]
-    fn the_exact_kind_skips_the_case_fallback() {
-        let host = load_onto(&["x_0_100", "A"], &["X_0_100", "A"], FeatureNameKind::Exact);
-        assert_eq!(host.keep_target_indices, vec![1]);
     }
 
     #[test]
