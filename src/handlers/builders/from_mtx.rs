@@ -1,7 +1,7 @@
 use super::{log_feature_type_histogram, run_squeeze_if_needed};
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
-use crate::utilities::name_matching::{make_names_unique, RowTypeFilter};
+use crate::utilities::name_matching::{id_name, make_names_unique, RowTypeFilter};
 use crate::zarr_io::*;
 
 use clap::Args;
@@ -210,15 +210,7 @@ pub fn run_build_from_mtx(args: &FromMtxArgs) -> anyhow::Result<()> {
                     );
                 }
 
-                let tag_for = |hto_row: usize| -> String {
-                    let id = rows.ids[hto_row].as_ref();
-                    let name = rows.names[hto_row].as_ref();
-                    if name.is_empty() || name == id {
-                        id.to_string()
-                    } else {
-                        format!("{}_{}", id, name)
-                    }
-                };
+                let tag_for = |hto_row: usize| id_name(&rows.ids[hto_row], &rows.names[hto_row]);
 
                 let mut col_names = data.column_names()?;
 
@@ -297,31 +289,18 @@ struct MtxFeatureRows {
 }
 
 impl MtxFeatureRows {
-    /// Build the composite `id{ROW_SEP}name{...}` display names used when
-    /// registering rows on the backend. Derived on demand so the struct
-    /// doesn't carry a third parallel vector.
+    /// The display names registered on the backend: `id{ROW_SEP}name`
+    /// ([`id_name`]) with two or more name columns, else the id.
     fn build_display_names(&self) -> Vec<Box<str>> {
-        let take = self.row_name_columns.max(1);
-        self.ids
-            .iter()
-            .zip(self.names.iter())
-            .map(|(id, name)| {
-                let id = id.as_ref();
-                let name = name.as_ref();
-                // `id` alone when the name is empty or repeats it, as the
-                // other 10x readers name rows (`compose_id_name`).
-                let joined = if take >= 2 && !name.is_empty() && name != id {
-                    let mut s = String::with_capacity(id.len() + ROW_SEP.len() + name.len());
-                    s.push_str(id);
-                    s.push_str(ROW_SEP);
-                    s.push_str(name);
-                    s
-                } else {
-                    id.to_string()
-                };
-                joined.into_boxed_str()
-            })
-            .collect()
+        if self.row_name_columns >= 2 {
+            self.ids
+                .iter()
+                .zip(&self.names)
+                .map(|(id, name)| id_name(id, name))
+                .collect()
+        } else {
+            self.ids.clone()
+        }
     }
 }
 
@@ -419,41 +398,4 @@ fn is_chromosome_name(s: &str) -> bool {
         return true;
     }
     s.parse::<u32>().is_ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::utilities::name_matching::compose_id_name;
-
-    fn boxed(xs: &[&str]) -> Vec<Box<str>> {
-        xs.iter().map(|&x| Box::from(x)).collect()
-    }
-
-    #[test]
-    fn rows_are_named_as_the_other_10x_readers_name_them() {
-        let rows = |row_name_columns| MtxFeatureRows {
-            ids: boxed(&["FID1", "FID2", "FID3"]),
-            names: boxed(&["GENE1", "FID2", ""]),
-            types: None,
-            row_name_columns,
-        };
-        // By id alone where the name is empty or repeats it, as
-        // `compose_id_name` does.
-        assert_eq!(
-            rows(2).build_display_names(),
-            compose_id_name(
-                boxed(&["FID1", "FID2", "FID3"]),
-                boxed(&["GENE1", "FID2", ""])
-            )
-        );
-        assert_eq!(
-            rows(2).build_display_names(),
-            boxed(&["FID1_GENE1", "FID2", "FID3"])
-        );
-        assert_eq!(
-            rows(1).build_display_names(),
-            boxed(&["FID1", "FID2", "FID3"])
-        );
-    }
 }

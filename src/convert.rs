@@ -13,12 +13,16 @@ use log::info;
 /// its triplets, how far they reach, and whatever names the file lists.
 pub struct TenxMatrix {
     pub triplets: Vec<(u64, u64, f32)>,
-    /// Rows and columns the triplets reach (`max index + 1`).
+    /// Rows and columns the triplets span: every compressed vector, and up
+    /// to the largest index on the other axis.
     pub reach: (usize, usize),
     pub row_ids: Option<Vec<Box<str>>>,
     pub row_names: Option<Vec<Box<str>>>,
     pub row_types: Option<Vec<Box<str>>>,
     pub column_names: Option<Vec<Box<str>>>,
+    /// Rows to keep whatever their type, as a probe set's targets; `None`
+    /// for all.
+    pub keep_rows: Option<Vec<bool>>,
 }
 
 /// The length of one axis: the number of names the file lists for it (one
@@ -35,9 +39,9 @@ fn axis_len(named: Option<usize>, reach: usize, what: &str) -> anyhow::Result<us
 
 /// Write `m` as a new backend at `backend_file`: rows named `{id}_{name}`
 /// (just `id` when the name is empty or repeats it; made unique) and kept by
-/// type (comma-separated, case-insensitive patterns), columns named as the
-/// file names them. Shared by the 10x readers, so every format and entry
-/// point names and keeps rows alike.
+/// type (comma-separated, case-insensitive patterns; a file without types
+/// keeps all), columns named as the file names them. Shared by the 10x
+/// readers, so every format and entry point names and keeps rows alike.
 pub fn write_10x_matrix(
     m: TenxMatrix,
     select_row_type: &str,
@@ -45,186 +49,82 @@ pub fn write_10x_matrix(
     backend_file: &str,
     backend: &SparseIoBackend,
 ) -> anyhow::Result<()> {
-    let nrows = axis_len(m.row_ids.as_ref().map(Vec::len), m.reach.0, "rows")?;
-    let ncols = axis_len(m.column_names.as_ref().map(Vec::len), m.reach.1, "columns")?;
-    let nnz = m.triplets.len();
-    info!("Matrix: {nrows} x {ncols}");
+    let TenxMatrix {
+        mut triplets,
+        reach,
+        row_ids,
+        row_names,
+        row_types,
+        column_names,
+        keep_rows,
+    } = m;
+    let nrows = axis_len(row_ids.as_ref().map(Vec::len), reach.0, "rows")?;
+    let ncols = axis_len(column_names.as_ref().map(Vec::len), reach.1, "columns")?;
     let index = |n: usize| {
         (0..n)
             .map(|i| i.to_string().into_boxed_str())
             .collect::<Vec<_>>()
     };
-    let row_ids = m.row_ids.unwrap_or_else(|| index(nrows));
-    let row_names = m.row_names.unwrap_or_else(|| vec![Box::from(""); nrows]);
-    let row_types = m
-        .row_types
-        .unwrap_or_else(|| vec![Box::from(select_row_type); nrows]);
+    let row_ids = row_ids.unwrap_or_else(|| index(nrows));
+    let row_names = row_names.unwrap_or_else(|| vec![Box::from(""); nrows]);
     anyhow::ensure!(
-        row_names.len() == nrows && row_types.len() == nrows,
+        row_names.len() == nrows
+            && row_types.as_ref().is_none_or(|t| t.len() == nrows)
+            && keep_rows.as_ref().is_none_or(|k| k.len() == nrows),
         "the file lists {nrows} row ids but {} row names and {} row types",
         row_names.len(),
-        row_types.len()
+        row_types.as_ref().map_or(0, Vec::len)
     );
-    let column_names = m.column_names.unwrap_or_else(|| index(ncols));
+    let column_names = column_names.unwrap_or_else(|| index(ncols));
 
     let mut row_ids = compose_id_name(row_ids, row_names);
     make_names_unique(&mut row_ids);
-    let select_rows = filter_row_indices_by_type(&row_types, select_row_type, remove_row_type);
+    let mut keep = match &row_types {
+        Some(types) => filter_row_indices_by_type(types, select_row_type, remove_row_type),
+        None => (0..nrows).collect(),
+    };
+    if let Some(keep_rows) = &keep_rows {
+        keep.retain(|&i| keep_rows[i]);
+    }
+    // The other rows leave the triplets before anything is written.
+    if keep.len() < nrows {
+        info!("Keeping {} of {nrows} rows", keep.len());
+        let mut new_row = vec![None; nrows];
+        for (new, &old) in keep.iter().enumerate() {
+            new_row[old] = Some(new as u64);
+        }
+        triplets.retain_mut(|(i, _, _)| match new_row[*i as usize] {
+            Some(new) => {
+                *i = new;
+                true
+            }
+            None => false,
+        });
+        row_ids = keep
+            .iter()
+            .map(|&i| std::mem::take(&mut row_ids[i]))
+            .collect();
+    }
 
+    let nnz = triplets.len();
+    info!("Matrix: {} x {ncols}, {nnz} non-zeros", row_ids.len());
     let mut out = create_sparse_from_triplets_owned(
-        m.triplets,
-        (nrows, ncols, nnz),
+        triplets,
+        (row_ids.len(), ncols, nnz),
         Some(backend_file),
         Some(backend),
     )?;
     info!("Created sparse matrix: {}", backend_file);
     out.register_row_names_vec(&row_ids);
     out.register_column_names_vec(&column_names);
-    if select_rows.len() < nrows {
-        info!(
-            "Keeping {} of {nrows} rows of type `{select_row_type}`",
-            select_rows.len()
-        );
-        out.subset_columns_rows(None, Some(&select_rows))?;
-    }
     Ok(())
 }
 
-/// Where a 10x HDF5 file keeps its sparse matrix and the names of its rows
-/// and columns, and which rows to keep. [`Default`] is Cell Ranger / Space
-/// Ranger / Xenium `*feature_bc_matrix.h5`: features × barcodes under
-/// `matrix`, pointers over barcodes.
+/// Where a 10x file keeps its sparse matrix and the names of its rows and
+/// columns, and which rows to keep: [`MatrixLayout::cell_ranger_h5`] and
+/// [`MatrixLayout::xenium_zarr`].
 #[derive(Clone, Debug)]
-pub struct H5MatrixLayout {
-    pub root_group: Box<str>,
-    pub data_field: Box<str>,
-    pub indices_field: Box<str>,
-    pub indptr_field: Box<str>,
-    pub pointer_type: IndexPointerType,
-    pub row_id_field: Box<str>,
-    pub row_name_field: Box<str>,
-    pub row_type_field: Box<str>,
-    pub select_row_type: Box<str>,
-    pub remove_row_type: Box<str>,
-    pub column_name_field: Box<str>,
-}
-
-impl H5MatrixLayout {
-    pub const ROOT: &'static str = "matrix";
-    pub const DATA: &'static str = "data";
-    pub const INDICES: &'static str = "indices";
-    pub const INDPTR: &'static str = "indptr";
-    pub const ROW_IDS: &'static str = "features/id";
-    pub const ROW_NAMES: &'static str = "features/name";
-    pub const ROW_TYPES: &'static str = "features/feature_type";
-    pub const COLUMN_NAMES: &'static str = "barcodes";
-}
-
-impl Default for H5MatrixLayout {
-    fn default() -> Self {
-        Self {
-            root_group: Self::ROOT.into(),
-            data_field: Self::DATA.into(),
-            indices_field: Self::INDICES.into(),
-            indptr_field: Self::INDPTR.into(),
-            pointer_type: IndexPointerType::Column,
-            row_id_field: Self::ROW_IDS.into(),
-            row_name_field: Self::ROW_NAMES.into(),
-            row_type_field: Self::ROW_TYPES.into(),
-            select_row_type: ZarrMatrixLayout::SELECT_ROW_TYPES.into(),
-            remove_row_type: ZarrMatrixLayout::REMOVE_ROW_TYPES.into(),
-            column_name_field: Self::COLUMN_NAMES.into(),
-        }
-    }
-}
-
-/// Read the sparse matrix of a 10x HDF5 file into a new backend at
-/// `backend_file` ([`write_10x_matrix`]). Shared by `data-beans
-/// from-10x-matrix` and [`try_open_or_convert`]. The caller clears
-/// `backend_file` beforehand and finalizes after.
-#[cfg(feature = "hdf5")]
-pub fn build_from_h5_matrix(
-    h5_file: &str,
-    layout: &H5MatrixLayout,
-    backend_file: &str,
-    backend: &SparseIoBackend,
-) -> anyhow::Result<()> {
-    let file = hdf5::File::open(h5_file)?;
-    info!("Opened 10x HDF5 file: {}", h5_file);
-    let root = file
-        .group(&layout.root_group)
-        .map_err(|_| anyhow::anyhow!("no group `{}` in {}", layout.root_group, h5_file))?;
-    let read = |field: &str| -> anyhow::Result<Vec<u64>> {
-        Ok(root
-            .dataset(field)
-            .map_err(|_| {
-                anyhow::anyhow!("no dataset `{}/{field}` in {h5_file}", layout.root_group)
-            })?
-            .read_1d::<u64>()?
-            .to_vec())
-    };
-    let values: Vec<f32> = root
-        .dataset(&layout.data_field)
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "no dataset `{}/{}` in {h5_file}",
-                layout.root_group,
-                layout.data_field
-            )
-        })?
-        .read_1d::<f32>()?
-        .to_vec();
-    let (indices, indptr) = (read(&layout.indices_field)?, read(&layout.indptr_field)?);
-    let CooTripletsShape { triplets, shape } = ValuesIndicesPointers {
-        values: &values,
-        indices: &indices,
-        indptr: &indptr,
-    }
-    .to_coo(layout.pointer_type)?;
-    info!(
-        "Read {} non-zero elements reaching {} x {}",
-        shape.nnz, shape.nrows, shape.ncols
-    );
-    let names = |field: &str| root.dataset(field).ok().map(read_hdf5_strings).transpose();
-    write_10x_matrix(
-        TenxMatrix {
-            triplets,
-            reach: (shape.nrows, shape.ncols),
-            row_ids: names(&layout.row_id_field)?,
-            row_names: names(&layout.row_name_field)?,
-            row_types: names(&layout.row_type_field)?,
-            column_names: names(&layout.column_name_field)?,
-        },
-        &layout.select_row_type,
-        &layout.remove_row_type,
-        backend_file,
-        backend,
-    )
-}
-
-/// Convert a 10x HDF5 file (Cell Ranger / Space Ranger / Xenium
-/// `*feature_bc_matrix.h5`) to a data-beans backend, read as `data-beans
-/// from-10x-matrix` reads it with its defaults ([`H5MatrixLayout::default`]).
-#[cfg(feature = "hdf5")]
-pub fn convert_h5_to_backend(h5_file: &str, output: &str) -> anyhow::Result<()> {
-    let (backend, backend_file) =
-        resolve_backend_file(&Box::from(output), Some(SparseIoBackend::Zarr))?;
-    if std::path::Path::new(backend_file.as_ref()).exists() {
-        info!("Removing existing backend file: {}", &backend_file);
-        remove_file(&backend_file)?;
-    }
-    build_from_h5_matrix(h5_file, &H5MatrixLayout::default(), &backend_file, &backend)?;
-    finalize_zarr_output(&backend_file, output)?;
-    info!("Conversion done: {}", output);
-    Ok(())
-}
-
-/// Where a 10x-style Zarr store keeps its sparse matrix and the names of
-/// its rows and columns, and which rows to keep. [`Default`] is Xenium's
-/// `cell_feature_matrix.zarr`: features × cells, pointers over features,
-/// feature names as attributes of `/cell_features`.
-#[derive(Clone, Debug)]
-pub struct ZarrMatrixLayout {
+pub struct MatrixLayout {
     pub data_field: Box<str>,
     pub indices_field: Box<str>,
     pub indptr_field: Box<str>,
@@ -239,7 +139,17 @@ pub struct ZarrMatrixLayout {
     pub column_name_field: Box<str>,
 }
 
-impl ZarrMatrixLayout {
+impl MatrixLayout {
+    /// The group a Cell Ranger HDF5 file keeps its matrix under; the
+    /// `H5_*` fields are relative to it.
+    pub const H5_ROOT: &'static str = "matrix";
+    pub const H5_DATA: &'static str = "data";
+    pub const H5_INDICES: &'static str = "indices";
+    pub const H5_INDPTR: &'static str = "indptr";
+    pub const H5_ROW_IDS: &'static str = "features/id";
+    pub const H5_ROW_NAMES: &'static str = "features/name";
+    pub const H5_ROW_TYPES: &'static str = "features/feature_type";
+    pub const H5_COLUMN_NAMES: &'static str = "barcodes";
     pub const XENIUM_DATA: &'static str = "/cell_features/data";
     pub const XENIUM_INDICES: &'static str = "/cell_features/indices";
     pub const XENIUM_INDPTR: &'static str = "/cell_features/indptr";
@@ -251,10 +161,27 @@ impl ZarrMatrixLayout {
     pub const SELECT_ROW_TYPES: &'static str = "gene,peak";
     /// Xenium's per-gene aggregates (`aggregate_gene`).
     pub const REMOVE_ROW_TYPES: &'static str = "aggregate";
-}
 
-impl Default for ZarrMatrixLayout {
-    fn default() -> Self {
+    /// Cell Ranger / Space Ranger / Xenium `*feature_bc_matrix.h5`:
+    /// features × barcodes under [`Self::H5_ROOT`], pointers over barcodes.
+    pub fn cell_ranger_h5() -> Self {
+        Self {
+            data_field: Self::H5_DATA.into(),
+            indices_field: Self::H5_INDICES.into(),
+            indptr_field: Self::H5_INDPTR.into(),
+            pointer_type: IndexPointerType::Column,
+            row_id_field: Self::H5_ROW_IDS.into(),
+            row_name_field: Self::H5_ROW_NAMES.into(),
+            row_type_field: Self::H5_ROW_TYPES.into(),
+            select_row_type: Self::SELECT_ROW_TYPES.into(),
+            remove_row_type: Self::REMOVE_ROW_TYPES.into(),
+            column_name_field: Self::H5_COLUMN_NAMES.into(),
+        }
+    }
+
+    /// Xenium's `cell_feature_matrix.zarr`: features × cells, pointers over
+    /// features, feature names as attributes of `/cell_features`.
+    pub fn xenium_zarr() -> Self {
         Self {
             data_field: Self::XENIUM_DATA.into(),
             indices_field: Self::XENIUM_INDICES.into(),
@@ -270,14 +197,70 @@ impl Default for ZarrMatrixLayout {
     }
 }
 
+/// Read the sparse matrix of a 10x HDF5 file, its fields under
+/// `root_group`, into a new backend at `backend_file`
+/// ([`write_10x_matrix`]). Shared by `data-beans from-10x-matrix` and
+/// [`try_open_or_convert`]. The caller prepares and finalizes the output
+/// ([`prepare_output`], [`finalize_output`]).
+#[cfg(feature = "hdf5")]
+pub fn build_from_h5_matrix(
+    h5_file: &str,
+    root_group: &str,
+    layout: &MatrixLayout,
+    backend_file: &str,
+    backend: &SparseIoBackend,
+) -> anyhow::Result<()> {
+    let file = hdf5::File::open(h5_file)?;
+    info!("Opened 10x HDF5 file: {}", h5_file);
+    let root = file
+        .group(root_group)
+        .map_err(|_| anyhow::anyhow!("no group `{root_group}` in {h5_file}"))?;
+    let dataset = |field: &str| {
+        root.dataset(field)
+            .map_err(|_| anyhow::anyhow!("no dataset `{root_group}/{field}` in {h5_file}"))
+    };
+    // The arrays go once their triplets are made.
+    let CooTripletsShape { triplets, shape } = {
+        let values: Vec<f32> = dataset(&layout.data_field)?.read_raw()?;
+        let indices: Vec<u64> = dataset(&layout.indices_field)?.read_raw()?;
+        let indptr: Vec<u64> = dataset(&layout.indptr_field)?.read_raw()?;
+        ValuesIndicesPointers {
+            values: &values,
+            indices: &indices,
+            indptr: &indptr,
+        }
+        .to_coo(layout.pointer_type)?
+    };
+    info!(
+        "Read {} non-zero elements reaching {} x {}",
+        shape.nnz, shape.nrows, shape.ncols
+    );
+    let names = |field: &str| root.dataset(field).ok().map(read_hdf5_strings).transpose();
+    write_10x_matrix(
+        TenxMatrix {
+            triplets,
+            reach: (shape.nrows, shape.ncols),
+            row_ids: names(&layout.row_id_field)?,
+            row_names: names(&layout.row_name_field)?,
+            row_types: names(&layout.row_type_field)?,
+            column_names: names(&layout.column_name_field)?,
+            keep_rows: None,
+        },
+        &layout.select_row_type,
+        &layout.remove_row_type,
+        backend_file,
+        backend,
+    )
+}
+
 /// Read the sparse matrix of a 10x-style Zarr store into a new backend at
 /// `backend_file` ([`write_10x_matrix`]), columns named by Xenium cell id
-/// when they are encoded so. Shared by
-/// `data-beans from-zarr` and [`try_open_or_convert`], so both read a store
-/// alike. The caller clears `backend_file` beforehand and finalizes after.
+/// when they are encoded so. Shared by `data-beans from-zarr` and
+/// [`try_open_or_convert`], so both read a store alike. The caller prepares
+/// and finalizes the output ([`prepare_output`], [`finalize_output`]).
 pub fn build_from_zarr_matrix(
     zarr_file: &str,
-    layout: &ZarrMatrixLayout,
+    layout: &MatrixLayout,
     backend_file: &str,
     backend: &SparseIoBackend,
 ) -> anyhow::Result<()> {
@@ -293,16 +276,18 @@ pub fn build_from_zarr_matrix(
     let store = open_zarr_store(zarr_file)?;
     info!("Opened zarr store: {}", zarr_file);
 
-    let indices: Vec<u64> = read_zarr_numerics(store.clone(), &layout.indices_field)?;
-    let indptr: Vec<u64> = read_zarr_numerics(store.clone(), &layout.indptr_field)?;
-    let values: Vec<f32> = read_zarr_numerics(store.clone(), &layout.data_field)?;
-
-    let CooTripletsShape { triplets, shape } = ValuesIndicesPointers {
-        values: &values,
-        indices: &indices,
-        indptr: &indptr,
-    }
-    .to_coo(layout.pointer_type)?;
+    // The arrays go once their triplets are made.
+    let CooTripletsShape { triplets, shape } = {
+        let indices: Vec<u64> = read_zarr_numerics(store.clone(), &layout.indices_field)?;
+        let indptr: Vec<u64> = read_zarr_numerics(store.clone(), &layout.indptr_field)?;
+        let values: Vec<f32> = read_zarr_numerics(store.clone(), &layout.data_field)?;
+        ValuesIndicesPointers {
+            values: &values,
+            indices: &indices,
+            indptr: &indptr,
+        }
+        .to_coo(layout.pointer_type)?
+    };
     let TripletsShape { nrows, ncols, nnz } = shape;
     info!("Read {nnz} non-zero elements reaching {nrows} x {ncols}");
 
@@ -327,6 +312,7 @@ pub fn build_from_zarr_matrix(
             row_names: names(&layout.row_name_field),
             row_types: names(&layout.row_type_field),
             column_names,
+            keep_rows: None,
         },
         &layout.select_row_type,
         &layout.remove_row_type,
@@ -335,25 +321,48 @@ pub fn build_from_zarr_matrix(
     )
 }
 
-/// Convert a 10x-style Zarr file (Xenium `cell_feature_matrix.zarr.zip` or
-/// directory) to a data-beans backend, read as `data-beans from-zarr` reads
-/// it with its defaults ([`ZarrMatrixLayout::default`]).
-pub fn convert_zarr_to_backend(zarr_file: &str, output: &str) -> anyhow::Result<()> {
-    let (backend, backend_file) =
-        resolve_backend_file(&Box::from(output), Some(SparseIoBackend::Zarr))?;
-    if std::path::Path::new(backend_file.as_ref()).exists() {
-        info!("Removing existing backend file: {}", &backend_file);
-        remove_file(&backend_file)?;
-    }
-    build_from_zarr_matrix(
-        zarr_file,
-        &ZarrMatrixLayout::default(),
-        &backend_file,
-        &backend,
-    )?;
-    finalize_zarr_output(&backend_file, output)?;
+/// Convert to a Zarr backend at `output` with `build`, which writes it.
+fn convert_with(
+    output: &str,
+    build: impl FnOnce(&str, &SparseIoBackend) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let (output, backend, backend_file) = prepare_output(output, SparseIoBackend::Zarr, false)?;
+    build(&backend_file, &backend)?;
+    finalize_output(&backend_file, &output)?;
     info!("Conversion done: {}", output);
     Ok(())
+}
+
+/// Convert a 10x HDF5 file (Cell Ranger / Space Ranger / Xenium
+/// `*feature_bc_matrix.h5`) to a data-beans backend, read as `data-beans
+/// from-10x-matrix` reads it with its defaults
+/// ([`MatrixLayout::cell_ranger_h5`]).
+#[cfg(feature = "hdf5")]
+pub fn convert_h5_to_backend(h5_file: &str, output: &str) -> anyhow::Result<()> {
+    convert_with(output, |backend_file, backend| {
+        let layout = MatrixLayout::cell_ranger_h5();
+        build_from_h5_matrix(
+            h5_file,
+            MatrixLayout::H5_ROOT,
+            &layout,
+            backend_file,
+            backend,
+        )
+    })
+}
+
+/// Convert a 10x-style Zarr file (Xenium `cell_feature_matrix.zarr.zip` or
+/// directory) to a data-beans backend, read as `data-beans from-zarr` reads
+/// it with its defaults ([`MatrixLayout::xenium_zarr`]).
+pub fn convert_zarr_to_backend(zarr_file: &str, output: &str) -> anyhow::Result<()> {
+    convert_with(output, |backend_file, backend| {
+        build_from_zarr_matrix(
+            zarr_file,
+            &MatrixLayout::xenium_zarr(),
+            backend_file,
+            backend,
+        )
+    })
 }
 
 /// Try to open a data file directly; if that fails, attempt automatic
@@ -506,17 +515,18 @@ mod tests {
             row_names: names(&["GENE1", "FID2", ""]),
             row_types: names(&["Gene Expression"; 3]),
             column_names: names(&["BC1", "BC2", "BC3"]),
+            keep_rows: None,
         };
         write_10x_matrix(m, "gene", "", out, &SparseIoBackend::Zarr).unwrap();
 
         let data = open_sparse_matrix(out, &SparseIoBackend::Zarr).unwrap();
         assert_eq!(
             data.row_names().unwrap(),
-            names(&["FID1_GENE1", "FID2", "FID3"]).unwrap()
+            ["FID1_GENE1", "FID2", "FID3"].map(Box::from)
         );
         assert_eq!(
             data.column_names().unwrap(),
-            names(&["BC1", "BC2", "BC3"]).unwrap()
+            ["BC1", "BC2", "BC3"].map(Box::from)
         );
         let m = data.read_columns_dmatrix((0..3).collect()).unwrap();
         assert_eq!(m.shape(), (3, 3));
@@ -537,6 +547,7 @@ mod tests {
             row_names: None,
             row_types: None,
             column_names: None,
+            keep_rows: None,
         };
         let e = write_10x_matrix(m, "gene", "", out.to_str().unwrap(), &SparseIoBackend::Zarr);
         assert!(e.unwrap_err().to_string().contains("names 2 rows"));

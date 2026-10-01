@@ -1,12 +1,10 @@
 use super::run_squeeze_if_needed;
-use crate::convert::{build_from_h5_matrix, H5MatrixLayout, ZarrMatrixLayout};
-use crate::hdf5_io::*;
+use crate::convert::{build_from_h5_matrix, MatrixLayout};
 use crate::sparse_io::*;
 use crate::sparse_util::*;
 use crate::zarr_io::*;
 
 use clap::Args;
-use legume_numeric::matrix::common_io::*;
 use log::info;
 
 #[derive(Args, Debug)]
@@ -46,7 +44,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'x',
         long,
-        default_value = H5MatrixLayout::ROOT,
+        default_value = MatrixLayout::H5_ROOT,
         help = "Root group name for sparse data triplets",
         long_help = "Set the root group name under which sparse data triplets are stored in the HDF5 file.\n\
                      Use the 'list-h5' command to inspect available groups."
@@ -56,7 +54,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'd',
         long,
-        default_value = H5MatrixLayout::DATA,
+        default_value = MatrixLayout::H5_DATA,
         help = "Data field name",
         long_help = "Name of the dataset containing triplet values X(i,j) under the root group."
     )]
@@ -65,7 +63,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'i',
         long,
-        default_value = H5MatrixLayout::INDICES,
+        default_value = MatrixLayout::H5_INDICES,
         help = "Indices field name",
         long_help = "Name of the dataset containing indices. Row indices for CSC,\n\
                      column indices for CSR, under the root group."
@@ -75,7 +73,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'p',
         long,
-        default_value = H5MatrixLayout::INDPTR,
+        default_value = MatrixLayout::H5_INDPTR,
         help = "Indptr field name",
         long_help = "Name of the dataset containing indptr. Column pointers for CSC,\n\
                      row pointers for CSR, under the root group."
@@ -95,7 +93,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'r',
         long,
-        default_value = H5MatrixLayout::ROW_IDS,
+        default_value = MatrixLayout::H5_ROW_IDS,
         help = "Row ID field name",
         long_help = "Group or dataset name for row, gene, or feature IDs under the root group."
     )]
@@ -104,7 +102,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'n',
         long,
-        default_value = H5MatrixLayout::ROW_NAMES,
+        default_value = MatrixLayout::H5_ROW_NAMES,
         help = "Row name field name",
         long_help = "Group or dataset name for row, gene,\n\
                      or feature names under the root group."
@@ -114,7 +112,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'f',
         long,
-        default_value = H5MatrixLayout::ROW_TYPES,
+        default_value = MatrixLayout::H5_ROW_TYPES,
         help = "Row type field name",
         long_help = "Group or dataset name for row, gene,\n\
                      or feature types under the root group."
@@ -123,7 +121,7 @@ pub struct From10xMatrixArgs {
 
     #[arg(
         long,
-        default_value = ZarrMatrixLayout::SELECT_ROW_TYPES,
+        default_value = MatrixLayout::SELECT_ROW_TYPES,
         help = "Select row type (comma-separated patterns; ANY match keeps the row)",
         long_help = "Select which row types to include. Patterns are comma-separated,\n\
                      case-insensitive substrings.\n\
@@ -134,7 +132,7 @@ pub struct From10xMatrixArgs {
 
     #[arg(
         long,
-        default_value = ZarrMatrixLayout::REMOVE_ROW_TYPES,
+        default_value = MatrixLayout::REMOVE_ROW_TYPES,
         help = "Remove row type (comma-separated patterns; ANY match drops the row)",
         long_help = "Remove rows if their type contains any of these comma-separated patterns."
     )]
@@ -143,7 +141,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'c',
         long,
-        default_value = H5MatrixLayout::COLUMN_NAMES,
+        default_value = MatrixLayout::H5_COLUMN_NAMES,
         help = "Column name field",
         long_help = "Group or dataset name for columns or cells under the root group."
     )]
@@ -185,17 +183,10 @@ pub struct From10xMatrixArgs {
     pub block_size: Option<usize>,
 }
 pub fn run_build_from_10x_matrix(args: &From10xMatrixArgs) -> anyhow::Result<()> {
-    let effective_output = apply_zip_flag(&args.output, args.zip, &args.backend);
-    let (backend, backend_file) =
-        resolve_backend_file(&effective_output, Some(args.backend.clone()))?;
+    let (effective_output, backend, backend_file) =
+        prepare_output(&args.output, args.backend.clone(), args.zip)?;
 
-    if std::path::Path::new(backend_file.as_ref()).exists() {
-        info!("Removing existing backend file: {}", &backend_file);
-        remove_file(&backend_file)?;
-    }
-
-    let layout = H5MatrixLayout {
-        root_group: args.root_group_name.clone(),
+    let layout = MatrixLayout {
         data_field: args.data_field.clone(),
         indices_field: args.indices_field.clone(),
         indptr_field: args.indptr_field.clone(),
@@ -207,7 +198,13 @@ pub fn run_build_from_10x_matrix(args: &From10xMatrixArgs) -> anyhow::Result<()>
         remove_row_type: args.remove_row_type.clone(),
         column_name_field: args.column_name_field.clone(),
     };
-    build_from_h5_matrix(&args.h5_file, &layout, &backend_file, &backend)?;
+    build_from_h5_matrix(
+        &args.h5_file,
+        &args.root_group_name,
+        &layout,
+        &backend_file,
+        &backend,
+    )?;
 
     run_squeeze_if_needed(
         args.do_squeeze,
@@ -216,7 +213,7 @@ pub fn run_build_from_10x_matrix(args: &From10xMatrixArgs) -> anyhow::Result<()>
         args.block_size,
         &backend_file,
     )?;
-    finalize_zarr_output(&backend_file, &effective_output)?;
+    finalize_output(&backend_file, &effective_output)?;
     info!("done");
     Ok(())
 }

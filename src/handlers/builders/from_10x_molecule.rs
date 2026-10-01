@@ -1,14 +1,12 @@
 use super::run_squeeze_if_needed;
+use crate::convert::{write_10x_matrix, TenxMatrix};
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
-use crate::utilities::name_matching::{
-    compose_id_name, filter_row_indices_by_type, make_names_unique,
-};
 use crate::zarr_io::*;
 
 use clap::Args;
-use legume_numeric::matrix::common_io::*;
 use log::info;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Args, Debug)]
 pub struct From10xMoleculeArgs {
@@ -125,26 +123,32 @@ pub struct From10xMoleculeArgs {
     )]
     pub block_size: Option<usize>,
 }
+/// A library `--library-type` keeps.
+struct Library {
+    gem_group: Option<u16>,
+    /// The probe set a probe-based (Flex) library targets.
+    target_set: Option<Box<str>>,
+}
+
 pub fn run_build_from_10x_molecule(args: &From10xMoleculeArgs) -> anyhow::Result<()> {
     let file = hdf5::File::open(args.h5_file.to_string())?;
     info!("Opened molecule_info.h5: {}", args.h5_file);
 
-    let effective_output = apply_zip_flag(&args.output, args.zip, &args.backend);
-    let (backend, backend_file) =
-        resolve_backend_file(&effective_output, Some(args.backend.clone()))?;
-
-    if std::path::Path::new(backend_file.as_ref()).exists() {
-        info!("Removing existing backend file: {}", &backend_file);
-        remove_file(&backend_file)?;
-    }
+    let (effective_output, backend, backend_file) =
+        prepare_output(&args.output, args.backend.clone(), args.zip)?;
 
     // 1. Read per-molecule arrays. Keep ndarray `Array1` owners — don't
     // `.to_vec()` them, as that doubles peak memory on large molecule files.
     let barcode_idx = file.dataset("barcode_idx")?.read_1d::<u64>()?;
     let feature_idx = file.dataset("feature_idx")?.read_1d::<u32>()?;
-    let count = file.dataset("count")?.read_1d::<u32>()?;
     let gem_group = file.dataset("gem_group")?.read_1d::<u16>()?;
     let library_idx = file.dataset("library_idx")?.read_1d::<u16>()?;
+    // Reads per molecule, needed only to sum them.
+    let count = if args.sum_reads {
+        Some(file.dataset("count")?.read_1d::<u32>()?)
+    } else {
+        None
+    };
     // Cell Ranger 7+: whether a molecule counts towards the feature-barcode
     // matrix (1) or not (0). Older files have no such field: all count.
     let umi_type = file
@@ -158,25 +162,20 @@ pub fn run_build_from_10x_molecule(args: &From10xMoleculeArgs) -> anyhow::Result
     // 2. Read lookup tables
     let barcodes = read_hdf5_strings(file.dataset("barcodes")?)?;
     let feature_group = file.group("features")?;
-    let mut row_ids: Vec<Box<str>> = read_hdf5_strings(feature_group.dataset("id")?)?;
-    let mut row_names: Vec<Box<str>> = read_hdf5_strings(feature_group.dataset("name")?)?;
-    let mut row_types: Vec<Box<str>> = read_hdf5_strings(feature_group.dataset("feature_type")?)?;
+    let row_ids: Vec<Box<str>> = read_hdf5_strings(feature_group.dataset("id")?)?;
+    let row_names: Vec<Box<str>> = read_hdf5_strings(feature_group.dataset("name")?)?;
+    let row_types: Vec<Box<str>> = read_hdf5_strings(feature_group.dataset("feature_type")?)?;
 
     let n_features = row_ids.len();
     info!("Read {} barcodes, {} features", barcodes.len(), n_features);
 
-    // 3. Parse library_info and filter by library type: each library kept,
-    //    with its gem group when the file gives one, and the probe sets
-    //    they target.
-    let (valid_libraries, target_sets): (rustc_hash::FxHashMap<u16, Option<u16>>, Vec<_>) = {
-        let lib_info_ds = file.dataset("library_info")?;
-        let lib_info_raw = read_hdf5_strings(lib_info_ds)?;
+    // 3. Parse library_info and keep the libraries of the requested type
+    let libraries: FxHashMap<u16, Library> = {
+        let lib_info_raw = read_hdf5_strings(file.dataset("library_info")?)?;
         let lib_info_json: String = lib_info_raw.iter().map(|s| s.as_ref()).collect();
         let lib_entries: Vec<serde_json::Value> = serde_json::from_str(&lib_info_json)?;
 
-        let mut valid = rustc_hash::FxHashMap::default();
-        let mut target_sets = Vec::new();
-        let mut types_seen = Vec::new();
+        let mut kept = FxHashMap::default();
         for entry in &lib_entries {
             // Cell Ranger writes `library_id` as a number or, in older files,
             // as a numeric string ("0").
@@ -185,230 +184,171 @@ pub fn run_build_from_10x_molecule(args: &From10xMoleculeArgs) -> anyhow::Result
                     .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
             });
             let lib_type = entry.get("library_type").and_then(|v| v.as_str());
-            let gem_group = entry.get("gem_group").and_then(|v| v.as_u64());
-            if let Some(t) = lib_type {
-                types_seen.push(t.to_string());
-            }
             if let (Some(lib_id), Some(lib_type)) = (lib_id, lib_type) {
                 if lib_type.contains(args.library_type.as_ref()) {
-                    valid.insert(lib_id as u16, gem_group.map(|g| g as u16));
-                    let target_set = entry.get("target_set_name").and_then(|v| v.as_str());
-                    target_sets.push(target_set.map(str::to_string));
+                    let library = Library {
+                        gem_group: entry
+                            .get("gem_group")
+                            .and_then(|v| v.as_u64())
+                            .map(|g| g as u16),
+                        target_set: entry
+                            .get("target_set_name")
+                            .and_then(|v| v.as_str())
+                            .map(Box::from),
+                    };
+                    kept.insert(lib_id as u16, library);
                 }
             }
         }
         info!(
             "Library type '{}': {} of {} libraries match",
             args.library_type,
-            valid.len(),
+            kept.len(),
             lib_entries.len()
         );
         anyhow::ensure!(
-            !valid.is_empty(),
+            !kept.is_empty(),
             "no library of type '{}' in {} (library types: {})",
             args.library_type,
             args.h5_file,
-            types_seen.join(", ")
+            lib_entries
+                .iter()
+                .filter_map(|e| e.get("library_type")?.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        (valid, target_sets)
+        kept
     };
 
     // A probe-based library (Flex) counts the genes its probe set targets:
-    // Cell Ranger's matrices have those rows only, so molecules of other
-    // genes, from probes it excludes, are left out too. Libraries without a
-    // probe set keep every feature.
-    let targeted: Option<Vec<bool>> = match target_sets
-        .iter()
-        .map(Option::as_deref)
+    // Cell Ranger's matrices have those rows only, leaving out molecules of
+    // other genes, from probes it excludes. Libraries without a probe set
+    // keep every feature.
+    let targeted: Option<Vec<bool>> = libraries
+        .values()
+        .map(|l| l.target_set.as_deref())
         .collect::<Option<Vec<_>>>()
-    {
-        Some(names) => {
+        .map(|names| -> anyhow::Result<Vec<bool>> {
             let mut keep = vec![false; n_features];
             for name in names {
-                let rows = file
+                let rows: Vec<u32> = file
                     .dataset(&format!("features/target_sets/{name}"))
                     .map_err(|_| anyhow::anyhow!("no probe set '{name}' in {}", args.h5_file))?
-                    .read_1d::<u32>()?;
-                for &i in rows.iter() {
+                    .read_raw()?;
+                for i in rows {
                     *keep.get_mut(i as usize).ok_or_else(|| {
                         anyhow::anyhow!("probe set '{name}' names feature {i} of {n_features}")
                     })? = true;
                 }
             }
-            info!(
-                "Probe set: {} of {n_features} features targeted",
-                keep.iter().filter(|&&k| k).count()
-            );
-            Some(keep)
-        }
-        None => None,
-    };
+            Ok(keep)
+        })
+        .transpose()?;
 
-    // 4. Read pass_filter if needed
-    //    Column key = (barcode_idx, gem_group)
-    use rustc_hash::FxHashMap as HashMap;
-    use std::collections::BTreeSet;
-
-    let mut col_keys = BTreeSet::new();
-    let valid_cells: Option<rustc_hash::FxHashSet<(u64, u16)>> = if !args.no_pass_filter {
+    // 4. Columns, (barcode, gem group) → index. With cell calling, every
+    //    called cell is one, as in Cell Ranger's filtered matrix, even one
+    //    without a molecule of these libraries.
+    let mut columns: FxHashMap<(u64, u16), u64> = FxHashMap::default();
+    let called: Option<FxHashSet<(u64, u16)>> = if !args.no_pass_filter {
         // Rows of [barcode_idx, library_idx, genome_idx].
         let pf = file.dataset("barcode_info/pass_filter")?.read_2d::<u64>()?;
-        let mut cells = rustc_hash::FxHashSet::default();
+        let mut cells = FxHashSet::default();
         for row in pf.rows() {
-            let bc_idx = row[0];
-            let lib_idx = row[1] as u16;
-            if let Some(gem_group) = valid_libraries.get(&lib_idx) {
-                cells.insert((bc_idx, lib_idx));
-                // Every cell is a column, as in Cell Ranger's filtered
-                // matrix, even one without a molecule of this library type.
-                if let Some(gem_group) = gem_group {
-                    col_keys.insert((bc_idx, *gem_group));
+            let (bc, lib) = (row[0], row[1] as u16);
+            if let Some(library) = libraries.get(&lib) {
+                cells.insert((bc, lib));
+                if let Some(gg) = library.gem_group {
+                    let next = columns.len() as u64;
+                    columns.entry((bc, gg)).or_insert(next);
                 }
             }
         }
-        info!("pass_filter: {} valid cells", cells.len());
+        info!("pass_filter: {} called cells", cells.len());
         Some(cells)
     } else {
         info!("Skipping pass_filter (--no-pass-filter)");
         None
     };
 
-    // 5. Filter molecules and aggregate into triplets
-    let mut triplet_map: HashMap<(u64, u64), f32> = Default::default();
-
+    // 5. Filter molecules and aggregate them by (feature, column)
+    let mut entries: FxHashMap<(u64, u64), f32> = FxHashMap::default();
     {
         // Borrow raw arrays as slices once; avoids repeated bounds-checked
         // indexing through `Array1::Index` in the hot loop.
-        let barcode_idx_s = barcode_idx.as_slice().expect("barcode_idx not contiguous");
-        let feature_idx_s = feature_idx.as_slice().expect("feature_idx not contiguous");
-        let count_s = count.as_slice().expect("count not contiguous");
-        let gem_group_s = gem_group.as_slice().expect("gem_group not contiguous");
-        let library_idx_s = library_idx.as_slice().expect("library_idx not contiguous");
+        fn slice<T>(a: &ndarray::Array1<T>) -> &[T] {
+            a.as_slice().expect("molecule array not contiguous")
+        }
+        let barcode_idx_s: &[u64] = slice(&barcode_idx);
+        let feature_idx_s: &[u32] = slice(&feature_idx);
+        let gem_group_s: &[u16] = slice(&gem_group);
+        let library_idx_s: &[u16] = slice(&library_idx);
+        let count_s: Option<&[u32]> = count.as_ref().map(slice);
+        let umi_type_s: Option<&[u32]> = umi_type.as_ref().map(slice);
 
         for i in 0..n_molecules {
-            // Filter by library type
-            if !valid_libraries.contains_key(&library_idx_s[i]) {
+            let (bc, lib) = (barcode_idx_s[i], library_idx_s[i]);
+            if !libraries.contains_key(&lib)
+                // Molecules Cell Ranger leaves out of its matrices
+                || umi_type_s.is_some_and(|t| t[i] != 1)
+                || called.as_ref().is_some_and(|c| !c.contains(&(bc, lib)))
+            {
                 continue;
             }
-
-            // Molecules Cell Ranger leaves out of its matrices
-            if umi_type.as_ref().is_some_and(|t| t[i] != 1) {
-                continue;
-            }
-
-            // Filter by pass_filter
-            if let Some(ref cells) = valid_cells {
-                if !cells.contains(&(barcode_idx_s[i], library_idx_s[i])) {
-                    continue;
-                }
-            }
-
-            let col_key = (barcode_idx_s[i], gem_group_s[i]);
-            col_keys.insert(col_key);
-
-            // Will remap column index after collecting all keys
-            let row = feature_idx_s[i] as u64;
-            *triplet_map
-                .entry((row, barcode_idx_s[i] * 65536 + gem_group_s[i] as u64))
-                .or_insert(0.0) += if args.sum_reads {
-                count_s[i] as f32
-            } else {
-                1.0
-            };
+            let next = columns.len() as u64;
+            let col = *columns.entry((bc, gem_group_s[i])).or_insert(next);
+            *entries.entry((feature_idx_s[i] as u64, col)).or_insert(0.0) +=
+                count_s.map_or(1.0, |c| c[i] as f32);
         }
     }
 
     // Free the raw per-molecule arrays before we materialize the (huge)
     // triplets Vec. These can easily be multiple GB on 10X Aggr outputs.
-    drop(barcode_idx);
-    drop(feature_idx);
-    drop(count);
-    drop(gem_group);
-    drop(library_idx);
-    drop(umi_type);
-    drop(valid_cells);
+    drop((
+        barcode_idx,
+        feature_idx,
+        gem_group,
+        library_idx,
+        count,
+        umi_type,
+    ));
+    drop(called);
 
-    // Build dense column index mapping
-    let col_keys_vec: Vec<(u64, u16)> = col_keys.into_iter().collect();
-    let col_key_to_idx: HashMap<(u64, u16), u64> = col_keys_vec
+    // Columns in barcode order, named SEQUENCE-GEMGROUP.
+    let mut columns: Vec<((u64, u16), u64)> = columns.into_iter().collect();
+    columns.sort_unstable();
+    let mut new_col = vec![0u64; columns.len()];
+    for (new, &(_, old)) in columns.iter().enumerate() {
+        new_col[old as usize] = new as u64;
+    }
+    let column_names: Vec<Box<str>> = columns
         .iter()
-        .enumerate()
-        .map(|(idx, &key)| (key, idx as u64))
+        .map(|&((bc, gg), _)| format!("{}-{gg}", barcodes[bc as usize]).into_boxed_str())
         .collect();
-    let ncols = col_keys_vec.len();
+    info!("Aggregated into {} columns (cells)", column_names.len());
 
-    // Build column names: SEQUENCE-GEMGROUP
-    let column_names: Vec<Box<str>> = col_keys_vec
-        .iter()
-        .map(|&(bc_idx, gg)| {
-            let bc = barcodes[bc_idx as usize].as_ref();
-            format!("{}-{}", bc, gg).into_boxed_str()
-        })
-        .collect();
-
-    info!("Aggregated into {} columns (cells)", ncols);
-
-    // Convert triplet_map to proper triplets with remapped column indices
-    let triplets: Vec<(u64, u64, f32)> = triplet_map
+    let triplets: Vec<(u64, u64, f32)> = entries
         .into_iter()
-        .map(|((row, packed_col), val)| {
-            let bc_idx = packed_col / 65536;
-            let gg = (packed_col % 65536) as u16;
-            let col = col_key_to_idx[&(bc_idx, gg)];
-            (row, col, val)
-        })
+        .map(|((row, col), val)| (row, new_col[col as usize], val))
         .collect();
 
-    let nrows = n_features;
-    let nnz = triplets.len();
-    info!("Built {} triplets in {} x {} matrix", nnz, nrows, ncols);
-
-    // 6. Build backend
-    let mut out = create_sparse_from_triplets_owned(
-        triplets,
-        (nrows, ncols, nnz),
-        Some(&backend_file),
-        Some(&backend),
+    // 6. Name and keep rows, and write the backend
+    write_10x_matrix(
+        TenxMatrix {
+            triplets,
+            reach: (n_features, column_names.len()),
+            row_ids: Some(row_ids),
+            row_names: Some(row_names),
+            row_types: Some(row_types),
+            column_names: Some(column_names),
+            keep_rows: targeted,
+        },
+        &args.select_row_type,
+        &args.remove_row_type,
+        &backend_file,
+        &backend,
     )?;
-    info!("Created sparse matrix: {}", backend_file);
 
-    // 7. Register names
-    // Composite row names: id_name
-    if nrows < row_ids.len() {
-        row_ids.truncate(nrows);
-    }
-    if nrows < row_names.len() {
-        row_names.truncate(nrows);
-    }
-
-    let mut row_id_names = compose_id_name(row_ids, row_names);
-    make_names_unique(&mut row_id_names);
-
-    out.register_row_names_vec(&row_id_names);
-    out.register_column_names_vec(&column_names);
-
-    // 8. Filter by feature type
-    if nrows < row_types.len() {
-        row_types.truncate(nrows);
-    }
-
-    let mut select_rows =
-        filter_row_indices_by_type(&row_types, &args.select_row_type, &args.remove_row_type);
-    if let Some(targeted) = &targeted {
-        select_rows.retain(|&i| targeted[i]);
-    }
-
-    if select_rows.len() < nrows {
-        info!(
-            "Filtering features: {} -> {} of '{}' type",
-            nrows,
-            select_rows.len(),
-            args.select_row_type
-        );
-        out.subset_columns_rows(None, Some(&select_rows))?;
-    }
-
-    // 9. Squeeze if needed
+    // 7. Squeeze if needed
     run_squeeze_if_needed(
         args.do_squeeze,
         args.row_nnz_cutoff,
@@ -416,7 +356,7 @@ pub fn run_build_from_10x_molecule(args: &From10xMoleculeArgs) -> anyhow::Result
         args.block_size,
         &backend_file,
     )?;
-    finalize_zarr_output(&backend_file, &effective_output)?;
+    finalize_output(&backend_file, &effective_output)?;
     info!("done");
     Ok(())
 }
@@ -515,8 +455,11 @@ mod tests {
             block_size: None,
         };
         run_build_from_10x_molecule(&args).unwrap();
-        let data = open_sparse_matrix(&format!("{}.zarr.zip", args.output), &SparseIoBackend::Zarr)
-            .unwrap();
+        let data = open_sparse_matrix(
+            &apply_zip_flag(&args.output, true, &SparseIoBackend::Zarr),
+            &SparseIoBackend::Zarr,
+        )
+        .unwrap();
         let m = data
             .read_columns_dmatrix((0..data.num_columns().unwrap()).collect())
             .unwrap();

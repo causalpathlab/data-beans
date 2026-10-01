@@ -1,11 +1,9 @@
 use super::run_squeeze_if_needed;
-use crate::convert::{build_from_zarr_matrix, ZarrMatrixLayout};
-use crate::hdf5_io::*;
+use crate::convert::{build_from_zarr_matrix, MatrixLayout};
 use crate::sparse_io::*;
 use crate::sparse_util::*;
 use crate::zarr_io::*;
 
-use legume_numeric::matrix::common_io::*;
 use log::info;
 
 #[derive(clap::Args, Debug)]
@@ -45,7 +43,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'd',
         long,
-        default_value = ZarrMatrixLayout::XENIUM_DATA,
+        default_value = MatrixLayout::XENIUM_DATA,
         help = "Data field path",
         long_help = "Path to the dataset containing triplet values.\n\
                      Use the 'list-zarr' subcommand to inspect available fields."
@@ -55,7 +53,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'i',
         long,
-        default_value = ZarrMatrixLayout::XENIUM_INDICES,
+        default_value = MatrixLayout::XENIUM_INDICES,
         help = "Indices field path",
         long_help = "Path to the dataset containing indices. Row indices for CSC,\n\
                      column indices for CSR."
@@ -65,7 +63,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'p',
         long,
-        default_value = ZarrMatrixLayout::XENIUM_INDPTR,
+        default_value = MatrixLayout::XENIUM_INDPTR,
         help = "Indptr field path",
         long_help = "Path to the dataset containing indptr. Column pointers for CSC,\n\
                      row pointers for CSR."
@@ -85,7 +83,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'r',
         long,
-        default_value = ZarrMatrixLayout::XENIUM_ROW_IDS,
+        default_value = MatrixLayout::XENIUM_ROW_IDS,
         help = "Row ID field path",
         long_help = "Path to the group or dataset for row, gene, or feature IDs."
     )]
@@ -94,7 +92,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'n',
         long,
-        default_value = ZarrMatrixLayout::XENIUM_ROW_NAMES,
+        default_value = MatrixLayout::XENIUM_ROW_NAMES,
         help = "Row name field path",
         long_help = "Path to the group or dataset for row, gene, or feature names."
     )]
@@ -103,7 +101,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'f',
         long,
-        default_value = ZarrMatrixLayout::XENIUM_ROW_TYPES,
+        default_value = MatrixLayout::XENIUM_ROW_TYPES,
         help = "Row type field path",
         long_help = "Path to the group or dataset for row, gene, or feature types."
     )]
@@ -111,7 +109,7 @@ pub struct FromZarrArgs {
 
     #[arg(
         long,
-        default_value = ZarrMatrixLayout::SELECT_ROW_TYPES,
+        default_value = MatrixLayout::SELECT_ROW_TYPES,
         help = "Select row type (comma-separated patterns; ANY match keeps the row)",
         long_help = "Select which row types to include. Patterns are comma-separated,\n\
                      case-insensitive substrings.\n\
@@ -122,7 +120,7 @@ pub struct FromZarrArgs {
 
     #[arg(
         long,
-        default_value = ZarrMatrixLayout::REMOVE_ROW_TYPES,
+        default_value = MatrixLayout::REMOVE_ROW_TYPES,
         help = "Remove row type (comma-separated patterns; ANY match drops the row)",
         long_help = "Remove rows if their type contains any of these comma-separated patterns."
     )]
@@ -131,7 +129,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'c',
         long,
-        default_value = ZarrMatrixLayout::XENIUM_COLUMN_NAMES,
+        default_value = MatrixLayout::XENIUM_COLUMN_NAMES,
         help = "Column name field path",
         long_help = "Path to the group or dataset for columns or cells.\n\
                      Will first attempt Xenium's Cell ID format mapping."
@@ -174,21 +172,10 @@ pub struct FromZarrArgs {
     pub block_size: Option<usize>,
 }
 pub fn run_build_from_zarr_triplets(args: &FromZarrArgs) -> anyhow::Result<()> {
-    let source_zarr_file_path = args.zarr_file.clone();
+    let (effective_output, backend, backend_file) =
+        prepare_output(&args.output, args.backend.clone(), args.zip)?;
 
-    let effective_output = apply_zip_flag(&args.output, args.zip, &args.backend);
-    let (backend, backend_file) =
-        resolve_backend_file(&effective_output, Some(args.backend.clone()))?;
-
-    if std::path::Path::new(backend_file.as_ref()).exists() {
-        info!(
-            "This existing backend file '{}' will be deleted",
-            &backend_file
-        );
-        remove_file(&backend_file)?;
-    }
-
-    let layout = ZarrMatrixLayout {
+    let layout = MatrixLayout {
         data_field: args.data_field.clone(),
         indices_field: args.indices_field.clone(),
         indptr_field: args.indptr_field.clone(),
@@ -200,7 +187,7 @@ pub fn run_build_from_zarr_triplets(args: &FromZarrArgs) -> anyhow::Result<()> {
         remove_row_type: args.remove_row_type.clone(),
         column_name_field: args.column_name_field.clone(),
     };
-    build_from_zarr_matrix(&source_zarr_file_path, &layout, &backend_file, &backend)?;
+    build_from_zarr_matrix(&args.zarr_file, &layout, &backend_file, &backend)?;
 
     run_squeeze_if_needed(
         args.do_squeeze,
@@ -210,7 +197,7 @@ pub fn run_build_from_zarr_triplets(args: &FromZarrArgs) -> anyhow::Result<()> {
         &backend_file,
     )?;
 
-    finalize_zarr_output(&backend_file, &effective_output)?;
+    finalize_output(&backend_file, &effective_output)?;
     info!("done");
     Ok(())
 }
