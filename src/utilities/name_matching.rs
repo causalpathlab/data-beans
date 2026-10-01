@@ -1,4 +1,5 @@
 use crate::sparse_io::ROW_SEP;
+use genomic_data::coordinates::{import_interval, locus_key};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -44,6 +45,44 @@ pub fn compose_id_name(ids: Vec<Box<str>>, names: Vec<Box<str>>) -> Vec<Box<str>
         .zip(&names)
         .map(|(id, name)| id_name(id, name))
         .collect()
+}
+
+/// Import boundary for feature rows: peak rows get their id and name
+/// rewritten in the colon locus form, whatever spelling the producer used
+/// (`chr1-100-200` and `chr1_100_200` become `chr1:100-200`). With feature
+/// types, a row is a peak when its type names peaks or ATAC; without them,
+/// the file is a peak list only when every id reads as an interval. A gene
+/// id that happens to end in two numbers is therefore left alone. Returns
+/// how many rows were rewritten.
+pub fn colon_peak_names(
+    ids: &mut [Box<str>],
+    names: &mut [Box<str>],
+    types: Option<&[Box<str>]>,
+) -> usize {
+    let is_peak = |i: usize| match types {
+        Some(types) => {
+            contains_ignore_ascii_case(&types[i], "peak")
+                || contains_ignore_ascii_case(&types[i], "atac")
+        }
+        None => true,
+    };
+    if types.is_none() && !ids.iter().all(|id| import_interval(id).is_some()) {
+        return 0;
+    }
+    let mut n = 0;
+    for (i, (id, name)) in ids.iter_mut().zip(names.iter_mut()).enumerate() {
+        if !is_peak(i) {
+            continue;
+        }
+        for s in [id, name] {
+            if let Some(l) = import_interval(s) {
+                let colon = l.to_string().into_boxed_str();
+                n += usize::from(*s != colon);
+                *s = colon;
+            }
+        }
+    }
+    n
 }
 
 /// Inverse of [`compose_id_name`]: split a composite `id{ROW_SEP}name` display
@@ -277,6 +316,9 @@ fn alias_candidates(sym: &str) -> Vec<String> {
 
 /// Pre-built index over a gene-name vocabulary for fast marker→row matching.
 /// Resolves a query gene in tiers, returning the first matching row:
+///   0. a locus query (`chr:start-end`) matches only a locus row, by its
+///      locus key with the chromosome case kept, and stops here: loci never
+///      go through the case-insensitive or fuzzy tiers below,
 ///   1. exact (case-insensitive) full-name match,
 ///   2. last `_`-segment symbol match (`CD8A` ↔ `ENSG…_CD8A`),
 ///   3. leading Ensembl-id segment match (`ENSG…` ↔ `ENSG…_CD8A`),
@@ -298,6 +340,8 @@ pub struct GeneIndex {
     exact: HashMap<String, usize>,
     symbol: HashMap<String, usize>,
     ensg: HashMap<String, usize>,
+    /// Locus rows by their locus key. Loci match only here, case kept.
+    locus: HashMap<Box<str>, usize>,
 }
 
 #[allow(dead_code)] // consumed by downstream crates (geu, senna), not the data-beans bin
@@ -306,11 +350,36 @@ impl GeneIndex {
     /// wins on duplicate keys (matching positional-scan semantics).
     #[must_use]
     pub fn build(gene_names: &[Box<str>]) -> Self {
-        let lowered: Vec<String> = gene_names.par_iter().map(|g| g.to_lowercase()).collect();
+        // A locus row gets its key and an empty lowered name, which keeps it
+        // out of every gene tier, the fallback scan included. A row whose
+        // `/`-core is a locus (`chr1:1-2/count/spliced`) also gets its core
+        // key, and stays in the gene tiers for its full name.
+        let (lowered, keys): (Vec<String>, Vec<Option<Box<str>>>) = gene_names
+            .par_iter()
+            .map(|g| match locus_key(g) {
+                Some(key) => (String::new(), Some(key)),
+                None => {
+                    let core = g.split('/').next().unwrap_or(g);
+                    let key = if core.len() < g.len() {
+                        locus_key(core)
+                    } else {
+                        None
+                    };
+                    (g.to_lowercase(), key)
+                }
+            })
+            .unzip();
         let mut exact: HashMap<String, usize> = HashMap::default();
         let mut symbol: HashMap<String, usize> = HashMap::default();
         let mut ensg: HashMap<String, usize> = HashMap::default();
-        for (i, low) in lowered.iter().enumerate() {
+        let mut locus: HashMap<Box<str>, usize> = HashMap::default();
+        for (i, (low, key)) in lowered.iter().zip(keys).enumerate() {
+            if let Some(key) = key {
+                locus.entry(key).or_insert(i);
+            }
+            if low.is_empty() {
+                continue;
+            }
             exact.entry(low.clone()).or_insert(i);
             // Strip a faba-style aux suffix first (`SYMBOL/count/spliced` →
             // symbol is the leading `/`-segment), then an Ensembl-style prefix
@@ -332,12 +401,18 @@ impl GeneIndex {
             exact,
             symbol,
             ensg,
+            locus,
         }
     }
 
     /// Row index for `gene`, or `None` if unmatched (tiers above).
     #[must_use]
     pub fn match_gene(&self, gene: &str) -> Option<usize> {
+        // A locus matches a locus row by key, strictly: no case folding,
+        // aliasing or prefix fallback.
+        if let Some(key) = locus_key(gene) {
+            return self.locus.get(&key).copied();
+        }
         let gl = gene.to_lowercase();
         if let Some(&i) = self.exact.get(&gl) {
             return Some(i);

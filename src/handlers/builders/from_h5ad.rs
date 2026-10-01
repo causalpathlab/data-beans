@@ -3,7 +3,7 @@ use crate::hdf5_io::*;
 use crate::sparse_io::*;
 use crate::sparse_util::*;
 use crate::utilities::name_matching::{
-    compose_id_name, filter_row_indices_by_type, make_names_unique,
+    colon_peak_names, compose_id_name, filter_row_indices_by_type, make_names_unique,
 };
 use crate::zarr_io::*;
 
@@ -211,17 +211,27 @@ pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
     assert_eq!(nrows, row_ids.len());
     assert_eq!(nrows, row_names.len());
 
-    // Composite row names: id_name
-    let mut row_ids = compose_id_name(row_ids, row_names);
-    make_names_unique(&mut row_ids);
-
     // Feature types from var/feature_type (often categorical)
-    let mut row_types: Vec<Box<str>> =
-        read_h5ad_column(&var_group, "feature_type").unwrap_or_else(|_| vec![Box::from(""); nrows]);
+    let typed = read_h5ad_column(&var_group, "feature_type").ok();
+    let has_types = typed.is_some();
+    let mut row_types: Vec<Box<str>> = typed.unwrap_or_else(|| vec![Box::from(""); nrows]);
     if nrows < row_types.len() {
         row_types.truncate(nrows);
     }
     assert_eq!(nrows, row_types.len());
+
+    // Peak rows in chr:start-end form, then composite row names: id_name
+    let mut row_ids = row_ids;
+    let n_peaks = colon_peak_names(
+        &mut row_ids,
+        &mut row_names,
+        has_types.then_some(&row_types[..]),
+    );
+    if n_peaks > 0 {
+        info!("{n_peaks} peak names rewritten in chr:start-end form");
+    }
+    let mut row_ids = compose_id_name(row_ids, row_names);
+    make_names_unique(&mut row_ids);
 
     // Cell barcodes from obs/ (try each candidate in order)
     let mut column_names: Vec<Box<str>> =
