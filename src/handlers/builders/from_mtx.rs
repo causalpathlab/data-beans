@@ -213,7 +213,7 @@ pub fn run_build_from_mtx(args: &FromMtxArgs) -> anyhow::Result<()> {
                 let tag_for = |hto_row: usize| -> String {
                     let id = rows.ids[hto_row].as_ref();
                     let name = rows.names[hto_row].as_ref();
-                    if name.is_empty() {
+                    if name.is_empty() || name == id {
                         id.to_string()
                     } else {
                         format!("{}_{}", id, name)
@@ -308,7 +308,9 @@ impl MtxFeatureRows {
             .map(|(id, name)| {
                 let id = id.as_ref();
                 let name = name.as_ref();
-                let joined = if take >= 2 && !name.is_empty() {
+                // `id` alone when the name is empty or repeats it, as the
+                // other 10x readers name rows (`compose_id_name`).
+                let joined = if take >= 2 && !name.is_empty() && name != id {
                     let mut s = String::with_capacity(id.len() + ROW_SEP.len() + name.len());
                     s.push_str(id);
                     s.push_str(ROW_SEP);
@@ -417,4 +419,41 @@ fn is_chromosome_name(s: &str) -> bool {
         return true;
     }
     s.parse::<u32>().is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utilities::name_matching::compose_id_name;
+
+    fn boxed(xs: &[&str]) -> Vec<Box<str>> {
+        xs.iter().map(|&x| Box::from(x)).collect()
+    }
+
+    #[test]
+    fn rows_are_named_as_the_other_10x_readers_name_them() {
+        let rows = |row_name_columns| MtxFeatureRows {
+            ids: boxed(&["FID1", "FID2", "FID3"]),
+            names: boxed(&["GENE1", "FID2", ""]),
+            types: None,
+            row_name_columns,
+        };
+        // By id alone where the name is empty or repeats it, as
+        // `compose_id_name` does.
+        assert_eq!(
+            rows(2).build_display_names(),
+            compose_id_name(
+                boxed(&["FID1", "FID2", "FID3"]),
+                boxed(&["GENE1", "FID2", ""])
+            )
+        );
+        assert_eq!(
+            rows(2).build_display_names(),
+            boxed(&["FID1_GENE1", "FID2", "FID3"])
+        );
+        assert_eq!(
+            rows(1).build_display_names(),
+            boxed(&["FID1", "FID2", "FID3"])
+        );
+    }
 }

@@ -1,10 +1,8 @@
 use super::run_squeeze_if_needed;
+use crate::convert::{build_from_zarr_matrix, ZarrMatrixLayout};
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
 use crate::sparse_util::*;
-use crate::utilities::name_matching::{
-    compose_id_name, filter_row_indices_by_type, make_names_unique,
-};
 use crate::zarr_io::*;
 
 use legume_numeric::matrix::common_io::*;
@@ -47,7 +45,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'd',
         long,
-        default_value = "/cell_features/data",
+        default_value = ZarrMatrixLayout::XENIUM_DATA,
         help = "Data field path",
         long_help = "Path to the dataset containing triplet values.\n\
                      Use the 'list-zarr' subcommand to inspect available fields."
@@ -57,7 +55,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'i',
         long,
-        default_value = "/cell_features/indices",
+        default_value = ZarrMatrixLayout::XENIUM_INDICES,
         help = "Indices field path",
         long_help = "Path to the dataset containing indices. Row indices for CSC,\n\
                      column indices for CSR."
@@ -67,7 +65,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'p',
         long,
-        default_value = "/cell_features/indptr",
+        default_value = ZarrMatrixLayout::XENIUM_INDPTR,
         help = "Indptr field path",
         long_help = "Path to the dataset containing indptr. Column pointers for CSC,\n\
                      row pointers for CSR."
@@ -87,7 +85,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'r',
         long,
-        default_value = "/cell_features/feature_ids",
+        default_value = ZarrMatrixLayout::XENIUM_ROW_IDS,
         help = "Row ID field path",
         long_help = "Path to the group or dataset for row, gene, or feature IDs."
     )]
@@ -96,7 +94,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'n',
         long,
-        default_value = "/cell_features/feature_keys",
+        default_value = ZarrMatrixLayout::XENIUM_ROW_NAMES,
         help = "Row name field path",
         long_help = "Path to the group or dataset for row, gene, or feature names."
     )]
@@ -105,7 +103,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'f',
         long,
-        default_value = "/cell_features/feature_types",
+        default_value = ZarrMatrixLayout::XENIUM_ROW_TYPES,
         help = "Row type field path",
         long_help = "Path to the group or dataset for row, gene, or feature types."
     )]
@@ -113,7 +111,7 @@ pub struct FromZarrArgs {
 
     #[arg(
         long,
-        default_value = "gene,peak",
+        default_value = ZarrMatrixLayout::SELECT_ROW_TYPES,
         help = "Select row type (comma-separated patterns; ANY match keeps the row)",
         long_help = "Select which row types to include. Patterns are comma-separated,\n\
                      case-insensitive substrings.\n\
@@ -124,7 +122,7 @@ pub struct FromZarrArgs {
 
     #[arg(
         long,
-        default_value = "aggregate",
+        default_value = ZarrMatrixLayout::REMOVE_ROW_TYPES,
         help = "Remove row type (comma-separated patterns; ANY match drops the row)",
         long_help = "Remove rows if their type contains any of these comma-separated patterns."
     )]
@@ -133,7 +131,7 @@ pub struct FromZarrArgs {
     #[arg(
         short = 'c',
         long,
-        default_value = "/cell_features/cell_id",
+        default_value = ZarrMatrixLayout::XENIUM_COLUMN_NAMES,
         help = "Column name field path",
         long_help = "Path to the group or dataset for columns or cells.\n\
                      Will first attempt Xenium's Cell ID format mapping."
@@ -190,91 +188,19 @@ pub fn run_build_from_zarr_triplets(args: &FromZarrArgs) -> anyhow::Result<()> {
         remove_file(&backend_file)?;
     }
 
-    let store = open_zarr_store(&source_zarr_file_path)?;
-    info!("Opened zarr store: {}", source_zarr_file_path);
-
-    let indices: Vec<u64> = read_zarr_numerics(store.clone(), args.indices_field.as_ref())?;
-    let indptr: Vec<u64> = read_zarr_numerics(store.clone(), args.indptr_field.as_ref())?;
-    let values: Vec<f32> = read_zarr_numerics(store.clone(), args.data_field.as_ref())?;
-    info!("Read the arrays");
-
-    let CooTripletsShape { triplets, shape } = ValuesIndicesPointers {
-        values: &values,
-        indices: &indices,
-        indptr: &indptr,
-    }
-    .to_coo(args.pointer_type)?;
-
-    let TripletsShape { nrows, ncols, nnz } = shape;
-    info!("Read {} non-zero elements in {} x {}", nnz, nrows, ncols);
-
-    let mut row_ids = read_zarr_group_attr::<Vec<Box<str>>>(store.clone(), &args.row_id_field)
-        .or_else(|_| read_zarr_strings(store.clone(), args.row_id_field.as_ref()))
-        .unwrap_or_else(|_| (0..nrows).map(|x| x.to_string().into_boxed_str()).collect());
-
-    let mut row_names = read_zarr_group_attr::<Vec<Box<str>>>(store.clone(), &args.row_name_field)
-        .or_else(|_| read_zarr_strings(store.clone(), args.row_name_field.as_ref()))
-        .unwrap_or_else(|_| (0..nrows).map(|x| x.to_string().into_boxed_str()).collect());
-
-    info!("Read {} row names", row_ids.len());
-    if nrows < row_ids.len() {
-        info!("data doesn't contain all the row IDs");
-        row_ids.truncate(nrows);
-    }
-
-    if nrows < row_names.len() {
-        info!("data doesn't contain all the row names");
-        row_names.truncate(nrows);
-    }
-
-    assert_eq!(nrows, row_ids.len());
-    assert_eq!(nrows, row_names.len());
-
-    // have composite row names
-    let mut row_ids = compose_id_name(row_ids, row_names);
-    make_names_unique(&mut row_ids);
-
-    let mut row_types = read_zarr_group_attr::<Vec<Box<str>>>(store.clone(), &args.row_type_field)
-        .or_else(|_| read_zarr_strings(store.clone(), args.row_type_field.as_ref()))
-        .unwrap_or_else(|_| vec![args.select_row_type.clone(); nrows]);
-    if nrows < row_types.len() {
-        info!("data doesn't contain all the rows");
-        row_types.truncate(nrows);
-    }
-    assert_eq!(nrows, row_types.len());
-
-    let select_rows =
-        filter_row_indices_by_type(&row_types, &args.select_row_type, &args.remove_row_type);
-
-    let mut column_names = read_zarr_flat_u32(store.clone(), &args.column_name_field)
-        .and_then(|(ids, shape)| {
-            anyhow::ensure!(shape.len() == 2 && shape[1] == 2, "cell_id must be [N, 2]");
-            parse_10x_cell_id_flat(&ids, shape[0] as usize)
-        })
-        .or_else(|_| read_zarr_group_attr::<Vec<Box<str>>>(store.clone(), &args.column_name_field))
-        .or_else(|_| read_zarr_strings(store.clone(), args.column_name_field.as_ref()))
-        .unwrap_or_else(|_| (0..ncols).map(|x| x.to_string().into_boxed_str()).collect());
-
-    if ncols < column_names.len() {
-        info!("data doesn't contain all the columns");
-        column_names.truncate(ncols);
-    }
-    assert_eq!(ncols, column_names.len());
-
-    let mut out = create_sparse_from_triplets_owned(
-        triplets,
-        (nrows, ncols, nnz),
-        Some(&backend_file),
-        Some(&backend),
-    )?;
-    info!("created sparse matrix: {}", backend_file);
-    out.register_row_names_vec(&row_ids);
-    out.register_column_names_vec(&column_names);
-
-    if select_rows.len() < nrows {
-        info!("filtering in features of `{}` type", args.select_row_type);
-        out.subset_columns_rows(None, Some(&select_rows))?;
-    }
+    let layout = ZarrMatrixLayout {
+        data_field: args.data_field.clone(),
+        indices_field: args.indices_field.clone(),
+        indptr_field: args.indptr_field.clone(),
+        pointer_type: args.pointer_type,
+        row_id_field: args.row_id_field.clone(),
+        row_name_field: args.row_name_field.clone(),
+        row_type_field: args.row_type_field.clone(),
+        select_row_type: args.select_row_type.clone(),
+        remove_row_type: args.remove_row_type.clone(),
+        column_name_field: args.column_name_field.clone(),
+    };
+    build_from_zarr_matrix(&source_zarr_file_path, &layout, &backend_file, &backend)?;
 
     run_squeeze_if_needed(
         args.do_squeeze,

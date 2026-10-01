@@ -1,10 +1,8 @@
 use super::run_squeeze_if_needed;
+use crate::convert::{build_from_h5_matrix, H5MatrixLayout, ZarrMatrixLayout};
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
 use crate::sparse_util::*;
-use crate::utilities::name_matching::{
-    compose_id_name, filter_row_indices_by_type, make_names_unique,
-};
 use crate::zarr_io::*;
 
 use clap::Args;
@@ -48,7 +46,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'x',
         long,
-        default_value = "matrix",
+        default_value = H5MatrixLayout::ROOT,
         help = "Root group name for sparse data triplets",
         long_help = "Set the root group name under which sparse data triplets are stored in the HDF5 file.\n\
                      Use the 'list-h5' command to inspect available groups."
@@ -58,7 +56,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'd',
         long,
-        default_value = "data",
+        default_value = H5MatrixLayout::DATA,
         help = "Data field name",
         long_help = "Name of the dataset containing triplet values X(i,j) under the root group."
     )]
@@ -67,7 +65,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'i',
         long,
-        default_value = "indices",
+        default_value = H5MatrixLayout::INDICES,
         help = "Indices field name",
         long_help = "Name of the dataset containing indices. Row indices for CSC,\n\
                      column indices for CSR, under the root group."
@@ -77,7 +75,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'p',
         long,
-        default_value = "indptr",
+        default_value = H5MatrixLayout::INDPTR,
         help = "Indptr field name",
         long_help = "Name of the dataset containing indptr. Column pointers for CSC,\n\
                      row pointers for CSR, under the root group."
@@ -97,7 +95,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'r',
         long,
-        default_value = "features/id",
+        default_value = H5MatrixLayout::ROW_IDS,
         help = "Row ID field name",
         long_help = "Group or dataset name for row, gene, or feature IDs under the root group."
     )]
@@ -106,7 +104,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'n',
         long,
-        default_value = "features/name",
+        default_value = H5MatrixLayout::ROW_NAMES,
         help = "Row name field name",
         long_help = "Group or dataset name for row, gene,\n\
                      or feature names under the root group."
@@ -116,7 +114,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'f',
         long,
-        default_value = "features/feature_type",
+        default_value = H5MatrixLayout::ROW_TYPES,
         help = "Row type field name",
         long_help = "Group or dataset name for row, gene,\n\
                      or feature types under the root group."
@@ -125,7 +123,7 @@ pub struct From10xMatrixArgs {
 
     #[arg(
         long,
-        default_value = "gene,peak",
+        default_value = ZarrMatrixLayout::SELECT_ROW_TYPES,
         help = "Select row type (comma-separated patterns; ANY match keeps the row)",
         long_help = "Select which row types to include. Patterns are comma-separated,\n\
                      case-insensitive substrings.\n\
@@ -136,7 +134,7 @@ pub struct From10xMatrixArgs {
 
     #[arg(
         long,
-        default_value = "aggregate",
+        default_value = ZarrMatrixLayout::REMOVE_ROW_TYPES,
         help = "Remove row type (comma-separated patterns; ANY match drops the row)",
         long_help = "Remove rows if their type contains any of these comma-separated patterns."
     )]
@@ -145,7 +143,7 @@ pub struct From10xMatrixArgs {
     #[arg(
         short = 'c',
         long,
-        default_value = "barcodes",
+        default_value = H5MatrixLayout::COLUMN_NAMES,
         help = "Column name field",
         long_help = "Group or dataset name for columns or cells under the root group."
     )]
@@ -187,8 +185,6 @@ pub struct From10xMatrixArgs {
     pub block_size: Option<usize>,
 }
 pub fn run_build_from_10x_matrix(args: &From10xMatrixArgs) -> anyhow::Result<()> {
-    let file = hdf5::File::open(args.h5_file.to_string())?;
-    info!("Opened 10X H5 file: {}", args.h5_file);
     let effective_output = apply_zip_flag(&args.output, args.zip, &args.backend);
     let (backend, backend_file) =
         resolve_backend_file(&effective_output, Some(args.backend.clone()))?;
@@ -198,105 +194,20 @@ pub fn run_build_from_10x_matrix(args: &From10xMatrixArgs) -> anyhow::Result<()>
         remove_file(&backend_file)?;
     }
 
-    let root = file.group(args.root_group_name.as_ref()).map_err(|_| {
-        anyhow::anyhow!(
-            "unable to identify data with the specified root group name: {}",
-            args.root_group_name
-        )
-    })?;
-
-    let CooTripletsShape { triplets, shape } =
-        if let (Ok(values_ds), Ok(indices_ds), Ok(indptr_ds)) = (
-            root.dataset(args.data_field.as_ref()),
-            root.dataset(args.indices_field.as_ref()),
-            root.dataset(args.indptr_field.as_ref()),
-        ) {
-            let values = values_ds.read_1d::<f32>()?;
-            let indices = indices_ds.read_1d::<u64>()?;
-            let indptr = indptr_ds.read_1d::<u64>()?;
-            ValuesIndicesPointers {
-                values: values.as_slice().expect("values not contiguous"),
-                indices: indices.as_slice().expect("indices not contiguous"),
-                indptr: indptr.as_slice().expect("indptr not contiguous"),
-            }
-            .to_coo(args.pointer_type)?
-        } else {
-            return Err(anyhow::anyhow!("unable to read triplets"));
-        };
-
-    let TripletsShape { nrows, ncols, nnz } = shape;
-    info!("Read {} non-zero elements in {} x {}", nnz, nrows, ncols);
-
-    let mut row_ids: Vec<Box<str>> = match root.dataset(args.row_id_field.as_ref()) {
-        Ok(rows) => read_hdf5_strings(rows)?,
-        _ => {
-            info!("row (feature) IDs not found");
-            (0..nrows).map(|x| x.to_string().into_boxed_str()).collect()
-        }
+    let layout = H5MatrixLayout {
+        root_group: args.root_group_name.clone(),
+        data_field: args.data_field.clone(),
+        indices_field: args.indices_field.clone(),
+        indptr_field: args.indptr_field.clone(),
+        pointer_type: args.pointer_type,
+        row_id_field: args.row_id_field.clone(),
+        row_name_field: args.row_name_field.clone(),
+        row_type_field: args.row_type_field.clone(),
+        select_row_type: args.select_row_type.clone(),
+        remove_row_type: args.remove_row_type.clone(),
+        column_name_field: args.column_name_field.clone(),
     };
-
-    let mut row_names: Vec<Box<str>> = match root.dataset(args.row_name_field.as_ref()) {
-        Ok(rows) => read_hdf5_strings(rows)?,
-        _ => {
-            info!("row (feature) names not found");
-            vec![Box::from(""); nrows]
-        }
-    };
-
-    if nrows < row_ids.len() {
-        row_ids.truncate(nrows);
-    }
-    if nrows < row_names.len() {
-        row_names.truncate(nrows);
-    }
-    assert_eq!(nrows, row_ids.len());
-    assert_eq!(nrows, row_names.len());
-
-    let mut row_ids = compose_id_name(row_ids, row_names);
-    make_names_unique(&mut row_ids);
-
-    let mut row_types: Vec<Box<str>> = match root.dataset(args.row_type_field.as_ref()) {
-        Ok(rows) => read_hdf5_strings(rows)?,
-        _ => {
-            info!("use all the types");
-            vec![args.select_row_type.clone(); nrows]
-        }
-    };
-    if nrows < row_types.len() {
-        row_types.truncate(nrows);
-    }
-    assert_eq!(nrows, row_types.len());
-
-    let mut column_names: Vec<Box<str>> = match root.dataset(args.column_name_field.as_ref()) {
-        Ok(columns) => read_hdf5_strings(columns)?,
-        _ => {
-            info!("column (cell) names not found");
-            (0..ncols).map(|x| x.to_string().into_boxed_str()).collect()
-        }
-    };
-    info!("Read {} column names", column_names.len());
-    if ncols < column_names.len() {
-        column_names.truncate(ncols);
-    }
-    assert_eq!(ncols, column_names.len());
-
-    let mut out = create_sparse_from_triplets_owned(
-        triplets,
-        (nrows, ncols, nnz),
-        Some(&backend_file),
-        Some(&backend),
-    )?;
-    info!("created sparse matrix: {}", backend_file);
-    out.register_row_names_vec(&row_ids);
-    out.register_column_names_vec(&column_names);
-
-    let select_rows =
-        filter_row_indices_by_type(&row_types, &args.select_row_type, &args.remove_row_type);
-
-    if select_rows.len() < nrows {
-        info!("filtering in features of `{}` type", args.select_row_type);
-        out.subset_columns_rows(None, Some(&select_rows))?;
-    }
+    build_from_h5_matrix(&args.h5_file, &layout, &backend_file, &backend)?;
 
     run_squeeze_if_needed(
         args.do_squeeze,
