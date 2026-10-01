@@ -1,3 +1,5 @@
+#![cfg(feature = "ndarray")]
+
 //! Tests for the zarr-backed `SparseMtxData` read path that *does not* preload
 //! columns into memory. The sibling `sparse_io_vector_tests.rs` always calls
 //! `preload_columns()` so it never exercises the zarr storage reads — these

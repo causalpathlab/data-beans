@@ -1,3 +1,5 @@
+#![cfg(feature = "ndarray")]
+
 //! `subset_columns_rows` round-trips, written against the CURRENT
 //! implementation so they pin behaviour before the streaming rewrite.
 //!

@@ -183,6 +183,7 @@ impl SparseMtxData {
         Ok(ret)
     }
 
+    #[cfg(feature = "ndarray")]
     /// Create a new `SparseMtxData` instance from an `ndarray` array
     /// * `array` - 2D array to be added to the backend
     /// * `backend_file` - Optional zarr backend file

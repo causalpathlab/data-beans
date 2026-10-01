@@ -6,7 +6,9 @@ use std::sync::Arc;
 use crate::sparse_backend::hdf5 as sparse_matrix_hdf5;
 use crate::sparse_backend::zarr as sparse_matrix_zarr;
 
-use super::{Array2, DMatrix, SparseIo, SparseIoBackend};
+#[cfg(feature = "ndarray")]
+use super::Array2;
+use super::{DMatrix, SparseIo, SparseIoBackend};
 
 /// Returned when the user asks for the HDF5 backend but data-beans was built
 /// without the `hdf5` feature. Keeps the error message consistent across the
@@ -145,6 +147,7 @@ pub fn create_sparse_from_mtx_file(
     }
 }
 
+#[cfg(feature = "ndarray")]
 /// Create a sparse matrix io (backend) with dense `Array2`
 /// * `data`: data matrix
 /// * `backend_file`: file path to the sparse matrix

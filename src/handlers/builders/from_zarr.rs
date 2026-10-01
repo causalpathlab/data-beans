@@ -246,13 +246,14 @@ pub fn run_build_from_zarr_triplets(args: &FromZarrArgs) -> anyhow::Result<()> {
     let select_rows =
         filter_row_indices_by_type(&row_types, &args.select_row_type, &args.remove_row_type);
 
-    let mut column_names =
-        parse_10x_cell_id(read_zarr_ndarray::<u32>(store.clone(), &args.column_name_field)?.view())
-            .or_else(|_| {
-                read_zarr_group_attr::<Vec<Box<str>>>(store.clone(), &args.column_name_field)
-            })
-            .or_else(|_| read_zarr_strings(store.clone(), args.column_name_field.as_ref()))
-            .unwrap_or_else(|_| (0..ncols).map(|x| x.to_string().into_boxed_str()).collect());
+    let mut column_names = read_zarr_flat_u32(store.clone(), &args.column_name_field)
+        .and_then(|(ids, shape)| {
+            anyhow::ensure!(shape.len() == 2 && shape[1] == 2, "cell_id must be [N, 2]");
+            parse_10x_cell_id_flat(&ids, shape[0] as usize)
+        })
+        .or_else(|_| read_zarr_group_attr::<Vec<Box<str>>>(store.clone(), &args.column_name_field))
+        .or_else(|_| read_zarr_strings(store.clone(), args.column_name_field.as_ref()))
+        .unwrap_or_else(|_| (0..ncols).map(|x| x.to_string().into_boxed_str()).collect());
 
     if ncols < column_names.len() {
         info!("data doesn't contain all the columns");

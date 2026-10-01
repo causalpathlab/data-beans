@@ -9,7 +9,6 @@ use crate::utilities::name_matching::match_by_substring;
 use clap::Args;
 use legume_numeric::matrix::common_io::*;
 use legume_numeric::matrix::traits::IoOps;
-use ndarray::Array2;
 use std::io::Write;
 
 /// A quick information of the underlying matrix of a backend file.
@@ -95,13 +94,13 @@ pub struct TakeRowNamesArgs {
     pub output: Box<str>,
 }
 
-/// Write an Array2 as TSV with optional row/column names.
+/// Write a matrix as TSV with optional row/column names.
 /// Arguments mirror `to_parquet_with_names`:
 /// - `row_names`: `(Option<&[Box<str>]>, Option<&str>)` — names and label for the row dimension
 /// - `column_names`: `Option<&[Box<str>]>` — column headers
 fn write_named_tsv(
     output: &str,
-    data: &Array2<f32>,
+    data: &DMatrix<f32>,
     row_names: (Option<&[Box<str>]>, Option<&str>),
     column_names: Option<&[Box<str>]>,
 ) -> anyhow::Result<()> {
@@ -125,7 +124,7 @@ fn write_named_tsv(
     }
     writeln!(w)?;
     // Data rows
-    for (i, row) in data.rows().into_iter().enumerate() {
+    for (i, row) in data.row_iter().enumerate() {
         write!(w, "{}", row_names[i])?;
         for val in row.iter() {
             write!(w, "\t{}", val)?;
@@ -207,7 +206,7 @@ pub fn take_columns(args: &TakeColumnsArgs) -> anyhow::Result<()> {
     let (data, column_names) = if let Some(columns) = picked {
         let names = data.column_names()?;
         let column_names: Vec<Box<str>> = columns.iter().map(|&i| names[i].clone()).collect();
-        (data.read_columns_ndarray(columns)?, column_names)
+        (data.read_columns_dmatrix(columns)?, column_names)
     } else if let Some(columns) = columns {
         let columns = parse_index_spec(&columns)?;
         let n_columns = data.num_columns().unwrap_or(0);
@@ -220,18 +219,18 @@ pub fn take_columns(args: &TakeColumnsArgs) -> anyhow::Result<()> {
         let _names = data.column_names()?;
         let column_names: Vec<Box<str>> = columns.iter().map(|&i| _names[i].clone()).collect();
 
-        (data.read_columns_ndarray(columns)?, column_names)
+        (data.read_columns_dmatrix(columns)?, column_names)
     } else if let Some(column_file) = column_name_file {
         let col_names_to_match = read_col_names(column_file, MAX_COLUMN_NAME_IDX)?;
         let all_names = data.column_names()?;
         let (matched_indices, column_names) =
             match_by_substring(&all_names, &col_names_to_match, "column")?;
-        (data.read_columns_ndarray(matched_indices)?, column_names)
+        (data.read_columns_dmatrix(matched_indices)?, column_names)
     } else if let Some(col_names_to_match) = column_names_arg {
         let all_names = data.column_names()?;
         let (matched_indices, column_names) =
             match_by_substring(&all_names, &col_names_to_match, "column")?;
-        (data.read_columns_ndarray(matched_indices)?, column_names)
+        (data.read_columns_dmatrix(matched_indices)?, column_names)
     } else {
         return Err(anyhow::anyhow!(
             "either `column-indices`, `name-file`, `column-names`, or `--interactive` must be provided"
@@ -282,7 +281,7 @@ pub fn take_rows(args: &TakeRowsArgs) -> anyhow::Result<()> {
     let (data, row_names) = if let Some(rows) = picked {
         let names = data_backend.row_names()?;
         let row_names: Vec<Box<str>> = rows.iter().map(|&i| names[i].clone()).collect();
-        (data_backend.read_rows_ndarray(rows)?, row_names)
+        (data_backend.read_rows_dmatrix(rows)?, row_names)
     } else if let Some(rows) = rows {
         let rows = parse_index_spec(&rows)?;
         let n_rows = data_backend.num_rows().unwrap_or(0);
@@ -295,25 +294,25 @@ pub fn take_rows(args: &TakeRowsArgs) -> anyhow::Result<()> {
         let _names = data_backend.row_names()?;
         let row_names: Vec<Box<str>> = rows.iter().map(|&i| _names[i].clone()).collect();
 
-        (data_backend.read_rows_ndarray(rows)?, row_names)
+        (data_backend.read_rows_dmatrix(rows)?, row_names)
     } else if let Some(row_name_file) = row_name_file {
         let row_names_to_match = read_col_names(row_name_file, MAX_ROW_NAME_IDX)?;
         let all_names = data_backend.row_names()?;
         let (matched_indices, row_names) =
             match_by_substring(&all_names, &row_names_to_match, "row")?;
-        (data_backend.read_rows_ndarray(matched_indices)?, row_names)
+        (data_backend.read_rows_dmatrix(matched_indices)?, row_names)
     } else if let Some(row_names_to_match) = row_names_arg {
         let all_names = data_backend.row_names()?;
         let (matched_indices, row_names) =
             match_by_substring(&all_names, &row_names_to_match, "row")?;
-        (data_backend.read_rows_ndarray(matched_indices)?, row_names)
+        (data_backend.read_rows_dmatrix(matched_indices)?, row_names)
     } else {
         return Err(anyhow::anyhow!(
             "either `row-indices`, `name-file`, `row-names`, or `--interactive` must be provided"
         ));
     };
 
-    let data_t = data.t().to_owned();
+    let data_t = data.transpose();
     let column_names = data_backend.column_names()?;
 
     if let Ok(ext) = file_ext(&output) {
