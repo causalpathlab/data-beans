@@ -13,6 +13,7 @@ pub const COLUMN_SEP: &str = "@";
 pub const ROW_SEP: &str = "_";
 
 use super::helpers::*;
+use super::meta::Metadata;
 
 use crate::sparse_data_visitors::styled_progress_bar;
 use clap::ValueEnum;
@@ -402,6 +403,33 @@ pub trait SparseIo: Sync + Send {
     /// * `key`: key for the registered names
     fn retrieve_registered_names(&self, key: &str) -> anyhow::Result<Vec<Box<str>>>;
 
+    //////////////
+    // metadata //
+    //////////////
+
+    /// The strings stored with the data to say what it is (see
+    /// [`meta`](crate::sparse_io::meta) for the keys programs share); empty
+    /// when none were set.
+    fn metadata(&self) -> Metadata;
+
+    /// Store `meta` as the data's metadata, replacing what was there. It
+    /// needs a writable backend: one being created (set it before zipping),
+    /// or an unzipped zarr store. A zipped zarr store, or an HDF5 file opened
+    /// to read, refuses it.
+    fn set_metadata(&mut self, meta: &Metadata) -> anyhow::Result<()>;
+
+    /// One metadata value, e.g. `meta(meta::SAMPLE)`.
+    fn meta(&self, key: &str) -> Option<String> {
+        self.metadata().remove(key)
+    }
+
+    /// Set one metadata value, keeping the others.
+    fn set_meta(&mut self, key: &str, value: &str) -> anyhow::Result<()> {
+        let mut meta = self.metadata();
+        meta.insert(key.to_string(), value.to_string());
+        self.set_metadata(&meta)
+    }
+
     /////////////////////////////
     // major structural change //
     /////////////////////////////
@@ -606,6 +634,7 @@ pub trait SparseIo: Sync + Send {
             out.build_csr_from_csc_streaming()?;
             out.register_row_names_vec(&new_row_names);
             out.register_column_names_vec(&new_col_names);
+            out.set_metadata(&self.metadata())?;
         }
 
         ////////////////////////////////////
@@ -624,6 +653,8 @@ pub trait SparseIo: Sync + Send {
     /// Reposition rows in a new order specified by `remap`
     /// * `row_names_order` - a vector of row names in the new order
     fn reorder_rows(&mut self, row_names_order: &[Box<str>]) -> anyhow::Result<()> {
+        // The backend is rebuilt from scratch below; its metadata comes along.
+        let meta = self.metadata();
         let new_col_names = self.column_names()?.clone();
         let name2new = build_name2index_map(row_names_order);
 
@@ -706,6 +737,7 @@ pub trait SparseIo: Sync + Send {
 
             self.register_row_names_vec(row_names_order);
             self.register_column_names_vec(&new_col_names);
+            self.set_metadata(&meta)?;
             info!("registered new data to {}", self.get_backend_file_name());
         }
 

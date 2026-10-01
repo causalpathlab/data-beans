@@ -134,5 +134,6 @@ pub fn stream_column_selection(
     );
     out.register_row_names_vec(out_row_names);
     out.register_column_names_vec(out_col_names);
+    out.set_metadata(&data.metadata())?;
     Ok((out_nrow, out_ncol, nnz as usize))
 }

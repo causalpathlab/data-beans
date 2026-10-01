@@ -554,6 +554,23 @@ impl SparseIo for SparseMtxData {
         &self.by_column_indptr
     }
 
+    fn metadata(&self) -> Metadata {
+        Self::_get_group_attr::<Metadata>(self.read_store.clone(), "/", meta::ATTR)
+            .unwrap_or_default()
+    }
+
+    fn set_metadata(&mut self, values: &Metadata) -> anyhow::Result<()> {
+        let mut root = zarrs::group::Group::open(self.write_store()?.clone(), "/")?;
+        if values.is_empty() {
+            root.attributes_mut().remove(meta::ATTR);
+        } else {
+            root.attributes_mut()
+                .insert(meta::ATTR.to_string(), serde_json::to_value(values)?);
+        }
+        root.store_metadata()?;
+        Ok(())
+    }
+
     fn reopen_backend(&mut self) -> anyhow::Result<()> {
         // Path-addressed store: rebuild it, refresh the resident indptrs — and
         // DROP the decoded-chunk LRU caches, which pin arrays of the store they

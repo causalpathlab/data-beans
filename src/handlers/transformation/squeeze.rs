@@ -191,6 +191,7 @@ fn run_merge_then_squeeze(
     let mut column_names: Vec<Box<str>> = Vec::new();
     let mut column_batch_names: Vec<Box<str>> = Vec::new();
     let mut col_offset: u64 = 0;
+    let mut metas: Vec<Metadata> = Vec::with_capacity(cmd_args.data_files.len());
 
     for (batch_idx, data_file_arg) in cmd_args.data_files.iter().enumerate() {
         info!(
@@ -202,6 +203,7 @@ fn run_merge_then_squeeze(
 
         let (backend, data_file) = resolve_backend_file(data_file_arg, None)?;
         let mut data = open_sparse_matrix(&data_file, &backend)?;
+        metas.push(data.metadata());
         // Honours the flag it always ignored: this path preloaded once per
         // input file unconditionally, and `--preload` had no off switch anyway.
         if cmd_args.preload {
@@ -285,6 +287,7 @@ fn run_merge_then_squeeze(
 
     merged_data.register_row_names_vec(&all_row_names);
     merged_data.register_column_names_vec(&column_names);
+    merged_data.set_metadata(&meta::common_metadata(&metas))?;
 
     info!("Created merged file: {}", &backend_file);
 

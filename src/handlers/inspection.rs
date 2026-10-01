@@ -169,6 +169,9 @@ pub fn show_info(cmd_args: &InfoArgs) -> anyhow::Result<()> {
         println!("number_of_columns:\t{}", ncol);
         println!("number_of_nonzeros:\t{}", nnz);
     }
+    for (key, value) in data.metadata() {
+        println!("meta.{key}:\t{value}");
+    }
 
     if !output.is_empty() {
         use {mkdir, write_lines};
