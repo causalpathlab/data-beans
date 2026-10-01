@@ -4,6 +4,9 @@ use crate::sparse_io::*;
 use crate::zarr_io::*;
 
 use clap::Args;
+// A peaks BED using `1` and a fragments file using `chr1` resolve to the
+// same chromosome key.
+use genomic_data::coordinates::chr_stripped as chr_key;
 use legume_numeric::matrix::common_io::*;
 use log::info;
 
@@ -846,18 +849,6 @@ fn run_fragments_preload_parallel(
     }
 
     Ok(())
-}
-
-/// Strip an optional `chr` / `Chr` / `CHR` prefix to get the canonical
-/// chromosome key. This matches `genomic_data::coordinates::chr_stripped`
-/// behavior so a peaks BED using `1` and a fragments file using `chr1`
-/// (or vice versa) resolve to the same internal key.
-fn chr_key(s: &str) -> &str {
-    if s.len() >= 3 && s.as_bytes()[..3].eq_ignore_ascii_case(b"chr") {
-        &s[3..]
-    } else {
-        s
-    }
 }
 
 /// Open a fragments-like text file with bgzip-safe gzip support.
