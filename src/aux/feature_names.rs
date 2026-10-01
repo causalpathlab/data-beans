@@ -191,6 +191,13 @@ fn locus_key(name: &str) -> Option<Box<str>> {
     coordinates::parse_interval(name).map(|l| l.locus_key())
 }
 
+/// [`locus_key`] with its case folded: the form data-beans 0.6.5 to 0.6.23
+/// wrote (`x_0_100` for `chrX:0-100`). Only for matching such saved keys
+/// back to case-kept rows; never a row name.
+pub(crate) fn folded_locus_key(name: &str) -> Option<Box<str>> {
+    locus_key(name).map(|k| k.to_ascii_lowercase().into_boxed_str())
+}
+
 /// Per-name rule of [`FeatureNameKind::Mixed`]: locus key, else the gene
 /// rule for `_` names, else the name unchanged.
 fn mixed_canonicalize(name: &str) -> Box<str> {
