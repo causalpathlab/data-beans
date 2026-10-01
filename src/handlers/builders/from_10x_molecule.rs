@@ -166,14 +166,16 @@ pub fn run_build_from_10x_molecule(args: &From10xMoleculeArgs) -> anyhow::Result
     info!("Read {} barcodes, {} features", barcodes.len(), n_features);
 
     // 3. Parse library_info and filter by library type: each library kept,
-    //    with its gem group when the file gives one.
-    let valid_libraries: rustc_hash::FxHashMap<u16, Option<u16>> = {
+    //    with its gem group when the file gives one, and the probe sets
+    //    they target.
+    let (valid_libraries, target_sets): (rustc_hash::FxHashMap<u16, Option<u16>>, Vec<_>) = {
         let lib_info_ds = file.dataset("library_info")?;
         let lib_info_raw = read_hdf5_strings(lib_info_ds)?;
         let lib_info_json: String = lib_info_raw.iter().map(|s| s.as_ref()).collect();
         let lib_entries: Vec<serde_json::Value> = serde_json::from_str(&lib_info_json)?;
 
         let mut valid = rustc_hash::FxHashMap::default();
+        let mut target_sets = Vec::new();
         let mut types_seen = Vec::new();
         for entry in &lib_entries {
             // Cell Ranger writes `library_id` as a number or, in older files,
@@ -190,6 +192,8 @@ pub fn run_build_from_10x_molecule(args: &From10xMoleculeArgs) -> anyhow::Result
             if let (Some(lib_id), Some(lib_type)) = (lib_id, lib_type) {
                 if lib_type.contains(args.library_type.as_ref()) {
                     valid.insert(lib_id as u16, gem_group.map(|g| g as u16));
+                    let target_set = entry.get("target_set_name").and_then(|v| v.as_str());
+                    target_sets.push(target_set.map(str::to_string));
                 }
             }
         }
@@ -206,7 +210,38 @@ pub fn run_build_from_10x_molecule(args: &From10xMoleculeArgs) -> anyhow::Result
             args.h5_file,
             types_seen.join(", ")
         );
-        valid
+        (valid, target_sets)
+    };
+
+    // A probe-based library (Flex) counts the genes its probe set targets:
+    // Cell Ranger's matrices have those rows only, so molecules of other
+    // genes, from probes it excludes, are left out too. Libraries without a
+    // probe set keep every feature.
+    let targeted: Option<Vec<bool>> = match target_sets
+        .iter()
+        .map(Option::as_deref)
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(names) => {
+            let mut keep = vec![false; n_features];
+            for name in names {
+                let rows = file
+                    .dataset(&format!("features/target_sets/{name}"))
+                    .map_err(|_| anyhow::anyhow!("no probe set '{name}' in {}", args.h5_file))?
+                    .read_1d::<u32>()?;
+                for &i in rows.iter() {
+                    *keep.get_mut(i as usize).ok_or_else(|| {
+                        anyhow::anyhow!("probe set '{name}' names feature {i} of {n_features}")
+                    })? = true;
+                }
+            }
+            info!(
+                "Probe set: {} of {n_features} features targeted",
+                keep.iter().filter(|&&k| k).count()
+            );
+            Some(keep)
+        }
+        None => None,
     };
 
     // 4. Read pass_filter if needed
@@ -357,8 +392,11 @@ pub fn run_build_from_10x_molecule(args: &From10xMoleculeArgs) -> anyhow::Result
         row_types.truncate(nrows);
     }
 
-    let select_rows =
+    let mut select_rows =
         filter_row_indices_by_type(&row_types, &args.select_row_type, &args.remove_row_type);
+    if let Some(targeted) = &targeted {
+        select_rows.retain(|&i| targeted[i]);
+    }
 
     if select_rows.len() < nrows {
         info!(
@@ -396,22 +434,34 @@ mod tests {
     /// A `molecule_info.h5` as Cell Ranger writes it: three features (the
     /// last without a molecule), a library of each type, one of them with a
     /// string id, molecules left out by `umi_type`, library type and cell
-    /// calling, and a called cell without a molecule.
-    fn molecule_info(path: &std::path::Path) {
+    /// calling, and a called cell without a molecule. With `probe_set`, the
+    /// expression library is probe-based, targeting the first and last
+    /// features.
+    fn molecule_info(path: &std::path::Path, probe_set: Option<&str>) {
         let f = hdf5::File::create(path).unwrap();
         let features = f.create_group("features").unwrap();
         strings(&features, "id", &["FID1", "FID2", "FID3"]);
         strings(&features, "name", &["GENE1", "GENE2", "GENE3"]);
         strings(&features, "feature_type", &["Gene Expression"; 3]);
         strings(&f, "barcodes", &["AAAC", "AAAG", "AAAT", "AACA"]);
-        strings(
-            &f,
-            "library_info",
-            &[
-                r#"[{"gem_group": 1, "library_id": "0", "library_type": "Gene Expression"},
-                  {"gem_group": 1, "library_id": 1, "library_type": "Antibody Capture"}]"#,
-            ],
+        let target = match probe_set {
+            Some(name) => {
+                features
+                    .create_group("target_sets")
+                    .unwrap()
+                    .new_dataset_builder()
+                    .with_data(&[0u32, 2])
+                    .create(name)
+                    .unwrap();
+                format!(r#", "target_set_name": "{name}""#)
+            }
+            None => String::new(),
+        };
+        let libraries = format!(
+            r#"[{{"gem_group": 1, "library_id": "0", "library_type": "Gene Expression"{target}}},
+                {{"gem_group": 1, "library_id": 1, "library_type": "Antibody Capture"}}]"#
         );
+        strings(&f, "library_info", &[&libraries]);
         let column = |name: &str, v: &[u64]| {
             f.new_dataset_builder().with_data(v).create(name).unwrap();
         };
@@ -481,7 +531,7 @@ mod tests {
     fn molecules_count_as_cell_ranger_counts_them() {
         let dir = tempfile::tempdir().unwrap();
         let h5 = dir.path().join("molecule_info.h5");
-        molecule_info(&h5);
+        molecule_info(&h5, None);
 
         let umis = read(&h5, &dir.path().join("umis"), false);
         // Every feature and every called cell, with or without molecules.
@@ -494,5 +544,17 @@ mod tests {
 
         let reads = read(&h5, &dir.path().join("reads"), true);
         assert_eq!(reads.values, [[5., 0., 0.], [0., 1., 0.], [0., 0., 0.]]);
+    }
+
+    #[test]
+    fn a_probe_based_library_counts_the_genes_its_probes_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let h5 = dir.path().join("molecule_info.h5");
+        molecule_info(&h5, Some("SET1"));
+
+        let umis = read(&h5, &dir.path().join("umis"), false);
+        assert_eq!(umis.rows, ["FID1_GENE1", "FID3_GENE3"].map(Box::from));
+        assert_eq!(umis.columns, ["AAAC-1", "AAAG-1", "AACA-1"].map(Box::from));
+        assert_eq!(umis.values, [[2., 0., 0.], [0., 0., 0.]]);
     }
 }
