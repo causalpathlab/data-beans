@@ -2,7 +2,7 @@ use crate::hdf5_io::*;
 use crate::sparse_io::*;
 use crate::sparse_util::*;
 use crate::utilities::name_matching::{
-    compose_id_name, filter_row_indices_by_type, make_names_unique,
+    colon_peak_names, compose_id_name, filter_row_indices_by_type, make_names_unique,
 };
 use crate::zarr_io::*;
 
@@ -65,8 +65,8 @@ pub fn write_10x_matrix(
             .map(|i| i.to_string().into_boxed_str())
             .collect::<Vec<_>>()
     };
-    let row_ids = row_ids.unwrap_or_else(|| index(nrows));
-    let row_names = row_names.unwrap_or_else(|| vec![Box::from(""); nrows]);
+    let mut row_ids = row_ids.unwrap_or_else(|| index(nrows));
+    let mut row_names = row_names.unwrap_or_else(|| vec![Box::from(""); nrows]);
     anyhow::ensure!(
         row_names.len() == nrows
             && row_types.as_ref().is_none_or(|t| t.len() == nrows)
@@ -77,6 +77,10 @@ pub fn write_10x_matrix(
     );
     let column_names = column_names.unwrap_or_else(|| index(ncols));
 
+    let n_peaks = colon_peak_names(&mut row_ids, &mut row_names, row_types.as_deref());
+    if n_peaks > 0 {
+        info!("{n_peaks} peak names rewritten in chr:start-end form");
+    }
     let mut row_ids = compose_id_name(row_ids, row_names);
     make_names_unique(&mut row_ids);
     let mut keep = match &row_types {

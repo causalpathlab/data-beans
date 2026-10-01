@@ -1,7 +1,9 @@
 use super::{log_feature_type_histogram, run_squeeze_if_needed};
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
-use crate::utilities::name_matching::{id_name, make_names_unique, RowTypeFilter};
+use crate::utilities::name_matching::{
+    colon_peak_names, id_name, make_names_unique, RowTypeFilter,
+};
 use crate::zarr_io::*;
 
 use clap::Args;
@@ -354,6 +356,10 @@ fn read_mtx_feature_rows(
         });
     }
 
+    let n_peaks = colon_peak_names(&mut ids, &mut names, any_type.then_some(&types[..]));
+    if n_peaks > 0 {
+        info!("{row_file}: {n_peaks} peak names rewritten in chr:start-end form");
+    }
     Ok(MtxFeatureRows {
         ids,
         names,

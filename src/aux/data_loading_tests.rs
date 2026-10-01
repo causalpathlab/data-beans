@@ -62,7 +62,7 @@ fn locus_rows_keep_chromosome_case() {
     .expect("load");
     let mut rows = loaded.data.row_names().unwrap();
     rows.sort();
-    assert_eq!(rows, vec![Box::<str>::from("1_0_100"), "X_0_100".into()]);
+    assert_eq!(rows, vec![Box::<str>::from("1:0-100"), "X:0-100".into()]);
 }
 
 ////////////////////////////////////////////////////////////////////
