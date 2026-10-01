@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.6.21"
+version = "0.6.22"
 rust-version = "1.91"
 # Ship only the sources, README and license: nothing else in the working tree
 # (data stores, saved name lists, scratch files) can end up on crates.io.
@@ -42,8 +42,6 @@ aux = []
 tui = ["dep:ratatui"]
 alg = ["aux"]
 sim = ["alg"]
-cuda = ["legume-numeric/cuda"]
-metal = ["legume-numeric/metal"]
 # Pulls in libhdf5 — opt-in so installs on hosts without HDF5 headers still
 # build. When off, the HDF5 sparse backend and all H5/H5AD readers compile
 # out; .zarr / .zarr.zip remain the supported formats.

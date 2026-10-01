@@ -9,8 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # `sim` implies `alg` implies `aux`: the widest non-GPU, non-HDF5 build.
-  # `cuda` / `metal` need hardware a hosted runner does not have.
+  # `sim` implies `alg` implies `aux`: the widest build without HDF5.
   FEATURES: sim
 
 jobs:

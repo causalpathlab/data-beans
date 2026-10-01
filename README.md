@@ -4,8 +4,8 @@
 ## Installation
 
 ```sh
-make install          # data-beans + data-beans-sim, auto-detected backend and HDF5
-make install-cpu      # or: install-cuda / install-metal
+make install          # data-beans + data-beans-sim, HDF5 if detected
+make install HDF5=off # without .h5/.h5ad support
 make help             # what was detected on this host, and the overrides
 ```
 
