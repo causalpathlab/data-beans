@@ -72,6 +72,10 @@ jobs:
             cargo check --all-targets --features "$f"
             echo "::endgroup::"
           done
+          # Matrices without candle (no `tensor`): what faba builds.
+          echo "::group::--no-default-features --features aux,tui"
+          cargo check --all-targets --no-default-features --features aux,tui
+          echo "::endgroup::"
 
   # `rust-version` is the highest `rust-version` among resolved dependencies
   # (1.91, from the zarrs stack). That is the floor the dependency graph

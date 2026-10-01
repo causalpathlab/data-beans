@@ -292,6 +292,7 @@ impl SparseIoVec {
         nalgebra_sparse::CsrMatrix::<f32>::from_nonzero_triplets(nrow, ncol, &triplets)
     }
 
+    #[cfg(feature = "tensor")]
     pub fn read_columns_tensor<I>(&self, cells: I) -> anyhow::Result<Tensor>
     where
         I: Iterator<Item = usize>,
@@ -393,6 +394,7 @@ impl SparseIoVec {
         nalgebra_sparse::CsrMatrix::<f32>::from_nonzero_triplets(nrow, ncol, &triplets)
     }
 
+    #[cfg(feature = "tensor")]
     pub fn read_rows_tensor<I>(&self, rows: I) -> anyhow::Result<Tensor>
     where
         I: Iterator<Item = usize>,
