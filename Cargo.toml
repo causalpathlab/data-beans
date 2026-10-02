@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.7.3"
+version = "0.7.4"
 rust-version = "1.91"
 # Ship only the sources, README and license: nothing else in the working tree
 # (data stores, saved name lists, scratch files) can end up on crates.io.
