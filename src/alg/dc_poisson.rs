@@ -470,8 +470,7 @@ fn score_move(e: usize, k: usize, stats: &DcPoissonStats, profiles: &Profiles) -
     }
 }
 
-/// Log-probability of placing entity `e` into each of the `allowed` blocks
-/// (see the score below; `allowed` must not repeat a block).
+/// Log-probability of placing entity `e` into each of the `allowed` blocks.
 ///
 /// `  s(e, k) = Σ_{g : y_eg > 0} y_eg · ln(gene_sum⁻ᵉ[k, g] + ε) − size_factor[e] · ln(size_sum⁻ᵉ[k] + Mε)`
 ///
@@ -484,10 +483,12 @@ fn score_move(e: usize, k: usize, stats: &DcPoissonStats, profiles: &Profiles) -
 /// feature, the `K` cached values sit side by side (feature-major layout),
 /// so the pass touches one short contiguous run per feature. Each block's
 /// sum is still accumulated in feature order, the same order as scoring the
-/// blocks one at a time.
+/// blocks one at a time, so the scores match that bit for bit. Partial
+/// candidate lists accumulate by *position* in `allowed`, so a block listed
+/// twice gets the same, correct score in both places.
 ///
 /// Only the `allowed` slots of `log_probs` are written, unless `allowed`
-/// covers all `K` blocks, in which case the first `K` slots are written.
+/// is as long as `K`, in which case the first `K` slots are written.
 /// The rest keep whatever stale values a previous call left (the caller
 /// reuses one buffer across sweeps). Downstream consumers
 /// ([`sample_categorical_log_restricted`], [`argmax_log_restricted`]) read
@@ -499,57 +500,70 @@ pub fn compute_log_probs_restricted(
     allowed: &[usize],
     log_probs: &mut [f64],
 ) {
-    debug_assert!(
-        allowed.len() == stats.k
-            || allowed
-                .iter()
-                .enumerate()
-                .all(|(i, k)| !allowed[..i].contains(k)),
-        "allowed blocks must be distinct"
-    );
     let kk = stats.k;
     let m = stats.num_features;
     let sf = profiles.size_factor[e] as f64;
     let row = &profiles.rows[e];
     let cur = stats.membership[e];
+    // Every block 0..K is scored straight into `log_probs`, so repeats in
+    // `allowed` (which then misses some block) are harmless.
     let dense = allowed.len() == kk;
-
-    // Cached (non-leave-one-out) scores for every allowed block, including
-    // the current one, which is overwritten below.
-    if dense {
-        for (slot, &o) in log_probs[..kk].iter_mut().zip(&stats.log_size_offset) {
-            *slot = sf * o as f64;
-        }
-    } else {
-        for &k in allowed {
-            log_probs[k] = sf * stats.log_size_offset[k] as f64;
-        }
-    }
     let score_cur = dense || allowed.contains(&cur);
+
+    // Leave-one-out score of the current block.
     let mut cur_acc = if score_cur {
         let loo_size = (stats.size_sum[cur] - sf).max(0.0);
         -sf * (loo_size + m as f64 * LOG_EPS).ln()
     } else {
         0.0
     };
-
-    for &(g, v) in row {
-        let vg = v as f64;
-        let base = g as usize * kk;
-        let logs = &stats.log_gene[base..base + kk];
-        if dense {
-            for (slot, &l) in log_probs[..kk].iter_mut().zip(logs) {
-                *slot += vg * l as f64;
-            }
-        } else {
-            for &k in allowed {
-                log_probs[k] += vg * logs[k] as f64;
-            }
-        }
+    let mut add_cur = |base: usize, vg: f64| {
         if score_cur {
             let loo = (stats.gene_sum[base + cur] - vg).max(0.0);
             cur_acc += vg * (loo + LOG_EPS).ln();
         }
+    };
+
+    // Cached (non-leave-one-out) scores for every allowed block, including
+    // the current one, which is overwritten at the end.
+    if dense {
+        for (slot, &o) in log_probs[..kk].iter_mut().zip(&stats.log_size_offset) {
+            *slot = sf * o as f64;
+        }
+        for &(g, v) in row {
+            let vg = v as f64;
+            let base = g as usize * kk;
+            let logs = &stats.log_gene[base..base + kk];
+            for (slot, &l) in log_probs[..kk].iter_mut().zip(logs) {
+                *slot += vg * l as f64;
+            }
+            add_cur(base, vg);
+        }
+    } else {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            scratch.extend(
+                allowed
+                    .iter()
+                    .map(|&k| sf * stats.log_size_offset[k] as f64),
+            );
+            for &(g, v) in row {
+                let vg = v as f64;
+                let base = g as usize * kk;
+                let logs = &stats.log_gene[base..base + kk];
+                for (acc, &k) in scratch.iter_mut().zip(allowed) {
+                    *acc += vg * logs[k] as f64;
+                }
+                add_cur(base, vg);
+            }
+            for (&acc, &k) in scratch.iter().zip(allowed) {
+                log_probs[k] = acc;
+            }
+        });
     }
     if score_cur {
         log_probs[cur] = cur_acc;
