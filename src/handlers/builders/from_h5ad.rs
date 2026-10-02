@@ -211,8 +211,11 @@ pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
     assert_eq!(nrows, row_ids.len());
     assert_eq!(nrows, row_names.len());
 
-    // Feature types from var/feature_type (often categorical)
-    let typed = read_h5ad_column(&var_group, "feature_type").ok();
+    // Feature types from var/feature_type or var/feature_types (scanpy,
+    // muon), often categorical
+    let typed = read_h5ad_column(&var_group, "feature_type")
+        .or_else(|_| read_h5ad_column(&var_group, "feature_types"))
+        .ok();
     let has_types = typed.is_some();
     let mut row_types: Vec<Box<str>> = typed.unwrap_or_else(|| vec![Box::from(""); nrows]);
     if nrows < row_types.len() {
@@ -221,7 +224,6 @@ pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
     assert_eq!(nrows, row_types.len());
 
     // Peak rows in chr:start-end form, then composite row names: id_name
-    let mut row_ids = row_ids;
     let n_peaks = colon_peak_names(
         &mut row_ids,
         &mut row_names,
