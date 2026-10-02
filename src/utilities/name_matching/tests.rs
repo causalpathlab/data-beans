@@ -120,3 +120,27 @@ fn an_untyped_list_converts_only_when_every_row_is_an_interval() {
     assert_eq!(colon_peak_names(&mut ids, &mut nm, None), 0);
     assert_eq!(ids, names(&["chr1-100-200", "GENE1"]));
 }
+
+#[test]
+fn locus_queries_prefer_the_exact_row_and_reach_composite_rows() {
+    let idx = GeneIndex::build(&names(&["chr2:5-9/count/spliced", "chr2:5-9"]));
+    assert_eq!(idx.match_gene("chr2:5-9"), Some(1), "exact name first");
+    assert_eq!(
+        idx.match_gene("2:5-9"),
+        Some(1),
+        "a whole-locus row wins its key"
+    );
+    assert_eq!(idx.match_gene("chr2:5-9/count/spliced"), Some(0));
+    assert_eq!(
+        idx.match_gene("2:5-9/count/spliced"),
+        Some(0),
+        "chr prefix free"
+    );
+    let idx = GeneIndex::build(&names(&["chrX:0-100", "X:0-100"]));
+    assert_eq!(idx.match_gene("X:0-100"), Some(1));
+    assert_eq!(idx.match_gene("chrX:0-100"), Some(0));
+    // An id_name composite peak row is reached by its locus.
+    let idx = GeneIndex::build(&names(&["GENE9", "chr1:100-200_GENE1"]));
+    assert_eq!(idx.match_gene("chr1:100-200"), Some(1));
+    assert_eq!(idx.match_gene("x:0-100/count/spliced"), None);
+}

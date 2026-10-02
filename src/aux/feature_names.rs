@@ -117,19 +117,7 @@ impl FeatureNameKind {
         let pct_locus = n_locus as f32 / n as f32;
         let pct_gene = n_gene_like as f32 / n as f32;
         if pct_locus < 0.50 {
-            let n_spelled = names
-                .iter()
-                .filter(|name| {
-                    !coordinates::is_locus(name) && coordinates::import_interval(name).is_some()
-                })
-                .count();
-            if n_spelled * 2 >= n {
-                log::warn!(
-                    "{n_spelled} of {n} row names read as intervals only in a non-colon \
-                     spelling (e.g. `chr1-100-200`); they are not loci here. Re-import them so \
-                     peaks are named `chr:start-end`."
-                );
-            }
+            warn_non_colon_loci(names);
         }
         if pct_locus >= 0.10 && pct_gene >= 0.10 {
             Self::Mixed
@@ -207,7 +195,8 @@ pub use genomic_data::coordinates::locus_key;
 /// Per-name rule of [`FeatureNameKind::Mixed`]: locus key, else the gene
 /// rule for gene-style names, else the name unchanged.
 fn mixed_canonicalize(name: &str) -> Box<str> {
-    locus_key(name).unwrap_or_else(|| gene_canonicalize(name, '_'))
+    let untagged = strip_feature_type_suffix(name, '_');
+    locus_key(untagged).unwrap_or_else(|| gene_canonicalize(name, '_'))
 }
 
 /// Build the overlap-merge canonical map from a flat list of row names
@@ -294,7 +283,27 @@ pub fn build_locus_overlap_canonical_map(names: &[Box<str>]) -> HashMap<Box<str>
             out.insert(names[i].clone(), cluster.locus_key());
         }
     }
+    if out.is_empty() {
+        warn_non_colon_loci(names);
+    }
     out
+}
+
+/// Warn when many of `names` read as intervals only in a non-colon spelling
+/// (`chr1-100-200`): they are not loci, so a locus rule passes them through.
+fn warn_non_colon_loci(names: &[Box<str>]) {
+    let n_spelled = names
+        .iter()
+        .filter(|name| !coordinates::is_locus(name) && coordinates::import_interval(name).is_some())
+        .count();
+    if n_spelled > 0 && n_spelled * 10 >= names.len() {
+        log::warn!(
+            "{n_spelled} of {} row names read as intervals only in a non-colon spelling \
+             (e.g. `chr1-100-200`); they are not loci here. Re-import them so peaks are named \
+             `chr:start-end`.",
+            names.len()
+        );
+    }
 }
 
 /// Build a `RowNameCanonicalizer` for [`FeatureNameKind::LocusOverlap`].
@@ -341,7 +350,15 @@ pub fn build_mixed_kind_canonicalizer(names: &[Box<str>]) -> RowNameCanonicalize
 /// first so the actual symbol becomes the rsplit target.
 fn gene_canonicalize(name: &str, delim: char) -> Box<str> {
     let (head, rest) = gene_part(name);
-    match gene_symbol(head, delim) {
+    // A coordinate keeps itself, without a feature-type tag
+    // (`chr1:0-100_Peaks` matches `chr1:0-100`).
+    let untagged = strip_feature_type_suffix(head, delim);
+    let symbol = if coordinates::is_region(untagged) {
+        Some(untagged)
+    } else {
+        gene_symbol(head, delim)
+    };
+    match symbol {
         Some(symbol) if rest.is_empty() => symbol.into(),
         Some(symbol) => format!("{symbol}{rest}").into_boxed_str(),
         None => name.into(),
@@ -745,11 +762,19 @@ mod tests {
             gene.canonicalize("ENSG000_GENE1/count/spliced").as_ref(),
             "GENE1/count/spliced"
         );
+        // A tagged locus loses its tag and nothing else.
+        assert_eq!(gene.canonicalize("chr1:0-100_Peaks").as_ref(), "chr1:0-100");
+        assert_eq!(
+            FeatureNameKind::Mixed
+                .canonicalize("chr1:0-100_Peaks")
+                .as_ref(),
+            "1:0-100"
+        );
         // A locus is never cut at `_`, even when its contig name has one or
         // it carries a feature-type tag.
         assert_eq!(
             gene.canonicalize("chrUn_CTG1v1:0-100_Peaks").as_ref(),
-            "chrUn_CTG1v1:0-100_Peaks"
+            "chrUn_CTG1v1:0-100"
         );
         assert_eq!(
             gene.canonicalize("chrUn_CTG1v1:0-100").as_ref(),
