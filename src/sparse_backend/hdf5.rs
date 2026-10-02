@@ -44,6 +44,10 @@ pub struct SparseMtxData {
     by_column_data: Option<Vec<f32>>,
     by_row_indices: Option<Vec<u64>>,
     by_row_data: Option<Vec<f32>>,
+    /// Budget share of the preloaded column arrays, given back with them.
+    column_preload: Option<crate::sparse_io::PreloadReservation>,
+    /// Budget share of the preloaded row arrays, given back with them.
+    row_preload: Option<crate::sparse_io::PreloadReservation>,
 }
 
 impl SparseMtxData {
@@ -89,6 +93,8 @@ impl SparseMtxData {
             by_column_data: None,
             by_row_indices: None,
             by_row_data: None,
+            column_preload: None,
+            row_preload: None,
         };
 
         ret.read_column_indptr()?;
@@ -241,6 +247,8 @@ impl SparseMtxData {
             by_column_data: None,
             by_row_indices: None,
             by_row_data: None,
+            column_preload: None,
+            row_preload: None,
         })
     }
 }
@@ -352,16 +360,22 @@ impl SparseIo for SparseMtxData {
     }
 
     fn preload_columns(&mut self) -> anyhow::Result<()> {
-        if let Some(nnz) = self.num_non_zeros() {
-            if !crate::sparse_io::preload_within_budget(nnz, "column") {
-                return Ok(());
-            }
+        if self.by_column_data.is_some() && self.by_column_indices.is_some() {
+            return Ok(());
         }
+        let reservation = match self.num_non_zeros() {
+            Some(nnz) => match crate::sparse_io::reserve_preload(nnz, "column") {
+                Some(r) => Some(r),
+                None => return Ok(()),
+            },
+            None => None,
+        };
         let by_column = self.backend.group("/by_column")?;
         let data = by_column.dataset("data")?.read_1d::<f32>()?.to_vec();
         let indices = by_column.dataset("indices")?.read_1d::<u64>()?.to_vec();
 
         self.by_column_data = Some(data);
+        self.column_preload = reservation;
         self.by_column_indices = Some(indices);
         Ok(())
     }
@@ -369,19 +383,26 @@ impl SparseIo for SparseMtxData {
     fn clean_preloaded_columns(&mut self) {
         self.by_column_data = None;
         self.by_column_indices = None;
+        self.column_preload = None;
     }
 
     fn preload_rows(&mut self) -> anyhow::Result<()> {
-        if let Some(nnz) = self.num_non_zeros() {
-            if !crate::sparse_io::preload_within_budget(nnz, "row") {
-                return Ok(());
-            }
+        if self.by_row_data.is_some() && self.by_row_indices.is_some() {
+            return Ok(());
         }
+        let reservation = match self.num_non_zeros() {
+            Some(nnz) => match crate::sparse_io::reserve_preload(nnz, "row") {
+                Some(r) => Some(r),
+                None => return Ok(()),
+            },
+            None => None,
+        };
         let by_row = self.backend.group("/by_row")?;
         let data = by_row.dataset("data")?.read_1d::<f32>()?.to_vec();
         let indices = by_row.dataset("indices")?.read_1d::<u64>()?.to_vec();
 
         self.by_row_data = Some(data);
+        self.row_preload = reservation;
         self.by_row_indices = Some(indices);
         Ok(())
     }
@@ -389,6 +410,7 @@ impl SparseIo for SparseMtxData {
     fn clean_preloaded_rows(&mut self) {
         self.by_row_data = None;
         self.by_row_indices = None;
+        self.row_preload = None;
     }
 
     /// Remove backend file to free up disk space

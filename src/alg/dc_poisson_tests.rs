@@ -258,3 +258,101 @@ fn test_compute_sibling_sets_respects_parent() {
     assert_eq!(sibs[2], vec![2, 3]);
     assert_eq!(sibs[3], vec![2, 3]);
 }
+
+#[test]
+fn test_one_pass_scores_match_per_block_scores_exactly() {
+    // The one-pass kernel must reproduce the per-block reference bit for bit,
+    // for the full block set (dense path), for unsorted subsets with and
+    // without the entity's current block (gather path), after moves.
+    let n = 40;
+    let m = 30;
+    let k = 6;
+    let labels: Vec<usize> = (0..n).map(|i| i % k).collect();
+    let gs = toy_gene_sums(n, m, &labels, 21);
+    let mut profiles = make_profiles(&gs, m);
+    profiles.apply_feature_weighting(FeatureWeighting::FisherInfoNb);
+    let mut stats = DcPoissonStats::from_profiles(&profiles, k, &labels);
+    let mut rng = SmallRng::seed_from_u64(5);
+    for _ in 0..30 {
+        let e: usize = rng.random_range(0..n);
+        let to: usize = rng.random_range(0..k);
+        let from = stats.membership[e];
+        stats.delta_move(e, from, to, &profiles);
+    }
+    let subsets: Vec<Vec<usize>> = vec![
+        (0..k).collect(),
+        (0..k).rev().collect(),
+        vec![4, 1],
+        vec![5, 0, 2],
+        vec![3],
+    ];
+    for e in 0..n {
+        let mut reference = vec![f64::NAN; k];
+        compute_log_probs(e, &stats, &profiles, &mut reference);
+        for allowed in &subsets {
+            let mut fast = vec![f64::NEG_INFINITY; k];
+            compute_log_probs_restricted(e, &stats, &profiles, allowed, &mut fast);
+            for &b in allowed {
+                assert_eq!(
+                    fast[b].to_bits(),
+                    reference[b].to_bits(),
+                    "entity {e}, block {b}, allowed {allowed:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_stats_layout_is_feature_major() {
+    let gs = vec![vec![(0usize, 1.0f32), (2, 3.0)], vec![(1usize, 4.0f32)]];
+    let profiles = Profiles::from_gene_sums(&gs, 3);
+    let stats = DcPoissonStats::from_profiles(&profiles, 2, &[0, 1]);
+    assert_eq!(stats.idx(1, 2), 2 * 2 + 1);
+    assert_eq!(stats.gene_sum, vec![1.0, 0.0, 0.0, 4.0, 3.0, 0.0]);
+}
+
+#[test]
+fn test_repeated_candidates_score_like_single_ones() {
+    // A proposer may list a block twice; each listing must get the block's
+    // own score (the per-block reference), never a double-counted one.
+    let n = 30;
+    let m = 20;
+    let k = 5;
+    let labels: Vec<usize> = (0..n).map(|i| i % k).collect();
+    let gs = toy_gene_sums(n, m, &labels, 33);
+    let profiles = make_profiles(&gs, m);
+    let stats = DcPoissonStats::from_profiles(&profiles, k, &labels);
+    let subsets: Vec<Vec<usize>> = vec![
+        vec![2, 2],
+        vec![1, 3, 1],
+        vec![0, 4, 0, 4, 2],
+        // as long as K, with a repeat (dense path, block 4 missing)
+        vec![0, 1, 1, 2, 3],
+        // longer than K
+        vec![0, 1, 2, 3, 4, 3, 0],
+    ];
+    for e in 0..n {
+        let mut reference = vec![f64::NAN; k];
+        compute_log_probs(e, &stats, &profiles, &mut reference);
+        let cur = stats.membership[e];
+        for base in &subsets {
+            for allowed in [base.clone(), {
+                let mut a = base.clone();
+                a.push(cur);
+                a.push(cur);
+                a
+            }] {
+                let mut fast = vec![f64::NEG_INFINITY; k];
+                compute_log_probs_restricted(e, &stats, &profiles, &allowed, &mut fast);
+                for &b in &allowed {
+                    assert_eq!(
+                        fast[b].to_bits(),
+                        reference[b].to_bits(),
+                        "entity {e}, block {b}, allowed {allowed:?}"
+                    );
+                }
+            }
+        }
+    }
+}
