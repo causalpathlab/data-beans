@@ -204,6 +204,12 @@ impl NodeBlock {
     }
 }
 
+/// Fewest cells a parallel fold over one node takes per task. Each task
+/// carries its own dense per-gene accumulators (all genes, per batch), so
+/// splitting a small leaf down to a handful of cells per task spends far
+/// more time zeroing and merging those vectors than summing counts.
+const FOLD_MIN_CELLS: usize = 256;
+
 /// Per-batch gene rates of a (sub)node, with a pooled fallback for batches
 /// that hold too few cells to carry their own profile.
 pub(crate) struct NodeProfiles {
@@ -234,6 +240,7 @@ impl NodeProfiles {
         };
         let acc = local
             .par_iter()
+            .with_min_len(FOLD_MIN_CELLS)
             .fold(fresh, |mut a, &c| {
                 let b = block.batch[c];
                 let col = block.csc.col(c);
@@ -326,6 +333,7 @@ pub(crate) fn residual_variance(
     let fresh = || (vec![0f64; d], vec![vec![0f64; d]; nb]);
     let (sq, nz_depth) = local
         .par_iter()
+        .with_min_len(FOLD_MIN_CELLS)
         .fold(fresh, |(mut sq, mut nz), &c| {
             let b = block.batch[c];
             let n_c = f64::from(block.depth[c]);
@@ -630,6 +638,7 @@ fn side_sums(block: &NodeBlock, cells: &[usize], genes: &[usize]) -> Vec<f64> {
     }
     cells
         .par_iter()
+        .with_min_len(FOLD_MIN_CELLS)
         .fold(
             || vec![0f64; genes.len()],
             |mut acc, &c| {
