@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.7.0"
+version = "0.7.1"
 rust-version = "1.91"
 # Ship only the sources, README and license: nothing else in the working tree
 # (data stores, saved name lists, scratch files) can end up on crates.io.
@@ -49,7 +49,7 @@ hdf5 = ["dep:hdf5", "ndarray"]
 
 [dependencies]
 legume-numeric = { version = "0.8.14", default-features = false, features = ["matrix", "param"] }
-legume-genomic-types = "0.5.0"
+legume-genomic-types = "0.5.2"
 
 anyhow = "1.0"
 clap = { version = "4.5.20", features = ["derive"] }
