@@ -123,7 +123,7 @@ pub fn read_data_on_shared_rows(args: ReadSharedRowsArgs) -> anyhow::Result<Spar
     for data_file in args.data_files.iter() {
         info!("Importing data file: {}", data_file);
         let mut data = try_open_or_convert(data_file)?;
-        if args.preload {
+        if args.preload || crate::sparse_io::auto_preload_enabled() {
             data.preload_columns()?;
         }
         opened.push((data_file.clone(), data));

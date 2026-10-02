@@ -8,25 +8,6 @@ use rand_distr::{Distribution, Poisson};
 // Fixtures //
 //////////////
 
-/// Columns `cells` of `csc`, in that order.
-fn select_columns(csc: &CscMatrix<f32>, cells: &[usize]) -> CscMatrix<f32> {
-    let mut rows = Vec::new();
-    let mut cols = Vec::new();
-    let mut vals = Vec::new();
-    for (j, &c) in cells.iter().enumerate() {
-        let col = csc.col(c);
-        for (&g, &v) in col.row_indices().iter().zip(col.values()) {
-            rows.push(g);
-            cols.push(j);
-            vals.push(v);
-        }
-    }
-    let coo =
-        nalgebra_sparse::CooMatrix::try_from_triplets(csc.nrows(), cells.len(), rows, cols, vals)
-            .expect("valid triplets");
-    CscMatrix::from(&coo)
-}
-
 fn csc_from_dense(x_gc: &[Vec<f32>]) -> CscMatrix<f32> {
     let ngenes = x_gc.len();
     let ncells = x_gc[0].len();
@@ -508,4 +489,27 @@ fn landmark_path_agrees_with_exact() {
     assert!(agreement(&a, &state) >= 0.9);
     assert!(agreement(&b, &state) >= 0.9);
     assert!(agreement(&a, &b) >= 0.9);
+}
+
+#[test]
+fn select_columns_keeps_the_requested_order_and_entries() {
+    let csc = csc_from_dense(&[vec![1.0, 0.0, 3.0], vec![0.0, 2.0, 4.0]]);
+    let out = select_columns(&csc, &[2, 0, 2]);
+    assert_eq!(out.ncols(), 3);
+    let dense = |m: &CscMatrix<f32>| -> Vec<Vec<f32>> {
+        (0..m.ncols())
+            .map(|j| {
+                let mut v = vec![0f32; m.nrows()];
+                let col = m.col(j);
+                for (&g, &x) in col.row_indices().iter().zip(col.values()) {
+                    v[g] = x;
+                }
+                v
+            })
+            .collect()
+    };
+    assert_eq!(
+        dense(&out),
+        vec![vec![3.0, 4.0], vec![1.0, 0.0], vec![3.0, 4.0]]
+    );
 }

@@ -1148,8 +1148,14 @@ pub(crate) fn pack_levels(levels: &[Vec<usize>]) -> (Vec<usize>, Vec<usize>) {
 /// Build the tree over `data_vec` from a top-level partition `node_of_cell`
 /// (`usize::MAX` = not a root member) to the leaf targets, and return the
 /// packed codes, their level widths (finest-first) and the tree.
+///
+/// `csc` holds every cell's counts (genes x cells, global column order), read
+/// once by the caller. Each node's block is cut from it in memory: a node's
+/// cells are scattered over the whole store, so reading per node decodes
+/// every chunk once per node, and in parallel those reads thrash a slow disk.
 pub(crate) fn build_tree(
     data_vec: &SparseIoVec,
+    csc: &CscMatrix<f32>,
     node_of_cell: &[usize],
     reference: &[usize],
     level_targets: &[usize],
@@ -1161,6 +1167,7 @@ pub(crate) fn build_tree(
         "node labels for {} of {n} cells",
         node_of_cell.len()
     );
+    anyhow::ensure!(csc.ncols() == n, "counts for {} of {n} cells", csc.ncols());
     let col_to_batch = data_vec.get_batch_membership(0..n);
     let num_batches = data_vec.num_batches().max(1);
     let mut by_node: HashMap<usize, Vec<usize>> = HashMap::default();
@@ -1174,15 +1181,15 @@ pub(crate) fn build_tree(
     let roots: Vec<RootBlock> = nodes
         .into_par_iter()
         .map(|(root, cells)| {
-            let csc = data_vec.read_columns_csc(cells.iter().copied())?;
+            let block = select_columns(csc, &cells);
             let batch: Vec<usize> = cells.iter().map(|&c| col_to_batch[c]).collect();
-            Ok(RootBlock {
+            RootBlock {
                 root,
                 cells,
-                block: NodeBlock::new(csc, batch, num_batches),
-            })
+                block: NodeBlock::new(block, batch, num_batches),
+            }
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect();
     let mut out = bisect_to_target(&roots, n, level_targets, params);
     let finest = out
         .labels_per_level
@@ -1194,6 +1201,23 @@ pub(crate) fn build_tree(
     out.tree.coarse_bits = *widths.last().unwrap_or(&0);
     log_tree(&out.tree, level_targets, &out.labels_per_level);
     Ok((codes, widths, out.tree))
+}
+
+/// Columns `cols` of `csc`, in that order.
+pub(crate) fn select_columns(csc: &CscMatrix<f32>, cols: &[usize]) -> CscMatrix<f32> {
+    let nnz: usize = cols.iter().map(|&c| csc.col(c).nnz()).sum();
+    let mut offsets = Vec::with_capacity(cols.len() + 1);
+    let mut rows = Vec::with_capacity(nnz);
+    let mut vals = Vec::with_capacity(nnz);
+    offsets.push(0);
+    for &c in cols {
+        let col = csc.col(c);
+        rows.extend_from_slice(col.row_indices());
+        vals.extend_from_slice(col.values());
+        offsets.push(rows.len());
+    }
+    CscMatrix::try_from_csc_data(csc.nrows(), cols.len(), offsets, rows, vals)
+        .expect("columns of a valid CSC form a valid CSC")
 }
 
 fn log_tree(tree: &PbTree, targets: &[usize], levels: &[Vec<usize>]) {

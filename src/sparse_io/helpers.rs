@@ -95,25 +95,41 @@ pub fn remove_backend_path(path: &str) -> anyhow::Result<()> {
 
 /// Whether a preload of `nnz` entries fits the budget.
 ///
-/// Preloading costs 12 bytes per non-zero (a `u64` index and an `f32` value),
-/// there was no size check anywhere in front of it, and no consumer ever
-/// releases it — so at imaging scale a `--preload-data` was an OOM order, not a
-/// request. The budget turns that into a logged skip: every read path already
-/// handles the not-preloaded state, it is just slower.
+/// Preloading costs 12 bytes per non-zero (a `u64` index and an `f32` value)
+/// and no consumer ever releases it, so an unchecked preload at imaging scale
+/// is an OOM order, not a request. The budget turns that into a logged skip:
+/// every read path already handles the not-preloaded state, it is just slower.
 ///
-/// `LEGUME_PRELOAD_BUDGET_BYTES` overrides the default, following the
+/// The budget is half the memory available when the process first asks,
+/// shared by every preload of the process (8 GiB when the system does not
+/// say). `LEGUME_PRELOAD_BUDGET_BYTES` overrides it per preload, following the
 /// `LEGUME_ZARR_CACHE_CAP` precedent for memory knobs.
 pub fn preload_within_budget(nnz: usize, what: &str) -> bool {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     const BYTES_PER_NNZ: usize = 12;
-    const DEFAULT_BUDGET_BYTES: usize = 8 << 30;
-    let budget = std::env::var("LEGUME_PRELOAD_BUDGET_BYTES")
+    static RESERVED: AtomicUsize = AtomicUsize::new(0);
+
+    let cost = nnz.saturating_mul(BYTES_PER_NNZ);
+    if let Some(budget) = std::env::var("LEGUME_PRELOAD_BUDGET_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_BUDGET_BYTES);
-    let cost = nnz.saturating_mul(BYTES_PER_NNZ);
+    {
+        return fits_or_warn(cost, budget, nnz, what);
+    }
+    let budget = auto_preload_budget_bytes();
+    let reserved = RESERVED.fetch_add(cost, Ordering::Relaxed);
+    if fits_or_warn(reserved.saturating_add(cost), budget, nnz, what) {
+        true
+    } else {
+        RESERVED.fetch_sub(cost, Ordering::Relaxed);
+        false
+    }
+}
+
+fn fits_or_warn(cost: usize, budget: usize, nnz: usize, what: &str) -> bool {
     if cost > budget {
         log::warn!(
-            "skipping {what} preload: {cost} bytes ({nnz} nnz x {BYTES_PER_NNZ}) exceeds the \
+            "skipping {what} preload of {nnz} nnz: {cost} bytes would exceed the \
              {budget}-byte budget (LEGUME_PRELOAD_BUDGET_BYTES to raise); reads stay on the \
              streaming path"
         );
@@ -121,6 +137,32 @@ pub fn preload_within_budget(nnz: usize, what: &str) -> bool {
     } else {
         true
     }
+}
+
+/// Half the memory available at the first call, or 8 GiB when unknown.
+fn auto_preload_budget_bytes() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        const FALLBACK_BYTES: usize = 8 << 30;
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        match usize::try_from(sys.available_memory()) {
+            Ok(avail) if avail > 0 => avail / 2,
+            _ => FALLBACK_BYTES,
+        }
+    })
+}
+
+/// Whether loaders preload columns without being asked. On unless
+/// `LEGUME_AUTO_PRELOAD` is `0`, `false` or `off`; the preload itself still
+/// answers to [`preload_within_budget`], so data that does not fit in memory
+/// stays on the streaming path.
+#[allow(dead_code)] // called by library loaders; the bin has none
+pub fn auto_preload_enabled() -> bool {
+    !matches!(
+        std::env::var("LEGUME_AUTO_PRELOAD").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
 }
 
 /// Bytes of `(u64, u64, f32)` triplets a streaming-write slab may hold, and the

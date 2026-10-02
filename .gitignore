@@ -3,3 +3,6 @@ target/
 
 # Local crates.io path patches (sibling checkouts)
 .cargo/
+
+# Not tracked; resolved fresh on each build
+Cargo.lock

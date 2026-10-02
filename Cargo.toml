@@ -84,5 +84,6 @@ petgraph = "0.8"
 fastobo = "0.15"
 special = "0.13"
 num_cpus = "1.16.0"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 statrs = { version = "0.18", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }

@@ -258,10 +258,12 @@ fn finest_codes(
             };
             let low: Vec<usize> = codes.iter().map(|&c| c & low_mask).collect();
             let (mut node, _) = crate::alg::dc_poisson::compact_labels(&low);
+            // One pass over the store serves both the reassignment and the
+            // tree; per-node reads would decode every chunk once per node.
+            let csc = data_vec.read_columns_csc(0..n)?;
             let reassigned_cells = match rb.reassign_cells.as_ref() {
                 Some(cr) => {
                     let col_to_batch = data_vec.get_batch_membership(0..n);
-                    let csc = data_vec.read_columns_csc(0..n)?;
                     reassign_cells::reassign_cells_to_nodes(
                         &csc,
                         &col_to_batch,
@@ -281,7 +283,7 @@ fn finest_codes(
             // Leaf targets per level, coarse to fine — expression budget only.
             let targets: Vec<usize> = level_dims.iter().rev().map(|&d| 1usize << d).collect();
             let (codes, widths, mut tree) =
-                pb_tree::build_tree(data_vec, &node, &codes, &targets, rb)?;
+                pb_tree::build_tree(data_vec, &csc, &node, &codes, &targets, rb)?;
             tree.reassigned_cells = reassigned_cells;
             (codes, widths, Some(tree))
         }
