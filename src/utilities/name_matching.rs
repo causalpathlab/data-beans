@@ -1,5 +1,5 @@
 use crate::sparse_io::ROW_SEP;
-use genomic_data::coordinates::{import_interval, locus_key};
+use genomic_data::coordinates::{import_interval, is_locus, locus_key};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -66,21 +66,36 @@ pub fn colon_peak_names(
         }
         None => true,
     };
-    if types.is_none() && !ids.iter().all(|id| import_interval(id).is_some()) {
-        return 0;
+    if types.is_none() {
+        let n_read = ids
+            .iter()
+            .filter(|id| import_interval(id).is_some())
+            .count();
+        if n_read < ids.len() {
+            if n_read * 2 >= ids.len() {
+                log::info!(
+                    "{n_read} of {} untyped rows read as intervals, but not all; \
+                     the names are kept as written",
+                    ids.len()
+                );
+            }
+            return 0;
+        }
     }
     let mut n = 0;
     for (i, (id, name)) in ids.iter_mut().zip(names.iter_mut()).enumerate() {
         if !is_peak(i) {
             continue;
         }
+        let mut changed = false;
         for s in [id, name] {
             if let Some(l) = import_interval(s) {
                 let colon = l.to_string().into_boxed_str();
-                n += usize::from(*s != colon);
+                changed |= *s != colon;
                 *s = colon;
             }
         }
+        n += usize::from(changed);
     }
     n
 }
@@ -340,8 +355,40 @@ pub struct GeneIndex {
     exact: HashMap<String, usize>,
     symbol: HashMap<String, usize>,
     ensg: HashMap<String, usize>,
-    /// Locus rows by their locus key. Loci match only here, case kept.
+    /// Rows with a locus part ([`locus_part`]), by their name as written,
+    /// then by locus key plus the rest of the name, then (for rows with a
+    /// rest) by the bare locus key. Loci match only here, case kept.
+    locus_raw: HashMap<Box<str>, usize>,
     locus: HashMap<Box<str>, usize>,
+}
+
+/// A name's locus part and the rest after it: the whole name when it is a
+/// locus, its `/`-core (`chr1:1-2/count/spliced`), or the locus before an
+/// `id{ROW_SEP}name` join (`chr1:1-2_GENE1`). `None` when no part is a locus.
+fn locus_part(name: &str) -> Option<(&str, &str)> {
+    if is_locus(name) {
+        return Some((name, ""));
+    }
+    let core = name.split('/').next().unwrap_or(name);
+    let cut = if is_locus(core) {
+        core.len()
+    } else {
+        let colon = core.find(':')?;
+        colon + 1 + core[colon + 1..].find(ROW_SEP)?
+    };
+    let (part, rest) = name.split_at(cut);
+    is_locus(part).then_some((part, rest))
+}
+
+/// The key a name with a locus part is matched by: the locus key, then the
+/// rest of the name as written.
+fn locus_match_key(part: &str, rest: &str) -> Option<Box<str>> {
+    let key = locus_key(part)?;
+    Some(if rest.is_empty() {
+        key
+    } else {
+        format!("{key}{rest}").into_boxed_str()
+    })
 }
 
 #[allow(dead_code)] // consumed by downstream crates (geu, senna), not the data-beans bin
@@ -350,33 +397,42 @@ impl GeneIndex {
     /// wins on duplicate keys (matching positional-scan semantics).
     #[must_use]
     pub fn build(gene_names: &[Box<str>]) -> Self {
-        // A locus row gets its key and an empty lowered name, which keeps it
-        // out of every gene tier, the fallback scan included. A row whose
-        // `/`-core is a locus (`chr1:1-2/count/spliced`) also gets its core
-        // key, and stays in the gene tiers for its full name.
-        let (lowered, keys): (Vec<String>, Vec<Option<Box<str>>>) = gene_names
+        // A whole-locus row gets an empty lowered name, which keeps it out
+        // of every gene tier, the fallback scan included. A row with a
+        // locus part plus a rest stays in the gene tiers for its full name.
+        let lowered: Vec<String> = gene_names
             .par_iter()
-            .map(|g| match locus_key(g) {
-                Some(key) => (String::new(), Some(key)),
-                None => {
-                    let core = g.split('/').next().unwrap_or(g);
-                    let key = if core.len() < g.len() {
-                        locus_key(core)
-                    } else {
-                        None
-                    };
-                    (g.to_lowercase(), key)
+            .map(|g| {
+                if is_locus(g) {
+                    String::new()
+                } else {
+                    g.to_lowercase()
                 }
             })
-            .unzip();
+            .collect();
+        let mut locus_raw: HashMap<Box<str>, usize> = HashMap::default();
+        let mut locus: HashMap<Box<str>, usize> = HashMap::default();
+        let mut bare: Vec<(Box<str>, usize)> = Vec::new();
+        for (i, g) in gene_names.iter().enumerate() {
+            let Some((part, rest)) = locus_part(g) else {
+                continue;
+            };
+            locus_raw.entry(g.clone()).or_insert(i);
+            if let Some(key) = locus_match_key(part, rest) {
+                locus.entry(key).or_insert(i);
+            }
+            if !rest.is_empty() {
+                bare.extend(locus_key(part).map(|k| (k, i)));
+            }
+        }
+        // A whole-locus row wins its key over a row that only starts with it.
+        for (key, i) in bare {
+            locus.entry(key).or_insert(i);
+        }
         let mut exact: HashMap<String, usize> = HashMap::default();
         let mut symbol: HashMap<String, usize> = HashMap::default();
         let mut ensg: HashMap<String, usize> = HashMap::default();
-        let mut locus: HashMap<Box<str>, usize> = HashMap::default();
-        for (i, (low, key)) in lowered.iter().zip(keys).enumerate() {
-            if let Some(key) = key {
-                locus.entry(key).or_insert(i);
-            }
+        for (i, low) in lowered.iter().enumerate() {
             if low.is_empty() {
                 continue;
             }
@@ -401,6 +457,7 @@ impl GeneIndex {
             exact,
             symbol,
             ensg,
+            locus_raw,
             locus,
         }
     }
@@ -408,10 +465,14 @@ impl GeneIndex {
     /// Row index for `gene`, or `None` if unmatched (tiers above).
     #[must_use]
     pub fn match_gene(&self, gene: &str) -> Option<usize> {
-        // A locus matches a locus row by key, strictly: no case folding,
-        // aliasing or prefix fallback.
-        if let Some(key) = locus_key(gene) {
-            return self.locus.get(&key).copied();
+        // A name with a locus part matches only a row with one: the same
+        // name as written first, then by locus key plus the rest. Strictly:
+        // no case folding, aliasing or prefix fallback.
+        if let Some((part, rest)) = locus_part(gene) {
+            if let Some(&i) = self.locus_raw.get(gene) {
+                return Some(i);
+            }
+            return locus_match_key(part, rest).and_then(|k| self.locus.get(&k).copied());
         }
         let gl = gene.to_lowercase();
         if let Some(&i) = self.exact.get(&gl) {
