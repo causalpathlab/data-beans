@@ -56,10 +56,6 @@ pub struct FrozenFeatureHost {
     pub h: usize,
 }
 
-/// Which source rows may match, given their names: see
-/// [`load_frozen_feature_host_matching`].
-pub type MatchableRows<'a> = dyn FnMut(&[Box<str>]) -> anyhow::Result<Vec<bool>> + 'a;
-
 /// A rename of source row names, see [`FrozenLoadArgs::source_name_map`].
 pub type SourceNameMap<'a> = &'a dyn Fn(&str) -> Box<str>;
 
@@ -80,27 +76,32 @@ pub struct FrozenLoadArgs<'a> {
     /// matching; [`FeatureNameKind::Gene { delim: '_' }`] is the typical
     /// choice for scRNA gene IDs.
     pub name_kind: FeatureNameKind,
-    /// Applied to every SOURCE row name before canonicalization, and kept as
+    /// Applied to each SOURCE row name that may match (every row, unless
+    /// [`load_frozen_feature_host_matching`] marks fewer) before
+    /// canonicalization, and kept as
     /// the host's `src_names`: how a caller whose axis carries a row grammar
     /// (`{gene}/count/spliced`) reads a plain gene table, lifting each bare
     /// name into the grammar first. `None` = the names as read.
     pub source_name_map: Option<SourceNameMap<'a>>,
 }
 
+/// Load the dictionary and match its rows to the target axis by canonical
+/// name. Among source rows with one canonical name the first wins.
 pub fn load_frozen_feature_host(args: FrozenLoadArgs) -> anyhow::Result<FrozenFeatureHost> {
-    load_frozen_feature_host_matching(args, &mut |names| Ok(vec![true; names.len()]))
+    load_frozen_feature_host_matching(args, |names| Ok(vec![true; names.len()]))
 }
 
 /// [`load_frozen_feature_host`], matching only the source rows `matchable`
 /// marks. It is handed the dictionary's row names as read (before
-/// [`FrozenLoadArgs::source_name_map`]) and returns one flag per row. A row
-/// left unmarked is never matched, yet stays in `src_names` / `src_e_feat`:
-/// how a mixed-type table (genes beside ontology terms, words, cell types)
-/// is read for its gene rows alone, so a term or cell type that shares a
-/// gene's name cannot stand in for the gene.
+/// [`FrozenLoadArgs::source_name_map`]) and returns one flag per row, BY
+/// POSITION: two rows may share a name (a cell type `CD4` beside the gene
+/// `CD4`), so marking by name would mark both and the first would still win.
+/// [`crate::aux::feature_types::feature_rows`] marks a mixed-type table's
+/// gene and region rows from its types table. A row left unmarked is never
+/// matched or renamed, yet stays in `src_names` / `src_e_feat`.
 pub fn load_frozen_feature_host_matching(
     args: FrozenLoadArgs,
-    matchable: &mut MatchableRows<'_>,
+    matchable: impl FnOnce(&[Box<str>]) -> anyhow::Result<Vec<bool>>,
 ) -> anyhow::Result<FrozenFeatureHost> {
     let dict = <DMatrix<f32> as IoOps>::from_parquet(args.dictionary_path)?;
     let n_src = dict.rows.len();
@@ -134,7 +135,8 @@ pub fn load_frozen_feature_host_matching(
         }
     };
 
-    let matchable = matchable(&dict.rows)?;
+    let matchable = matchable(&dict.rows)
+        .map_err(|e| anyhow::anyhow!("{}: marking its rows: {e}", args.dictionary_path))?;
     anyhow::ensure!(
         matchable.len() == n_src,
         "{}: {} row flags for {} rows",
@@ -144,13 +146,19 @@ pub fn load_frozen_feature_host_matching(
     );
     let n_matchable = matchable.iter().filter(|&&m| m).count();
     anyhow::ensure!(
-        n_matchable > 0,
-        "{}: none of its {} rows is one that may match a feature",
+        n_src == 0 || n_matchable > 0,
+        "{}: none of its {} rows is marked as one that may match a feature",
         args.dictionary_path,
         n_src
     );
+    // Only a row that may match is renamed: an unmarked one keeps its name.
     let src_names: Vec<Box<str>> = match args.source_name_map {
-        Some(f) => dict.rows.iter().map(|n| f(n)).collect(),
+        Some(f) => dict
+            .rows
+            .iter()
+            .zip(&matchable)
+            .map(|(n, &m)| if m { f(n) } else { n.clone() })
+            .collect(),
         None => dict.rows,
     };
     let mut src_by_canon: FxHashMap<Box<str>, usize> = FxHashMap::default();
@@ -160,7 +168,8 @@ pub fn load_frozen_feature_host_matching(
             continue;
         }
         let canon = args.name_kind.canonicalize(name);
-        // First occurrence wins, as documented; `insert` would keep the last.
+        // First occurrence wins (see `load_frozen_feature_host`); `insert`
+        // would keep the last.
         if let std::collections::hash_map::Entry::Vacant(e) = src_by_canon.entry(canon) {
             e.insert(i);
         } else {
@@ -172,6 +181,18 @@ pub fn load_frozen_feature_host_matching(
             "{}: {} source rows had duplicate canonical names — kept first occurrence",
             args.dictionary_path,
             src_dupes
+        );
+    }
+    let shadowing = src_names
+        .iter()
+        .zip(&matchable)
+        .filter(|(n, &m)| !m && src_by_canon.contains_key(&args.name_kind.canonicalize(n)))
+        .count();
+    if shadowing > 0 {
+        log::info!(
+            "{}: {} unmarked rows share a name with a matchable row and were passed over",
+            args.dictionary_path,
+            shadowing
         );
     }
 
@@ -210,20 +231,25 @@ pub fn load_frozen_feature_host_matching(
         .count();
     if channelized_unmatched > 0 {
         log::warn!(
-            "{}: {} unmatched source rows carry the channelized row grammar —              is this a raw gene dictionary, or a channelized/co-embedding output?",
+            "{}: {} unmatched source rows carry the channelized row grammar — is this a raw gene dictionary, or a channelized/co-embedding output?",
             args.dictionary_path,
             channelized_unmatched
         );
     }
+    let matchable_note = if n_matchable < n_src {
+        format!("; {n_matchable} source rows may match")
+    } else {
+        String::new()
+    };
     log::info!(
-        "Frozen feature side from {}: {}/{} target features matched (H={}, {} of {} source rows reused, {} of them matchable, kind={:?})",
+        "Frozen feature side from {}: {}/{} target features matched (H={}, {} of {} source rows reused{}, kind={:?})",
         args.dictionary_path,
         keep_target_indices.len(),
         args.target_feature_names.len(),
         h,
         unique_src_used.len(),
         n_src,
-        n_matchable,
+        matchable_note,
         args.name_kind
     );
 
@@ -426,13 +452,8 @@ mod tests {
             name_kind: FeatureNameKind::Exact,
             source_name_map: None,
         };
-        let mut seen: Vec<Box<str>> = Vec::new();
-        let host = load_frozen_feature_host_matching(args(), &mut |names| {
-            seen = names.to_vec();
-            Ok(vec![false, true, true])
-        })
-        .unwrap();
-        assert_eq!(seen.len(), 3);
+        let host =
+            load_frozen_feature_host_matching(args(), |_| Ok(vec![false, true, true])).unwrap();
         assert_eq!(host.keep_target_indices, vec![0, 1]);
         assert_eq!(host.keep_src_indices, vec![2, 1]);
         assert_eq!(
@@ -442,10 +463,44 @@ mod tests {
         assert_eq!(host.src_names.len(), 3);
 
         // Every row unmarked, or the wrong count: refused.
-        assert!(
-            load_frozen_feature_host_matching(args(), &mut |n| Ok(vec![false; n.len()])).is_err()
-        );
-        assert!(load_frozen_feature_host_matching(args(), &mut |_| Ok(vec![true])).is_err());
+        let err = |m: Vec<bool>| {
+            load_frozen_feature_host_matching(args(), |_| Ok(m))
+                .err()
+                .unwrap()
+                .to_string()
+        };
+        assert!(err(vec![false; 3]).contains("none of its 3 rows is marked"));
+        assert!(err(vec![true]).contains("1 row flags for 3 rows"));
+
+        // The marks are asked of the names as read, before any rename.
+        let lift = |n: &str| -> Box<str> { format!("{n}/count/spliced").into() };
+        let mut seen: Vec<Box<str>> = Vec::new();
+        let renamed = FrozenLoadArgs {
+            source_name_map: Some(&lift),
+            ..args()
+        };
+        assert!(load_frozen_feature_host_matching(renamed, |names| {
+            seen = names.to_vec();
+            Ok(vec![false; names.len()])
+        })
+        .is_err());
+        let read: Vec<Box<str>> = vec!["CD4".into(), "CD4".into(), "MYC".into()];
+        assert_eq!(seen, read);
+
+        // ...and only a marked row is renamed.
+        let target: Vec<Box<str>> = vec!["CD4/count/spliced".into()];
+        let host = load_frozen_feature_host_matching(
+            FrozenLoadArgs {
+                target_feature_names: &target,
+                source_name_map: Some(&lift),
+                ..args()
+            },
+            |_| Ok(vec![false, true, true]),
+        )
+        .unwrap();
+        assert_eq!(&*host.src_names[0], "CD4");
+        assert_eq!(&*host.src_names[1], "CD4/count/spliced");
+        assert_eq!(host.keep_src_indices, vec![1]);
     }
 
     #[test]
