@@ -77,7 +77,14 @@ where
             for k in 0..len {
                 let inner = indices_buf[off + k];
                 let val = data_buf[off + k];
-                debug_assert!((inner as usize) < inner_bound);
+                if inner >= inner_bound as u64 {
+                    return Err(crate::sparse_io::index_audit::inner_out_of_range(
+                        "sparse read",
+                        (start + k as u64) as usize,
+                        inner,
+                        inner_bound,
+                    ));
+                }
                 ret.push(make_triplet(tag, inner, val));
             }
         }

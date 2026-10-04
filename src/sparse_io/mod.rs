@@ -2,6 +2,7 @@
 
 mod factory;
 mod helpers;
+pub(crate) mod index_audit;
 pub mod meta;
 mod traits;
 

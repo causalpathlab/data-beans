@@ -1,6 +1,33 @@
 #![allow(dead_code)]
 
 use super::*;
+use crate::sparse_io::index_audit;
+
+/// Map a backend-local row through `l2g` then `g2c`: `Ok(None)` for a row
+/// outside the intersection, an error naming the backend, the column and the
+/// row when either lookup is out of range.
+#[inline]
+fn remap_row(
+    l2g: &[usize],
+    g2c: &[Option<usize>],
+    row: u64,
+    didx: usize,
+    col: usize,
+) -> anyhow::Result<Option<usize>> {
+    let Some(&g) = l2g.get(row as usize) else {
+        anyhow::bail!(
+            "backend {didx}, column {col}: row index {row} (0x{row:016x}) is outside \
+             the backend's {} rows",
+            l2g.len()
+        );
+    };
+    g2c.get(g).copied().ok_or_else(|| {
+        anyhow::anyhow!(
+            "backend {didx}, column {col}: row index {row} maps to global row {g}, \
+             outside the global row table"
+        )
+    })
+}
 
 impl SparseIoVec {
     ////////////////////
@@ -203,18 +230,26 @@ impl SparseIoVec {
             let l2g = self.data_local_to_global_row[didx].as_slice();
 
             if let Some((indptr, indices, values)) = self.data_vec[didx].csc_column_arrays() {
-                // Fast path: zero-copy slicing into preloaded arrays.
+                // Fast path: zero-copy slicing into preloaded arrays. Every
+                // index is checked at use, so a value that went bad after the
+                // preload audit fails here, naming its backend, column and row.
                 for &(loc, out_col) in group {
                     if loc + 1 >= indptr.len() {
                         continue;
                     }
+                    index_audit::check_slot(
+                        "preloaded column",
+                        loc,
+                        indptr[loc],
+                        indptr[loc + 1],
+                        indices.len().min(values.len()),
+                    )?;
                     let s = indptr[loc] as usize;
                     let e = indptr[loc + 1] as usize;
                     let bucket = &mut buckets[out_col];
                     bucket.reserve(e - s);
                     for k in s..e {
-                        let local_row = indices[k] as usize;
-                        if let Some(c) = g2c[l2g[local_row]] {
+                        if let Some(c) = remap_row(l2g, g2c, indices[k], didx, loc)? {
                             bucket.push((c as u32, values[k]));
                         }
                     }
@@ -229,8 +264,13 @@ impl SparseIoVec {
                 let cols: Vec<usize> = group.iter().map(|&(loc, _)| loc).collect();
                 let (_, _, trip) = self.data_vec[didx].read_triplets_by_columns(cols)?;
                 for (i, jj, v) in trip {
-                    let (_, out_col) = group[jj as usize];
-                    if let Some(c) = g2c[l2g[i as usize]] {
+                    let &(loc, out_col) = group.get(jj as usize).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "backend {didx}: read returned output column {jj} of {}",
+                            group.len()
+                        )
+                    })?;
+                    if let Some(c) = remap_row(l2g, g2c, i, didx, loc)? {
                         buckets[out_col].push((c as u32, v));
                     }
                 }

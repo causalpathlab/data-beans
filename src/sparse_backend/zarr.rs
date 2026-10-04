@@ -562,6 +562,10 @@ impl SparseIo for SparseMtxData {
         &self.by_column_indptr
     }
 
+    fn row_indptr(&self) -> &[u64] {
+        &self.by_row_indptr
+    }
+
     fn metadata(&self) -> Metadata {
         Self::_get_group_attr::<Metadata>(self.read_store.clone(), "/", meta::ATTR)
             .unwrap_or_default()
@@ -649,6 +653,15 @@ impl SparseIo for SparseMtxData {
         let data = data.retrieve_array_subset::<Vec<f32>>(&data.subset_all())?;
         let indices = indices.retrieve_array_subset::<Vec<u64>>(&indices.subset_all())?;
 
+        index_audit::check_preload(
+            index_audit::Major::Column,
+            self.num_rows(),
+            self.num_columns(),
+            &self.by_column_indptr,
+            &indices,
+            data.len(),
+        )?;
+
         self.by_column_indices = Some(indices);
         self.by_column_data = Some(data);
         self.column_preload = reservation;
@@ -680,6 +693,15 @@ impl SparseIo for SparseMtxData {
 
         let data = data.retrieve_array_subset::<Vec<f32>>(&data.subset_all())?;
         let indices = indices.retrieve_array_subset::<Vec<u64>>(&indices.subset_all())?;
+
+        index_audit::check_preload(
+            index_audit::Major::Row,
+            self.num_rows(),
+            self.num_columns(),
+            &self.by_row_indptr,
+            &indices,
+            data.len(),
+        )?;
 
         self.by_row_indices = Some(indices);
         self.by_row_data = Some(data);
@@ -773,7 +795,7 @@ impl SparseIo for SparseMtxData {
 
             let (indptr, data, indices) = self.open_csc_triplets()?;
             let indptr = indptr.retrieve_array_subset::<Vec<u64>>(&indptr.subset_all())?;
-            debug_assert!(indptr.len() == ncol + 1);
+            crate::sparse_io::index_audit::check_indptr("to_mtx_file", &indptr, ncol, nnz)?;
 
             // Stream the CSC value/row-index arrays in large sequential blocks
             // (instead of two retrieves per column) and walk `indptr` to map
@@ -910,30 +932,28 @@ impl SparseIo for SparseMtxData {
     ) -> anyhow::Result<(usize, usize, Vec<(u64, u64, f32)>)> {
         use zarrs::array::Array as ZArray;
 
-        debug_assert!(!self.by_column_indptr.is_empty()); // pre-loaded
-        debug_assert!(j_data < self.num_columns().unwrap_or(0)); //
-
         let indptr = &self.by_column_indptr;
-
-        debug_assert!((j_data + 1) < indptr.len());
-        debug_assert!(indptr.len() > self.num_columns().unwrap_or(0));
 
         let nrow = self
             .num_rows()
             .ok_or(anyhow!("can't figure out the number of rows"))?;
+        index_audit::check_requested_slots("column", [j_data], indptr.len())?;
 
         if let (Some(data), Some(indices)) = (&self.by_column_data, &self.by_column_indices) {
             let ncol_out = 1;
             let jj = 0;
 
-            // [start, end)
-            let start = indptr[j_data] as usize;
-            let end = indptr[j_data + 1] as usize;
-            let ret: Vec<(u64, u64, f32)> = indices[start..end]
-                .iter()
-                .zip(data[start..end].iter())
-                .map(|(&ii, &x_ij)| (ii, jj, x_ij))
-                .collect();
+            let mut ret = Vec::new();
+            index_audit::emit_slot(
+                "preloaded column",
+                j_data,
+                indptr,
+                indices,
+                data,
+                nrow,
+                &mut ret,
+                |ii, x| (ii, jj, x),
+            )?;
 
             Ok((nrow, ncol_out, ret))
         } else {
@@ -948,6 +968,10 @@ impl SparseIo for SparseMtxData {
             // [start, end)
             let start = indptr[j_data];
             let end = indptr[j_data + 1];
+            anyhow::ensure!(
+                start <= end,
+                "column read: slot {j_data} points at [{start}, {end})"
+            );
 
             let mut ret: Vec<(u64, u64, f32)> = Vec::with_capacity((end - start) as usize);
 
@@ -959,7 +983,14 @@ impl SparseIo for SparseMtxData {
                 for k in 0..(end - start) {
                     let x_ij = data_slice[k as usize];
                     let ii = indices_slice[k as usize];
-                    debug_assert!((ii as usize) < nrow);
+                    if ii >= nrow as u64 {
+                        return Err(index_audit::inner_out_of_range(
+                            "column read",
+                            (start + k) as usize,
+                            ii,
+                            nrow,
+                        ));
+                    }
                     ret.push((ii, jj, x_ij));
                 }
             }
@@ -975,11 +1006,8 @@ impl SparseIo for SparseMtxData {
         &self,
         columns: Self::IndexIter,
     ) -> anyhow::Result<(usize, usize, Vec<(u64, u64, f32)>)> {
-        debug_assert!(!self.by_column_indptr.is_empty());
         let indptr = &self.by_column_indptr;
         let columns_vec = columns.into_iter().collect::<Vec<usize>>();
-
-        debug_assert!(indptr.len() > self.num_columns().unwrap_or(0));
 
         let nrow = self
             .num_rows()
@@ -990,8 +1018,16 @@ impl SparseIo for SparseMtxData {
             .ok_or(anyhow!("can't figure out the number of columns"))?;
 
         let ncol_out = columns_vec.len();
+        index_audit::check_requested_slots(
+            "column",
+            columns_vec.iter().copied().filter(|&j| j < ncol),
+            indptr.len(),
+        )?;
 
         if let (Some(data), Some(indices)) = (&self.by_column_data, &self.by_column_indices) {
+            if let Some(&bad) = columns_vec.iter().find(|&&j| j >= ncol) {
+                anyhow::bail!("read column {bad}: outside {ncol} columns");
+            }
             let min_start = columns_vec
                 .iter()
                 .map(|&j_data| indptr[j_data])
@@ -1004,15 +1040,21 @@ impl SparseIo for SparseMtxData {
                 .max()
                 .unwrap_or(0);
 
-            let mut ret: Vec<(u64, u64, f32)> = Vec::with_capacity((max_end - min_start) as usize);
+            let mut ret: Vec<(u64, u64, f32)> =
+                Vec::with_capacity(max_end.saturating_sub(min_start) as usize);
 
             for (jj, &j_data) in columns_vec.iter().enumerate() {
                 let jj = jj as u64;
-                let start = indptr[j_data] as usize;
-                let end = indptr[j_data + 1] as usize;
-                for (&ii, &x_ij) in indices[start..end].iter().zip(data[start..end].iter()) {
-                    ret.push((ii, jj, x_ij));
-                }
+                index_audit::emit_slot(
+                    "preloaded column",
+                    j_data,
+                    indptr,
+                    indices,
+                    data,
+                    nrow,
+                    &mut ret,
+                    |ii, x| (ii, jj, x),
+                )?;
             }
 
             Ok((nrow, ncol_out, ret))
@@ -1081,9 +1123,7 @@ impl SparseIo for SparseMtxData {
         &self,
         rows: Self::IndexIter,
     ) -> anyhow::Result<(usize, usize, Vec<(u64, u64, f32)>)> {
-        debug_assert!(!self.by_row_indptr.is_empty());
         let indptr = &self.by_row_indptr;
-        debug_assert!(indptr.len() > self.num_rows().unwrap_or(0));
 
         let rows_vec = rows.into_iter().collect::<Vec<_>>();
 
@@ -1092,6 +1132,11 @@ impl SparseIo for SparseMtxData {
             _ => return Err(anyhow!("Unable to figure out the size of the backend data")),
         };
         let nrow_out = rows_vec.len();
+        index_audit::check_requested_slots(
+            "row",
+            rows_vec.iter().copied().filter(|&i| i < nrow),
+            indptr.len(),
+        )?;
 
         if let (Some(data), Some(indices)) = (&self.by_row_data, &self.by_row_indices) {
             let mut nnz_total: usize = 0;
@@ -1102,18 +1147,23 @@ impl SparseIo for SparseMtxData {
                     if i_data >= nrow {
                         return None;
                     }
-                    nnz_total += (indptr[i_data + 1] - indptr[i_data]) as usize;
+                    nnz_total += indptr[i_data + 1].saturating_sub(indptr[i_data]) as usize;
                     Some((ii as u64, i_data))
                 })
                 .collect();
 
             let mut ret: Vec<(u64, u64, f32)> = Vec::with_capacity(nnz_total);
             for (ii, i_data) in valid {
-                let start = indptr[i_data] as usize;
-                let end = indptr[i_data + 1] as usize;
-                for (&jj, &x_ij) in indices[start..end].iter().zip(data[start..end].iter()) {
-                    ret.push((ii, jj, x_ij));
-                }
+                index_audit::emit_slot(
+                    "preloaded row",
+                    i_data,
+                    indptr,
+                    indices,
+                    data,
+                    ncol,
+                    &mut ret,
+                    |jj, x| (ii, jj, x),
+                )?;
             }
             return Ok((nrow_out, ncol, ret));
         }
@@ -1126,7 +1176,6 @@ impl SparseIo for SparseMtxData {
                 if i_data >= nrow {
                     return None;
                 }
-                debug_assert!((i_data + 1) < indptr.len());
                 let start = indptr[i_data];
                 let end = indptr[i_data + 1];
                 (start < end).then_some((ii as u64, start, end))

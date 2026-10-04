@@ -13,7 +13,9 @@ pub const COLUMN_SEP: &str = "@";
 pub const ROW_SEP: &str = "_";
 
 use super::helpers::*;
+use super::index_audit;
 use super::meta::Metadata;
+use anyhow::Context;
 
 use crate::sparse_data_visitors::styled_progress_bar;
 use clap::ValueEnum;
@@ -79,6 +81,30 @@ fn slab_end(
         major(&triplets[end])
     };
     (end, band_end)
+}
+
+/// Every triplet must sit inside the declared `nrow × ncol` matrix before
+/// the streaming writers see it: one that does not is never consumed by the
+/// band walk, and would otherwise surface only as a count mismatch at the
+/// finalize audit, with no trace of which entry was wrong.
+fn check_triplet_bounds(
+    label: &str,
+    triplets: &[(u64, u64, f32)],
+    nrow: usize,
+    ncol: usize,
+) -> anyhow::Result<()> {
+    let (nrow_u, ncol_u) = (nrow as u64, ncol as u64);
+    if let Some(k) = triplets
+        .par_iter()
+        .position_first(|&(r, c, _)| r >= nrow_u || c >= ncol_u)
+    {
+        let (r, c, v) = triplets[k];
+        anyhow::bail!(
+            "{label}: triplet {k} = (row {r} (0x{r:016x}), column {c} (0x{c:016x}), {v}) \
+             is outside the {nrow} x {ncol} matrix"
+        );
+    }
+    Ok(())
 }
 
 pub trait SparseIo: Sync + Send {
@@ -348,6 +374,10 @@ pub trait SparseIo: Sync + Send {
     /// silently does nothing on that failure, and the accessors below must
     /// report that absence rather than read zeros out of it.
     fn column_indptr(&self) -> &[u64];
+
+    /// The resident by-row indptr; the row-major twin of
+    /// [`column_indptr`](Self::column_indptr), empty when absent.
+    fn row_indptr(&self) -> &[u64];
 
     /// Exact nnz of one column, from the resident indptr — no I/O.
     ///
@@ -770,6 +800,8 @@ pub trait SparseIo: Sync + Send {
             return self.record_csr_dataset_backend(&[], &[], &csr_rowptr);
         }
 
+        check_triplet_bounds("record_triplets_by_row", row_col_val_triplets, nrow, ncol)?;
+
         // One in-place pass on the full key. A stable sort would allocate a
         // scratch copy of the whole vector, and duplicate coordinates carry no
         // meaning in coordinate format, so stability buys nothing.
@@ -799,7 +831,12 @@ pub trait SparseIo: Sync + Send {
                     i += 1;
                 }
             }
-            debug_assert_eq!(i, end, "every entry of the band belongs to one of its rows");
+            if i != end {
+                anyhow::bail!(
+                    "record_triplets_by_row: band walk left triplet {:?} at {i}",
+                    row_col_val_triplets[i]
+                );
+            }
 
             self.append_csr_slab(row_offset, start as u64, &local_rowptr, &cols, &vals)?;
             start = end;
@@ -828,6 +865,8 @@ pub trait SparseIo: Sync + Send {
             return self.record_csc_dataset_backend(&[], &[], &csc_colptr);
         }
 
+        check_triplet_bounds("record_triplets_by_col", row_col_val_triplets, nrow, ncol)?;
+
         // See `record_triplets_by_row` for why this is one unstable pass.
         row_col_val_triplets.par_sort_unstable_by_key(|&(row, col, _)| (col, row));
 
@@ -855,10 +894,12 @@ pub trait SparseIo: Sync + Send {
                     i += 1;
                 }
             }
-            debug_assert_eq!(
-                i, end,
-                "every entry of the band belongs to one of its columns"
-            );
+            if i != end {
+                anyhow::bail!(
+                    "record_triplets_by_col: band walk left triplet {:?} at {i}",
+                    row_col_val_triplets[i]
+                );
+            }
 
             self.append_csc_slab(col_offset, start as u64, &local_colptr, &rows, &vals)?;
             start = end;
@@ -1022,25 +1063,11 @@ pub trait SparseIo: Sync + Send {
         // declaration by construction, which is why the old debug_assert on it
         // could never fire; the shape of the vector between the endpoints is
         // what carries the truth.
-        let indptr = self.column_indptr();
-        anyhow::ensure!(
-            indptr.len() == ncol + 1,
-            "finalize_streaming_csc: indptr has {} entries, expected {}",
-            indptr.len(),
-            ncol + 1
-        );
-        anyhow::ensure!(
-            indptr.first().copied() == Some(0),
-            "finalize_streaming_csc: indptr[0] = {:?}, expected 0 — the first \
-             slab was never appended",
-            indptr.first()
-        );
-        if let Some(w) = indptr.windows(2).position(|w| w[0] > w[1]) {
-            anyhow::bail!(
-                "finalize_streaming_csc: indptr decreases at column {w} — slabs \
-                 were appended with a gap or overlap in their nnz offsets"
-            );
-        }
+        index_audit::check_indptr("finalize_streaming_csc", self.column_indptr(), ncol, nnz)
+            .context(
+                "the slabs were appended with a gap or overlap in their nnz offsets, \
+             or the first slab was never appended",
+            )?;
         // The appended count is the ground truth the indptr cannot carry: an
         // over-declared nnz leaves the written indptr perfectly monotone with
         // the phantom tail hiding between the last written pointer and the
@@ -1150,6 +1177,12 @@ pub trait SparseIo: Sync + Send {
         self.cs_write_u64(CsKey::CsrIndptr, nrow as u64, &[nnz as u64])?;
         self.read_row_indptr()?;
 
+        // The same tiling audit as `finalize_streaming_csc`.
+        index_audit::check_indptr("finalize_streaming_csr", self.row_indptr(), nrow, nnz).context(
+            "the slabs were appended with a gap or overlap in their nnz offsets, \
+             or the first slab was never appended",
+        )?;
+
         let appended = self.streamed_nnz();
         anyhow::ensure!(
             appended == nnz as u64,
@@ -1192,8 +1225,16 @@ pub trait SparseIo: Sync + Send {
             let col_hi = (col_lo + COL_BLOCK).min(ncol);
             let cols: Self::IndexIter = (col_lo..col_hi).collect();
             let (_, _, triplets) = self.read_triplets_by_columns(cols)?;
-            for (row_i, _, _) in &triplets {
-                row_counts[*row_i as usize] += 1;
+            for t in &triplets {
+                let slot = row_counts.get_mut(t.0 as usize).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "build_csr_from_csc_streaming: row index {} (0x{:016x}) outside \
+                         the {nrow}-row matrix",
+                        t.0,
+                        t.0
+                    )
+                })?;
+                *slot += 1;
             }
             col_lo = col_hi;
             bar1.inc(1);
@@ -1207,7 +1248,11 @@ pub trait SparseIo: Sync + Send {
             acc += row_counts[i];
         }
         rowptr[nrow] = acc;
-        debug_assert_eq!(acc, nnz as u64);
+        anyhow::ensure!(
+            acc == nnz as u64,
+            "build_csr_from_csc_streaming: counted {acc} entries in the CSC arrays, \
+             but {nnz} are declared"
+        );
 
         self.cs_create(CsKey::CsrData, nnz)?;
         self.cs_create(CsKey::CsrIndices, nnz)?;
