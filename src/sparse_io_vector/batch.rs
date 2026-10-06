@@ -117,7 +117,7 @@ impl SparseIoVec {
         // silently permuted batch ids vs the label order — a latent bug for δ /
         // `AdjMethod::Batch` consumers.
         let mut batches_vec: Vec<_> = batches.into_iter().collect();
-        batches_vec.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
+        batches_vec.sort_by_key(|a| a.0.to_string());
         // Schedule largest batches first (LPT) so the heavy tail overlaps with
         // the small batches. The canonical id rides along; `sort_by_key(idx)`
         // below restores canonical order.
@@ -273,7 +273,7 @@ impl SparseIoVec {
         let mut col_to_batch = vec![0; ntot];
 
         let mut sorted_batches: Vec<_> = batches.into_iter().collect();
-        sorted_batches.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
+        sorted_batches.sort_by_key(|a| a.0.to_string());
 
         let mut batch_names = Vec::with_capacity(sorted_batches.len());
         let mut batch_to_cols = Vec::with_capacity(sorted_batches.len());

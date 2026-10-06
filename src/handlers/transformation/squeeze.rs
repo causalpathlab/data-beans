@@ -273,7 +273,7 @@ fn run_merge_then_squeeze(
     let (backend, backend_file) = resolve_backend_file(&effective_output, Some(backend))?;
 
     if std::path::Path::new(backend_file.as_ref()).exists() {
-        info!("Removing existing output file: {}", &backend_file);
+        info!("Removing existing output file: {}", backend_file);
         remove_file(&backend_file)?;
     }
 
@@ -289,7 +289,7 @@ fn run_merge_then_squeeze(
     merged_data.register_column_names_vec(&column_names);
     merged_data.set_metadata(&meta::common_metadata(&metas))?;
 
-    info!("Created merged file: {}", &backend_file);
+    info!("Created merged file: {}", backend_file);
 
     // Step 4: Squeeze the merged result
     info!(

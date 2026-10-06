@@ -83,10 +83,10 @@ impl Ontology {
                     }
                     TermClause::IsObsolete(b) => obsolete = obsolete || *b,
                     TermClause::IsA(parent) => is_a.push(parent.to_string().trim().into()),
-                    TermClause::Relationship(rel, target) => {
-                        if rel.to_string().trim() == "part_of" {
-                            part_of.push(target.to_string().trim().into());
-                        }
+                    TermClause::Relationship(rel, target)
+                        if rel.to_string().trim() == "part_of" =>
+                    {
+                        part_of.push(target.to_string().trim().into());
                     }
                     _ => {}
                 }

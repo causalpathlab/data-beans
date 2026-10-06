@@ -63,7 +63,7 @@ impl SparseIoVec {
             {
                 let (matched, matched_distances) =
                     source_lookup.match_by_query_name_against(&glob, knn, target_lookup)?;
-                for (glob_matched, dist) in matched.into_iter().zip(matched_distances.into_iter()) {
+                for (glob_matched, dist) in matched.into_iter().zip(matched_distances) {
                     if glob == glob_matched {
                         continue; // avoid identical cell pairs
                     }
@@ -235,9 +235,7 @@ impl SparseIoVec {
                         knn_columns,
                         target_lookup,
                     )?;
-                    for (glob_matched_index, dist) in
-                        matched.into_iter().zip(matched_distances.into_iter())
-                    {
+                    for (glob_matched_index, dist) in matched.into_iter().zip(matched_distances) {
                         if glob_index == glob_matched_index {
                             continue;
                         }

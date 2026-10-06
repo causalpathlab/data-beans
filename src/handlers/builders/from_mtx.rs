@@ -92,7 +92,7 @@ pub fn run_build_from_mtx(args: &FromMtxArgs) -> anyhow::Result<()> {
     if std::path::Path::new(backend_file.as_ref()).exists() {
         info!(
             "This existing backend file '{}' will be deleted",
-            &backend_file
+            backend_file
         );
         remove_file(&backend_file)?;
     }
