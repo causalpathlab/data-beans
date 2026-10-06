@@ -3,10 +3,11 @@
 //! plot with a y gutter, an x axis, and markers.
 
 use ratatui::buffer::Buffer;
+use std::time::{Duration, Instant};
+
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseEvent, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -43,8 +44,8 @@ pub trait Screen {
         None
     }
     fn do_work(&mut self) {}
-    /// Called about every [`TICK`] while no key comes: true redraws, for a
-    /// view waiting on work in the background.
+    /// Called about every [`TICK`], keys or not: true redraws, for a view
+    /// waiting on work in the background.
     fn tick(&mut self) -> bool {
         false
     }
@@ -53,8 +54,12 @@ pub trait Screen {
     fn takes_mouse(&self) -> bool {
         false
     }
-    /// A left click or a turn of the wheel, at a cell of the screen.
-    fn mouse(&mut self, _event: MouseEvent) {}
+    /// A mouse event (a button pressed or let go, or a turn of the wheel)
+    /// at a cell of the screen; whether the screen changed and is drawn
+    /// again.
+    fn mouse(&mut self, _event: MouseEvent) -> bool {
+        false
+    }
     /// Whether the terminal is asked to report keys held with Shift, Alt or
     /// Ctrl apart (the kitty keyboard protocol; others ignore the request),
     /// so that Shift+Enter, say, is not taken for Enter.
@@ -76,11 +81,30 @@ struct Modes {
     chords: bool,
 }
 
+/// Buttons and the wheel (1000) in SGR form (1006); not the pointer's every
+/// move, which would wake the loop for nothing.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+
+/// Write `text` to the terminal as it is.
+fn send(text: &str) -> bool {
+    let mut out = std::io::stdout();
+    std::io::Write::write_all(&mut out, text.as_bytes()).is_ok()
+        && std::io::Write::flush(&mut out).is_ok()
+}
+
+/// Ring the terminal's bell and ask it for a desktop notification saying
+/// `text` (OSC 9); terminals without either ignore them.
+pub fn notify(text: &str) {
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    send(&format!("\x07\x1b]9;{text}\x07"));
+}
+
 impl Modes {
     fn ask(&mut self, screen: &impl Screen) {
         let mut out = std::io::stdout();
         if screen.takes_mouse() && !self.mouse {
-            self.mouse = ratatui::crossterm::execute!(out, EnableMouseCapture).is_ok();
+            self.mouse = send(MOUSE_ON);
         }
         if screen.reports_chords() && !self.chords {
             let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
@@ -92,7 +116,7 @@ impl Modes {
     fn release(&mut self) {
         let mut out = std::io::stdout();
         if std::mem::take(&mut self.mouse) {
-            let _ = ratatui::crossterm::execute!(out, DisableMouseCapture);
+            send(MOUSE_OFF);
         }
         if std::mem::take(&mut self.chords) {
             let _ = ratatui::crossterm::execute!(out, PopKeyboardEnhancementFlags);
@@ -100,7 +124,7 @@ impl Modes {
     }
 }
 
-/// How long [`run_screen`] waits for a key before asking [`Screen::tick`].
+/// How often [`run_screen`] asks [`Screen::tick`], keys or not.
 pub const TICK: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Holds log records back while alive, writing them when dropped.
@@ -126,11 +150,24 @@ impl Drop for HeldLogs {
 /// after it. The mouse and keys held with modifiers are reported only to a
 /// screen that asks for them, and events already queued (a turn of the wheel
 /// is several) are taken before the screen is drawn again.
-pub fn run_screen(screen: &mut impl Screen) -> anyhow::Result<()> {
+pub fn run_screen<S: Screen>(screen: &mut S) -> anyhow::Result<()> {
+    run_screen_with(screen, S::handle_key)
+}
+
+/// [`run_screen`], with each key (but Ctrl-C) handed to `on_key` rather
+/// than [`Screen::handle_key`]: for a caller with rules of its own about
+/// which keys a screen sees.
+pub fn run_screen_with<S: Screen>(
+    screen: &mut S,
+    mut on_key: impl FnMut(&mut S, KeyEvent),
+) -> anyhow::Result<()> {
     ratatui::run(|terminal| -> anyhow::Result<()> {
         let held = HeldLogs::new();
         let mut modes = Modes::default();
         let mut redraw = true;
+        // Ticks keep time while events come: a stream of them must not
+        // keep a view from its background work.
+        let mut next_tick = Instant::now() + TICK;
         while !screen.done() {
             if redraw {
                 terminal.draw(|f| screen.render(f))?;
@@ -138,52 +175,39 @@ pub fn run_screen(screen: &mut impl Screen) -> anyhow::Result<()> {
                 modes.ask(screen);
             }
             if let Some(notice) = screen.take_notice() {
-                // A bell, and a desktop notification where the terminal shows
-                // one (OSC 9); terminals without either ignore them.
-                let mut out = std::io::stdout();
-                let _ = std::io::Write::write_all(
-                    &mut out,
-                    format!("\x07\x1b]9;{notice}\x07").as_bytes(),
-                );
-                let _ = std::io::Write::flush(&mut out);
-            }
-            if !event::poll(TICK)? {
-                redraw = screen.tick();
-                continue;
+                notify(&notice);
             }
             redraw = false;
-            loop {
-                redraw |= match event::read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Press => false,
-                    Event::Key(key)
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && key.code == KeyCode::Char('c') =>
+            if event::poll(next_tick.saturating_duration_since(Instant::now()))? {
+                loop {
+                    redraw |= match event::read()? {
+                        Event::Key(key) if key.kind != KeyEventKind::Press => false,
+                        Event::Key(key)
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && key.code == KeyCode::Char('c') =>
+                        {
+                            screen.interrupt();
+                            true
+                        }
+                        Event::Key(key) => {
+                            on_key(screen, key);
+                            true
+                        }
+                        Event::Mouse(m) => screen.mouse(m),
+                        Event::Resize(..) => true,
+                        _ => false,
+                    };
+                    if screen.done()
+                        || screen.pending_work().is_some()
+                        || !event::poll(Duration::ZERO)?
                     {
-                        screen.interrupt();
-                        true
+                        break;
                     }
-                    Event::Key(key) => {
-                        screen.handle_key(key);
-                        true
-                    }
-                    Event::Mouse(m)
-                        if matches!(
-                            m.kind,
-                            MouseEventKind::Down(MouseButton::Left)
-                                | MouseEventKind::ScrollUp
-                                | MouseEventKind::ScrollDown
-                        ) =>
-                    {
-                        screen.mouse(m);
-                        true
-                    }
-                    Event::Resize(..) => true,
-                    _ => false,
-                };
-                let more = !screen.done() && screen.pending_work().is_none();
-                if !more || !event::poll(std::time::Duration::ZERO)? {
-                    break;
                 }
+            }
+            if Instant::now() >= next_tick {
+                redraw |= screen.tick();
+                next_tick = Instant::now() + TICK;
             }
             if let Some(message) = screen.pending_work() {
                 modes.release();
