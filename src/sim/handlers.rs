@@ -492,7 +492,7 @@ pub fn run_simulate(cmd_args: &RunSimulateArgs) -> anyhow::Result<()> {
         .collect();
 
     write_lines(&batch_out, &batch_memb_file)?;
-    info!("batch membership: {:?}", &batch_memb_file);
+    info!("batch membership: {:?}", batch_memb_file);
 
     let rows: Vec<Box<str>> = (0..sim_args.rows)
         .map(|i| i.to_string().into_boxed_str())
@@ -515,12 +515,12 @@ pub fn run_simulate(cmd_args: &RunSimulateArgs) -> anyhow::Result<()> {
     if let Some(ref node_probs) = sim.hierarchy_node_probs {
         let hierarchy_file = mtx_file.replace(".mtx.gz", ".hierarchy.parquet");
         node_probs.to_parquet_with_names(&hierarchy_file, (Some(&rows), Some("feature")), None)?;
-        info!("wrote hierarchy node probabilities: {:?}", &hierarchy_file);
+        info!("wrote hierarchy node probabilities: {:?}", hierarchy_file);
     }
 
     info!(
         "wrote parameter files:\n{:?},\n{:?},\n{:?}",
-        &ln_batch_file, &dict_file, &prop_file
+        ln_batch_file, dict_file, prop_file
     );
 
     if cmd_args.save_mtx {

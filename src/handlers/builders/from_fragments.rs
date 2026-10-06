@@ -131,7 +131,7 @@ pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> 
         resolve_backend_file(&effective_output, Some(args.backend.clone()))?;
 
     if std::path::Path::new(backend_file.as_ref()).exists() {
-        info!("Removing existing backend file: {}", &backend_file);
+        info!("Removing existing backend file: {}", backend_file);
         remove_file(&backend_file)?;
     }
 
@@ -1110,8 +1110,8 @@ mod tests {
     ///////////////////////////////////////////////////////////////
 
     fn run_pair_and_compare(args_serial: FromFragmentsArgs, args_parallel: FromFragmentsArgs) {
-        let out_serial = format!("{}.zarr", &args_serial.output);
-        let out_parallel = format!("{}.zarr", &args_parallel.output);
+        let out_serial = format!("{}.zarr", args_serial.output);
+        let out_parallel = format!("{}.zarr", args_parallel.output);
         run_build_from_fragments(&args_serial).unwrap();
         run_build_from_fragments(&args_parallel).unwrap();
         let a = open_sparse_matrix(&out_serial, &SparseIoBackend::Zarr).unwrap();

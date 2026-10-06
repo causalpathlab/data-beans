@@ -39,7 +39,7 @@ fn dense_to_triplets_by_rows(mat: &Array2<f32>, rows: &[usize]) -> Vec<(u64, u64
 }
 
 fn sort_triplets(mut t: Vec<(u64, u64, f32)>) -> Vec<(u64, u64, f32)> {
-    t.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
+    t.sort_by_key(|a| (a.1, a.0));
     t
 }
 

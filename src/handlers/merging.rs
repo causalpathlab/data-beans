@@ -342,7 +342,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
     if std::path::Path::new(backend_file.as_ref()).exists() {
         info!(
             "This existing backend file '{}' will be deleted",
-            &backend_file
+            backend_file
         );
         remove_file(&backend_file)?;
     }
@@ -398,7 +398,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
 
     info!(
         "Successfully created a sparse backend file: {}",
-        &backend_file
+        backend_file
     );
 
     let batch_map = column_names
@@ -407,7 +407,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         .collect::<HashMap<_, _>>();
 
     if args.do_squeeze {
-        info!("Squeeze the backend data {}", &backend_file);
+        info!("Squeeze the backend data {}", backend_file);
         let squeeze_args = RunSqueezeArgs {
             // Squeezing in place on a path the caller already resolved: the
             // zip decision was made there, so nothing is re-zipped here.
@@ -459,7 +459,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
 
         if let Some(base) = std::path::Path::new(&dir).file_stem() {
             let base = base.to_str().expect("invalid base name").to_string();
-            info!("Searching relevant files within: {}", &base);
+            info!("Searching relevant files within: {}", base);
             let batch_name = Some(base);
 
             if let Ok(this_dir) = std::fs::read_dir(&dir) {
@@ -482,7 +482,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
                 }
 
                 if let (Some(m), Some(r), Some(c), Some(b)) = (mtx, row, col, batch_name) {
-                    info!("Build {} from {}, {}, {} ", &b, &m, &r, &c);
+                    info!("Build {} from {}, {}, {} ", b, m, r, c);
                     mtx_files.push(m);
                     row_files.push(r);
                     col_files.push(c);
@@ -491,7 +491,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
             }
         }
 
-        info!("Searching subdir within: {}", &dir);
+        info!("Searching subdir within: {}", dir);
 
         let mut sub_dir_vec = std::fs::read_dir(&dir)?
             .filter_map(Result::ok)
@@ -507,7 +507,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
 
                 if let Some(base) = std::path::Path::new(&sub_dir).file_stem() {
                     let base = base.to_str().expect("invalid base name").to_string();
-                    info!("searching {} ...", &base);
+                    info!("searching {} ...", base);
 
                     let batch_name = Some(base);
 
@@ -516,7 +516,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
                             if let Some(_path) = x?.path().to_str() {
                                 let _path = _path.to_string();
 
-                                info!("Found: {}", &_path);
+                                info!("Found: {}", _path);
 
                                 if _path.ends_with(args.mtx_file_name.as_ref()) {
                                     mtx = Some(_path.into_boxed_str());
@@ -530,7 +530,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
                     }
 
                     if let (Some(m), Some(r), Some(c), Some(b)) = (mtx, row, col, batch_name) {
-                        info!("Build {} from {}, {}, {} ", &b, &m, &r, &c);
+                        info!("Build {} from {}, {}, {} ", b, m, r, c);
                         mtx_files.push(m);
                         row_files.push(r);
                         col_files.push(c);
@@ -655,7 +655,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
     if std::path::Path::new(&backend_file).exists() {
         info!(
             "This existing backend file '{}' will be deleted",
-            &backend_file
+            backend_file
         );
         remove_file(&backend_file)?;
     }
@@ -701,7 +701,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
 
     info!(
         "Successfully created a sparse backend file: {}",
-        &backend_file
+        backend_file
     );
 
     let batch_map = column_names
@@ -710,7 +710,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
         .collect::<HashMap<_, _>>();
 
     if args.do_squeeze {
-        info!("Squeeze the backend data {}", &backend_file);
+        info!("Squeeze the backend data {}", backend_file);
         let squeeze_args = RunSqueezeArgs {
             // Squeezing in place on a path the caller already resolved: the
             // zip decision was made there, so nothing is re-zipped here.

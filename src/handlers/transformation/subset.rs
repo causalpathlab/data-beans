@@ -168,7 +168,7 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
     drop(data);
 
     if args.do_squeeze {
-        info!("Squeeze the backend data {}", &output_file);
+        info!("Squeeze the backend data {}", output_file);
         let squeeze_args = build_squeeze_args(
             output_file.clone(),
             args.column_nnz_cutoff,
@@ -270,7 +270,7 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
     drop(data);
 
     if args.do_squeeze {
-        info!("Squeeze the backend data {}", &output_file);
+        info!("Squeeze the backend data {}", output_file);
         let squeeze_args = build_squeeze_args(
             output_file.clone(),
             args.column_nnz_cutoff,

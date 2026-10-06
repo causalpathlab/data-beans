@@ -344,7 +344,7 @@ fn optimize_block(
         for _opt_iter in 0..num_iter {
             #[cfg(debug_assertions)]
             {
-                debug!("iteration: {}", &_opt_iter);
+                debug!("iteration: {}", _opt_iter);
             }
 
             update_mu(&mut mu_adj_param, &delta_gb);

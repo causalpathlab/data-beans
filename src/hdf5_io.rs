@@ -86,8 +86,8 @@ pub fn resolve_backend_file(
                  `hdf5` feature; writing Zarr instead ({} -> {}). Pass \
                  `--zip=true` (or use a `.zarr.zip` output path) for a zipped \
                  archive.",
-                &backend_file,
-                &new_path
+                backend_file,
+                new_path
             );
             return Ok((SparseIoBackend::Zarr, new_path.into_boxed_str()));
         }
