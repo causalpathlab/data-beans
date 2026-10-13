@@ -32,6 +32,23 @@ use rustc_hash::FxHashMap as HashMap;
 /// mass.
 pub const LOG_EPS: f64 = 1e-9;
 
+/// `ln(x)` for positive `x`, read off the `f32` exponent bits plus a
+/// rational correction of the mantissa (Mineiro's `fastlog`): absolute error
+/// below 1.5e-4. Every log the move scores read goes through this one function,
+/// so the cached and the leave-one-out terms carry the same approximation;
+/// next to the Gibbs noise the error is invisible, and it skips libm's `ln`
+/// on every nonzero feature of every entity in every sweep.
+#[inline]
+pub fn fast_ln(x: f64) -> f64 {
+    let bits = (x as f32).to_bits();
+    let mantissa = f32::from_bits((bits & 0x007F_FFFF) | 0x3F00_0000);
+    let log2 = bits as f32 * 1.192_092_9e-7
+        - 124.225_52
+        - 1.498_030_3 * mantissa
+        - 1.725_88 / (0.352_088_7 + mantissa);
+    f64::from(std::f32::consts::LN_2 * log2)
+}
+
 //////////////////////////
 // Public configuration //
 //////////////////////////
@@ -356,12 +373,12 @@ impl DcPoissonStats {
         }
         let log_gene: Vec<f32> = gene_sum
             .iter()
-            .map(|&s| (s + LOG_EPS).ln() as f32)
+            .map(|&s| fast_ln(s + LOG_EPS) as f32)
             .collect();
         let m_eps = m as f64 * LOG_EPS;
         let log_size_offset: Vec<f32> = size_sum
             .iter()
-            .map(|&s| -((s + m_eps).ln()) as f32)
+            .map(|&s| -fast_ln(s + m_eps) as f32)
             .collect();
         Self {
             k,
@@ -392,14 +409,14 @@ impl DcPoissonStats {
             let (i_from, i_to) = (base + k_from, base + k_to);
             self.gene_sum[i_from] = (self.gene_sum[i_from] - v as f64).max(0.0);
             self.gene_sum[i_to] += v as f64;
-            self.log_gene[i_from] = (self.gene_sum[i_from] + LOG_EPS).ln() as f32;
-            self.log_gene[i_to] = (self.gene_sum[i_to] + LOG_EPS).ln() as f32;
+            self.log_gene[i_from] = fast_ln(self.gene_sum[i_from] + LOG_EPS) as f32;
+            self.log_gene[i_to] = fast_ln(self.gene_sum[i_to] + LOG_EPS) as f32;
         }
         let sf = profiles.size_factor[e] as f64;
         self.size_sum[k_from] = (self.size_sum[k_from] - sf).max(0.0);
         self.size_sum[k_to] += sf;
-        self.log_size_offset[k_from] = -((self.size_sum[k_from] + m_eps).ln()) as f32;
-        self.log_size_offset[k_to] = -((self.size_sum[k_to] + m_eps).ln()) as f32;
+        self.log_size_offset[k_from] = -fast_ln(self.size_sum[k_from] + m_eps) as f32;
+        self.log_size_offset[k_to] = -fast_ln(self.size_sum[k_to] + m_eps) as f32;
 
         self.membership[e] = k_to;
     }
@@ -419,11 +436,11 @@ impl DcPoissonStats {
             self.size_sum[z] += profiles.size_factor[e] as f64;
         }
         for i in 0..k * m {
-            self.log_gene[i] = (self.gene_sum[i] + LOG_EPS).ln() as f32;
+            self.log_gene[i] = fast_ln(self.gene_sum[i] + LOG_EPS) as f32;
         }
         let m_eps = m as f64 * LOG_EPS;
         for i in 0..k {
-            self.log_size_offset[i] = -((self.size_sum[i] + m_eps).ln()) as f32;
+            self.log_size_offset[i] = -fast_ln(self.size_sum[i] + m_eps) as f32;
         }
     }
 }
@@ -454,11 +471,11 @@ fn score_move(e: usize, k: usize, stats: &DcPoissonStats, profiles: &Profiles) -
     if stats.membership[e] == k {
         let m_eps = m as f64 * LOG_EPS;
         let loo_size = (stats.size_sum[k] - sf).max(0.0);
-        let mut acc = -sf * (loo_size + m_eps).ln();
+        let mut acc = -sf * fast_ln(loo_size + m_eps);
         for &(g, v) in row {
             let vg = v as f64;
             let loo = (stats.gene_sum[stats.idx(k, g as usize)] - vg).max(0.0);
-            acc += vg * (loo + LOG_EPS).ln();
+            acc += vg * fast_ln(loo + LOG_EPS);
         }
         acc
     } else {
@@ -513,14 +530,14 @@ pub fn compute_log_probs_restricted(
     // Leave-one-out score of the current block.
     let mut cur_acc = if score_cur {
         let loo_size = (stats.size_sum[cur] - sf).max(0.0);
-        -sf * (loo_size + m as f64 * LOG_EPS).ln()
+        -sf * fast_ln(loo_size + m as f64 * LOG_EPS)
     } else {
         0.0
     };
     let mut add_cur = |base: usize, vg: f64| {
         if score_cur {
             let loo = (stats.gene_sum[base + cur] - vg).max(0.0);
-            cur_acc += vg * (loo + LOG_EPS).ln();
+            cur_acc += vg * fast_ln(loo + LOG_EPS);
         }
     };
 
@@ -594,7 +611,7 @@ pub fn sample_categorical_log_restricted(
         let lp = log_probs[k];
         if lp.is_finite() {
             let u: f64 = rng.random_range(1e-12..1.0_f64);
-            let g = -(-u.ln()).ln();
+            let g = -fast_ln(-fast_ln(u));
             let key = lp + g;
             if key > best_key {
                 best_key = key;
