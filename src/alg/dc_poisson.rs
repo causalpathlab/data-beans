@@ -32,21 +32,13 @@ use rustc_hash::FxHashMap as HashMap;
 /// mass.
 pub const LOG_EPS: f64 = 1e-9;
 
-/// `ln(x)` for positive `x`, read off the `f32` exponent bits plus a
-/// rational correction of the mantissa (Mineiro's `fastlog`): absolute error
-/// below 1.5e-4. Every log the move scores read goes through this one function,
-/// so the cached and the leave-one-out terms carry the same approximation;
-/// next to the Gibbs noise the error is invisible, and it skips libm's `ln`
-/// on every nonzero feature of every entity in every sweep.
+/// `ln(x)` in `f32`: libm's single-precision log, near half the cost of
+/// the `f64` one. Its error is `f32` rounding (about 1e-7 relative), the
+/// precision the cached block logs are stored at anyway. NaN, infinite and
+/// non-positive inputs keep their usual `ln` values.
 #[inline]
-pub fn fast_ln(x: f64) -> f64 {
-    let bits = (x as f32).to_bits();
-    let mantissa = f32::from_bits((bits & 0x007F_FFFF) | 0x3F00_0000);
-    let log2 = bits as f32 * 1.192_092_9e-7
-        - 124.225_52
-        - 1.498_030_3 * mantissa
-        - 1.725_88 / (0.352_088_7 + mantissa);
-    f64::from(std::f32::consts::LN_2 * log2)
+fn fast_ln(x: f64) -> f64 {
+    f64::from((x as f32).ln())
 }
 
 //////////////////////////
@@ -333,8 +325,9 @@ impl Profiles {
 /// one entity walks its nonzero features once and, for each, reads the `K`
 /// group values side by side, instead of striding across a `K × M` table
 /// once per candidate group. Use [`DcPoissonStats::idx`] to address them.
-/// Log caches let `compute_log_probs_restricted` avoid any `ln()` inside the
-/// hot loop; only `delta_move` calls `ln()` on two columns / two scalars per move.
+/// Log caches score every non-current block with no log; the current block's
+/// leave-one-out score takes one `fast_ln` per nonzero feature, and
+/// `delta_move` refreshes the logs of the columns a move touches.
 ///
 /// Log caches are `f32` — values live in roughly `[-20, +25]` (dominated by
 /// `-ln(LOG_EPS)` at the floor), and scoring is noise-dominated so f32's
@@ -611,7 +604,7 @@ pub fn sample_categorical_log_restricted(
         let lp = log_probs[k];
         if lp.is_finite() {
             let u: f64 = rng.random_range(1e-12..1.0_f64);
-            let g = -fast_ln(-fast_ln(u));
+            let g = -(-u.ln()).ln();
             let key = lp + g;
             if key > best_key {
                 best_key = key;

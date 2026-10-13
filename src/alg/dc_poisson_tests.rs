@@ -358,11 +358,24 @@ fn test_repeated_candidates_score_like_single_ones() {
 }
 
 #[test]
-fn fast_ln_stays_within_its_error_bound() {
+fn fast_ln_is_ln_to_f32_rounding() {
+    // f32 rounding of the input and of the result: below 4e-6 for |ln x| < 30.
     let mut x = LOG_EPS;
     while x < 1e12 {
         let err = (fast_ln(x) - x.ln()).abs();
-        assert!(err < 1.5e-4, "x = {x}: {} vs {}", fast_ln(x), x.ln());
+        assert!(err < 4e-6, "x = {x}: {} vs {}", fast_ln(x), x.ln());
         x *= 1.0137;
     }
+    // Monotone and exact near 1, where -ln(u) is tiny.
+    let mut prev = f64::NEG_INFINITY;
+    for i in (0..1000).rev() {
+        let u = 1.0 - i as f64 * 1e-7;
+        let v = fast_ln(u);
+        assert!(v >= prev && (v - u.ln()).abs() < 1e-7, "u = {u}");
+        prev = v;
+    }
+    assert!(fast_ln(f64::NAN).is_nan());
+    assert!(fast_ln(-1.0).is_nan());
+    assert_eq!(fast_ln(0.0), f64::NEG_INFINITY);
+    assert_eq!(fast_ln(f64::INFINITY), f64::INFINITY);
 }
