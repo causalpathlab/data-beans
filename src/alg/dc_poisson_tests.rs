@@ -356,3 +356,13 @@ fn test_repeated_candidates_score_like_single_ones() {
         }
     }
 }
+
+#[test]
+fn fast_ln_stays_within_its_error_bound() {
+    let mut x = LOG_EPS;
+    while x < 1e12 {
+        let err = (fast_ln(x) - x.ln()).abs();
+        assert!(err < 1.5e-4, "x = {x}: {} vs {}", fast_ln(x), x.ln());
+        x *= 1.0137;
+    }
+}
