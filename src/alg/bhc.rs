@@ -57,10 +57,13 @@
 //! `BhcConfig { dp_alpha, ... }` and replace the pure pairwise log-BF rule
 //! with the full posterior `r_k` recursion.
 //!
-//! Runs over K clusters (not N samples). K²·M per merge, K·K²·M overall;
-//! trivially fast for K ≤ few hundred. Single-threaded, no RNG.
+//! Runs over K clusters (not N samples). Pairwise log BFs are cached, so only
+//! a new node's K pairs are scored after each merge: K²·M overall, the scoring
+//! spread over threads. No RNG; the merges match scoring every pair afresh.
 
 use crate::alg::union_find::UnionFind;
+use rayon::prelude::*;
+use rustc_hash::FxHashMap as HashMap;
 use special::Gamma as SpecialGamma;
 
 /// Borrowed view over the per-cluster sufficient statistics needed by `bhc_merge`.
@@ -248,6 +251,23 @@ pub fn bhc_merge(input: BhcInput<'_>, gamma: f64) -> Vec<BhcMerge> {
     let mut merges: Vec<BhcMerge> = Vec::with_capacity(k_eff - 1);
     let mut next_id: i32 = k as i32;
 
+    // Every active pair's log BF, keyed by arena indices `(lower, higher)`.
+    // `active` stays in arena order (removals keep the order, a new node goes
+    // last), so a pair is always scored as `(arena[lower], arena[higher])`,
+    // the same argument order as scoring every pair afresh: a merge only
+    // needs the new node's pairs, K²·M overall instead of K³·M.
+    let mut pair_bf: HashMap<(usize, usize), f64> = active
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(i, &a)| {
+            let arena = &arena;
+            let prior = &prior;
+            active[i + 1..]
+                .iter()
+                .map(move |&b| ((a, b), pairwise_log_bf(&arena[a], &arena[b], prior)))
+        })
+        .collect();
+
     while active.len() >= 2 {
         // Maximize log BF; tiebreak on ascending (min_id, max_id).
         let mut best: Option<(usize, usize, f64, (i32, i32))> = None;
@@ -255,7 +275,7 @@ pub fn bhc_merge(input: BhcInput<'_>, gamma: f64) -> Vec<BhcMerge> {
             for j in (i + 1)..active.len() {
                 let a = &arena[active[i]];
                 let b = &arena[active[j]];
-                let bf = pairwise_log_bf(a, b, &prior);
+                let bf = pair_bf[&(active[i], active[j])];
                 let key = order_pair(a.id, b.id);
                 let pick = match best {
                     None => true,
@@ -305,6 +325,15 @@ pub fn bhc_merge(input: BhcInput<'_>, gamma: f64) -> Vec<BhcMerge> {
         // Remove j first (j > i) so the index for i stays valid.
         active.remove(j);
         active.remove(i);
+        pair_bf.retain(|&(a, b), _| a != ai && a != aj && b != ai && b != aj);
+        let new_pairs: Vec<((usize, usize), f64)> = active
+            .par_iter()
+            .map(|&a| {
+                let bf = pairwise_log_bf(&arena[a], &arena[new_arena_idx], &prior);
+                ((a, new_arena_idx), bf)
+            })
+            .collect();
+        pair_bf.extend(new_pairs);
         active.push(new_arena_idx);
     }
 
@@ -365,3 +394,7 @@ pub fn bhc_cut(merges: &[BhcMerge], k: usize, cutoff: f64) -> Vec<i32> {
     }
     labels
 }
+
+#[cfg(test)]
+#[path = "bhc_tests.rs"]
+mod tests;
