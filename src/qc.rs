@@ -262,7 +262,7 @@ fn col_stat_visitor(
 
 //////////////////////////////////////////////////////////////////////////////////
 // Automatic nnz-cutoff selection + ASCII histogram (shared by `squeeze` and by //
-// callers that want cell-calling on a per-column nnz vector, e.g. `senna gem`). //
+// callers that want cell-calling on a per-column nnz vector).                   //
 //////////////////////////////////////////////////////////////////////////////////
 
 /// Bin width of the trough search, in natural-log units (~5% per bin).
@@ -511,8 +511,7 @@ pub fn fmt_stat(v: f32, decimals: usize) -> String {
 /// A non-zero `cutoff` marks the cutoff bin and reports how much it removes;
 /// an optional `suggested` value reports the trough suggestion.
 ///
-/// Used by `data-beans squeeze --show-histogram`, `data-beans histogram`, and
-/// `senna gem --auto-cell-cutoff`.
+/// Used by `data-beans squeeze --show-histogram` and `data-beans histogram`.
 pub fn print_nnz_summary(
     label: &str,
     metric: &str,

@@ -208,7 +208,7 @@ pub struct FabaArgs {
                      \n\
                      The SPLICED (mature) track uses θ(t).\n\
                      The UNSPLICED (nascent) track uses the look-ahead θ(t+Δ).\n\
-                     So gem's velocity δ points along the trajectory tangent.\n\
+                     So a velocity δ read off the two tracks points along the trajectory tangent.\n\
                      \n\
                      Ground truth goes to two files.\n\
                      `{out}.pseudotime.parquet` carries pseudotime and branch.\n\
