@@ -48,7 +48,7 @@ fn resolve_dedupes_names_hitting_the_same_row() {
     assert_eq!(got, vec![0]);
 }
 
-/// gem resolves against interned gene keys, so a rescued gene keeps both splice
+/// Resolving against interned gene keys, a rescued gene keeps both splice
 /// tracks. Resolving against the raw count rows instead would return only the
 /// first — the regression this guards.
 #[test]

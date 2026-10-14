@@ -142,7 +142,7 @@ pub struct HvgCliArgs {
                      it only gets a post-hoc PROJECTED embedding.\n\
                      Naming it here is what puts it in the model. This is the intended use.\n\
                      \n\
-                     • `senna` (topic / svd / vae / bge / gem) — HVG only WEIGHTS the\n\
+                     • `senna` (topic / svd / vae / bge / rbm) — HVG only WEIGHTS the\n\
                      random projection used for pseudobulk sketching.\n\
                      Every feature is trained either way.\n\
                      Naming it here raises its projection weight, nothing more.\n\

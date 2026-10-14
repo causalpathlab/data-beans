@@ -37,7 +37,7 @@ pub struct RandRowProjOut {
 /// Johnson–Lindenstrauss draw is still a valid projection), so callers that do
 /// not thread their own `--seed` get a pinned, reproducible basis for free.
 /// Callers that want `--seed` to also drive the projection use the `_seeded`
-/// variants (e.g. the shared `graph_embedding_util::fit` gem/bge path).
+/// variants (e.g. the `graph_embedding_util::fit` path behind `senna bge`).
 pub const DEFAULT_PROJECTION_SEED: u64 = 0x50524F4A_50524F4A; // "PROJPROJ"
 
 pub trait RandProjOps {
@@ -707,7 +707,7 @@ mod repro_tests {
     }
 
     /// The seeded projection must be byte-identical across runs for a fixed seed
-    /// — this is the reproducibility guarantee the gem/bge pipeline relies on.
+    /// — this is the reproducibility guarantee the bge pipeline relies on.
     #[test]
     fn seeded_projection_is_reproducible() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;

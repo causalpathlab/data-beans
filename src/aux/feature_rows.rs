@@ -59,10 +59,9 @@
 //! trailing `/count/{channel}` with `rfind`. That is safe *there* — it runs only
 //! over faba's own gene matrices, and its job is to group every row of a gene
 //! (including the pooled `total` track) under one key for QC, which is what its
-//! callers want. Contrast `senna::gem::rows`, which must additionally decide
-//! WHICH track a row is: there the same shortcut put `total` in the spliced
-//! bucket and double-counted the gene, so that one goes through
-//! [`parse_feature_row`].
+//! callers want. A caller that must additionally decide WHICH track a row is
+//! goes through [`parse_feature_row`]: the same shortcut would put `total` in
+//! the spliced bucket and double-count the gene.
 //!
 //! The unit of a parsed row is [`FeatureRow::unit`], and the gene is
 //! [`FeatureRow::gene`] — read those fields rather than re-splitting the string.
