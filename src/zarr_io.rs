@@ -22,36 +22,41 @@ use zarrs_zip::ZipStorageAdapter;
 /// A read store paired with an optional write store (present for directories, `None` for zips).
 pub type ZarrStoreRw = (Arc<dyn ZReadStorageTraits>, Option<Arc<FilesystemStore>>);
 
-/// Detect the path prefix inside a zarr zip (empty if entries are at root).
-///
-/// Tries the new `foo/` prefix first (zips produced by `finalize_zarr_output`
-/// after the rename), then falls back to the legacy `foo.zarr/` prefix for
-/// archives created before the rename.
-fn detect_zip_zarr_prefix(zip_path: &std::path::Path) -> anyhow::Result<Box<str>> {
-    let filename = zip_path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid zip path: {:?}", zip_path))?;
-    let stem = filename.strip_suffix(".zip").unwrap_or(filename);
-    let new_prefix = format!("{}/", stem.strip_suffix(".zarr").unwrap_or(stem));
-    let legacy_prefix = format!("{}/", stem);
-
+/// The directory a zarr zip holds its store under: the one all its metadata
+/// files (`zarr.json`, or v2's `.zgroup` / `.zarray`) share, e.g. `foo` as
+/// [`legume_numeric::matrix::common_io::zip_dir`] writes it, or empty when
+/// the store sits at the root. Read from the stored names, which
+/// [`ZipStorageAdapter`] matches too.
+fn zip_zarr_root(zip_path: &std::path::Path) -> anyhow::Result<String> {
+    const METADATA: [&str; 3] = ["zarr.json", ".zgroup", ".zarray"];
     let file = std::fs::File::open(zip_path)?;
     let archive = zip::ZipArchive::new(std::io::BufReader::new(file))?;
-    if archive
-        .file_names()
-        .any(|n| n.is_ok_and(|n| n.starts_with(&new_prefix)))
-    {
-        Ok(new_prefix.into())
-    } else if new_prefix != legacy_prefix
-        && archive
-            .file_names()
-            .any(|n| n.is_ok_and(|n| n.starts_with(&legacy_prefix)))
-    {
-        Ok(legacy_prefix.into())
-    } else {
-        Ok("".into())
+    let mut root: Option<Vec<String>> = None;
+    for name in archive.file_names().flatten() {
+        let (dir, file) = name.rsplit_once('/').unwrap_or(("", &*name));
+        if !METADATA.contains(&file) {
+            continue;
+        }
+        let dir = dir.split('/').map(str::to_owned);
+        if let Some(root) = &mut root {
+            let shared = root.iter().zip(dir).take_while(|(a, b)| *a == b).count();
+            root.truncate(shared);
+        } else {
+            root = Some(dir.collect());
+        }
     }
+    Ok(root.unwrap_or_default().join("/"))
+}
+
+/// The path prefix inside a zarr zip: its [`zip_zarr_root`] with a trailing
+/// `/`, or empty.
+fn detect_zip_zarr_prefix(zip_path: &std::path::Path) -> anyhow::Result<Box<str>> {
+    let root = zip_zarr_root(zip_path)?;
+    Ok(if root.is_empty() {
+        root.into()
+    } else {
+        format!("{root}/").into()
+    })
 }
 
 /// Open a zarr store, returning both a read store and an optional write store.
@@ -154,60 +159,12 @@ pub fn finalize_output<'a>(
     })
 }
 
-/// Extract a `.zarr.zip` archive into `target_dir`, transparently stripping
-/// any internal prefix produced by [`legume_numeric::matrix::common_io::zip_dir`] so
-/// the result is a flat `.zarr` directory regardless of the zip's filename.
+/// Extract a `.zarr.zip` archive into `target_dir` as a flat `.zarr`
+/// directory: the store under the directory its metadata files share, with
+/// legume-numeric's checks against entries that would leave the target.
 pub fn extract_zarr_zip(zip_path: &str, target_dir: &str) -> anyhow::Result<()> {
-    let zip_file = std::fs::File::open(zip_path)?;
-    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(zip_file))?;
-
-    // Detect prefix directly from the already-opened archive (avoids a
-    // second open + central-directory parse). Try the new `foo/` prefix
-    // first, then fall back to legacy `foo.zarr/`.
-    let filename = std::path::Path::new(zip_path)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid zip path: {}", zip_path))?;
-    let stem = filename.strip_suffix(".zip").unwrap_or(filename);
-    let new_prefix = format!("{}/", stem.strip_suffix(".zarr").unwrap_or(stem));
-    let legacy_prefix = format!("{}/", stem);
-    let prefix: &str = if archive
-        .file_names()
-        .any(|n| n.is_ok_and(|n| n.starts_with(&new_prefix)))
-    {
-        &new_prefix
-    } else if new_prefix != legacy_prefix
-        && archive
-            .file_names()
-            .any(|n| n.is_ok_and(|n| n.starts_with(&legacy_prefix)))
-    {
-        &legacy_prefix
-    } else {
-        ""
-    };
-
-    std::fs::create_dir_all(target_dir)?;
-    let target = std::path::Path::new(target_dir);
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let name = file.name()?.into_owned();
-        let rel = name.strip_prefix(prefix).unwrap_or(&name);
-        if rel.is_empty() {
-            continue;
-        }
-        let out_path = target.join(rel);
-        if file.is_dir() {
-            std::fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut outfile = std::fs::File::create(&out_path)?;
-            std::io::copy(&mut file, &mut outfile)?;
-        }
-    }
-    Ok(())
+    let root = zip_zarr_root(std::path::Path::new(zip_path))?;
+    legume_numeric::matrix::common_io::unzip_subdir(zip_path, &root, target_dir)
 }
 
 /// Copy input backend to a writable output location. Transparently extracts
