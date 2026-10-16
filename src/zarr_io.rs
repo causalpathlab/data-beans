@@ -870,15 +870,26 @@ mod tests {
         }
     }
 
-    /// The store's prefix is the directory all its metadata files share, read
-    /// from the entries: a renamed archive keeps it, a store without a root
-    /// group still gets its root, stray entries beside the store (a README, an
-    /// OS's metadata) neither hide it nor end up in the extracted store, and a
-    /// store at the archive's root has none.
+    /// The store's prefix is read from the entries: the archive's single
+    /// top-level directory, so a renamed archive keeps it and a store without
+    /// a root group (a nested array) still gets its root, with loose files
+    /// and an OS's metadata beside it ignored and left out of the extracted
+    /// store; beside other directories (a backup), the one named like the
+    /// archive; and none for a store at the archive's root.
     #[test]
-    fn the_store_prefix_comes_from_its_metadata() {
+    fn the_store_prefix_comes_from_the_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let cases: [(&str, Entries, &str); 5] = [
+        let cases: [(&str, Entries, &str); 7] = [
+            (
+                "nested.zarr.zip",
+                &[("run/m/X/zarr.json", b"{}"), ("run/m/X/c/0", b"chunk")],
+                "run/",
+            ),
+            (
+                "run.zarr.zip",
+                &[("run/zarr.json", b"{}"), ("run.zarr.bak/zarr.json", b"{}")],
+                "run/",
+            ),
             (
                 "renamed.zarr.zip",
                 &[("run/zarr.json", b"{}"), ("run/X/zarr.json", b"{}")],
