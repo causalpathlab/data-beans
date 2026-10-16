@@ -38,10 +38,15 @@ fn detect_zip_zarr_prefix(zip_path: &std::path::Path) -> anyhow::Result<Box<str>
 
     let file = std::fs::File::open(zip_path)?;
     let archive = zip::ZipArchive::new(std::io::BufReader::new(file))?;
-    if archive.file_names().any(|n| n.starts_with(&new_prefix)) {
+    if archive
+        .file_names()
+        .any(|n| n.is_ok_and(|n| n.starts_with(&new_prefix)))
+    {
         Ok(new_prefix.into())
     } else if new_prefix != legacy_prefix
-        && archive.file_names().any(|n| n.starts_with(&legacy_prefix))
+        && archive
+            .file_names()
+            .any(|n| n.is_ok_and(|n| n.starts_with(&legacy_prefix)))
     {
         Ok(legacy_prefix.into())
     } else {
@@ -166,10 +171,15 @@ pub fn extract_zarr_zip(zip_path: &str, target_dir: &str) -> anyhow::Result<()> 
     let stem = filename.strip_suffix(".zip").unwrap_or(filename);
     let new_prefix = format!("{}/", stem.strip_suffix(".zarr").unwrap_or(stem));
     let legacy_prefix = format!("{}/", stem);
-    let prefix: &str = if archive.file_names().any(|n| n.starts_with(&new_prefix)) {
+    let prefix: &str = if archive
+        .file_names()
+        .any(|n| n.is_ok_and(|n| n.starts_with(&new_prefix)))
+    {
         &new_prefix
     } else if new_prefix != legacy_prefix
-        && archive.file_names().any(|n| n.starts_with(&legacy_prefix))
+        && archive
+            .file_names()
+            .any(|n| n.is_ok_and(|n| n.starts_with(&legacy_prefix)))
     {
         &legacy_prefix
     } else {
@@ -181,7 +191,8 @@ pub fn extract_zarr_zip(zip_path: &str, target_dir: &str) -> anyhow::Result<()> 
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let rel = file.name().strip_prefix(prefix).unwrap_or(file.name());
+        let name = file.name()?.into_owned();
+        let rel = name.strip_prefix(prefix).unwrap_or(&name);
         if rel.is_empty() {
             continue;
         }
