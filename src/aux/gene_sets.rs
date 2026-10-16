@@ -433,6 +433,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_tab_separated_label_keeps_its_commas() {
+        let f = tmp(
+            "CD4\tCD4-positive, alpha-beta T cell\nCD8A\tCD8-positive, alpha-beta T cell\nMS4A1,B cell\n",
+            ".tsv",
+        );
+        let pairs = read_membership_pairs(f.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (Box::from("CD4"), Box::from("CD4-positive, alpha-beta T cell")),
+                (Box::from("CD8A"), Box::from("CD8-positive, alpha-beta T cell")),
+                (Box::from("MS4A1"), Box::from("B cell")),
+            ],
+            "a line with a tab splits on the tab only; one without, on its comma"
+        );
+    }
+
     fn tmp(contents: &str, suffix: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
         f.write_all(contents.as_bytes()).unwrap();
