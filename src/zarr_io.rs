@@ -831,4 +831,141 @@ mod tests {
         assert_eq!(result.cols[0].as_ref(), "cell_area");
         assert_eq!(result.cols[1].as_ref(), "nucleus_centroid_x");
     }
+
+    /// (entry name, contents) pairs for a test zip.
+    type Entries<'a> = &'a [(&'a str, &'a [u8])];
+
+    /// A zip `name` in `dir` of the given entries, written as is.
+    fn zip_of(dir: &tempfile::TempDir, name: &str, entries: Entries) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.path().join(name);
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        for (entry, bytes) in entries {
+            w.start_file(*entry, opts).unwrap();
+            w.write_all(bytes).unwrap();
+        }
+        w.finish().unwrap();
+        path
+    }
+
+    fn extract(zip: &std::path::Path, out: &std::path::Path) -> anyhow::Result<()> {
+        extract_zarr_zip(zip.to_str().unwrap(), out.to_str().unwrap())
+    }
+
+    /// An entry that climbs out of the target (`run/../../x`, behind the
+    /// store's own prefix) refuses the whole archive before anything is
+    /// written.
+    #[test]
+    fn extracting_refuses_an_entry_that_leaves_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = zip_of(
+            &dir,
+            "run.zarr.zip",
+            &[
+                ("run/zarr.json", b"{}"),
+                ("run/../../escape.txt", b"escaped"),
+            ],
+        );
+        let target = dir.path().join("out").join("run.zarr");
+        let err = extract(&zip, &target).unwrap_err().to_string();
+        assert!(err.contains("no safe path"), "{err}");
+        assert!(
+            !dir.path().join("out").join("escape.txt").exists()
+                && !dir.path().join("escape.txt").exists(),
+            "an entry was written outside the target"
+        );
+        assert!(
+            !target.join("zarr.json").exists(),
+            "a refused archive left files behind"
+        );
+    }
+
+    /// A store zipped by `zip_dir_as` behind its `run/` root, or by `zip_dir`
+    /// behind the older `run.zarr/` one, extracts back to the same files.
+    #[test]
+    fn a_zipped_store_extracts_back_to_its_files() {
+        for root in [Some("run"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("run.zarr");
+            std::fs::create_dir_all(src.join("X/c/0")).unwrap();
+            std::fs::write(src.join("zarr.json"), b"{}").unwrap();
+            std::fs::write(src.join("X/c/0/1"), b"chunk").unwrap();
+            let zip = dir.path().join("run.zarr.zip");
+            legume_numeric::matrix::common_io::zip_dir_as(
+                src.to_str().unwrap(),
+                zip.to_str().unwrap(),
+                root,
+            )
+            .unwrap();
+            let out = dir.path().join("back.zarr");
+            extract(&zip, &out).unwrap();
+            assert_eq!(
+                std::fs::read(out.join("zarr.json")).unwrap(),
+                b"{}",
+                "{root:?}"
+            );
+            assert_eq!(
+                std::fs::read(out.join("X/c/0/1")).unwrap(),
+                b"chunk",
+                "{root:?}"
+            );
+        }
+    }
+
+    /// The store's prefix is the directory all its metadata files share, read
+    /// from the entries: a renamed archive keeps it, a store without a root
+    /// group still gets its root, stray entries beside the store (a README, an
+    /// OS's metadata) neither hide it nor end up in the extracted store, and a
+    /// store at the archive's root has none.
+    #[test]
+    fn the_store_prefix_comes_from_its_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [(&str, Entries, &str); 5] = [
+            (
+                "renamed.zarr.zip",
+                &[("run/zarr.json", b"{}"), ("run/X/zarr.json", b"{}")],
+                "run/",
+            ),
+            (
+                "no_group.zarr.zip",
+                &[("run/X/zarr.json", b"{}"), ("run/rows/zarr.json", b"{}")],
+                "run/",
+            ),
+            (
+                "stray.zarr.zip",
+                &[
+                    ("README.txt", b""),
+                    ("__MACOSX/run/._zarr.json", b""),
+                    ("run/zarr.json", b"{}"),
+                ],
+                "run/",
+            ),
+            (
+                "v2.zarr.zip",
+                &[("old.zarr/.zgroup", b"{}"), ("old.zarr/X/.zarray", b"{}")],
+                "old.zarr/",
+            ),
+            (
+                "at_root.zarr.zip",
+                &[("zarr.json", b"{}"), ("X/zarr.json", b"{}")],
+                "",
+            ),
+        ];
+        for (name, entries, prefix) in cases {
+            let zip = zip_of(&dir, name, entries);
+            assert_eq!(&*detect_zip_zarr_prefix(&zip).unwrap(), prefix, "{name}");
+        }
+        for (name, kept, dropped) in [
+            ("stray.zarr.zip", "zarr.json", "README.txt"),
+            ("no_group.zarr.zip", "rows/zarr.json", "run"),
+        ] {
+            let out = dir.path().join(name).with_extension("out");
+            extract(&dir.path().join(name), &out).unwrap();
+            assert!(
+                out.join(kept).exists() && !out.join(dropped).exists(),
+                "{name}"
+            );
+        }
+    }
 }
