@@ -22,30 +22,39 @@ use zarrs_zip::ZipStorageAdapter;
 /// A read store paired with an optional write store (present for directories, `None` for zips).
 pub type ZarrStoreRw = (Arc<dyn ZReadStorageTraits>, Option<Arc<FilesystemStore>>);
 
-/// The directory a zarr zip holds its store under: the one all its metadata
-/// files (`zarr.json`, or v2's `.zgroup` / `.zarray`) share, e.g. `foo` as
-/// [`legume_numeric::matrix::common_io::zip_dir`] writes it, or empty when
-/// the store sits at the root. Read from the stored names, which
-/// [`ZipStorageAdapter`] matches too.
+/// The directory a zarr zip holds its store under, read from the stored
+/// names, which [`ZipStorageAdapter`] matches too: empty when a metadata file
+/// (`zarr.json`, or v2's `.zgroup` / `.zarray`) sits at the archive's root;
+/// else the single top-level directory (as
+/// [`legume_numeric::matrix::common_io::zip_dir`] writes, whatever the
+/// archive is named), ignoring loose files and `__MACOSX`; else, among
+/// several, the one named like the archive (`foo` for `foo.zarr.zip`, or the
+/// older `foo.zarr`); else empty.
 fn zip_zarr_root(zip_path: &std::path::Path) -> anyhow::Result<String> {
     const METADATA: [&str; 3] = ["zarr.json", ".zgroup", ".zarray"];
     let file = std::fs::File::open(zip_path)?;
     let archive = zip::ZipArchive::new(std::io::BufReader::new(file))?;
-    let mut root: Option<Vec<String>> = None;
+    let mut dirs = std::collections::BTreeSet::new();
     for name in archive.file_names().flatten() {
-        let (dir, file) = name.rsplit_once('/').unwrap_or(("", &*name));
-        if !METADATA.contains(&file) {
-            continue;
-        }
-        let dir = dir.split('/').map(str::to_owned);
-        if let Some(root) = &mut root {
-            let shared = root.iter().zip(dir).take_while(|(a, b)| *a == b).count();
-            root.truncate(shared);
-        } else {
-            root = Some(dir.collect());
+        match name.split_once('/') {
+            None if METADATA.contains(&&*name) => return Ok(String::new()),
+            None | Some(("__MACOSX", _)) => {}
+            Some((top, _)) => {
+                dirs.insert(top.to_owned());
+            }
         }
     }
-    Ok(root.unwrap_or_default().join("/"))
+    if dirs.len() == 1 {
+        return Ok(dirs.pop_first().unwrap_or_default());
+    }
+    let file_name = zip_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+    let stem = file_name.strip_suffix(".zip").unwrap_or(file_name);
+    let named = [stem.strip_suffix(".zarr").unwrap_or(stem), stem];
+    Ok(named
+        .into_iter()
+        .find(|d| dirs.contains(*d))
+        .unwrap_or_default()
+        .to_owned())
 }
 
 /// The path prefix inside a zarr zip: its [`zip_zarr_root`] with a trailing
@@ -160,8 +169,8 @@ pub fn finalize_output<'a>(
 }
 
 /// Extract a `.zarr.zip` archive into `target_dir` as a flat `.zarr`
-/// directory: the store under the directory its metadata files share, with
-/// legume-numeric's checks against entries that would leave the target.
+/// directory: the store under its root directory, with legume-numeric's
+/// checks against entries that would leave the target.
 pub fn extract_zarr_zip(zip_path: &str, target_dir: &str) -> anyhow::Result<()> {
     let root = zip_zarr_root(std::path::Path::new(zip_path))?;
     legume_numeric::matrix::common_io::unzip_subdir(zip_path, &root, target_dir)
