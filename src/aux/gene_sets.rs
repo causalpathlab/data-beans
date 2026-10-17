@@ -13,7 +13,7 @@
 use crate::aux::ontology::Ontology;
 use crate::utilities::name_matching::GeneIndex;
 use anyhow::{Context, Result};
-use legume_numeric::matrix::common_io::open_buf_reader;
+use legume_numeric::matrix::common_io::{open_buf_reader, read_two_field_rows, TwoFieldRows};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io::BufRead;
 
@@ -93,37 +93,41 @@ pub fn read_gmt(path: &str) -> Result<GeneSets> {
 }
 
 /// Parse a two-column membership file — `gene <TAB> label` (a marker panel,
-/// a TF→target list, any gene→category table) — into `(gene, label)` pairs
-/// via the shared, gz-aware line reader. A line with a tab (trailing
-/// whitespace aside) splits on its tabs only, so a label keeps its commas
-/// (`CD4-positive, alpha-beta T cell`); a line without one splits on its
-/// commas. Cells keep their columns: an empty gene or label skips the row. Takes the first two
-/// fields per line; skips blank lines, `#` comments, a `gene`/`symbol`
-/// header row and rows missing a label. Labels are kept verbatim; genes are
-/// not case-folded.
+/// a TF→target list, any gene→category table) — into `(gene, label)` pairs,
+/// by legume-numeric's two-column rule ([`read_two_field_rows`]): a line with
+/// a tab splits on its tabs only, so a label keeps its commas; one without is
+/// CSV, where a quoted label keeps its commas too. Cells keep their columns,
+/// trimmed and unquoted, and the first two are used. Blank lines, `#`/`%`
+/// comments and a `gene`/`symbol` header are skipped. One warning counts the
+/// rows skipped for an empty gene or label, another the comma rows with more
+/// than two cells. Labels are kept verbatim; genes are not case-folded.
 pub fn read_membership_pairs(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
-    let lines = legume_numeric::matrix::common_io::read_lines(path)
-        .with_context(|| format!("reading membership pairs from {path}"))?;
-    Ok(lines
-        .iter()
-        .filter_map(|line| {
-            // Trailing whitespace (a stray tab, a CR) does not choose the split.
-            let line = line.trim_end();
-            let mut words = line.split(if line.contains('\t') { '\t' } else { ',' });
-            let gene = words.next()?.trim();
-            let label = words.next()?.trim();
-            let gl = gene.to_lowercase();
-            if gene.is_empty()
-                || gene.starts_with('#')
-                || label.is_empty()
-                || gl == "gene"
-                || gl == "symbol"
-            {
-                return None;
-            }
-            Some((Box::from(gene), Box::from(label)))
-        })
-        .collect())
+    let got = membership_rows(path)?;
+    if got.gapped > 0 {
+        log::warn!(
+            "{path}: skipped {} row(s) with an empty gene or label",
+            got.gapped
+        );
+    }
+    if got.wide_comma > 0 {
+        log::warn!(
+            "{path}: {} comma-separated row(s) have more than two cells; the first two are \
+             read, so quote a label that holds a comma, or separate with tabs",
+            got.wide_comma
+        );
+    }
+    Ok(got.rows)
+}
+
+/// [`read_membership_pairs`] without its warnings: the rows, header dropped,
+/// with their skip counts, for a caller that sniffs files (a picker) or words
+/// its own message.
+pub fn membership_rows(path: &str) -> Result<TwoFieldRows> {
+    let mut got = read_two_field_rows(path)?;
+    got.rows.retain(|(gene, _)| {
+        !(gene.eq_ignore_ascii_case("gene") || gene.eq_ignore_ascii_case("symbol"))
+    });
+    Ok(got)
 }
 
 /// Options for [`read_gaf`].
@@ -460,6 +464,58 @@ mod tests {
             "a line with a tab splits on the tab only; one without (trailing space aside), on its \
              comma; cells keep their columns, so an empty gene or label skips the row"
         );
+    }
+
+    #[test]
+    fn membership_cells_are_unquoted_and_percent_lines_are_comments() {
+        let f = tmp(
+            "% panel v2\n\"CD3E\",\"T cell\"\n'MS4A1'\t'B cell, naive'\n#CD14\tMonocyte\n",
+            ".csv",
+        );
+        let pairs = read_membership_pairs(f.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (Box::from("CD3E"), Box::from("T cell")),
+                (Box::from("MS4A1"), Box::from("B cell, naive")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quoted_csv_label_keeps_its_comma() {
+        let f = tmp(
+            "gene,celltype\nCD4,\"CD4-positive, alpha-beta T cell\"\nCD8A,T cell, CD8\n",
+            ".csv",
+        );
+        let pairs = read_membership_pairs(f.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    Box::from("CD4"),
+                    Box::from("CD4-positive, alpha-beta T cell")
+                ),
+                (Box::from("CD8A"), Box::from("T cell")),
+            ]
+        );
+    }
+
+    #[test]
+    fn membership_rows_drop_the_header_and_count_what_they_skip() {
+        let f = tmp(
+            "\u{feff}gene\tcelltype\n# note\nLONELY\n\tT cell\nCD14\tMonocyte\nCD8A,T cell, CD8\n",
+            ".tsv",
+        );
+        let got = membership_rows(f.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            got.rows,
+            vec![
+                (Box::from("CD14"), Box::from("Monocyte")),
+                (Box::from("CD8A"), Box::from("T cell")),
+            ]
+        );
+        assert_eq!((got.gapped, got.wide_comma), (2, 1));
     }
 
     fn tmp(contents: &str, suffix: &str) -> tempfile::NamedTempFile {
