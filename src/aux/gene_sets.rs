@@ -94,9 +94,10 @@ pub fn read_gmt(path: &str) -> Result<GeneSets> {
 
 /// Parse a two-column membership file — `gene <TAB> label` (a marker panel,
 /// a TF→target list, any gene→category table) — into `(gene, label)` pairs
-/// via the shared, gz-aware line reader. A line with a tab splits on its
-/// tabs only, so a label keeps its commas (`CD4-positive, alpha-beta T
-/// cell`); a line without one splits on its commas. Takes the first two
+/// via the shared, gz-aware line reader. A line with a tab (trailing
+/// whitespace aside) splits on its tabs only, so a label keeps its commas
+/// (`CD4-positive, alpha-beta T cell`); a line without one splits on its
+/// commas. Cells keep their columns: an empty gene or label skips the row. Takes the first two
 /// fields per line; skips blank lines, `#` comments, a `gene`/`symbol`
 /// header row and rows missing a label. Labels are kept verbatim; genes are
 /// not case-folded.
@@ -106,6 +107,8 @@ pub fn read_membership_pairs(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
     Ok(lines
         .iter()
         .filter_map(|line| {
+            // Trailing whitespace (a stray tab, a CR) does not choose the split.
+            let line = line.trim_end();
             let mut words = line.split(if line.contains('\t') { '\t' } else { ',' });
             let gene = words.next()?.trim();
             let label = words.next()?.trim();
