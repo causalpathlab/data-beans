@@ -94,20 +94,24 @@ pub fn read_gmt(path: &str) -> Result<GeneSets> {
 
 /// Parse a two-column membership file — `gene <TAB> label` (a marker panel,
 /// a TF→target list, any gene→category table) — into `(gene, label)` pairs
-/// via the shared, gz-aware line reader (tab or comma delimited). Takes the
-/// first two tokens per line; skips blank lines, `#` comments, a
-/// `gene`/`symbol` header row and rows missing a label. Labels are kept
-/// verbatim; genes are not case-folded.
+/// via the shared, gz-aware line reader. A line with a tab (trailing
+/// whitespace aside) splits on its tabs only, so a label keeps its commas
+/// (`CD4-positive, alpha-beta T cell`); a line without one splits on its
+/// commas. Cells keep their columns: an empty gene or label skips the row. Takes the first two
+/// fields per line; skips blank lines, `#` comments, a `gene`/`symbol`
+/// header row and rows missing a label. Labels are kept verbatim; genes are
+/// not case-folded.
 pub fn read_membership_pairs(path: &str) -> Result<Vec<(Box<str>, Box<str>)>> {
-    let lines =
-        legume_numeric::matrix::common_io::read_lines_of_words_delim(path, &['\t', ','][..], -1)
-            .with_context(|| format!("reading membership pairs from {path}"))?
-            .lines;
+    let lines = legume_numeric::matrix::common_io::read_lines(path)
+        .with_context(|| format!("reading membership pairs from {path}"))?;
     Ok(lines
-        .into_iter()
-        .filter_map(|words| {
-            let gene = words.first()?.trim();
-            let label = words.get(1)?.trim();
+        .iter()
+        .filter_map(|line| {
+            // Trailing whitespace (a stray tab, a CR) does not choose the split.
+            let line = line.trim_end();
+            let mut words = line.split(if line.contains('\t') { '\t' } else { ',' });
+            let gene = words.next()?.trim();
+            let label = words.next()?.trim();
             let gl = gene.to_lowercase();
             if gene.is_empty()
                 || gene.starts_with('#')
@@ -430,6 +434,31 @@ mod tests {
                 (Box::from("MS4A1"), Box::from("B cell")),
                 (Box::from("CD14"), Box::from("Monocyte")),
             ]
+        );
+    }
+
+    #[test]
+    fn a_tab_separated_label_keeps_its_commas() {
+        let f = tmp(
+            "CD4\tCD4-positive, alpha-beta T cell\nCD8A\tCD8-positive, alpha-beta T cell\nMS4A1,B cell\t\nCD14\t\t1.8\n\tCD4-positive, x\n",
+            ".tsv",
+        );
+        let pairs = read_membership_pairs(f.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    Box::from("CD4"),
+                    Box::from("CD4-positive, alpha-beta T cell")
+                ),
+                (
+                    Box::from("CD8A"),
+                    Box::from("CD8-positive, alpha-beta T cell")
+                ),
+                (Box::from("MS4A1"), Box::from("B cell")),
+            ],
+            "a line with a tab splits on the tab only; one without (trailing space aside), on its \
+             comma; cells keep their columns, so an empty gene or label skips the row"
         );
     }
 
