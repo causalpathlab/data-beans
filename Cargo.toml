@@ -48,7 +48,7 @@ sim = ["alg"]
 hdf5 = ["dep:hdf5", "ndarray"]
 
 [dependencies]
-legume-numeric = { version = "0.9", default-features = false, features = ["matrix", "param"] }
+legume-numeric = { version = "0.9.4", default-features = false, features = ["matrix", "param"] }
 legume-genomic-types = "0.6"
 
 anyhow = "1.0"
@@ -78,7 +78,7 @@ env_logger = "0.11"
 log = "0.4"
 dashmap = { version = "6.1.0", features = ["rayon"] }
 rustc-hash = "2.1"
-zip = "8"
+zip = "9.0.4"
 zarrs_zip = "0.5"
 petgraph = "0.8"
 fastobo = "0.15"

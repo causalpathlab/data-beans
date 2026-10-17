@@ -40,14 +40,14 @@ pub fn list_zarr(cmd_args: &ListZarrArgs) -> anyhow::Result<()> {
             let file = std::fs::File::open(cmd_args.zarr_file.as_ref())?;
             let reader = std::io::BufReader::new(file);
 
-            let mut archive = ZipArchive::new(reader)?;
+            let archive = ZipArchive::new(reader)?;
 
             for i in 0..archive.len() {
-                let file = archive.by_index(i)?;
-                println!("{}", file.name());
-                // if file.is_dir() {
-                //     println!("{}", file.name());
-                // }
+                let entry = archive.by_index_data(i)?;
+                match entry.name() {
+                    Ok(name) => println!("{name}"),
+                    Err(_) => println!("{}", String::from_utf8_lossy(entry.name_raw())),
+                }
             }
         }
         _ => {
