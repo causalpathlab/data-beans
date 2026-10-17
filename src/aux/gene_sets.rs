@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn a_tab_separated_label_keeps_its_commas() {
         let f = tmp(
-            "CD4\tCD4-positive, alpha-beta T cell\nCD8A\tCD8-positive, alpha-beta T cell\nMS4A1,B cell\n",
+            "CD4\tCD4-positive, alpha-beta T cell\nCD8A\tCD8-positive, alpha-beta T cell\nMS4A1,B cell\t\nCD14\t\t1.8\n\tCD4-positive, x\n",
             ".tsv",
         );
         let pairs = read_membership_pairs(f.path().to_str().unwrap()).unwrap();
@@ -454,7 +454,8 @@ mod tests {
                 ),
                 (Box::from("MS4A1"), Box::from("B cell")),
             ],
-            "a line with a tab splits on the tab only; one without, on its comma"
+            "a line with a tab splits on the tab only; one without (trailing space aside), on its \
+             comma; cells keep their columns, so an empty gene or label skips the row"
         );
     }
 
