@@ -39,6 +39,9 @@ pub struct SubsetArgs {
     /// `.zarr.zip`
     #[arg(short, long, required = true)]
     pub output: Box<str>,
+
+    #[command(flatten)]
+    pub session: legume_tui::cli::SessionArgs,
 }
 
 #[derive(Args, Debug)]
@@ -57,6 +60,9 @@ pub struct SubsetColumnsArgs {
     /// pick the columns in a full-screen table: mark with Space, Enter to finish
     #[arg(short = 'I', long, default_value_t = false)]
     pub interactive: bool,
+
+    #[command(flatten)]
+    pub session: legume_tui::cli::SessionArgs,
 
     /// delimiter for base-key extraction (e.g., '@' to match "ACGT-1@batch" with "ACGT-1")
     #[arg(short = 'd', long, default_value = "@")]
@@ -111,6 +117,9 @@ pub struct SubsetRowsArgs {
     /// pick the rows in a full-screen table: mark with Space, Enter to finish
     #[arg(short = 'I', long, default_value_t = false)]
     pub interactive: bool,
+
+    #[command(flatten)]
+    pub session: legume_tui::cli::SessionArgs,
 
     /// delimiter for base-key extraction (e.g., '@' to match "gene@batch" with "gene")
     #[arg(short = 'd', long, default_value = "@")]
@@ -271,6 +280,9 @@ pub struct RunSqueezeArgs {
                      - union: Keep rows present in ANY file (union, fills missing with zeros)"
     )]
     pub row_align: RowAlignMode,
+
+    #[command(flatten)]
+    pub session: legume_tui::cli::SessionArgs,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]

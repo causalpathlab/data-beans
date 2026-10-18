@@ -14,8 +14,8 @@ use ratatui::widgets::{Block, BorderType, Clear, LineGauge, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::ui::{
-    header, help_line, input_line, median, panel, run_screen, Binned, HistPlot, Scale, Screen,
-    ACCENTED, DIM, HIGHLIGHT, PLAIN,
+    header, help_line, input_line, median, panel, run_screen, title_bar, Binned, HistPlot, Scale,
+    Screen, Tui, ACCENTED, DIM, HIGHLIGHT, PLAIN,
 };
 use crate::qc::{below_nnz_cutoff, pct};
 
@@ -227,6 +227,8 @@ pub struct CutoffPicker {
     /// Set once the user is done: the row and column cutoffs, or `None` to
     /// cancel.
     decision: Option<Option<(usize, usize)>>,
+    /// The detach and switch keys, for the title bar.
+    session_keys: Vec<(String, String)>,
 }
 
 impl CutoffPicker {
@@ -245,6 +247,7 @@ impl CutoffPicker {
             in_place_target: in_place_target.map(str::to_string),
             mode: Mode::Browse,
             decision: None,
+            session_keys: super::session_keys(),
         }
     }
 
@@ -296,6 +299,10 @@ impl Screen for CutoffPicker {
 
     fn interrupt(&mut self) {
         self.decision = Some(None);
+    }
+
+    fn status(&self) -> Option<String> {
+        Some(format!("picking nnz cutoffs for {}", self.title))
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -367,7 +374,12 @@ impl Screen for CutoffPicker {
         .areas(frame.area());
 
         let scales = format!("x {} · y {}", self.x_scale.name(), self.y_scale.name());
-        frame.render_widget(header("squeeze", &self.title, &scales), top);
+        title_bar(
+            frame,
+            top,
+            header("squeeze", &self.title, &scales),
+            &self.session_keys,
+        );
         for (i, area) in [row_area, col_area].into_iter().enumerate() {
             self.axes[i].render(frame, area, self.focus == i, self.y_scale);
         }
@@ -402,6 +414,16 @@ impl Screen for CutoffPicker {
 /// cutoffs) or cancels (`None`).
 pub fn choose_cutoffs(mut picker: CutoffPicker) -> anyhow::Result<Option<(usize, usize)>> {
     run_screen(&mut picker)?;
+    Ok(picker.decision.flatten())
+}
+
+/// [`choose_cutoffs`] on the screen of `tui`, in its session: a `kill`
+/// cancels it as `q` does.
+pub fn choose_cutoffs_in(
+    tui: &mut Tui<'_>,
+    mut picker: CutoffPicker,
+) -> anyhow::Result<Option<(usize, usize)>> {
+    tui.run(&mut picker)?;
     Ok(picker.decision.flatten())
 }
 

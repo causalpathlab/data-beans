@@ -428,3 +428,29 @@ fn picking_both_sides_allows_marks_on_one_side_only() {
     assert_eq!(picked.columns, [4]);
     assert!(picked.rows.is_empty(), "rows never shown, so kept whole");
 }
+
+/// The session keys a hosted view shows.
+fn hosted_keys() -> Vec<(String, String)> {
+    vec![
+        ("ctrl+alt+d".into(), "detach".into()),
+        ("ctrl+alt+s".into(), "switch".into()),
+    ]
+}
+
+#[test]
+fn the_session_keys_stay_on_screen_at_80_columns() {
+    let mut e = StatExplorer::new(
+        "a-long-input-name-that-fills-the-title-bar-on-its-own.zarr",
+        Side::Rows,
+        rows(),
+        None,
+        Some(reader()),
+        Purpose::Pick { verb: "subset" },
+    );
+    e.session_keys = hosted_keys();
+    let text = screen_text(&mut e, 80, 24);
+    let top: String = text.chars().take(80).collect();
+    assert!(top.contains("ctrl+alt+d detach"), "{top:?}");
+    assert!(top.contains("ctrl+alt+s switch"), "{top:?}");
+    assert!(top.contains("subset"), "the badge is kept: {top:?}");
+}

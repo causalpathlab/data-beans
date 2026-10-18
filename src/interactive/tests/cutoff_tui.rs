@@ -191,3 +191,20 @@ fn x_and_y_cycle_scales_for_both_axes() {
         .collect();
     assert!(text.contains("x sqrt · y linear"));
 }
+
+#[test]
+fn the_session_keys_stay_on_screen_at_80_columns() {
+    let mut p = picker(Some("target"));
+    p.session_keys = vec![
+        ("ctrl+alt+d".into(), "detach".into()),
+        ("ctrl+alt+s".into(), "switch".into()),
+    ];
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| p.render(f)).unwrap();
+    let top: String = term.backend().buffer().content()[..80]
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(top.contains("ctrl+alt+d detach"), "{top:?}");
+    assert!(top.contains("ctrl+alt+s switch"), "{top:?}");
+}

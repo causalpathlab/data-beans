@@ -12,6 +12,11 @@
 //!   columns, optionally marking entries and handing them back.
 //!
 //! Open a view only when [`tui_available`]; otherwise fall back to text.
+//!
+//! The views run in a legume-tui session ([`TOOL`]): a command opens it
+//! first thing and hands it to [`ui::Tui`] or [`ui::run_screen_in`]; where
+//! the session is hosted, the command keeps running when the connection
+//! drops. [`ui::run_screen`] runs a view in a plain session of its own.
 
 pub mod cutoff_tui;
 pub mod stat_tui;
@@ -23,6 +28,71 @@ use std::io::{self, IsTerminal, Write};
 /// Otherwise callers fall back to the line prompts below.
 pub fn tui_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// The tool data-beans' sessions belong to: they are named
+/// `data-beans-squeeze-1`, `data-beans-stat-2`, and `data-beans attach`
+/// finds them.
+pub const TOOL: legume_tui::Tool = legume_tui::Tool::new("data-beans");
+
+/// A session for a view opened without one of its own
+/// ([`ui::run_screen`]): never hosted by itself, it runs in this terminal.
+/// Started inside another program's session (under its
+/// [`legume_tui::SESSION_VAR`]), it follows that session, drawn whole
+/// again after each attach.
+pub fn plain_session() -> io::Result<legume_tui::Session> {
+    let nested = std::env::var_os(legume_tui::SESSION_VAR).is_some_and(|v| !v.is_empty());
+    TOOL.session("screen", &plain_options(nested))
+}
+
+/// [`plain_session`]'s options: opted out of hosting, unless `nested`,
+/// where a session's marker already keeps it from being hosted and the
+/// opt-out would cost it the repaints.
+fn plain_options(nested: bool) -> legume_tui::Options {
+    legume_tui::Options {
+        no_detach: !nested,
+        target: true,
+        ..Default::default()
+    }
+}
+
+/// The detach and switch keys for a title bar ([`ui::title_bar`]), each
+/// with what it does in a word (`detach`, `switch`); none when the views
+/// run plain.
+pub fn session_keys() -> Vec<(String, String)> {
+    legume_tui::help_keys()
+        .into_iter()
+        .map(|(key, help)| {
+            let what = help.split(':').next().unwrap_or(&help).trim().to_string();
+            (key.to_lowercase(), what)
+        })
+        .collect()
+}
+
+/// The paragraph a command's long help ends with about its session:
+/// `lead` first, for a command whose view is optional (when it runs as a
+/// session), then how it runs, the detach and switch keys, how to return,
+/// and `more` at the end. Its views are always opened on something
+/// named, so a new start never offers the live sessions; `data-beans
+/// attach` does.
+pub fn session_help(lead: Option<&str>, more: &str) -> String {
+    let text = legume_tui::cli::session_help(
+        &TOOL,
+        legume_tui::cli::SessionHelp {
+            what_goes_on: Some("the command goes on"),
+            resume_hint: "Starting it again starts a new one (naming the detached ones); \
+                          `data-beans attach` with no name",
+            more: Some(more),
+            ..Default::default()
+        },
+    );
+    match lead {
+        None => text,
+        Some(lead) => {
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            legume_tui::cli::wrap(&format!("{lead} {flat}"), legume_tui::cli::HELP_WIDTH)
+        }
+    }
 }
 
 /// User action after viewing histogram or other interactive prompts
@@ -87,3 +157,7 @@ pub fn confirm(message: &str) -> anyhow::Result<bool> {
 
     Ok(matches!(choice.as_str(), "y" | "yes"))
 }
+
+#[cfg(test)]
+#[path = "tests/session.rs"]
+mod tests;

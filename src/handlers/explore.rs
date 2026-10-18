@@ -3,9 +3,10 @@
 
 use crate::hdf5_io::resolve_backend_file;
 use crate::interactive::stat_tui::{
-    explore, Dataset, Picked, Purpose, Side, StatExplorer, Values, ValuesReader,
+    explore_in, Dataset, Picked, Purpose, Side, StatExplorer, Values, ValuesReader,
 };
-use crate::interactive::tui_available;
+use crate::interactive::ui::Tui;
+use crate::interactive::{tui_available, TOOL};
 use crate::qc::*;
 use crate::sparse_io::*;
 use crate::sparse_io_vector::*;
@@ -14,6 +15,29 @@ use legume_numeric::matrix::common_io::basename;
 use legume_numeric::matrix::traits::RunningStatOps;
 use log::info;
 use std::sync::Arc;
+
+/// The session of interactive command `screen` (`data-beans-<screen>-N`),
+/// opened before any of its work. Hosted, this process goes no further:
+/// it relays the terminal and exits with the command, which runs again in
+/// the session's host. Always on something named, so a new one starts.
+pub fn open_session(
+    screen: &str,
+    args: &legume_tui::cli::SessionArgs,
+) -> anyhow::Result<legume_tui::Session> {
+    Ok(TOOL.session(screen, &args.options(true))?)
+}
+
+/// Run `f`, a command's work after its views, off the screen of `tui` when
+/// there is one: a `kill` meanwhile lets it finish.
+pub fn off_screen<T>(
+    tui: Option<&mut Tui<'_>>,
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match tui {
+        Some(tui) => tui.work(f)?,
+        None => f(),
+    }
+}
 
 /// Open `files` as one matrix. Several files keep their column names
 /// distinct by appending each file's name.
@@ -101,6 +125,7 @@ pub fn values_reader(data: &SparseIoVec) -> ValuesReader<'_> {
 /// command labelled `verb`. Returns the marked indices (ascending), or
 /// `None` when the user quits without finishing.
 pub fn pick_entries(
+    tui: &mut Tui<'_>,
     data_file: &str,
     side: Side,
     verb: &'static str,
@@ -118,7 +143,7 @@ pub fn pick_entries(
         Some(values_reader(&data)),
         Purpose::Pick { verb },
     );
-    let picked = explore(explorer)?.map(|p| p.side(side));
+    let picked = explore_in(tui, explorer)?.map(|p| p.side(side));
     match &picked {
         Some(entries) => info!("picked {} entries", entries.len()),
         None => info!("nothing picked; cancelled"),
@@ -131,6 +156,7 @@ pub fn pick_entries(
 /// labelled `verb`. Returns the marks of both sides, or `None` when the user
 /// quits without finishing.
 pub fn pick_rows_and_columns(
+    tui: &mut Tui<'_>,
     data_file: &str,
     verb: &'static str,
 ) -> anyhow::Result<Option<Picked>> {
@@ -141,14 +167,17 @@ pub fn pick_rows_and_columns(
     let first = side_stats(&data, Side::Columns, None, None, None)?;
     let data = &data;
     let loader = Box::new(move |side| side_stats(data, side, None, None, None));
-    let picked = explore(StatExplorer::new(
-        data_file,
-        Side::Columns,
-        first,
-        Some(loader),
-        Some(values_reader(data)),
-        Purpose::PickBoth { verb },
-    ))?;
+    let picked = explore_in(
+        tui,
+        StatExplorer::new(
+            data_file,
+            Side::Columns,
+            first,
+            Some(loader),
+            Some(values_reader(data)),
+            Purpose::PickBoth { verb },
+        ),
+    )?;
     match &picked {
         Some(p) => info!(
             "picked {} rows and {} columns",

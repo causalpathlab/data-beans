@@ -1,7 +1,8 @@
-use crate::handlers::explore::{open_data, side_stats, values_reader};
+use crate::handlers::explore::{off_screen, open_data, open_session, side_stats, values_reader};
 use crate::hdf5_io::*;
-use crate::interactive::stat_tui::{explore, Purpose, Side, StatExplorer};
+use crate::interactive::stat_tui::{explore_in, Purpose, Side, StatExplorer};
 use crate::interactive::tui_available;
+use crate::interactive::ui::Tui;
 use crate::qc::*;
 use crate::sparse_io::*;
 use crate::sparse_io_vector::*;
@@ -115,6 +116,9 @@ pub struct RunStatArgs {
                      Not available with --column-group-file."
     )]
     pub interactive: bool,
+
+    #[command(flatten)]
+    pub session: legume_tui::cli::SessionArgs,
 }
 
 /// Compute statistics across sparse matrix data
@@ -123,6 +127,14 @@ pub struct RunStatArgs {
 /// data files. Statistics can be stratified by column groups if a group membership
 /// file is provided.
 pub fn run_stat(cmd_args: &RunStatArgs) -> anyhow::Result<()> {
+    let grouped = cmd_args.stat_dim == Some(StatDim::Row) && cmd_args.column_group_file.is_some();
+    let explore_after = !grouped && wants_explorer(cmd_args);
+    // The explorer's session first: hosted, the statistics are computed
+    // (and written) in the session, not here.
+    let session = explore_after
+        .then(|| open_session("stat", &cmd_args.session))
+        .transpose()?;
+    let mut tui = session.as_ref().map(Tui::new);
     let output = cmd_args.output.clone();
     dirname(&output).as_deref().map(mkdir).transpose()?;
 
@@ -207,31 +219,32 @@ pub fn run_stat(cmd_args: &RunStatArgs) -> anyhow::Result<()> {
         StatDim::Row => Side::Rows,
         StatDim::Column => Side::Columns,
     };
-    let explore_after = wants_explorer(cmd_args);
     // The explorer replaces printing to stdout; a file output is still written.
     let save = !(explore_after && cmd_args.output.eq_ignore_ascii_case("stdout"));
     let select_rows = rows_matching(cmd_args, &data)?;
     let select_rows = select_rows.as_deref();
-    let first = side_stats(
-        &data,
-        side,
-        select_rows,
-        cmd_args.block_size,
-        save.then_some(&*cmd_args.output),
-    )?;
-    if explore_after {
+    let output = save.then_some(&*cmd_args.output);
+    // A file written before the explorer is up is written off its screen,
+    // so a `kill` meanwhile lets the write finish.
+    let first = off_screen(tui.as_mut().filter(|_| output.is_some()), || {
+        side_stats(&data, side, select_rows, cmd_args.block_size, output)
+    })?;
+    if let Some(tui) = tui.as_mut() {
         let title = cmd_args.data_files.join(", ");
         let data = &data;
         let loader =
             Box::new(move |side| side_stats(data, side, select_rows, cmd_args.block_size, None));
-        explore(StatExplorer::new(
-            &title,
-            side,
-            first,
-            Some(loader),
-            Some(values_reader(data)),
-            Purpose::Explore,
-        ))?;
+        explore_in(
+            tui,
+            StatExplorer::new(
+                &title,
+                side,
+                first,
+                Some(loader),
+                Some(values_reader(data)),
+                Purpose::Explore,
+            ),
+        )?;
     }
     Ok(())
 }

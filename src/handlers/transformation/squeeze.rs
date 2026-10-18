@@ -1,9 +1,11 @@
 use super::{RowAlignMode, RunSqueezeArgs};
+use crate::handlers::explore::{off_screen, open_session};
 use crate::handlers::merging::{
     find_aligned_rows, generate_unique_batch_names, run_merge_backend, MergeBackendArgs,
 };
 use crate::hdf5_io::*;
-use crate::interactive::cutoff_tui::{choose_cutoffs, AxisView, CutoffPicker};
+use crate::interactive::cutoff_tui::{choose_cutoffs, choose_cutoffs_in, AxisView, CutoffPicker};
+use crate::interactive::ui::Tui;
 use crate::interactive::{confirm, prompt_user_action, tui_available, UserAction};
 use crate::qc::*;
 use crate::sparse_io::*;
@@ -17,13 +19,27 @@ use log::info;
 ///
 /// If --output is specified: Squeezes all files and merges into single output file.
 /// Otherwise, modifies files in-place (with confirmation in interactive mode).
+///
+/// With --interactive, every file is squeezed in one session, opened before
+/// any of the work. Once the picker has been up, a `kill` lets the squeeze
+/// under way finish and leaves the files after it untouched.
 pub fn run_squeeze(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
+    let session = cmd_args
+        .interactive
+        .then(|| open_session("squeeze", &cmd_args.session))
+        .transpose()?;
+    let mut tui = session.as_ref().map(Tui::new);
+
     // If output specified with multiple files, squeeze to temp and merge
     if cmd_args.output.is_some() && cmd_args.data_files.len() > 1 {
-        return run_squeeze_and_merge(cmd_args);
+        return run_squeeze_and_merge(cmd_args, tui.as_mut());
     }
 
     for data_file_arg in &cmd_args.data_files {
+        if tui.as_ref().is_some_and(Tui::stop_requested) {
+            info!("Stopped before {}", data_file_arg);
+            break;
+        }
         info!("Processing file: {}", data_file_arg);
         let (backend, data_file) = resolve_backend_file(data_file_arg, None)?;
 
@@ -60,7 +76,7 @@ pub fn run_squeeze(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
 
         let in_place = cmd_args.output.is_none().then_some(data_file_arg.as_ref());
         let Some((row_nnz_cutoff, col_nnz_cutoff)) =
-            settle_cutoffs(cmd_args, data.as_ref(), &data_file, in_place)?
+            settle_cutoffs(cmd_args, data.as_ref(), &data_file, in_place, tui.as_mut())?
         else {
             info!("Skipping {}", data_file_arg);
             continue;
@@ -74,35 +90,39 @@ pub fn run_squeeze(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
 
         // Stage now (only when we'll actually perform the squeeze)
         drop(data);
-        if cmd_args.output.is_some() {
-            info!("Staging {} -> {}", data_file, target_file);
-            materialize_writable_backend(&data_file, &target_file)?;
-        }
-        let data = open_sparse_matrix(&target_file, &backend)?;
+        // Off the screen, so a `kill` meanwhile lets it finish.
+        off_screen(tui.as_mut(), || {
+            if cmd_args.output.is_some() {
+                info!("Staging {} -> {}", data_file, target_file);
+                materialize_writable_backend(&data_file, &target_file)?;
+            }
+            let data = open_sparse_matrix(&target_file, &backend)?;
 
-        // Perform squeeze
-        squeeze_by_nnz(
-            data.as_ref(),
-            SqueezeCutoffs {
-                row: row_nnz_cutoff,
-                column: col_nnz_cutoff,
-            },
-            cmd_args.block_size,
-            cmd_args.preload,
-        )?;
+            // Perform squeeze
+            squeeze_by_nnz(
+                data.as_ref(),
+                SqueezeCutoffs {
+                    row: row_nnz_cutoff,
+                    column: col_nnz_cutoff,
+                },
+                cmd_args.block_size,
+                cmd_args.preload,
+            )?;
 
-        let data = open_sparse_matrix(&target_file, &backend)?;
+            let data = open_sparse_matrix(&target_file, &backend)?;
 
-        info!(
-            "after squeeze -- data: {} rows x {} columns",
-            data.num_rows().unwrap(),
-            data.num_columns().unwrap()
-        );
-        drop(data);
+            info!(
+                "after squeeze -- data: {} rows x {} columns",
+                data.num_rows().unwrap(),
+                data.num_columns().unwrap()
+            );
+            drop(data);
 
-        if let Some(output_prefix) = &effective_output {
-            finalize_zarr_output(&target_file, output_prefix)?;
-        }
+            if let Some(output_prefix) = &effective_output {
+                finalize_zarr_output(&target_file, output_prefix)?;
+            }
+            Ok(())
+        })?;
     }
 
     Ok(())
@@ -112,7 +132,10 @@ pub fn run_squeeze(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
 ///
 /// For Common mode: Squeeze each file first, then find common rows, subset, and merge.
 /// For Union mode: Merge first with union of all rows, then squeeze the merged result.
-fn run_squeeze_and_merge(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
+fn run_squeeze_and_merge(
+    cmd_args: &RunSqueezeArgs,
+    mut tui: Option<&mut Tui<'_>>,
+) -> anyhow::Result<()> {
     let output_prefix = cmd_args.output.as_ref().unwrap();
     info!(
         "Squeeze and merge mode: {} files -> {}",
@@ -124,7 +147,14 @@ fn run_squeeze_and_merge(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
     let (row_nnz_cutoff, col_nnz_cutoff) = if needs_stats(cmd_args) {
         let (backend, data_file) = resolve_backend_file(&cmd_args.data_files[0], None)?;
         let data = open_sparse_matrix(&data_file, &backend)?;
-        let Some(cutoffs) = settle_cutoffs(cmd_args, data.as_ref(), &data_file, None)? else {
+        let Some(cutoffs) = settle_cutoffs(
+            cmd_args,
+            data.as_ref(),
+            &data_file,
+            None,
+            tui.as_deref_mut(),
+        )?
+        else {
             info!("Operation cancelled");
             return Ok(());
         };
@@ -138,10 +168,11 @@ fn run_squeeze_and_merge(cmd_args: &RunSqueezeArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    match cmd_args.row_align {
+    // Off the screen, so a `kill` meanwhile lets it finish.
+    off_screen(tui, || match cmd_args.row_align {
         RowAlignMode::Union => run_merge_then_squeeze(cmd_args, row_nnz_cutoff, col_nnz_cutoff),
         RowAlignMode::Common => run_squeeze_then_merge(cmd_args, row_nnz_cutoff, col_nnz_cutoff),
-    }
+    })
 }
 
 /// Union mode: Merge first with union of all rows, then squeeze the merged result.
@@ -543,20 +574,26 @@ fn needs_stats(cmd_args: &RunSqueezeArgs) -> bool {
 /// these are the explicit cutoffs as given. Otherwise the nnz statistics are
 /// collected, auto/interactive fill unset cutoffs from the histogram trough,
 /// the histogram is printed/saved as asked, and `--interactive` lets the user
-/// adjust (confirming first when squeezing `in_place`).
+/// adjust (confirming first when squeezing `in_place`) on the screen of
+/// `tui`, the scans and printing off it.
 fn settle_cutoffs(
     cmd_args: &RunSqueezeArgs,
     data: &dyn SparseIo<IndexIter = Vec<usize>>,
     data_file: &str,
     in_place: Option<&str>,
+    mut tui: Option<&mut Tui<'_>>,
 ) -> anyhow::Result<Option<(usize, usize)>> {
     let save = cmd_args.save_histogram.as_deref();
     if !needs_stats(cmd_args) {
         return Ok(Some((cmd_args.row_nnz_cutoff, cmd_args.column_nnz_cutoff)));
     }
 
-    let row_nnz = collect_row_stat(data, cmd_args.block_size)?.count_positives();
-    let col_nnz = collect_column_stat(data, cmd_args.block_size)?.count_positives();
+    let (row_nnz, col_nnz) = off_screen(tui.as_deref_mut(), || {
+        Ok((
+            collect_row_stat(data, cmd_args.block_size)?.count_positives(),
+            collect_column_stat(data, cmd_args.block_size)?.count_positives(),
+        ))
+    })?;
 
     // Suggest cutoffs at the trough of the log(1+nnz) histogram
     let row_suggest = suggest_nnz_cutoff(&row_nnz);
@@ -585,11 +622,13 @@ fn settle_cutoffs(
     };
 
     if cmd_args.show_histogram || save.is_some() {
-        display_nnz_histogram(data_file, row, col, cmd_args.show_histogram, save)?;
+        off_screen(tui.as_deref_mut(), || {
+            display_nnz_histogram(data_file, row, col, cmd_args.show_histogram, save)
+        })?;
     }
 
     if cmd_args.interactive {
-        return pick_cutoffs(data_file, row, col, in_place);
+        return pick_cutoffs(data_file, row, col, in_place, tui);
     }
 
     // Headless auto mode (no histogram shown): report what was applied
@@ -602,13 +641,15 @@ fn settle_cutoffs(
 
 /// Let the user settle both cutoffs: a full-screen picker on a terminal,
 /// else the printed histogram and line prompts. `in_place` names the file an
-/// in-place squeeze would overwrite, so the user confirms that first.
-/// `None` means cancel.
+/// in-place squeeze would overwrite, so the user confirms that first. The
+/// picker runs on the screen of `tui` when there is one. `None` means
+/// cancel.
 fn pick_cutoffs(
     data_file: &str,
     row: NnzAxis<'_>,
     col: NnzAxis<'_>,
     in_place: Option<&str>,
+    tui: Option<&mut Tui<'_>>,
 ) -> anyhow::Result<Option<(usize, usize)>> {
     let picked = if tui_available() {
         let picker = CutoffPicker::new(
@@ -617,7 +658,10 @@ fn pick_cutoffs(
             AxisView::new("Columns", col.nnz, col.cutoff, col.suggest),
             in_place,
         );
-        choose_cutoffs(picker)?
+        match tui {
+            Some(tui) => choose_cutoffs_in(tui, picker)?,
+            None => choose_cutoffs(picker)?,
+        }
     } else {
         prompt_cutoffs(data_file, row, col, in_place)?
     };
