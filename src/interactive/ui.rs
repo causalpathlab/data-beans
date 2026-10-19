@@ -5,7 +5,7 @@
 use ratatui::buffer::Buffer;
 use std::time::{Duration, Instant};
 
-use legume_tui::{Mouse, Session};
+use legume_tui::{Keyboard, Modes, Mouse, Round, Session};
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
     MouseEvent,
@@ -83,18 +83,18 @@ pub trait Screen {
 /// on again after every attach): the mouse as buttons and the wheel in SGR
 /// form, not the pointer's every move, which would wake the loop for
 /// nothing; keys held with modifiers told apart.
-pub fn modes_of(screen: &impl Screen) -> legume_tui::Modes {
-    legume_tui::Modes {
-        mouse: if screen.takes_mouse() {
+pub fn modes_of(screen: &impl Screen) -> Modes {
+    Modes::new()
+        .mouse(if screen.takes_mouse() {
             Mouse::Buttons
         } else {
             Mouse::Off
-        },
-        keyboard_enhancement: screen
-            .reports_chords()
-            .then_some(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        ..Default::default()
-    }
+        })
+        .keyboard_enhancement(if screen.reports_chords() {
+            Keyboard::On(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        } else {
+            Keyboard::Off
+        })
 }
 
 /// Write `text` to the terminal as it is.
@@ -114,35 +114,19 @@ pub fn notify(text: &str) {
 /// How often a view's loop asks [`Screen::tick`], keys or not.
 pub const TICK: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Holds log records back while alive, writing them when dropped.
-struct HeldLogs;
-
-impl HeldLogs {
-    fn new() -> Self {
-        crate::aux::logging::hold_logs(true);
-        HeldLogs
-    }
-}
-
-impl Drop for HeldLogs {
-    fn drop(&mut self) {
-        crate::aux::logging::hold_logs(false);
-    }
-}
-
 /// The terminal a command's views draw on, in the command's session: up
-/// from the first view ([`Tui::run`]), or from work a `kill` could reach
-/// ([`Tui::work`]), until dropped, so every view of the command and the
-/// work around them share one screen. While it is up, a `data-beans kill`
-/// asks the views to stop as Ctrl-C does ([`Tui::stop_requested`]), and
-/// work under way finishes first. Log records raised while it is up are held back and written
-/// once the normal screen is back, or as work between views runs.
+/// from the first view ([`Tui::run`]) until dropped, so every view of the
+/// command and the work between them ([`Tui::work`]) share one screen.
+/// While it is up, a `data-beans kill` asks the views to stop as Ctrl-C
+/// does ([`Tui::stop_requested`]), and work under way finishes first. Log
+/// records raised while it is up are held back and written once the
+/// normal screen is back, or as work between views runs.
 pub struct Tui<'s> {
     session: &'s Session,
     terminal: Option<ratatui::DefaultTerminal>,
     /// The modes the screen has on now.
-    modes: legume_tui::Modes,
-    held: Option<HeldLogs>,
+    modes: Modes,
+    _held: legume_tui::logs::Hold,
 }
 
 impl<'s> Tui<'s> {
@@ -151,8 +135,8 @@ impl<'s> Tui<'s> {
         Self {
             session,
             terminal: None,
-            modes: legume_tui::Modes::default(),
-            held: None,
+            modes: Modes::new(),
+            _held: legume_tui::logs::hold(),
         }
     }
 
@@ -219,14 +203,9 @@ impl<'s> Tui<'s> {
                 notify(&notice);
             }
             redraw = false;
-            let mut repainted = false;
             let wait = next_tick.saturating_duration_since(Instant::now());
-            let first = session.poll_with(terminal, wait, || {
-                repainted = true;
-                Ok(())
-            })?;
-            if let Some(mut event) = first {
-                loop {
+            match session.poll(terminal, wait)? {
+                Round::Event(mut event) => loop {
                     redraw |= feed(screen, &mut on_key, event);
                     if screen.done()
                         || screen.pending_work().is_some()
@@ -236,22 +215,20 @@ impl<'s> Tui<'s> {
                         break;
                     }
                     event = event::read()?;
-                }
+                },
+                // An attach cleared the screen: drawn whole again.
+                Round::Repainted => redraw = true,
+                _ => {}
             }
-            // An attach cleared the screen: drawn whole again.
-            redraw |= repainted;
             if Instant::now() >= next_tick {
                 redraw |= screen.tick();
                 next_tick = Instant::now() + TICK;
             }
             if let Some(message) = screen.pending_work() {
-                crate::aux::logging::hold_logs(false);
-                let worked = session.off_screen(|| {
+                session.off_screen(|| {
                     eprintln!("{message}");
                     screen.do_work();
-                });
-                crate::aux::logging::hold_logs(true);
-                worked?;
+                })?;
                 redraw = true;
             }
         }
@@ -260,9 +237,8 @@ impl<'s> Tui<'s> {
 
     /// The screen, brought up with `modes` if it is not up yet, else
     /// switched to them.
-    fn up(&mut self, modes: legume_tui::Modes) -> anyhow::Result<()> {
+    fn up(&mut self, modes: Modes) -> anyhow::Result<()> {
         if self.terminal.is_none() {
-            self.held = Some(HeldLogs::new());
             self.terminal = Some(self.session.terminal_with(modes)?);
         } else if modes != self.modes {
             self.session.set_modes(modes)?;
@@ -275,20 +251,13 @@ impl<'s> Tui<'s> {
     /// views, on the normal screen, its log records written as they come;
     /// the screen is taken back after it, to be drawn whole by the next
     /// view. A `kill` meanwhile lets `f` finish and is then
-    /// [`Tui::stop_requested`]. Where a `kill` can reach the command, the
-    /// screen comes up first if no view has brought it up yet, as that is
-    /// what makes a `kill` wait; elsewhere `f` just runs then.
+    /// [`Tui::stop_requested`]. Before the first view the screen stays
+    /// down: `f` runs where it is, a `kill` waiting for it all the same.
     pub fn work<T>(&mut self, f: impl FnOnce() -> T) -> anyhow::Result<T> {
-        if self.terminal.is_none() {
-            if !self.session.offers_keys() {
-                return Ok(f());
-            }
-            self.up(self.modes)?;
+        if !self.session.screen_up() {
+            return Ok(self.session.stoppable(f));
         }
-        crate::aux::logging::hold_logs(false);
-        let done = self.session.off_screen(f);
-        crate::aux::logging::hold_logs(true);
-        Ok(done?)
+        Ok(self.session.off_screen(f)?)
     }
 }
 
@@ -297,8 +266,6 @@ impl Drop for Tui<'_> {
         if self.terminal.take().is_some() {
             self.session.restore();
         }
-        // Restored before writing what was held, not after.
-        self.held = None;
     }
 }
 
@@ -328,7 +295,7 @@ fn feed<S: Screen>(
 }
 
 /// Run `screen` full screen until it is done, in a plain session of its
-/// own ([`super::plain_session`]). The terminal is restored on return and
+/// own (`Session::plain`). The terminal is restored on return and
 /// on panic. See [`Tui::run_with`] for the rest.
 pub fn run_screen<S: Screen>(screen: &mut S) -> anyhow::Result<()> {
     run_screen_with(screen, S::handle_key)
@@ -341,7 +308,7 @@ pub fn run_screen_with<S: Screen>(
     screen: &mut S,
     on_key: impl FnMut(&mut S, KeyEvent),
 ) -> anyhow::Result<()> {
-    let session = super::plain_session()?;
+    let session = Session::plain(&super::TOOL);
     run_screen_in_with(&session, screen, on_key)
 }
 

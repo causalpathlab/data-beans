@@ -5,7 +5,8 @@
 //! running, and `data-beans kill` stops it through its own quit path,
 //! leaving no process or socket behind. A kill quits `subset` as `q` does
 //! (nothing written), lets a write under way finish (also one before the
-//! first view), and stops `squeeze` before the files after it.
+//! first view), and stops `squeeze` before the files after it. An error
+//! that ends a detached session waits on its screen for whoever attaches.
 //! `--no-detach`, and a view started inside a session, run plain.
 
 #![cfg(all(unix, feature = "tui"))]
@@ -39,6 +40,11 @@ fn term(dir: &Private, args: &[&str], env: &[(&str, &str)]) -> Term {
 /// A 6 x 8 backend named `name` in `dir` (a `.zarr` directory), built with
 /// the tool itself from a small MatrixMarket file.
 fn fixture(dir: &Path, name: &str) -> String {
+    built(dir, name, false)
+}
+
+/// [`fixture`], zipped (`.zarr.zip`) when `zip`.
+fn built(dir: &Path, name: &str, zip: bool) -> String {
     let mtx = dir.join(format!("{name}.mtx"));
     let rows = dir.join(format!("{name}.rows.tsv"));
     let cols = dir.join(format!("{name}.cols.tsv"));
@@ -81,11 +87,22 @@ fn fixture(dir: &Path, name: &str) -> String {
         .arg(&cols)
         .arg("-o")
         .arg(&out)
-        .arg("--no-zip")
+        .args((!zip).then_some("--no-zip"))
         .output()
         .unwrap();
     assert!(built.status.success(), "{built:?}");
-    format!("{}.zarr", out.display())
+    let ext = if zip { "zarr.zip" } else { "zarr" };
+    format!("{}.{ext}", out.display())
+}
+
+/// Send process `pid` signal `sig` (`STOP`, `CONT`).
+fn signal(pid: u32, sig: &str) {
+    let sent = Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg(pid.to_string())
+        .status()
+        .unwrap();
+    assert!(sent.success(), "kill -{sig} {pid}");
 }
 
 /// What `data-beans info` says of `file`.
@@ -103,9 +120,8 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
     // Started in a terminal, it is hosted: this terminal is its first
     // client, and the footer lists the session keys.
     let mut first = term(&dir, &["stat", &data, "-i"], &[]);
-    first.wait_for("ctrl+alt+d");
-    first.wait_for("detach");
-    first.wait_for("ctrl+alt+s");
+    first.wait_screen("ctrl+alt+d detach");
+    first.wait_screen("ctrl+alt+s switch");
     assert!(!first.cooked(), "the client's terminal is raw");
     let listed = dir.wait_listed("exploring columns of");
     assert!(listed.contains("data-beans-stat-1\tattached"), "{listed:?}");
@@ -130,7 +146,7 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
     // named; dropped at once.
     let mut again = term(&dir, &["stat", &data, "-i"], &[]);
     again.wait_for("[detached: data-beans-stat-1");
-    again.wait_for("ctrl+alt+d");
+    again.wait_screen("ctrl+alt+d");
     let said = dir.run(&["kill", "stat-2"]);
     assert!(said.contains("data-beans-stat-2 stopped"), "{said:?}");
     assert_eq!(again.exit_code(), 0);
@@ -138,13 +154,11 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
     // Attached from another terminal: back in the alternate screen and
     // painted whole there, keys reaching the program.
     let mut second = term(&dir, &["attach", "stat-1"], &[]);
-    second.wait_for("\x1b[?1049h");
-    let reset = second.text().rfind("\x1b[?1049h").unwrap();
-    second.wait_for_after(reset, "rows (computed on first use)");
-    second.wait_for_after(reset, "ctrl+alt+d");
-    let before = second.seen_len();
+    second.wait_screen("rows (computed on first use)");
+    second.wait_screen("ctrl+alt+d");
+    assert!(second.alternate(), "back in the alternate screen");
     second.type_(b"/");
-    second.wait_for_after(before, "filter /");
+    second.wait_screen("filter /");
     second.type_(b"\x1b");
     // Apart from the next key, or the two read as Alt+Tab.
     std::thread::sleep(Duration::from_millis(300));
@@ -153,8 +167,9 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
     let before = second.seen_len();
     second.type_(b"\t");
     second.wait_for_after(before, "computing rows statistics");
-    second.wait_for_after(before, "6 rows");
-    second.wait_for_after(before, "ctrl+alt+d");
+    second.wait_screen("6 rows");
+    second.wait_screen("ctrl+alt+d");
+    assert!(second.alternate(), "the view back after the work");
 
     // The client lost without a word (a dropped connection): it runs on.
     second.child.kill().unwrap();
@@ -182,12 +197,12 @@ fn a_kill_quits_subset_without_writing() {
     let out = out.to_string_lossy().into_owned();
 
     let mut t = term(&dir, &["subset", &data, "-o", &out], &[]);
-    t.wait_for("ctrl+alt+d");
+    t.wait_screen("ctrl+alt+d");
     dir.wait_listed("data-beans-subset-1\tattached");
     let pid = dir.program_pid();
     // Marked, not written: the kill discards it as q would.
     t.type_(b" ");
-    t.wait_for("1 marked");
+    t.wait_screen("1 marked");
     let said = dir.run(&["kill"]);
     assert!(said.contains("data-beans-subset-1 stopped"), "{said:?}");
     assert_eq!(t.exit_code(), 0);
@@ -214,7 +229,7 @@ fn a_kill_stops_squeeze_before_the_next_file() {
     // In place, two files, one session; logged so the stop is seen.
     let files = format!("{one},{two}");
     let mut t = term(&dir, &["-v", "squeeze", &files, "-i", "-r", "2"], &[]);
-    t.wait_for("rows/cols");
+    t.wait_screen("rows/cols");
     dir.wait_listed("picking nnz cutoffs for");
     let pid = dir.program_pid();
     let said = dir.run(&["kill"]);
@@ -222,13 +237,9 @@ fn a_kill_stops_squeeze_before_the_next_file() {
     assert_eq!(t.exit_code(), 0);
     // Held while the screen was up and written once the normal screen is
     // back, where it stays, rather than lost with the alternate screen.
-    let text = t.text();
-    let back = text.rfind("\x1b[?1049l").expect("the screen was up");
-    assert!(
-        text[back..].contains("Stopped before"),
-        "{:?}",
-        &text[back..]
-    );
+    assert!(!t.alternate(), "the normal screen is back");
+    let shown = t.screen();
+    assert!(shown.contains("Stopped before"), "{shown}");
     dir.gone(pid);
     assert!(dir.sockets().is_empty());
     assert_eq!(info(&one), one_before, "the cancelled file is untouched");
@@ -248,14 +259,14 @@ fn a_kill_lets_a_write_under_way_finish() {
     let out_arg = out.to_string_lossy().into_owned();
 
     let mut t = term(&dir, &["-v", "columns", &data, "-I", "-o", &out_arg], &[]);
-    t.wait_for("ctrl+alt+d");
+    t.wait_screen("ctrl+alt+d");
     dir.wait_listed("data-beans-columns-1\tattached");
     let pid = dir.program_pid();
     t.type_(b" ");
-    t.wait_for("1 marked");
+    t.wait_screen("1 marked");
     t.type_(b"\r");
     // Logged as the view ends; written as the write starts, off the screen.
-    t.wait_for("picked 1 entries");
+    t.wait_screen("picked 1 entries");
 
     let killer = std::thread::scope(|s| {
         let killer = s.spawn(|| dir.run(&["kill"]));
@@ -328,7 +339,7 @@ fn no_detach_and_a_view_inside_a_session_run_plain() {
         ),
     ] {
         let mut plain = term(&dir, &args, &env);
-        plain.wait_for("rows (computed on first use)");
+        plain.wait_screen("rows (computed on first use)");
         assert!(!plain.cooked());
         assert!(dir.sockets().is_empty(), "{args:?} {env:?}");
         assert!(dir
@@ -340,4 +351,57 @@ fn no_detach_and_a_view_inside_a_session_run_plain() {
         assert_eq!(plain.exit_code(), 0);
         assert!(plain.cooked(), "terminal restored");
     }
+}
+
+#[test]
+fn an_error_that_ends_a_detached_session_waits_for_whoever_attaches() {
+    let dir = private();
+    let work = tempfile::tempdir().unwrap();
+    let one = fixture(work.path(), "one");
+    // Squeezed in place, a zipped backend is refused: an error once the
+    // first file is done.
+    let two = built(work.path(), "two", true);
+    let files = format!("{one},{two}");
+
+    let mut t = term(&dir, &["squeeze", &files, "-i", "-r", "2"], &[]);
+    t.wait_screen("rows/cols");
+    dir.wait_listed("picking nnz cutoffs for");
+    let pid = dir.program_pid();
+    // The squeeze confirmed and the session left while the program is
+    // stopped, so it reads the confirmation only once nobody is attached
+    // and the error comes then, however fast the squeeze. Enter leaves it
+    // unnamed.
+    t.type_(b"\r");
+    t.wait_screen("Squeeze in place?");
+    signal(pid, "STOP");
+    t.type_(b"y\x1b\x04");
+    t.answer(1, b"\r");
+    assert_eq!(t.exit_code(), 0);
+    dir.wait_listed("data-beans-squeeze-1\tdetached");
+    signal(pid, "CONT");
+    let listed = dir.wait_listed("stopped: In-place squeeze is not supported");
+    assert!(
+        listed.contains("data-beans-squeeze-1\tdetached"),
+        "{listed:?}"
+    );
+    assert!(alive(pid), "held until seen");
+
+    // Attached: the error on the screen until a key, then said as the
+    // program ends, and not again.
+    let mut back = term(&dir, &["attach"], &[]);
+    back.wait_screen("In-place squeeze is not supported");
+    back.wait_screen("any key quits");
+    back.type_(b"x");
+    assert_eq!(back.exit_code(), 1, "the program's status");
+    assert!(!back.alternate() && back.cooked(), "terminal restored");
+    assert!(
+        back.screen().contains("Error: In-place squeeze"),
+        "{}",
+        back.screen()
+    );
+    dir.gone(pid);
+    assert!(dir.sockets().is_empty());
+    let said = dir.run(&["sessions"]);
+    assert!(said.contains("no live data-beans sessions"), "{said:?}");
+    assert!(!said.contains("In-place squeeze"), "said once: {said:?}");
 }

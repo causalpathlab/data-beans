@@ -58,9 +58,10 @@ fn main() -> anyhow::Result<()> {
     if cli.verbose {
         std::env::set_var("RUST_LOG", "info");
     }
-    // Records raised while a view's screen is up are held back until the
-    // normal screen is back, rather than written over the view.
-    data_beans::aux::logging::init_logger(cli.verbose);
+    // Errors only by default, as env_logger has it; records raised while a
+    // view's screen is up are held back until the normal screen is back,
+    // rather than written over the view.
+    data_beans::aux::logging::init_logger_with("error");
 
     if let Some(n) = cli.n_threads {
         if n == 0 {
@@ -78,7 +79,28 @@ fn main() -> anyhow::Result<()> {
             // before we finished writing. This is expected, not an error.
             std::process::exit(0);
         }
-        other => other,
+        Err(e) => {
+            hold_error(&e);
+            Err(e)
+        }
+        ok => ok,
+    }
+}
+
+/// Hold `error`, which ends the command, where it will be seen when its
+/// session runs detached: drawn on its screen until a terminal attaches
+/// and a key is pressed, else left for whoever looks next. Attached or
+/// plain, the error is said as usual, on return.
+fn hold_error(error: &anyhow::Error) {
+    let Some(session) = legume_tui::current().filter(|s| s.is_hosted() && !s.attached()) else {
+        return;
+    };
+    match session.terminal() {
+        Ok(mut terminal) => {
+            let _ = session.hold_error(&mut terminal, error);
+            session.restore();
+        }
+        Err(_) => session.leave(&format!("{error:#}")),
     }
 }
 
@@ -638,13 +660,13 @@ enum Commands {
 
     #[command(
         about = "Return to a detached data-beans view",
-        long_about = legume_tui::cli::about(TOOL.name()).attach
+        long_about = legume_tui::cli::about(&TOOL, legume_tui::cli::QUIT_KEY).attach
     )]
     Attach(legume_tui::cli::AttachArgs),
 
     #[command(
         about = "List the live data-beans sessions",
-        long_about = legume_tui::cli::about(TOOL.name()).sessions
+        long_about = legume_tui::cli::about(&TOOL, legume_tui::cli::QUIT_KEY).sessions
     )]
     Sessions,
 
@@ -660,7 +682,7 @@ enum Commands {
 
     #[command(
         about = "Give a data-beans session a label",
-        long_about = legume_tui::cli::about(TOOL.name()).rename
+        long_about = legume_tui::cli::about(&TOOL, legume_tui::cli::QUIT_KEY).rename
     )]
     Rename(legume_tui::cli::RenameArgs),
 }

@@ -89,9 +89,9 @@ sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 statrs = { version = "0.18", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 # Detachable sessions for the views; no pictures, so no graphics.
-legume-tui = { version = "0.2", optional = true, default-features = false, features = ["clap", "logs"] }
+legume-tui = { version = "0.3", optional = true, default-features = false, features = ["clap", "logs"] }
 
 [dev-dependencies]
 # The crate's harness, driving the views through pseudo-terminals in
 # tests/detach_session.rs.
-legume-tui = { version = "0.2", default-features = false, features = ["testing"] }
+legume-tui = { version = "0.3", default-features = false, features = ["testing"] }
