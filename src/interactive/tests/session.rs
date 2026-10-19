@@ -60,7 +60,7 @@ fn the_session_paragraph_names_the_keys_and_the_subcommands() {
         "the command goes on",
         "ctrl+alt+d",
         "ctrl+alt+s",
-        "`data-beans attach` offers them to return to",
+        "`data-beans attach` with no name offers the live sessions",
         "--no-detach",
         more,
     ] {

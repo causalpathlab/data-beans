@@ -55,7 +55,10 @@ pub fn session_keys() -> Vec<(String, String)> {
 pub fn session_help(lead: Option<&str>, more: &str) -> String {
     let help = legume_tui::cli::SessionHelp::new()
         .what_goes_on("the command goes on")
-        .resume_hint(None)
+        .resume_hint(Some(
+            "Starting it again starts a new one (naming the detached ones); \
+             `data-beans attach` with no name",
+        ))
         .more(more);
     let help = match lead {
         Some(lead) => help.lead(lead),
