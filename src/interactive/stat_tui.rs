@@ -21,8 +21,8 @@ use ratatui::Frame;
 use regex::{Regex, RegexBuilder};
 
 use super::ui::{
-    header, help_line, input_line, median, panel, run_screen, Binned, HistPlot, Scale, Screen,
-    ACCENTED, DIM, HIGHLIGHT, PLAIN,
+    header, help_line, input_line, median, panel, run_screen, title_bar, Binned, HistPlot, Scale,
+    Screen, Tui, ACCENTED, DIM, HIGHLIGHT, PLAIN,
 };
 use crate::qc::fmt_stat;
 
@@ -244,6 +244,8 @@ pub struct StatExplorer<'a> {
     quit: bool,
     /// Marked entries handed back by Enter when picking.
     picked: Option<Picked>,
+    /// The detach and switch keys, for the title bar.
+    session_keys: Vec<(String, String)>,
 }
 
 impl<'a> StatExplorer<'a> {
@@ -291,6 +293,7 @@ impl<'a> StatExplorer<'a> {
             mode: Mode::Browse,
             quit: false,
             picked: None,
+            session_keys: super::session_keys(),
         };
         explorer.reorder();
         explorer.refilter(None);
@@ -894,6 +897,14 @@ impl Screen for StatExplorer<'_> {
         self.quit = true;
     }
 
+    fn status(&self) -> Option<String> {
+        let doing = match self.purpose {
+            Purpose::Explore => "exploring",
+            Purpose::Pick { verb } | Purpose::PickBoth { verb } => verb,
+        };
+        Some(format!("{doing} {} of {}", self.side.name(), self.title))
+    }
+
     fn pending_work(&self) -> Option<String> {
         Some(match self.pending.as_ref()? {
             Work::OtherSide => format!("computing {} statistics ...", self.side.other().name()),
@@ -979,7 +990,12 @@ impl Screen for StatExplorer<'_> {
             self.y_scale.name()
         );
         let badge = self.purpose.verb().unwrap_or("stat");
-        frame.render_widget(header(badge, &self.title, &extra), top);
+        title_bar(
+            frame,
+            top,
+            header(badge, &self.title, &extra),
+            &self.session_keys,
+        );
 
         let in_values = matches!(self.mode, Mode::Values | Mode::Typing(Input::SaveValues, _));
         if in_values {
@@ -1023,6 +1039,16 @@ fn sorted_copy(values: &[f32]) -> Vec<f32> {
 /// the marked entries if the user finished with Enter.
 pub fn explore(mut explorer: StatExplorer<'_>) -> anyhow::Result<Option<Picked>> {
     run_screen(&mut explorer)?;
+    Ok(explorer.picked)
+}
+
+/// [`explore`] on the screen of `tui`, in its session: a `kill` quits it
+/// as `q` does, handing nothing back.
+pub fn explore_in(
+    tui: &mut Tui<'_>,
+    mut explorer: StatExplorer<'_>,
+) -> anyhow::Result<Option<Picked>> {
+    tui.run(&mut explorer)?;
     Ok(explorer.picked)
 }
 

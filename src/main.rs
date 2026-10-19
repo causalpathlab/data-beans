@@ -46,14 +46,22 @@ use crate::handlers::transformation::{
 };
 
 use clap::{Parser, Subcommand};
+use interactive::{session_help, TOOL};
 
 fn main() -> anyhow::Result<()> {
+    // A session's host runs this binary again: it serves the session and
+    // exits here, before any of data-beans' own work.
+    legume_tui::serve_if_host();
+
     let cli = Cli::parse();
 
     if cli.verbose {
         std::env::set_var("RUST_LOG", "info");
     }
-    env_logger::init();
+    // Errors only by default, as env_logger has it; records raised while a
+    // view's screen is up are held back until the normal screen is back,
+    // rather than written over the view.
+    data_beans::aux::logging::init_logger_with("error");
 
     if let Some(n) = cli.n_threads {
         if n == 0 {
@@ -71,7 +79,28 @@ fn main() -> anyhow::Result<()> {
             // before we finished writing. This is expected, not an error.
             std::process::exit(0);
         }
-        other => other,
+        Err(e) => {
+            hold_error(&e);
+            Err(e)
+        }
+        ok => ok,
+    }
+}
+
+/// Hold `error`, which ends the command, where it will be seen when its
+/// session runs detached: drawn on its screen until a terminal attaches
+/// and a key is pressed, else left for whoever looks next. Attached or
+/// plain, the error is said as usual, on return.
+fn hold_error(error: &anyhow::Error) {
+    let Some(session) = legume_tui::current().filter(|s| s.is_hosted() && !s.attached()) else {
+        return;
+    };
+    match session.terminal() {
+        Ok(mut terminal) => {
+            let _ = session.hold_error(&mut terminal, error);
+            session.restore();
+        }
+        Err(_) => session.leave(&format!("{error:#}")),
     }
 }
 
@@ -174,6 +203,10 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::MergeBackend(args) => {
             run_merge_backend(args)?;
         }
+        Commands::Attach(args) => legume_tui::cli::attach(&TOOL, args)?,
+        Commands::Sessions => legume_tui::cli::sessions(&TOOL)?,
+        Commands::Kill(args) => legume_tui::cli::kill(&TOOL, args)?,
+        Commands::Rename(args) => legume_tui::cli::rename(&TOOL, args)?,
     }
 
     Ok(())
@@ -367,20 +400,34 @@ enum Commands {
     #[command(
         about = "Take columns and output dense matrix",
         visible_aliases = ["take-columns"],
-        long_about = "Take columns from the sparse matrix,\n\
-                      and save them to an `output` file as a dense matrix,\n\
-                      for quick examination.\n\
-                      Useful for extracting subsets for visualization or analysis."
+        long_about = format!(
+            "Take columns from the sparse matrix,\n\
+             and save them to an `output` file as a dense matrix,\n\
+             for quick examination.\n\
+             Useful for extracting subsets for visualization or analysis.\n\
+             \n\
+             {}",
+            interactive_session_help(STDOUT_IN_A_SESSION)
+        ),
+        mut_arg("no_detach", |a| a.requires("interactive")),
+        mut_arg("session", |a| a.requires("interactive"))
     )]
     Columns(TakeColumnsArgs),
 
     #[command(
         about = "Take rows and output dense matrix (transposed)",
         visible_aliases = ["take-rows"],
-        long_about = "Take rows from the sparse matrix,\n\
-                      and save them to an `output` file as a dense matrix,\n\
-                      for quick examination. For convenience,\n\
-                      it will output a transposed (`column x selected_row`) matrix."
+        long_about = format!(
+            "Take rows from the sparse matrix,\n\
+             and save them to an `output` file as a dense matrix,\n\
+             for quick examination. For convenience,\n\
+             it will output a transposed (`column x selected_row`) matrix.\n\
+             \n\
+             {}",
+            interactive_session_help(STDOUT_IN_A_SESSION)
+        ),
+        mut_arg("no_detach", |a| a.requires("interactive")),
+        mut_arg("session", |a| a.requires("interactive"))
     )]
     Rows(TakeRowsArgs),
 
@@ -400,24 +447,48 @@ enum Commands {
 
     #[command(
         about = "Pick rows and columns in a full-screen table and subset to them",
-        long_about = "Open the statistics explorer on the columns (Tab switches to the rows).\n\
-                      Mark what to keep with Space (`a` marks everything a filter shows),\n\
-                      then press Enter to write a new backend in the input's format.\n\
-                      A side with nothing marked is kept whole; q quits without writing."
+        long_about = format!(
+            "Open the statistics explorer on the columns (Tab switches to the rows).\n\
+             Mark what to keep with Space (`a` marks everything a filter shows),\n\
+             then press Enter to write a new backend in the input's format.\n\
+             A side with nothing marked is kept whole; q quits without writing.\n\
+             \n\
+             {}",
+            session_help(
+                None,
+                "A `kill` quits the explorer as q does, writing nothing; \
+                 a write under way finishes first. The title bar shows the detach \
+                 and switch keys, the footer the others."
+            )
+        )
     )]
     Subset(SubsetArgs),
 
     #[command(
         about = "Subset columns and create new backend",
-        long_about = "Take columns from the sparse matrix and create a new sparse matrix backend.\n\
-                      Allows for focused analysis on selected features."
+        long_about = format!(
+            "Take columns from the sparse matrix and create a new sparse matrix backend.\n\
+             Allows for focused analysis on selected features.\n\
+             \n\
+             {}",
+            interactive_session_help("")
+        ),
+        mut_arg("no_detach", |a| a.requires("interactive")),
+        mut_arg("session", |a| a.requires("interactive"))
     )]
     SubsetColumns(SubsetColumnsArgs),
 
     #[command(
         about = "Subset rows and create new backend",
-        long_about = "Take rows from the sparse matrix and create a new sparse matrix backend.\n\
-                      Allows for focused analysis on selected samples/observations."
+        long_about = format!(
+            "Take rows from the sparse matrix and create a new sparse matrix backend.\n\
+             Allows for focused analysis on selected samples/observations.\n\
+             \n\
+             {}",
+            interactive_session_help("")
+        ),
+        mut_arg("no_detach", |a| a.requires("interactive")),
+        mut_arg("session", |a| a.requires("interactive"))
     )]
     SubsetRows(SubsetRowsArgs),
 
@@ -531,8 +602,21 @@ enum Commands {
 
     #[command(
         about = "Squeeze out sparse rows/columns",
-        long_about = "Squeeze out rows and columns with too few non-zeros.\n\
-                      It will overwrite the original (be careful) and save the indices kept."
+        long_about = format!(
+            "Squeeze out rows and columns with too few non-zeros.\n\
+             It will overwrite the original (be careful) and save the indices kept.\n\
+             \n\
+             {}",
+            session_help(
+                Some("With --interactive, every file is squeezed in one session; \
+                      the session flags need it."),
+                "A `kill` cancels the picker as q does; a squeeze under way finishes \
+                 first, and the files after it are left as they are. \
+                 The title bar shows the detach and switch keys, the footer the others."
+            )
+        ),
+        mut_arg("no_detach", |a| a.requires("interactive")),
+        mut_arg("session", |a| a.requires("interactive"))
     )]
     Squeeze(RunSqueezeArgs),
 
@@ -545,11 +629,18 @@ enum Commands {
 
     #[command(
         about = "Take matrix statistics",
-        long_about = "Take basic statistics from a sparse matrix.\n\
-                      The output file will contain columns of (1) `nnz` - number of non-zero elements,\n\
-                      (2) `tot` - total sum, (3) `mu` - average `μ`,\n\
-                      (4) `sig` - standard deviation `σ`.",
-        visible_alias = "stat"
+        long_about = format!(
+            "Take basic statistics from a sparse matrix.\n\
+             The output file will contain columns of (1) `nnz` - number of non-zero elements,\n\
+             (2) `tot` - total sum, (3) `mu` - average `μ`,\n\
+             (4) `sig` - standard deviation `σ`.\n\
+             \n\
+             {}",
+            interactive_session_help("")
+        ),
+        visible_alias = "stat",
+        mut_arg("no_detach", |a| a.requires("interactive")),
+        mut_arg("session", |a| a.requires("interactive"))
     )]
     Statistics(RunStatArgs),
 
@@ -566,4 +657,49 @@ enum Commands {
         visible_alias = "hist"
     )]
     Histogram(RunHistogramArgs),
+
+    #[command(
+        about = "Return to a detached data-beans view",
+        long_about = legume_tui::cli::about(&TOOL, legume_tui::cli::QUIT_KEY).attach
+    )]
+    Attach(legume_tui::cli::AttachArgs),
+
+    #[command(
+        about = "List the live data-beans sessions",
+        long_about = legume_tui::cli::about(&TOOL, legume_tui::cli::QUIT_KEY).sessions
+    )]
+    Sessions,
+
+    #[command(
+        about = "Stop a data-beans session",
+        long_about = "Stop a `data-beans` session as its quit key does: an open view is\n\
+                      left as by q, so nothing it would write is written, while a squeeze\n\
+                      or write under way finishes first; files not reached yet are left\n\
+                      as they are. Waits up to a minute for it to end. --force kills it\n\
+                      at once, mid-write if it is writing."
+    )]
+    Kill(legume_tui::cli::KillArgs),
+
+    #[command(
+        about = "Give a data-beans session a label",
+        long_about = legume_tui::cli::about(&TOOL, legume_tui::cli::QUIT_KEY).rename
+    )]
+    Rename(legume_tui::cli::RenameArgs),
 }
+
+/// The session paragraph of a command whose view opens with --interactive,
+/// `more` added after what a `kill` does.
+fn interactive_session_help(more: &str) -> String {
+    session_help(
+        Some("With --interactive, its view runs as a session; the session flags need it."),
+        &format!(
+            "A `kill` quits the view as q does; a write under way finishes first. {more}\
+             The title bar shows the detach and switch keys, the footer the others."
+        ),
+    )
+}
+
+/// What becomes of a result written to stdout in a session.
+const STDOUT_IN_A_SESSION: &str = "Written to stdout, the result goes to the session's \
+                                   terminal, and the part written while detached is lost; \
+                                   give -o a file to keep it. ";

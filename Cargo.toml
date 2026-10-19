@@ -38,8 +38,9 @@ tensor = ["legume-numeric/tensor"]
 ndarray = ["dep:ndarray", "legume-numeric/ndarray", "zarrs/ndarray", "zarrs/transpose"]
 aux = []
 # Full-screen terminal views (ratatui): the CLI's interactive sessions, and
-# `data_beans::interactive` for downstream crates building their own.
-tui = ["dep:ratatui"]
+# `data_beans::interactive` for downstream crates building their own. The
+# views run in legume-tui sessions, which a dropped connection leaves running.
+tui = ["dep:ratatui", "dep:legume-tui"]
 alg = ["aux"]
 sim = ["alg"]
 # Pulls in libhdf5 — opt-in so installs on hosts without HDF5 headers still
@@ -87,3 +88,10 @@ num_cpus = "1.16.0"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 statrs = { version = "0.18", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
+# Detachable sessions for the views; no pictures, so no graphics.
+legume-tui = { version = "0.3.2", optional = true, default-features = false, features = ["clap", "logs"] }
+
+[dev-dependencies]
+# The crate's harness, driving the views through pseudo-terminals in
+# tests/detach_session.rs.
+legume-tui = { version = "0.3.2", default-features = false, features = ["testing"] }

@@ -60,6 +60,7 @@ pub(super) fn run_squeeze_if_needed(
             auto_cutoff: false,
             output: None,
             row_align: RowAlignMode::Common,
+            session: Default::default(),
         };
         run_squeeze(&squeeze_args)?;
     }

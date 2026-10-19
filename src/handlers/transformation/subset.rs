@@ -1,8 +1,9 @@
 use super::{run_squeeze, ReorderRowsArgs, RowAlignMode, RunSqueezeArgs};
 use super::{SubsetArgs, SubsetColumnsArgs, SubsetRowsArgs};
-use crate::handlers::explore::{pick_entries, pick_rows_and_columns};
+use crate::handlers::explore::{off_screen, open_session, pick_entries, pick_rows_and_columns};
 use crate::hdf5_io::*;
 use crate::interactive::stat_tui::Side;
+use crate::interactive::ui::Tui;
 use crate::sparse_io::*;
 use crate::utilities::io_helpers::{
     read_col_names, read_row_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
@@ -73,6 +74,7 @@ fn build_squeeze_args(output_file: Box<str>, args_cols: usize, args_rows: usize)
         auto_cutoff: false,
         output: None,
         row_align: RowAlignMode::Common,
+        session: Default::default(),
     }
 }
 
@@ -83,103 +85,112 @@ fn build_squeeze_args(output_file: Box<str>, args_cols: usize, args_rows: usize)
 /// a file containing column names. Optionally, the output can be squeezed to
 /// remove rows/columns with too few non-zero entries.
 pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
+    // The picker's session first: hosted, the rest runs in the session.
+    let session = args
+        .interactive
+        .then(|| open_session("subset-columns", &args.session))
+        .transpose()?;
+    let mut tui = session.as_ref().map(Tui::new);
     // Pick before staging, so cancelling copies nothing.
-    let columns_indices = if args.interactive {
-        match pick_entries(&args.data_file, Side::Columns, "subset")? {
+    let columns_indices = match tui.as_mut() {
+        Some(tui) => match pick_entries(tui, &args.data_file, Side::Columns, "subset")? {
             Some(picked) => Some(picked),
             None => return Ok(()),
-        }
-    } else {
-        args.column_indices.clone()
+        },
+        None => args.column_indices.clone(),
     };
-    let column_name_file = args.name_file.clone();
 
-    let zip = if args.interactive {
-        zip_like_input(&args.data_file, &args.output)
-    } else {
-        args.zip
-    };
-    let (_backend, effective_output, output_file, mut data) =
-        stage_for_edit(&args.data_file, &args.output, zip)?;
+    // Written off the screen: a `kill` meanwhile lets it finish.
+    off_screen(tui.as_mut(), || {
+        let column_name_file = args.name_file.clone();
 
-    let original_ncol = data.num_columns().unwrap_or(0);
-    info!("original data: {} columns", original_ncol);
+        let zip = if args.interactive {
+            zip_like_input(&args.data_file, &args.output)
+        } else {
+            args.zip
+        };
+        let (_backend, effective_output, output_file, mut data) =
+            stage_for_edit(&args.data_file, &args.output, zip)?;
 
-    let selected_columns = if let Some(idx) = columns_indices {
-        info!("using {} column indices directly", idx.len());
-        idx
-    } else if let Some(column_file) = column_name_file {
-        let col_names = read_col_names(column_file, MAX_COLUMN_NAME_IDX)?;
-        if col_names.is_empty() {
-            return Err(anyhow::anyhow!("Empty column file"));
-        }
-        info!("read {} column names from file", col_names.len());
+        let original_ncol = data.num_columns().unwrap_or(0);
+        info!("original data: {} columns", original_ncol);
 
-        let data_col_names = data
-            .column_names()
-            .expect("column names not found in data file");
+        let selected_columns = if let Some(idx) = columns_indices {
+            info!("using {} column indices directly", idx.len());
+            idx
+        } else if let Some(column_file) = column_name_file {
+            let col_names = read_col_names(column_file, MAX_COLUMN_NAME_IDX)?;
+            if col_names.is_empty() {
+                return Err(anyhow::anyhow!("Empty column file"));
+            }
+            info!("read {} column names from file", col_names.len());
 
-        let membership = Membership::from_pairs(
-            col_names
+            let data_col_names = data
+                .column_names()
+                .expect("column names not found in data file");
+
+            let membership = Membership::from_pairs(
+                col_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (name.clone(), i.to_string().into_boxed_str())),
+                args.allow_prefix && !args.exact_names,
+            )
+            .with_delimiter(args.delimiter);
+
+            let (matched, stats) = membership.match_keys(&data_col_names);
+
+            info!(
+                "Column matching: {} exact + {} base_key + {} prefix = {}/{} matched",
+                stats.exact,
+                stats.base_key,
+                stats.prefix,
+                stats.total_matched(),
+                data_col_names.len()
+            );
+
+            if matched.is_empty() {
+                let file_sample: Vec<_> = col_names.iter().take(3).collect();
+                let data_sample: Vec<_> = data_col_names.iter().take(3).collect();
+                info!("column names from file (sample): {:?}", file_sample);
+                info!("column names in data (sample): {:?}", data_sample);
+                return Err(anyhow::anyhow!(
+                    "Found empty columns - no matching column names"
+                ));
+            }
+
+            let idx: Vec<usize> = data_col_names
                 .iter()
                 .enumerate()
-                .map(|(i, name)| (name.clone(), i.to_string().into_boxed_str())),
-            args.allow_prefix && !args.exact_names,
-        )
-        .with_delimiter(args.delimiter);
+                .filter_map(|(i, name)| matched.get(name).map(|_| i))
+                .collect();
 
-        let (matched, stats) = membership.match_keys(&data_col_names);
-
-        info!(
-            "Column matching: {} exact + {} base_key + {} prefix = {}/{} matched",
-            stats.exact,
-            stats.base_key,
-            stats.prefix,
-            stats.total_matched(),
-            data_col_names.len()
-        );
-
-        if matched.is_empty() {
-            let file_sample: Vec<_> = col_names.iter().take(3).collect();
-            let data_sample: Vec<_> = data_col_names.iter().take(3).collect();
-            info!("column names from file (sample): {:?}", file_sample);
-            info!("column names in data (sample): {:?}", data_sample);
+            info!("subsetting to {} columns", idx.len());
+            idx
+        } else {
             return Err(anyhow::anyhow!(
-                "Found empty columns - no matching column names"
+                "either `column-indices`, `name-file`, or `--interactive` must be provided"
             ));
+        };
+
+        data.subset_columns_rows(Some(&selected_columns), None)?;
+        info!("after subset: {} columns", selected_columns.len());
+        drop(data);
+
+        if args.do_squeeze {
+            info!("Squeeze the backend data {}", output_file);
+            let squeeze_args = build_squeeze_args(
+                output_file.clone(),
+                args.column_nnz_cutoff,
+                args.row_nnz_cutoff,
+            );
+            run_squeeze(&squeeze_args)?;
         }
 
-        let idx: Vec<usize> = data_col_names
-            .iter()
-            .enumerate()
-            .filter_map(|(i, name)| matched.get(name).map(|_| i))
-            .collect();
-
-        info!("subsetting to {} columns", idx.len());
-        idx
-    } else {
-        return Err(anyhow::anyhow!(
-            "either `column-indices`, `name-file`, or `--interactive` must be provided"
-        ));
-    };
-
-    data.subset_columns_rows(Some(&selected_columns), None)?;
-    info!("after subset: {} columns", selected_columns.len());
-    drop(data);
-
-    if args.do_squeeze {
-        info!("Squeeze the backend data {}", output_file);
-        let squeeze_args = build_squeeze_args(
-            output_file.clone(),
-            args.column_nnz_cutoff,
-            args.row_nnz_cutoff,
-        );
-        run_squeeze(&squeeze_args)?;
-    }
-
-    finalize_zarr_output(&output_file, &effective_output)?;
-    info!("done");
-    Ok(())
+        finalize_zarr_output(&output_file, &effective_output)?;
+        info!("done");
+        Ok(())
+    })
 }
 
 /// Subset rows from a sparse matrix data file
@@ -189,99 +200,108 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
 /// a file containing row names. Optionally, the output can be squeezed to
 /// remove rows/columns with too few non-zero entries.
 pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
+    // The picker's session first: hosted, the rest runs in the session.
+    let session = args
+        .interactive
+        .then(|| open_session("subset-rows", &args.session))
+        .transpose()?;
+    let mut tui = session.as_ref().map(Tui::new);
     // Pick before staging, so cancelling copies nothing.
-    let row_indices = if args.interactive {
-        match pick_entries(&args.data_file, Side::Rows, "subset")? {
+    let row_indices = match tui.as_mut() {
+        Some(tui) => match pick_entries(tui, &args.data_file, Side::Rows, "subset")? {
             Some(picked) => Some(picked),
             None => return Ok(()),
-        }
-    } else {
-        args.row_indices.clone()
+        },
+        None => args.row_indices.clone(),
     };
-    let row_name_file = args.name_file.clone();
 
-    let zip = if args.interactive {
-        zip_like_input(&args.data_file, &args.output)
-    } else {
-        args.zip
-    };
-    let (_backend, effective_output, output_file, mut data) =
-        stage_for_edit(&args.data_file, &args.output, zip)?;
+    // Written off the screen: a `kill` meanwhile lets it finish.
+    off_screen(tui.as_mut(), || {
+        let row_name_file = args.name_file.clone();
 
-    let original_nrow = data.num_rows().unwrap_or(0);
-    info!("original data: {} rows", original_nrow);
+        let zip = if args.interactive {
+            zip_like_input(&args.data_file, &args.output)
+        } else {
+            args.zip
+        };
+        let (_backend, effective_output, output_file, mut data) =
+            stage_for_edit(&args.data_file, &args.output, zip)?;
 
-    let selected_rows = if let Some(idx) = row_indices {
-        info!("using {} row indices directly", idx.len());
-        idx
-    } else if let Some(row_file) = row_name_file {
-        let row_names = read_row_names(row_file, MAX_ROW_NAME_IDX)?;
-        if row_names.is_empty() {
-            return Err(anyhow::anyhow!("Empty row file"));
-        }
-        info!("read {} row names from file", row_names.len());
+        let original_nrow = data.num_rows().unwrap_or(0);
+        info!("original data: {} rows", original_nrow);
 
-        let data_row_names = data.row_names().expect("row names not found in data file");
+        let selected_rows = if let Some(idx) = row_indices {
+            info!("using {} row indices directly", idx.len());
+            idx
+        } else if let Some(row_file) = row_name_file {
+            let row_names = read_row_names(row_file, MAX_ROW_NAME_IDX)?;
+            if row_names.is_empty() {
+                return Err(anyhow::anyhow!("Empty row file"));
+            }
+            info!("read {} row names from file", row_names.len());
 
-        let membership = Membership::from_pairs(
-            row_names
+            let data_row_names = data.row_names().expect("row names not found in data file");
+
+            let membership = Membership::from_pairs(
+                row_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (name.clone(), i.to_string().into_boxed_str())),
+                args.allow_prefix && !args.exact_names,
+            )
+            .with_delimiter(args.delimiter);
+
+            let (matched, stats) = membership.match_keys(&data_row_names);
+
+            info!(
+                "Row matching: {} exact + {} base_key + {} prefix = {}/{} matched",
+                stats.exact,
+                stats.base_key,
+                stats.prefix,
+                stats.total_matched(),
+                data_row_names.len()
+            );
+
+            if matched.is_empty() {
+                let file_sample: Vec<_> = row_names.iter().take(3).collect();
+                let data_sample: Vec<_> = data_row_names.iter().take(3).collect();
+                info!("row names from file (sample): {:?}", file_sample);
+                info!("row names in data (sample): {:?}", data_sample);
+                return Err(anyhow::anyhow!("Found empty rows - no matching row names"));
+            }
+
+            let idx: Vec<usize> = data_row_names
                 .iter()
                 .enumerate()
-                .map(|(i, name)| (name.clone(), i.to_string().into_boxed_str())),
-            args.allow_prefix && !args.exact_names,
-        )
-        .with_delimiter(args.delimiter);
+                .filter_map(|(i, name)| matched.get(name).map(|_| i))
+                .collect();
 
-        let (matched, stats) = membership.match_keys(&data_row_names);
+            info!("subsetting to {} rows", idx.len());
+            idx
+        } else {
+            return Err(anyhow::anyhow!(
+                "either `row-indices`, `name-file`, or `--interactive` must be provided"
+            ));
+        };
 
-        info!(
-            "Row matching: {} exact + {} base_key + {} prefix = {}/{} matched",
-            stats.exact,
-            stats.base_key,
-            stats.prefix,
-            stats.total_matched(),
-            data_row_names.len()
-        );
+        data.subset_columns_rows(None, Some(&selected_rows))?;
+        info!("after subset: {} rows", selected_rows.len());
+        drop(data);
 
-        if matched.is_empty() {
-            let file_sample: Vec<_> = row_names.iter().take(3).collect();
-            let data_sample: Vec<_> = data_row_names.iter().take(3).collect();
-            info!("row names from file (sample): {:?}", file_sample);
-            info!("row names in data (sample): {:?}", data_sample);
-            return Err(anyhow::anyhow!("Found empty rows - no matching row names"));
+        if args.do_squeeze {
+            info!("Squeeze the backend data {}", output_file);
+            let squeeze_args = build_squeeze_args(
+                output_file.clone(),
+                args.column_nnz_cutoff,
+                args.row_nnz_cutoff,
+            );
+            run_squeeze(&squeeze_args)?;
         }
 
-        let idx: Vec<usize> = data_row_names
-            .iter()
-            .enumerate()
-            .filter_map(|(i, name)| matched.get(name).map(|_| i))
-            .collect();
-
-        info!("subsetting to {} rows", idx.len());
-        idx
-    } else {
-        return Err(anyhow::anyhow!(
-            "either `row-indices`, `name-file`, or `--interactive` must be provided"
-        ));
-    };
-
-    data.subset_columns_rows(None, Some(&selected_rows))?;
-    info!("after subset: {} rows", selected_rows.len());
-    drop(data);
-
-    if args.do_squeeze {
-        info!("Squeeze the backend data {}", output_file);
-        let squeeze_args = build_squeeze_args(
-            output_file.clone(),
-            args.column_nnz_cutoff,
-            args.row_nnz_cutoff,
-        );
-        run_squeeze(&squeeze_args)?;
-    }
-
-    finalize_zarr_output(&output_file, &effective_output)?;
-    info!("done");
-    Ok(())
+        finalize_zarr_output(&output_file, &effective_output)?;
+        info!("done");
+        Ok(())
+    })
 }
 
 /// Subset rows and columns picked in the explorer
@@ -291,30 +311,36 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
 /// same format as the input with just those. A side with nothing marked is
 /// kept whole.
 pub fn subset(args: &SubsetArgs) -> anyhow::Result<()> {
+    // The picker's session first: hosted, the rest runs in the session.
+    let session = open_session("subset", &args.session)?;
+    let mut tui = Tui::new(&session);
     // Pick before staging, so cancelling copies nothing.
-    let Some(picked) = pick_rows_and_columns(&args.data_file, "subset")? else {
+    let Some(picked) = pick_rows_and_columns(&mut tui, &args.data_file, "subset")? else {
         return Ok(());
     };
-    let zip = zip_like_input(&args.data_file, &args.output);
-    let (_backend, effective_output, output_file, mut data) =
-        stage_for_edit(&args.data_file, &args.output, zip)?;
+    // Written off the screen: a `kill` meanwhile lets it finish.
+    off_screen(Some(&mut tui), || {
+        let zip = zip_like_input(&args.data_file, &args.output);
+        let (_backend, effective_output, output_file, mut data) =
+            stage_for_edit(&args.data_file, &args.output, zip)?;
 
-    let rows = (!picked.rows.is_empty()).then_some(picked.rows);
-    let columns = (!picked.columns.is_empty()).then_some(picked.columns);
-    info!(
-        "subsetting to {} rows x {} columns",
-        rows.as_ref()
-            .map_or(data.num_rows().unwrap_or(0), |r| r.len()),
-        columns
-            .as_ref()
-            .map_or(data.num_columns().unwrap_or(0), |c| c.len())
-    );
-    data.subset_columns_rows(columns.as_ref(), rows.as_ref())?;
-    drop(data);
+        let rows = (!picked.rows.is_empty()).then_some(picked.rows);
+        let columns = (!picked.columns.is_empty()).then_some(picked.columns);
+        info!(
+            "subsetting to {} rows x {} columns",
+            rows.as_ref()
+                .map_or(data.num_rows().unwrap_or(0), |r| r.len()),
+            columns
+                .as_ref()
+                .map_or(data.num_columns().unwrap_or(0), |c| c.len())
+        );
+        data.subset_columns_rows(columns.as_ref(), rows.as_ref())?;
+        drop(data);
 
-    finalize_zarr_output(&output_file, &effective_output)?;
-    info!("done");
-    Ok(())
+        finalize_zarr_output(&output_file, &effective_output)?;
+        info!("done");
+        Ok(())
+    })
 }
 
 /// Reorder rows in a sparse matrix data file

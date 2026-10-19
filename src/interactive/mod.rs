@@ -12,6 +12,12 @@
 //!   columns, optionally marking entries and handing them back.
 //!
 //! Open a view only when [`tui_available`]; otherwise fall back to text.
+//!
+//! The views run in a legume-tui session ([`TOOL`]): a command opens it
+//! first thing and hands it to [`ui::Tui`] or [`ui::run_screen_in`]; where
+//! the session is hosted, the command keeps running when the connection
+//! drops. [`ui::run_screen`] runs a view in a plain session of its own
+//! (`legume_tui::Session::plain`).
 
 pub mod cutoff_tui;
 pub mod stat_tui;
@@ -23,6 +29,42 @@ use std::io::{self, IsTerminal, Write};
 /// Otherwise callers fall back to the line prompts below.
 pub fn tui_available() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// The tool data-beans' sessions belong to: they are named
+/// `data-beans-squeeze-1`, `data-beans-stat-2`, and `data-beans attach`
+/// finds them.
+pub const TOOL: legume_tui::Tool = legume_tui::Tool::new("data-beans");
+
+/// The detach and switch keys for a title bar ([`ui::title_bar`]), each
+/// with what it does in a word (`detach`, `switch`); none when the views
+/// run plain.
+pub fn session_keys() -> Vec<(String, String)> {
+    legume_tui::help_keys()
+        .into_iter()
+        .map(|k| (k.key.to_lowercase(), k.short))
+        .collect()
+}
+
+/// The paragraph a command's long help ends with about its session:
+/// `lead` first, for a command whose view is optional (when it runs as a
+/// session), then how it runs, the detach and switch keys, how to return,
+/// and `more` at the end. Its views are always opened on something
+/// named, so a new start never offers the live sessions; `data-beans
+/// attach` does.
+pub fn session_help(lead: Option<&str>, more: &str) -> String {
+    let help = legume_tui::cli::SessionHelp::new()
+        .what_goes_on("the command goes on")
+        .resume_hint(Some(
+            "Starting it again starts a new one (naming the detached ones); \
+             `data-beans attach` with no name",
+        ))
+        .more(more);
+    let help = match lead {
+        Some(lead) => help.lead(lead),
+        None => help,
+    };
+    legume_tui::cli::session_help(&TOOL, help)
 }
 
 /// User action after viewing histogram or other interactive prompts
@@ -87,3 +129,7 @@ pub fn confirm(message: &str) -> anyhow::Result<bool> {
 
     Ok(matches!(choice.as_str(), "y" | "yes"))
 }
+
+#[cfg(test)]
+#[path = "tests/session.rs"]
+mod tests;

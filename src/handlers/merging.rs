@@ -424,6 +424,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
             auto_cutoff: false,
             output: None,
             row_align: RowAlignMode::Common,
+            session: Default::default(),
         };
 
         run_squeeze(&squeeze_args)?;
@@ -727,6 +728,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
             auto_cutoff: false,
             output: None,
             row_align: RowAlignMode::Common,
+            session: Default::default(),
         };
 
         run_squeeze(&squeeze_args)?;

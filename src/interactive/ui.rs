@@ -5,9 +5,10 @@
 use ratatui::buffer::Buffer;
 use std::time::{Duration, Instant};
 
+use legume_tui::{Keyboard, Modes, Mouse, Round, Session};
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseEvent, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    MouseEvent,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -71,20 +72,30 @@ pub trait Screen {
     fn take_notice(&mut self) -> Option<String> {
         None
     }
+    /// What the view is doing, in one short line, for `data-beans
+    /// sessions` and the session picker to show.
+    fn status(&self) -> Option<String> {
+        None
+    }
 }
 
-/// The terminal modes a screen asked for, taken back while its screen is
-/// still up: terminals keep each screen's modes apart.
-#[derive(Default)]
-struct Modes {
-    mouse: bool,
-    chords: bool,
+/// The terminal modes `screen` asks for, as its session turns them on (and
+/// on again after every attach): the mouse as buttons and the wheel in SGR
+/// form, not the pointer's every move, which would wake the loop for
+/// nothing; keys held with modifiers told apart.
+pub fn modes_of(screen: &impl Screen) -> Modes {
+    Modes::new()
+        .mouse(if screen.takes_mouse() {
+            Mouse::Buttons
+        } else {
+            Mouse::Off
+        })
+        .keyboard_enhancement(if screen.reports_chords() {
+            Keyboard::On(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        } else {
+            Keyboard::Off
+        })
 }
-
-/// Buttons and the wheel (1000) in SGR form (1006); not the pointer's every
-/// move, which would wake the loop for nothing.
-const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
-const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 
 /// Write `text` to the terminal as it is.
 fn send(text: &str) -> bool {
@@ -100,56 +111,192 @@ pub fn notify(text: &str) {
     send(&format!("\x07\x1b]9;{text}\x07"));
 }
 
-impl Modes {
-    fn ask(&mut self, screen: &impl Screen) {
-        let mut out = std::io::stdout();
-        if screen.takes_mouse() && !self.mouse {
-            self.mouse = send(MOUSE_ON);
-        }
-        if screen.reports_chords() && !self.chords {
-            let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
-            self.chords =
-                ratatui::crossterm::execute!(out, PushKeyboardEnhancementFlags(flags)).is_ok();
-        }
-    }
-
-    fn release(&mut self) {
-        let mut out = std::io::stdout();
-        if std::mem::take(&mut self.mouse) {
-            send(MOUSE_OFF);
-        }
-        if std::mem::take(&mut self.chords) {
-            let _ = ratatui::crossterm::execute!(out, PopKeyboardEnhancementFlags);
-        }
-    }
-}
-
-/// How often [`run_screen`] asks [`Screen::tick`], keys or not.
+/// How often a view's loop asks [`Screen::tick`], keys or not.
 pub const TICK: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Holds log records back while alive, writing them when dropped.
-struct HeldLogs;
+/// The terminal a command's views draw on, in the command's session: up
+/// from the first view ([`Tui::run`]) until dropped, so every view of the
+/// command and the work between them ([`Tui::work`]) share one screen.
+/// While it is up, a `data-beans kill` asks the views to stop as Ctrl-C
+/// does ([`Tui::stop_requested`]), and work under way finishes first. Log
+/// records raised while it is up are held back and written once the
+/// normal screen is back, or as work between views runs.
+pub struct Tui<'s> {
+    session: &'s Session,
+    terminal: Option<ratatui::DefaultTerminal>,
+    /// The modes the screen has on now.
+    modes: Modes,
+    _held: legume_tui::logs::Hold,
+}
 
-impl HeldLogs {
-    fn new() -> Self {
-        crate::aux::logging::hold_logs(true);
-        HeldLogs
+impl<'s> Tui<'s> {
+    /// Views of `session`, the screen not up yet.
+    pub fn new(session: &'s Session) -> Self {
+        Self {
+            session,
+            terminal: None,
+            modes: Modes::new(),
+            _held: legume_tui::logs::hold(),
+        }
+    }
+
+    pub fn session(&self) -> &'s Session {
+        self.session
+    }
+
+    /// Whether `data-beans kill` asked the command to stop: no more views
+    /// and no more work after the one running.
+    pub fn stop_requested(&self) -> bool {
+        self.session.stop_requested()
+    }
+
+    /// Run `screen` until it is done, its keys to [`Screen::handle_key`].
+    pub fn run<S: Screen>(&mut self, screen: &mut S) -> anyhow::Result<()> {
+        self.run_with(screen, S::handle_key)
+    }
+
+    /// Run `screen` until it is done, each key (but Ctrl-C) handed to
+    /// `on_key`. The screen comes up with the first view and stays up
+    /// after. A stop interrupts the view, as Ctrl-C does. Blocking work
+    /// ([`Screen::pending_work`]) runs on the normal screen, where its own
+    /// progress output belongs, and the view comes back after it. The
+    /// mouse and keys held with modifiers are reported only to a screen
+    /// that asks for them, and events already queued (a turn of the wheel
+    /// is several) are taken before the screen is drawn again. After an
+    /// attach the modes are on again and the view is drawn whole.
+    pub fn run_with<S: Screen>(
+        &mut self,
+        screen: &mut S,
+        mut on_key: impl FnMut(&mut S, KeyEvent),
+    ) -> anyhow::Result<()> {
+        let session = self.session;
+        if session.stop_requested() {
+            screen.interrupt();
+            return Ok(());
+        }
+        let wanted = modes_of(screen);
+        self.up(wanted)?;
+        let Some(terminal) = self.terminal.as_mut() else {
+            unreachable!("the screen is up");
+        };
+        let mut redraw = true;
+        // Ticks keep time while events come: a stream of them must not
+        // keep a view from its background work.
+        let mut next_tick = Instant::now() + TICK;
+        while !screen.done() {
+            if session.stop_requested() {
+                screen.interrupt();
+                break;
+            }
+            if redraw {
+                session.draw(terminal, |f| screen.render(f))?;
+                let wanted = modes_of(screen);
+                if wanted != self.modes {
+                    session.set_modes(wanted)?;
+                    self.modes = wanted;
+                }
+            }
+            if let Some(status) = screen.status() {
+                session.status(&status);
+            }
+            if let Some(notice) = screen.take_notice() {
+                notify(&notice);
+            }
+            redraw = false;
+            let wait = next_tick.saturating_duration_since(Instant::now());
+            match session.poll(terminal, wait)? {
+                Round::Event(mut event) => loop {
+                    redraw |= feed(screen, &mut on_key, event);
+                    if screen.done()
+                        || screen.pending_work().is_some()
+                        || session.stop_requested()
+                        || !event::poll(Duration::ZERO)?
+                    {
+                        break;
+                    }
+                    event = event::read()?;
+                },
+                // An attach cleared the screen: drawn whole again.
+                Round::Repainted => redraw = true,
+                _ => {}
+            }
+            if Instant::now() >= next_tick {
+                redraw |= screen.tick();
+                next_tick = Instant::now() + TICK;
+            }
+            if let Some(message) = screen.pending_work() {
+                session.off_screen(|| {
+                    eprintln!("{message}");
+                    screen.do_work();
+                })?;
+                redraw = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// The screen, brought up with `modes` if it is not up yet, else
+    /// switched to them.
+    fn up(&mut self, modes: Modes) -> anyhow::Result<()> {
+        if self.terminal.is_none() {
+            self.terminal = Some(self.session.terminal_with(modes)?);
+        } else if modes != self.modes {
+            self.session.set_modes(modes)?;
+        }
+        self.modes = modes;
+        Ok(())
+    }
+
+    /// Run `f`, the command's own work before, between or after its
+    /// views, on the normal screen, its log records written as they come;
+    /// the screen is taken back after it, to be drawn whole by the next
+    /// view. A `kill` meanwhile lets `f` finish and is then
+    /// [`Tui::stop_requested`]. Before the first view the screen stays
+    /// down: `f` runs where it is, a `kill` waiting for it all the same.
+    pub fn work<T>(&mut self, f: impl FnOnce() -> T) -> anyhow::Result<T> {
+        if !self.session.screen_up() {
+            return Ok(self.session.stoppable(f));
+        }
+        Ok(self.session.off_screen(f)?)
     }
 }
 
-impl Drop for HeldLogs {
+impl Drop for Tui<'_> {
     fn drop(&mut self) {
-        crate::aux::logging::hold_logs(false);
+        if self.terminal.take().is_some() {
+            self.session.restore();
+        }
     }
 }
 
-/// Run `screen` full screen until it is done. The terminal is restored on
-/// return and on panic. Log records raised meanwhile are held back and
-/// written once the normal screen is back. Blocking work runs on the normal
-/// screen, where its own progress output belongs, and the view comes back
-/// after it. The mouse and keys held with modifiers are reported only to a
-/// screen that asks for them, and events already queued (a turn of the wheel
-/// is several) are taken before the screen is drawn again.
+/// Hand `event` to `screen`: Ctrl-C to [`Screen::interrupt`], other key
+/// presses to `on_key`. Whether the screen is drawn again.
+fn feed<S: Screen>(
+    screen: &mut S,
+    on_key: &mut impl FnMut(&mut S, KeyEvent),
+    event: Event,
+) -> bool {
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Press => false,
+        Event::Key(key)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') =>
+        {
+            screen.interrupt();
+            true
+        }
+        Event::Key(key) => {
+            on_key(screen, key);
+            true
+        }
+        Event::Mouse(m) => screen.mouse(m),
+        Event::Resize(..) => true,
+        _ => false,
+    }
+}
+
+/// Run `screen` full screen until it is done, in a plain session of its
+/// own (`Session::plain`). The terminal is restored on return and
+/// on panic. See [`Tui::run_with`] for the rest.
 pub fn run_screen<S: Screen>(screen: &mut S) -> anyhow::Result<()> {
     run_screen_with(screen, S::handle_key)
 }
@@ -159,73 +306,26 @@ pub fn run_screen<S: Screen>(screen: &mut S) -> anyhow::Result<()> {
 /// which keys a screen sees.
 pub fn run_screen_with<S: Screen>(
     screen: &mut S,
-    mut on_key: impl FnMut(&mut S, KeyEvent),
+    on_key: impl FnMut(&mut S, KeyEvent),
 ) -> anyhow::Result<()> {
-    ratatui::run(|terminal| -> anyhow::Result<()> {
-        let held = HeldLogs::new();
-        let mut modes = Modes::default();
-        let mut redraw = true;
-        // Ticks keep time while events come: a stream of them must not
-        // keep a view from its background work.
-        let mut next_tick = Instant::now() + TICK;
-        while !screen.done() {
-            if redraw {
-                terminal.draw(|f| screen.render(f))?;
-                // Asked once the screen is up: its modes are its own.
-                modes.ask(screen);
-            }
-            if let Some(notice) = screen.take_notice() {
-                notify(&notice);
-            }
-            redraw = false;
-            if event::poll(next_tick.saturating_duration_since(Instant::now()))? {
-                loop {
-                    redraw |= match event::read()? {
-                        Event::Key(key) if key.kind != KeyEventKind::Press => false,
-                        Event::Key(key)
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && key.code == KeyCode::Char('c') =>
-                        {
-                            screen.interrupt();
-                            true
-                        }
-                        Event::Key(key) => {
-                            on_key(screen, key);
-                            true
-                        }
-                        Event::Mouse(m) => screen.mouse(m),
-                        Event::Resize(..) => true,
-                        _ => false,
-                    };
-                    if screen.done()
-                        || screen.pending_work().is_some()
-                        || !event::poll(Duration::ZERO)?
-                    {
-                        break;
-                    }
-                }
-            }
-            if Instant::now() >= next_tick {
-                redraw |= screen.tick();
-                next_tick = Instant::now() + TICK;
-            }
-            if let Some(message) = screen.pending_work() {
-                modes.release();
-                ratatui::restore();
-                crate::aux::logging::hold_logs(false);
-                eprintln!("{message}");
-                screen.do_work();
-                crate::aux::logging::hold_logs(true);
-                *terminal = ratatui::try_init()?;
-                redraw = true;
-            }
-        }
-        modes.release();
-        // Restore before writing what was held, not after.
-        ratatui::restore();
-        drop(held);
-        Ok(())
-    })
+    let session = Session::plain(&super::TOOL);
+    run_screen_in_with(&session, screen, on_key)
+}
+
+/// [`run_screen`] in `session`: hosted, it keeps running when the
+/// connection drops and a `kill` stops it as Ctrl-C does. The screen is
+/// handed back on return; [`Tui`] keeps it up across several views.
+pub fn run_screen_in<S: Screen>(session: &Session, screen: &mut S) -> anyhow::Result<()> {
+    run_screen_in_with(session, screen, S::handle_key)
+}
+
+/// [`run_screen_in`], with each key (but Ctrl-C) handed to `on_key`.
+pub fn run_screen_in_with<S: Screen>(
+    session: &Session,
+    screen: &mut S,
+    on_key: impl FnMut(&mut S, KeyEvent),
+) -> anyhow::Result<()> {
+    Tui::new(session).run_with(screen, on_key)
 }
 
 /// Title bar: a reverse-video badge naming the view, then plain text.
@@ -238,6 +338,24 @@ pub fn header(badge: &str, title: &str, extra: &str) -> Line<'static> {
         Span::raw(format!(" {title}")),
         Span::styled(format!("   {extra}"), DIM),
     ])
+}
+
+/// Title bar: `title` (a [`header`]) with the session keys, `keys`
+/// ([`super::session_keys`]), at its right end. The keys stay whole however
+/// narrow the terminal, the title giving way, so the detach key is always
+/// on screen.
+pub fn title_bar(frame: &mut Frame, area: Rect, title: Line<'static>, keys: &[(String, String)]) {
+    if keys.is_empty() {
+        frame.render_widget(title, area);
+        return;
+    }
+    let pairs: Vec<_> = keys.iter().map(|(k, w)| (k.as_str(), w.as_str())).collect();
+    let keys = help_line(&pairs);
+    let width = (keys.width() as u16).min(area.width);
+    let [left, right] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(width)]).areas(area);
+    frame.render_widget(title, left);
+    frame.render_widget(keys, right);
 }
 
 /// Rounded panel titled `title`: plain border and accent title when
