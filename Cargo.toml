@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.9.1"
+version = "0.10.0"
 rust-version = "1.91"
 # Ship only the sources, README and license: nothing else in the working tree
 # (data stores, saved name lists, scratch files) can end up on crates.io.
@@ -98,7 +98,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 legume-tui = { version = "0.3.2", optional = true, default-features = false, features = ["clap", "logs"] }
 # Pinned to a commit until 0.1.0 is on crates.io.
 # Pinned to a commit until 0.1.0 is on crates.io.
-legume-mcp = { version = "0.1.0", git = "https://github.com/causalpathlab/legume-mcp", rev = "8a11b6b", optional = true }
+legume-mcp = { version = "0.1.0", git = "https://github.com/causalpathlab/legume-mcp", rev = "bce87e5", optional = true }
 legume-plot = { version = "0.3.2", optional = true }
 base64 = { version = "0.22", optional = true }
 
@@ -107,5 +107,5 @@ base64 = { version = "0.22", optional = true }
 # tests/detach_session.rs.
 legume-tui = { version = "0.3.2", default-features = false, features = ["testing"] }
 # tests/mcp_server.rs follows a server through the watch pane.
-legume-mcp = { version = "0.1.0", git = "https://github.com/causalpathlab/legume-mcp", rev = "8a11b6b", features = ["tui"] }
+legume-mcp = { version = "0.1.0", git = "https://github.com/causalpathlab/legume-mcp", rev = "bce87e5", features = ["tui"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
