@@ -54,7 +54,8 @@ pub struct MergeBackendArgs {
         long,
         required = true,
         help = "Output file header",
-        long_help = "Output file header: {output}.{backend} and {output}.batch.gz.\n\
+        long_help = "Output file header: {output}.{backend} and {output}.batch.gz,\n\
+                     {output} without a backend suffix it was given.\n\
                      The zarr backend produces {output}.zarr.zip by default;\n\
                      pass --no-zip to keep a {output}.zarr directory instead.\n\
                      The backend will contain everything.\n\
@@ -129,7 +130,8 @@ pub struct MergeMtxArgs {
         long,
         required = true,
         help = "Output file header",
-        long_help = "Output file header: {output}.{backend} and {output}.batch.gz.\n\
+        long_help = "Output file header: {output}.{backend} and {output}.batch.gz,\n\
+                     {output} without a backend suffix it was given.\n\
                      The zarr backend produces {output}.zarr.zip by default;\n\
                      pass --no-zip to keep a {output}.zarr directory instead.\n\
                      The backend will contain all merged data.\n\
@@ -262,6 +264,20 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
     let num_batches = args.data_files.len();
     info!("merging over {} batches ...", num_batches);
 
+    let effective_output = apply_zip_flag(&args.output, args.zip, &args.backend);
+    let (backend, backend_file) =
+        resolve_backend_file(&effective_output, Some(args.backend.clone()))?;
+    // The output is cleared before the inputs are read and zipped over its
+    // name after, so it must not be one of them.
+    for input in &args.data_files {
+        for out in [&*effective_output, &*backend_file] {
+            anyhow::ensure!(
+                !same_file(input, out),
+                "the output {out} is the input {input}: give -o another name"
+            );
+        }
+    }
+
     let batch_names = generate_unique_batch_names(&args.data_files)?;
     info!("Batch names: {:?}", batch_names);
 
@@ -299,11 +315,17 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
             .num_non_zeros()
             .ok_or_else(|| anyhow::anyhow!("missing nnz in {}", data_file))?;
 
-        if row_names.is_empty() {
+        if batch_idx == 0 {
             row_names = data.row_names()?;
         } else {
             info!("checking if the row names are consistent");
-            assert_eq!(row_names, data.row_names()?);
+            anyhow::ensure!(
+                row_names == data.row_names()?,
+                "{} has other row names than {}: merge-backend needs the same rows, in order; \
+                 subset them to common rows first",
+                data_file,
+                args.data_files[0]
+            );
         }
 
         let _names = data.column_names()?;
@@ -334,10 +356,6 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         "Found {} columns/barcodes across {} batches (total nnz = {})",
         total_ncol, num_batches, total_nnz
     );
-
-    let effective_output = apply_zip_flag(&args.output, args.zip, &args.backend);
-    let (backend, backend_file) =
-        resolve_backend_file(&effective_output, Some(args.backend.clone()))?;
 
     if std::path::Path::new(backend_file.as_ref()).exists() {
         info!(
@@ -430,21 +448,41 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         run_squeeze(&squeeze_args)?;
     }
 
-    // do the batch mapping at the end
-    let batch_memb_file = format!("{}.batch.gz", args.output);
-    let data = open_sparse_matrix(&backend_file, &backend)?;
-    let default_batch = basename(&args.output)?;
-    let column_batch_names = data
+    write_batches_and_finalize(&effective_output, &backend_file, &backend, &batch_map)?;
+    info!("done");
+    Ok(())
+}
+
+/// Whether paths `a` and `b` name the same file: compared resolved when
+/// they exist, as written (made absolute) when not.
+fn same_file(a: &str, b: &str) -> bool {
+    let resolve = |p: &str| std::fs::canonicalize(p).or_else(|_| std::path::absolute(p));
+    matches!((resolve(a), resolve(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// The end of a merge: label each column of the merged backend at
+/// `backend_file` with its batch (from `batch_map`; a column it misses takes
+/// the output's own name) in `{output}.batch.gz`, the output's name without
+/// its backend suffix; then finalize the backend as `effective_output`, the
+/// output resolved (a `.zarr.zip`, unless `--no-zip`).
+pub(crate) fn write_batches_and_finalize(
+    effective_output: &str,
+    backend_file: &str,
+    backend: &SparseIoBackend,
+    batch_map: &HashMap<Box<str>, Box<str>>,
+) -> anyhow::Result<()> {
+    let stem = strip_backend_suffix(effective_output);
+    // The name itself, dots and all (`sample.v2`), not cut at its last dot.
+    let default_batch: Box<str> = std::path::Path::new(stem)
+        .file_name()
+        .map_or_else(|| stem.into(), |n| n.to_string_lossy().into());
+    let labels: Vec<Box<str>> = open_sparse_matrix(backend_file, backend)?
         .column_names()?
         .iter()
         .map(|k| batch_map.get(k).unwrap_or(&default_batch).clone())
-        .collect::<Vec<_>>();
-
-    write_lines(&column_batch_names, &batch_memb_file)?;
-
-    finalize_zarr_output(&backend_file, &args.output)?;
-    info!("done");
-    Ok(())
+        .collect();
+    write_lines(&labels, &format!("{stem}.batch.gz"))?;
+    finalize_zarr_output(backend_file, effective_output)
 }
 
 pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
@@ -647,10 +685,10 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
 
     let backend = args.backend.clone();
     let effective_output = apply_zip_flag(&args.output, args.zip, &backend);
-    let output = args.output.clone();
-    let batch_memb_file = (output.to_string() + ".batch.gz").into_boxed_str();
 
-    let (_, backend_file) = resolve_backend_file(&effective_output, Some(backend.clone()))?;
+    // The backend the output's name resolves to (an `.h5` name, or a zarr
+    // fallback for hdf5 without the feature), not the flag's.
+    let (backend, backend_file) = resolve_backend_file(&effective_output, Some(backend))?;
     let backend_file: String = backend_file.to_string();
 
     if std::path::Path::new(&backend_file).exists() {
@@ -734,18 +772,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
         run_squeeze(&squeeze_args)?;
     }
 
-    // do the batch mapping at the end
-    let data = open_sparse_matrix(&backend_file, &backend)?;
-    let default_batch = basename(&args.output)?;
-    let column_batch_names = data
-        .column_names()?
-        .iter()
-        .map(|k| batch_map.get(k).unwrap_or(&default_batch).clone())
-        .collect::<Vec<_>>();
-
-    write_lines(&column_batch_names, &batch_memb_file)?;
-
-    finalize_zarr_output(&backend_file, &effective_output)?;
+    write_batches_and_finalize(&effective_output, &backend_file, &backend, &batch_map)?;
     info!("done");
     Ok(())
 }
