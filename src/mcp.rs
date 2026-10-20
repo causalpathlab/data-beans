@@ -489,7 +489,7 @@ impl Arguments {
 
     /// `out`, or, when the agent names none, `{name}{ext}` in today's
     /// results folder, `-2`, `-3`… added to `name` (before `ext`) while
-    /// `taken` says a name is in use.
+    /// `taken` says a name is in use, or a running job writes it.
     fn out_or(
         &self,
         cx: &Call,
@@ -508,7 +508,7 @@ impl Arguments {
                 k => dir.join(format!("{name}-{k}{ext}")),
             })
             .map(|p| p.to_string_lossy().into_owned())
-            .find(|p| !taken(p))
+            .find(|p| !held(cx, &[p]) && !taken(p))
             .context("no free name in the results folder")
     }
 
@@ -518,7 +518,8 @@ impl Arguments {
         self.out_or(cx, (name, ""), |c| {
             backend_target(c).map_or(true, |t| {
                 let stem = strip_backend_suffix(&t.effective);
-                being_written(stem).is_some()
+                held(cx, &[&t.effective, &t.found])
+                    || being_written(stem).is_some()
                     || outputs_beside(stem).map_or(true, |v| !v.is_empty())
             })
         })
@@ -663,6 +664,12 @@ fn fresh(path: &str) -> Result<()> {
 /// running, or by a background job for as long as the server runs. Until
 /// a command has made its outputs, only this says they are spoken for.
 static WRITING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether a running job writes one of `paths`, however spelled.
+fn held(cx: &Call, paths: &[&str]) -> bool {
+    let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    cx.ensure_free(&paths).is_err()
+}
 
 /// Whether two stems name some file alike: one is the other, or a file
 /// named after it.
