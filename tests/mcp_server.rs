@@ -321,6 +321,119 @@ fn unnamed_outputs_go_to_the_results_folder_and_the_records() {
     assert!(readme.contains("the test's fixture"));
 }
 
+#[test]
+fn a_write_in_the_background_returns_a_job_that_writes_it() {
+    let (dir, mut c) = setup();
+    let wait = |c: &mut Client, job: &Value| {
+        let mut v = Value::Null;
+        for _ in 0..10 {
+            v = c
+                .call("job_wait", json!({ "id": job, "seconds": 30 }))
+                .unwrap();
+            if v["state"] != "running" {
+                break;
+            }
+        }
+        assert_eq!(v["state"], "done", "{v}");
+    };
+
+    let started = c
+        .call(
+            "subset",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "pattern": "^G", "out": "genes", "background": true }),
+        )
+        .unwrap();
+    assert!(
+        started["job"].as_str().unwrap().starts_with("job-"),
+        "{started}"
+    );
+    assert!(started.get("info").is_none());
+    let written = started["written"].as_str().unwrap();
+    assert!(written.ends_with("genes.zarr.zip"));
+    wait(&mut c, &started["job"]);
+    assert!(Path::new(written).exists());
+    let info = c.call("info", json!({ "data": written })).unwrap();
+    assert_eq!(info["rows"], 4, "{info}");
+
+    // The names file outlives the call that wrote it.
+    let named = c
+        .call(
+            "subset",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "names": ["G2", "G3"], "out": "named", "background": true }),
+        )
+        .unwrap();
+    wait(&mut c, &named["job"]);
+    let info = c.call("info", json!({ "data": named["written"] })).unwrap();
+    assert_eq!(info["rows"], 2, "{info}");
+
+    // Two jobs started together, unnamed, write two outputs.
+    let jobs: Vec<Value> = ["^G", "^MT"]
+        .map(|p| {
+            c.call(
+                "subset",
+                json!({ "data": "base.zarr.zip", "axis": "rows", "pattern": p, "background": true }),
+            )
+            .unwrap()
+        })
+        .into();
+    assert_ne!(jobs[0]["written"], jobs[1]["written"], "{jobs:?}");
+    for j in &jobs {
+        wait(&mut c, &j["job"]);
+    }
+    // And an output a job is writing is no one else's.
+    let first = c
+        .call(
+            "subsample",
+            json!({ "data": "base.zarr.zip", "cells": 2, "out": "drawn", "background": true }),
+        )
+        .unwrap();
+    let again = c.call(
+        "subsample",
+        json!({ "data": "base.zarr.zip", "cells": 3, "out": "drawn" }),
+    );
+    wait(&mut c, &first["job"]);
+    assert!(again.is_err(), "{again:?}");
+
+    // Split's halves are named up front.
+    let started = c
+        .call(
+            "split",
+            json!({ "data": "base.zarr.zip", "test_frac": 0.5, "out": "cv", "background": true }),
+        )
+        .unwrap();
+    let halves: Vec<&str> = started["written"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h.as_str().unwrap())
+        .collect();
+    assert_eq!(halves.len(), 2, "{started}");
+    wait(&mut c, &started["job"]);
+    assert!(halves.iter().all(|h| Path::new(h).exists()), "{halves:?}");
+
+    // A job is a step of the session like any other.
+    let day = std::fs::read_dir(dir.path().join("results"))
+        .unwrap()
+        .flatten()
+        .find(|e| e.path().is_dir())
+        .unwrap()
+        .path();
+    let script = std::fs::read_to_string(day.join("runall.sh")).unwrap();
+    for made in ["genes.zarr.zip", "cv.train.zarr.zip"] {
+        assert!(script.contains(&format!("-e {made} ]")), "{made}: {script}");
+    }
+
+    // A job has nothing to wait for: a dry run, or an import of nothing.
+    let dry = c.call("qc", json!({ "data": "base.zarr.zip", "background": true }));
+    assert!(dry.unwrap_err().contains("dry run"));
+    let missing = c.call(
+        "import",
+        json!({ "command": "from-mtx", "input": "missing.mtx", "source": "nowhere", "background": true }),
+    );
+    assert!(missing.unwrap_err().contains("does not exist"));
+    assert!(!dir.path().join("data/README.md").exists());
+}
+
 /// What a call should come to.
 enum Want {
     /// Not an error, and the check holds on its structured content.

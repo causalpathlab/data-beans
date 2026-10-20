@@ -29,6 +29,7 @@ use legume_mcp::{Call, Content, Handler, ServerInfo, ToolSpec};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 #[derive(Args, Debug)]
 pub struct McpArgs {
@@ -84,7 +85,9 @@ convert and merge. Each writes to `out`, which must not exist yet: no tool \
 replaces a file. Leave `out` out and the output goes in today's results \
 folder, named after its input and the tool. Outputs are .zarr.zip archives \
 unless `out` ends in .zarr (a directory) or .h5. Paths are resolved against \
-the server's working directory; results give the paths written.
+the server's working directory; results give the paths written. On a big \
+store, pass `background` to these (and to qc with `out`): the call returns \
+a job at once, with the paths it will write.
 
 A person may be watching (`data-beans mcp watch`): a \"Note from the user\" \
 in a result is theirs to you; take it into account. A call they stopped \
@@ -135,6 +138,10 @@ fn tools() -> Vec<ToolSpec> {
     let options = json!({
         "type": "array", "items": { "type": "string" },
         "description": "Further command-line options, as `data-beans <command> --help` lists them"
+    });
+    let background = json!({
+        "type": "boolean",
+        "description": "Run in the background: the job's id comes back at once, and job_status / job_wait follow it (for big stores)"
     });
     let limit = json!({ "type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "Entries to return (default 100)" });
     vec![
@@ -200,6 +207,7 @@ fn tools() -> Vec<ToolSpec> {
                     let mut p = qc_properties(&data);
                     p["report"] = json!({ "type": "string", "description": "A .tsv(.gz) for the per-cell metrics and verdicts; must not exist" });
                     p["out"] = json!({ "type": "string", "description": "Output for the kept cells; must not exist. Omit for a dry run" });
+                    p["background"] = background.clone();
                     p
                 },
                 &["data"],
@@ -229,7 +237,7 @@ fn tools() -> Vec<ToolSpec> {
                     "command": { "type": "string", "enum": import_commands() },
                     "input": { "type": "string" },
                     "source": { "type": "string", "description": "Where the input came from (a URL or accession, and its version), kept in the project's data/README.md" },
-                    "out": out, "options": options,
+                    "out": out, "options": options, "background": background,
                 }),
                 &["command", "input"],
             ),
@@ -247,7 +255,7 @@ fn tools() -> Vec<ToolSpec> {
                         { "type": "string" }
                     ] },
                     "prefix_match": { "type": "boolean" },
-                    "out": out, "options": options,
+                    "out": out, "options": options, "background": background,
                 }),
                 &["data", "axis"],
             ),
@@ -263,7 +271,7 @@ fn tools() -> Vec<ToolSpec> {
                     "genes": { "type": "integer", "minimum": 1 },
                     "gene_frac": { "type": "number" },
                     "seed": { "type": "integer", "minimum": 0 },
-                    "out": out,
+                    "out": out, "background": background,
                 }),
                 &["data"],
             ),
@@ -278,7 +286,7 @@ fn tools() -> Vec<ToolSpec> {
                     "folds": { "type": "integer", "minimum": 2 },
                     "seed": { "type": "integer", "minimum": 0 },
                     "out": { "type": "string", "description": "Output prefix; nothing named {out}.train*, {out}.test* or {out}.fold* may exist. Omitted, a new prefix in today's results folder" },
-                    "options": options,
+                    "options": options, "background": background,
                 }),
                 &["data"],
             ),
@@ -286,7 +294,10 @@ fn tools() -> Vec<ToolSpec> {
         ToolSpec::new(
             "convert",
             "Copy a backend into another format: zarr <-> h5, .zarr <-> .zarr.zip; the format follows `out`.",
-            schema(json!({ "data": data, "out": out }), &["data"]),
+            schema(
+                json!({ "data": data, "out": out, "background": background }),
+                &["data"],
+            ),
         ),
         ToolSpec::new(
             "merge",
@@ -295,7 +306,7 @@ fn tools() -> Vec<ToolSpec> {
                 json!({
                     "data": { "type": "array", "items": { "type": "string" }, "minItems": 2 },
                     "common_rows": { "type": "boolean" },
-                    "out": out, "options": options,
+                    "out": out, "options": options, "background": background,
                 }),
                 &["data"],
             ),
@@ -321,7 +332,10 @@ fn written_backend(text: &str) -> Option<String> {
         .ok()?;
     let w = &v["written"];
     let path = w.as_str().or_else(|| w.get(0)?.as_str())?;
-    (strip_backend_suffix(path) != path).then(|| path.to_string())
+    // A job's output is not there until it is done; a .zarr.zip only
+    // appears then, but a .zarr or .h5 is there while it is written.
+    let done = v.get("job").is_none() || Path::new(path).exists();
+    (strip_backend_suffix(path) != path && done).then(|| path.to_string())
 }
 
 pub fn run_mcp(args: &McpArgs) -> Result<()> {
@@ -363,14 +377,21 @@ impl Handler for DataBeans {
                 let mut argv = argv(["subsample", &data]);
                 argv.extend(a.numbers(&["cells", "cell_frac", "genes", "gene_frac", "seed"])?);
                 let what = format!("cells and genes drawn at random from {data}");
-                written(cx, argv, &out, &what, &[data])?
+                written(cx, a.flag("background")?, argv, &out, &what, &[data])?
             }
             "split" => split(&a, cx)?,
             "convert" => {
                 let data = a.path("data")?;
                 let out = a.backend_out(cx, &named(&data, "converted"))?;
                 let what = format!("{data} in another format");
-                written(cx, argv(["convert", &data]), &out, &what, &[data])?
+                written(
+                    cx,
+                    a.flag("background")?,
+                    argv(["convert", &data]),
+                    &out,
+                    &what,
+                    &[data],
+                )?
             }
             "merge" => merge(&a, cx)?,
             _ => anyhow::bail!("no tool {name}"),
@@ -496,7 +517,9 @@ impl Arguments {
     fn backend_out(&self, cx: &Call, name: &str) -> Result<String> {
         self.out_or(cx, (name, ""), |c| {
             backend_target(c).map_or(true, |t| {
-                outputs_beside(strip_backend_suffix(&t.effective)).map_or(true, |v| !v.is_empty())
+                let stem = strip_backend_suffix(&t.effective);
+                being_written(stem).is_some()
+                    || outputs_beside(stem).map_or(true, |v| !v.is_empty())
             })
         })
     }
@@ -581,6 +604,24 @@ fn data_beans_making(
     cx.run_making(command(argv)?, &outputs, what)
 }
 
+/// [`data_beans_making`] as a background job: its id comes back at once,
+/// with `written`, where its output will be once it is done.
+fn data_beans_job(
+    cx: &Call,
+    argv: &[String],
+    outputs: &[impl AsRef<Path>],
+    what: &str,
+    written: Value,
+) -> Result<Map<String, Value>> {
+    let outputs: Vec<PathBuf> = outputs.iter().map(|p| p.as_ref().to_path_buf()).collect();
+    let job = cx.spawn_job(command(argv)?, &outputs, what)?;
+    let mut v = Map::new();
+    v.insert("note".into(), json!(format!("{job} writes `written`")));
+    v.insert("job".into(), json!(job));
+    v.insert("written".into(), written);
+    Ok(v)
+}
+
 /// `{stem}.{tool}`: `data`'s name without its folder and backend suffix,
 /// then the tool, so a chain of unnamed outputs spells its lineage
 /// (`pbmc.imported.qc.subset`). The name an output takes when the agent
@@ -614,17 +655,67 @@ fn fresh(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// The stems being written (all `{stem}.*` is theirs): by a call still
+/// running, or by a background job for as long as the server runs. Until
+/// a command has made its outputs, only this says they are spoken for.
+static WRITING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether two stems name some file alike: one is the other, or a file
+/// named after it.
+fn overlap(a: &str, b: &str) -> bool {
+    let after = |a: &str, b: &str| a.strip_prefix(b).is_some_and(|r| r.starts_with('.'));
+    a == b || after(a, b) || after(b, a)
+}
+
+/// The stem being written that `stem` would touch, if any.
+fn being_written(stem: &str) -> Option<String> {
+    let stem = absolute(stem);
+    let writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    writing.iter().find(|w| overlap(w, &stem)).cloned()
+}
+
+/// `stems` spoken for until the claim drops, or, [`Claim::keep`]ed, for
+/// good; refused when another call or job has one.
+struct Claim(Vec<String>);
+
+impl Claim {
+    fn new(stems: &[&str]) -> Result<Self> {
+        let stems: Vec<String> = stems.iter().map(|s| absolute(s)).collect();
+        let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = writing.iter().find(|w| stems.iter().any(|s| overlap(w, s))) {
+            anyhow::bail!(
+                "{w} is being written by another call or a background job: choose another `out`"
+            );
+        }
+        writing.extend(stems.iter().cloned());
+        Ok(Self(stems))
+    }
+
+    /// For a background job: the server cannot tell when it is done.
+    fn keep(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        writing.retain(|w| !self.0.contains(w));
+    }
+}
+
 /// Run `argv`, a command that writes the backend `out` (made of `what`)
 /// from `inputs`, with `-o`; say where the backend is and how big.
 fn written(
     cx: &Call,
+    background: bool,
     argv: Vec<String>,
     out: &str,
     what: &str,
     inputs: &[String],
 ) -> Result<Value> {
     Ok(Value::Object(
-        written_with(cx, argv, out, what, inputs, &[])?.0,
+        written_with(cx, background, argv, out, what, inputs, &[])?.0,
     ))
 }
 
@@ -636,6 +727,7 @@ fn written(
 /// it wrote come back as `also`.
 fn written_with(
     cx: &Call,
+    background: bool,
     mut argv: Vec<String>,
     out: &str,
     what: &str,
@@ -667,6 +759,12 @@ fn written_with(
     let path: &str = &target.found;
     let mut outputs = vec![path];
     outputs.extend(also);
+    let claim = Claim::new(&[&[stem.as_str()], also].concat())?;
+    if background {
+        let job = data_beans_job(cx, &argv, &outputs, what, json!(absolute(path)))?;
+        claim.keep();
+        return Ok((job, String::new()));
+    }
     let printed = data_beans_making(cx, &argv, &outputs, what)?;
     let written = absolute(path);
     // Nothing was there before, so the rest there now was written too.
@@ -984,12 +1082,17 @@ fn qc(a: &Arguments, cx: &Call) -> Result<Value> {
         argv.push(format!("--qc-report={report}"));
     }
     let what = format!("the cells of {data} that cell QC keeps");
+    anyhow::ensure!(
+        a.given("out").is_some() || !a.flag("background")?,
+        "`background` runs a qc that writes `out`; a dry run answers in the call"
+    );
     // Without `out` a dry run: only the summary, and the report if asked.
     let (mut v, printed) = match (a.given("out"), report) {
         (Some(_), _) => {
             let out = a.path("out")?;
             written_with(
                 cx,
+                a.flag("background")?,
                 argv,
                 &out,
                 &what,
@@ -1070,6 +1173,8 @@ fn import(a: &Arguments, cx: &Call) -> Result<Value> {
         import_commands()
     );
     let input = a.path("input")?;
+    // Its provenance is noted before a background job has read it.
+    anyhow::ensure!(Path::new(&input).exists(), "{input} does not exist");
     // The input's own suffixes (`.mtx.gz`, `.h5ad`) go.
     let file = Path::new(&input).file_name().map(|n| n.to_string_lossy());
     let stem = file
@@ -1080,9 +1185,16 @@ fn import(a: &Arguments, cx: &Call) -> Result<Value> {
     let what = format!("{input} as a backend ({command})");
     let mut argv = argv([&command, &input]);
     argv.extend(a.options()?);
-    let v = written(cx, argv, &out, &what, std::slice::from_ref(&input))?;
+    let v = written(
+        cx,
+        a.flag("background")?,
+        argv,
+        &out,
+        &what,
+        std::slice::from_ref(&input),
+    )?;
     // Where the input came from, in the project's data/README.md, once it
-    // is in.
+    // is in (or, in the background, once its job has started).
     let source = a.str("source").unwrap_or("a local file, source not given");
     cx.provenance(Path::new(&input), source);
     Ok(v)
@@ -1141,7 +1253,9 @@ fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
         given.iter().filter(|&&g| g).count() == 1,
         "give one of `names`, `pattern` or `indices`"
     );
-    // The names go to the command in a file, kept until it has run.
+    let background = a.flag("background")?;
+    // The names go to the command in a file, kept until it has run; a
+    // job's is left in the temp folder, as the job reads it later.
     let file;
     let what = if let Some(p) = a.str("pattern") {
         // `--flag=value`, so a pattern cannot read as an option.
@@ -1156,13 +1270,16 @@ fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
         // Through the call, so the session script carries the names too.
         cx.write_file(file.path(), &(names.join("\n") + "\n"))?;
         argv.extend(["-f".into(), file.path().to_string_lossy().into_owned()]);
+        if background {
+            file.keep()?;
+        }
         if !a.flag("prefix_match")? {
             argv.push("--exact-names".into());
         }
         format!("{} named {side} of {data}", names.len())
     };
     argv.extend(a.options()?);
-    written(cx, argv, &out, &what, &[data])
+    written(cx, background, argv, &out, &what, &[data])
 }
 
 fn merge(a: &Arguments, cx: &Call) -> Result<Value> {
@@ -1178,7 +1295,16 @@ fn merge(a: &Arguments, cx: &Call) -> Result<Value> {
         argv.push("--common-rows".into());
     }
     argv.extend(a.options()?);
-    let mut v = written_with(cx, argv, &out, &what, &data, &[&batches])?.0;
+    let mut v = written_with(
+        cx,
+        a.flag("background")?,
+        argv,
+        &out,
+        &what,
+        &data,
+        &[&batches],
+    )?
+    .0;
     v.insert("batches".into(), json!(absolute(&batches)));
     Ok(Value::Object(v))
 }
@@ -1217,7 +1343,7 @@ fn outputs_beside(stem: &str) -> Result<Vec<String>> {
 fn split(a: &Arguments, cx: &Call) -> Result<Value> {
     let data = a.path("data")?;
     let prefix = a.out_or(cx, (&named(&data, "split"), ""), |c| {
-        outputs_beside(c).map_or(true, |v| !v.is_empty())
+        being_written(c).is_some() || outputs_beside(c).map_or(true, |v| !v.is_empty())
     })?;
     let before = outputs_beside(&prefix)?;
     anyhow::ensure!(
@@ -1238,12 +1364,15 @@ fn split(a: &Arguments, cx: &Call) -> Result<Value> {
     let mut argv = argv(["split", &data, "-o", &prefix]);
     argv.extend(a.numbers(&["test_frac", "folds", "seed"])?);
     argv.extend(a.options()?);
-    data_beans_making(
-        cx,
-        &argv,
-        &halves,
-        &format!("cells of {data} split for testing"),
-    )?;
+    let what = format!("cells of {data} split for testing");
+    let claim = Claim::new(&[&prefix])?;
+    if a.flag("background")? {
+        let written: Vec<String> = halves.iter().map(|h| absolute(h)).collect();
+        let job = data_beans_job(cx, &argv, &halves, &what, json!(written))?;
+        claim.keep();
+        return Ok(Value::Object(job));
+    }
+    data_beans_making(cx, &argv, &halves, &what)?;
     // Nothing was there before, so all there is now was written.
     Ok(json!({ "written": outputs_beside(&prefix)? }))
 }
@@ -1275,6 +1404,8 @@ mod tests {
             written_backend(halves).as_deref(),
             Some("/p/cv.test.zarr.zip")
         );
+        let job = r#"{ "job": "job-1", "written": "/p/results/x.subset.zarr.zip" }"#;
+        assert_eq!(written_backend(job), None);
         // A note the person left follows the result.
         let noted = format!("{one}\nNote from the user: use exact names");
         assert_eq!(
