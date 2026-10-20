@@ -20,8 +20,9 @@ struct Client {
 }
 
 impl Client {
+    /// A server keeping no watch folder (none in the real runtime dir).
     fn start(dir: &Path) -> Self {
-        Self::start_with(dir, &[])
+        Self::start_with(dir, &[("LEGUME_MCP_WATCH", Path::new("off"))])
     }
 
     fn start_with(dir: &Path, env: &[(&str, &Path)]) -> Self {
@@ -441,6 +442,23 @@ fn every_tool_answers_or_refuses_as_it_should() {
             "subset",
             json!({ "data": "base.zarr.zip", "axis": "rows", "pattern": "^nope$", "out": "none" }),
             Refused("no rows match"),
+        ),
+        // An index list keeps its order; an empty names list is no choice.
+        (
+            "subset",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "indices": [3, 1, 2], "names": [], "out": "in_order" }),
+            Ok(|v| v["info"]["rows"] == 3),
+        ),
+        // A selection that fails copies nothing beside `out`.
+        (
+            "subset",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "indices": "0-5,0-5", "out": "repeats" }),
+            Refused("repeats an index"),
+        ),
+        (
+            "subset",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "indices": "0-2", "out": "repeats" }),
+            Ok(|v| v["info"]["rows"] == 3),
         ),
         // A selection flag of its own: the command refuses a second one.
         (

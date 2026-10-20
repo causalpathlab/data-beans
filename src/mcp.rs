@@ -21,12 +21,11 @@ use crate::handlers::merging::{batch_file, same_file};
 use crate::hdf5_io::strip_backend_suffix;
 use crate::sparse_io::SparseIoBackend;
 use crate::utilities::io_helpers::{index_count, parse_index_spec};
-use crate::utilities::name_matching::match_by_substring;
+use crate::utilities::name_matching::{match_by_substring, names_matching};
 use crate::zarr_io::{output_target, OutputTarget};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use legume_mcp::{Call, Content, Handler, ServerInfo, ToolSpec};
-use regex::RegexBuilder;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,11 +42,9 @@ pub enum McpCommand {
     /// they come, each one's log and result, the notebook; s stops the
     /// selected call, n leaves the agent a note, o opens what a call wrote
     /// in the statistics explorer
-    #[cfg(feature = "tui")]
     Watch(WatchArgs),
 }
 
-#[cfg(feature = "tui")]
 #[derive(Args, Debug)]
 pub struct WatchArgs {
     /// the server's watch folder (as `ls $XDG_RUNTIME_DIR/legume-mcp`
@@ -307,7 +304,6 @@ fn tools() -> Vec<ToolSpec> {
 }
 
 /// What o opens on a call: a backend it wrote, in the statistics explorer.
-#[cfg(feature = "tui")]
 fn open(call: &legume_mcp::watch::view::CallView) -> Option<Command> {
     let written = written_backend(&call.text)?;
     let mut cmd = Command::new(own_exe().ok()?);
@@ -317,16 +313,18 @@ fn open(call: &legume_mcp::watch::view::CallView) -> Option<Command> {
 
 /// The backend a result says it wrote (`written`, or the first of a list),
 /// when it is one. The feed cuts a result at 4 KB: past that, nothing opens.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 fn written_backend(text: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(text).ok()?;
+    // The first value: a note the person left may follow it.
+    let v: Value = serde_json::Deserializer::from_str(text)
+        .into_iter()
+        .next()?
+        .ok()?;
     let w = &v["written"];
     let path = w.as_str().or_else(|| w.get(0)?.as_str())?;
     (strip_backend_suffix(path) != path).then(|| path.to_string())
 }
 
 pub fn run_mcp(args: &McpArgs) -> Result<()> {
-    #[cfg(feature = "tui")]
     if let Some(McpCommand::Watch(w)) = &args.then {
         let tool = &crate::interactive::TOOL;
         return legume_mcp::watch::view::run(tool, w.server.clone(), !w.watch_only, open);
@@ -400,6 +398,11 @@ impl Arguments {
     fn path(&self, key: &str) -> Result<String> {
         let p = self.req(key)?;
         anyhow::ensure!(!p.starts_with('-'), "`{key}` {p}: write it as ./{p}");
+        // Commands that take several split them at commas.
+        anyhow::ensure!(
+            !p.contains(','),
+            "`{key}` {p}: a path with a comma; rename it"
+        );
         Ok(p)
     }
 
@@ -747,17 +750,21 @@ fn names_command(rows: bool) -> &'static str {
 
 fn names(a: &Arguments, cx: &Call) -> Result<Value> {
     let text = data_beans(cx, &argv([names_command(a.rows()?), &a.path("data")?]))?;
-    let pattern = a
-        .str("pattern")
-        .map(|p| RegexBuilder::new(p).case_insensitive(true).build())
-        .transpose()
-        .context("reading `pattern`")?;
+    let lines: Vec<&str> = text.lines().collect();
+    // Which names the pattern finds, as `subset --pattern` would.
+    let found: Option<std::collections::HashSet<usize>> = match a.str("pattern") {
+        Some(p) => {
+            let names: Vec<Box<str>> = lines.iter().map(|&n| n.into()).collect();
+            Some(names_matching(&names, p)?.into_iter().collect())
+        }
+        None => None,
+    };
     let offset: usize = a.parse("offset")?.unwrap_or(0);
     let limit = a.limit()?;
     let (mut total, mut matched, mut page) = (0, 0, vec![]);
-    for (i, n) in text.lines().enumerate() {
+    for (i, n) in lines.iter().enumerate() {
         total += 1;
-        if pattern.as_ref().is_none_or(|re| re.is_match(n)) {
+        if found.as_ref().is_none_or(|f| f.contains(&i)) {
             if (offset..offset.saturating_add(limit)).contains(&matched) {
                 page.push(json!({ "index": i, "name": n }));
             }
@@ -1081,15 +1088,14 @@ fn import(a: &Arguments, cx: &Call) -> Result<Value> {
     Ok(v)
 }
 
-/// `indices` as the CLI takes them: ranges (`0-9,20`) as given, a list
-/// folded into ranges.
+/// `indices` as the CLI takes them: text (`0-9,20`) as given, a list with
+/// its ascending runs folded into ranges.
 fn index_spec(v: &Value) -> Result<String> {
     if let Value::String(spec) = v {
         return Ok(spec.clone());
     }
-    let mut ix: Vec<usize> = serde_json::from_value(v.clone()).context("reading `indices`")?;
-    ix.sort_unstable();
-    ix.dedup();
+    let ix: Vec<usize> = serde_json::from_value(v.clone()).context("reading `indices`")?;
+    // Runs folded as they come: the order asked for is the order written.
     let mut runs: Vec<(usize, usize)> = vec![];
     for i in ix {
         match runs.last_mut() {
@@ -1120,7 +1126,17 @@ fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
     let data = a.path("data")?;
     let out = a.backend_out(cx, &named(&data, "subset"))?;
     let mut argv = argv([command, &data]);
-    let given = ["names", "pattern", "indices"].map(|k| a.given(k).is_some());
+    // An empty list of names is no choice.
+    let names = a.strings("names")?;
+    anyhow::ensure!(
+        a.given("pattern").is_none_or(Value::is_string),
+        "`pattern` is a regex, as text"
+    );
+    let given = [
+        !names.is_empty(),
+        a.given("pattern").is_some(),
+        a.given("indices").is_some(),
+    ];
     anyhow::ensure!(
         given.iter().filter(|&&g| g).count() == 1,
         "give one of `names`, `pattern` or `indices`"
@@ -1134,10 +1150,8 @@ fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
     } else if let Some(v) = a.given("indices") {
         let spec = index_spec(v)?;
         argv.push(format!("--{}-indices={spec}", &side[..side.len() - 1]));
-        format!("{side} {spec} of {data}")
+        format!("{} {side} of {data}", index_count(&spec)?)
     } else {
-        let names = a.strings("names")?;
-        anyhow::ensure!(!names.is_empty(), "`names` names none");
         file = tempfile::NamedTempFile::new()?;
         // Through the call, so the session script carries the names too.
         cx.write_file(file.path(), &(names.join("\n") + "\n"))?;
@@ -1249,6 +1263,12 @@ mod tests {
         assert_eq!(
             written_backend(halves).as_deref(),
             Some("/p/cv.test.zarr.zip")
+        );
+        // A note the person left follows the result.
+        let noted = format!("{one}\nNote from the user: use exact names");
+        assert_eq!(
+            written_backend(&noted).as_deref(),
+            Some("/p/results/x.subset.zarr.zip")
         );
         // A figure, a table, a read: nothing to open in the explorer.
         assert_eq!(written_backend(r#"{ "written": "/p/qc.png" }"#), None);

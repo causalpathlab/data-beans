@@ -113,19 +113,29 @@ pub fn index_count(spec: &str) -> anyhow::Result<usize> {
     Ok(index_ranges(spec)?
         .iter()
         // b >= a; a range to usize::MAX would wrap `b - a + 1` to 0.
-        .fold(0usize, |n, (a, b)| n.saturating_add((b - a).saturating_add(1))))
+        .fold(0usize, |n, (a, b)| {
+            n.saturating_add((b - a).saturating_add(1))
+        }))
 }
 
 /// [`parse_index_spec`] on a side of `n` entries: ranges end at its end and
-/// indices past it are dropped, so no spec lists more than `n`.
+/// indices past it are dropped. More than `n` left means one repeats, which
+/// is refused before anything is listed.
 pub fn parse_index_spec_within(spec: &str, n: usize) -> anyhow::Result<Vec<usize>> {
-    let out: Vec<usize> = index_ranges(spec)?
+    let ranges: Vec<(usize, usize)> = index_ranges(spec)?
         .into_iter()
         .filter(|&(a, _)| a < n)
-        .flat_map(|(a, b)| a..=b.min(n - 1))
+        .map(|(a, b)| (a, b.min(n - 1)))
         .collect();
-    anyhow::ensure!(!out.is_empty(), "no index in `{spec}` is below {n}");
-    Ok(out)
+    let count = ranges
+        .iter()
+        .fold(0usize, |c, (a, b)| c.saturating_add(b - a + 1));
+    anyhow::ensure!(count > 0, "no index in `{spec}` is below {n}");
+    anyhow::ensure!(
+        count <= n,
+        "`{spec}` repeats an index: it names {count} of {n}"
+    );
+    Ok(ranges.into_iter().flat_map(|(a, b)| a..=b).collect())
 }
 
 // Re-export constants for convenience
@@ -185,6 +195,8 @@ mod index_spec_tests {
             [0, 1, 2, 3, 4]
         );
         assert_eq!(parse_index_spec_within("3,7,1-2", 5).unwrap(), [3, 1, 2]);
+        // Repeats are refused before they are listed.
+        assert!(parse_index_spec_within(&"0-4,".repeat(1000), 5).is_err());
         assert!(parse_index_spec_within("9-12", 5).is_err());
         assert!(index_count("5-2").is_err());
     }

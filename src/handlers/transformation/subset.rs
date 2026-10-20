@@ -98,7 +98,13 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
             Some(picked) => Some(picked),
             None => return Ok(()),
         },
-        None => None,
+        // By index or pattern: resolved on the input before staging, so a
+        // selection that fails copies nothing.
+        None => early_columns(
+            args.column_indices.as_deref(),
+            args.pattern.as_deref(),
+            &args.data_file,
+        )?,
     };
 
     // Written off the screen: a `kill` meanwhile lets it finish.
@@ -118,16 +124,6 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
 
         let selected_columns = if let Some(idx) = columns_indices {
             info!("using {} column indices directly", idx.len());
-            idx
-        } else if let Some(spec) = &args.column_indices {
-            let idx = parse_index_spec_within(spec, original_ncol)?;
-            info!("using {} column indices", idx.len());
-            idx
-        } else if let Some(pattern) = &args.pattern {
-            let names = data.column_names()?;
-            let idx = names_matching(&names, pattern)?;
-            anyhow::ensure!(!idx.is_empty(), "no columns match `{pattern}`");
-            info!("`{pattern}` finds {} columns", idx.len());
             idx
         } else if let Some(column_file) = column_name_file {
             let col_names = read_col_names(column_file, MAX_COLUMN_NAME_IDX)?;
@@ -223,7 +219,13 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
             Some(picked) => Some(picked),
             None => return Ok(()),
         },
-        None => None,
+        // By index or pattern: resolved on the input before staging, so a
+        // selection that fails copies nothing.
+        None => early_rows(
+            args.row_indices.as_deref(),
+            args.pattern.as_deref(),
+            &args.data_file,
+        )?,
     };
 
     // Written off the screen: a `kill` meanwhile lets it finish.
@@ -243,16 +245,6 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
 
         let selected_rows = if let Some(idx) = row_indices {
             info!("using {} row indices directly", idx.len());
-            idx
-        } else if let Some(spec) = &args.row_indices {
-            let idx = parse_index_spec_within(spec, original_nrow)?;
-            info!("using {} row indices", idx.len());
-            idx
-        } else if let Some(pattern) = &args.pattern {
-            let names = data.row_names()?;
-            let idx = names_matching(&names, pattern)?;
-            anyhow::ensure!(!idx.is_empty(), "no rows match `{pattern}`");
-            info!("`{pattern}` finds {} rows", idx.len());
             idx
         } else if let Some(row_file) = row_name_file {
             let row_names = read_row_names(row_file, MAX_ROW_NAME_IDX)?;
@@ -385,3 +377,52 @@ pub fn reorder_rows(args: &ReorderRowsArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 #[path = "subset/tests.rs"]
 mod tests;
+
+/// The columns `-i` or `--pattern` selects in `data_file`, read without
+/// staging anything; none when neither is given.
+fn early_columns(
+    spec: Option<&str>,
+    pattern: Option<&str>,
+    data_file: &str,
+) -> anyhow::Result<Option<Vec<usize>>> {
+    early(spec, pattern, data_file, Side::Columns)
+}
+
+/// [`early_columns`] for rows.
+fn early_rows(
+    spec: Option<&str>,
+    pattern: Option<&str>,
+    data_file: &str,
+) -> anyhow::Result<Option<Vec<usize>>> {
+    early(spec, pattern, data_file, Side::Rows)
+}
+
+fn early(
+    spec: Option<&str>,
+    pattern: Option<&str>,
+    data_file: &str,
+    side: Side,
+) -> anyhow::Result<Option<Vec<usize>>> {
+    if spec.is_none() && pattern.is_none() {
+        return Ok(None);
+    }
+    let data = open_sparse_matrix_by_path(data_file)?;
+    let (what, n) = match side {
+        Side::Columns => ("columns", data.num_columns().unwrap_or(0)),
+        Side::Rows => ("rows", data.num_rows().unwrap_or(0)),
+    };
+    let idx = if let Some(spec) = spec {
+        parse_index_spec_within(spec, n)?
+    } else {
+        let pattern = pattern.unwrap_or_default();
+        let names = match side {
+            Side::Columns => data.column_names()?,
+            Side::Rows => data.row_names()?,
+        };
+        let idx = names_matching(&names, pattern)?;
+        anyhow::ensure!(!idx.is_empty(), "no {what} match `{pattern}`");
+        idx
+    };
+    info!("selected {} {what}", idx.len());
+    Ok(Some(idx))
+}
