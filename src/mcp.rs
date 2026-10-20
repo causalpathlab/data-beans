@@ -570,6 +570,9 @@ fn command(argv: &[String]) -> Result<Command> {
     let mut cmd = Command::new(own_exe()?);
     // `-v` so its log lines come back as progress.
     cmd.arg("-v").args(argv);
+    // No backtrace after an error: a failure quotes the last lines of the
+    // child's stderr, and one would push the error itself out of them.
+    cmd.env("RUST_BACKTRACE", "0").env("RUST_LIB_BACKTRACE", "0");
     Ok(cmd)
 }
 
