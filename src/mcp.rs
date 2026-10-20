@@ -1252,6 +1252,17 @@ fn split(a: &Arguments, cx: &Call) -> Result<Value> {
 mod tests {
     use super::written_backend;
 
+    /// The README gives the instructions for clients that do not pass them
+    /// on: they must be the server's, word for word.
+    #[test]
+    fn the_readme_says_what_the_server_tells_the_agent() {
+        let readme = include_str!("../README.md");
+        assert!(
+            readme.contains(super::INSTRUCTIONS),
+            "README.md's \"What the agent is told\" block differs from mcp.rs INSTRUCTIONS"
+        );
+    }
+
     #[test]
     fn a_result_opens_the_backend_it_wrote() {
         let one = r#"{ "written": "/p/results/x.subset.zarr.zip", "info": {} }"#;
