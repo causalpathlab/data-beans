@@ -20,7 +20,7 @@
 use crate::handlers::merging::{batch_file, same_file};
 use crate::hdf5_io::strip_backend_suffix;
 use crate::sparse_io::SparseIoBackend;
-use crate::utilities::io_helpers::parse_index_spec;
+use crate::utilities::io_helpers::{index_count, parse_index_spec};
 use crate::utilities::name_matching::match_by_substring;
 use crate::zarr_io::{output_target, OutputTarget};
 use anyhow::{Context, Result};
@@ -310,22 +310,19 @@ fn tools() -> Vec<ToolSpec> {
 #[cfg(feature = "tui")]
 fn open(call: &legume_mcp::watch::view::CallView) -> Option<Command> {
     let written = written_backend(&call.text)?;
-    let mut cmd = Command::new(std::env::current_exe().ok()?);
+    let mut cmd = Command::new(own_exe().ok()?);
     cmd.args(["statistics", &written, "-s", "column", "--interactive"]);
     Some(cmd)
 }
 
 /// The backend a result says it wrote (`written`, or the first of a list),
-/// when it is one.
+/// when it is one. The feed cuts a result at 4 KB: past that, nothing opens.
 #[cfg_attr(not(feature = "tui"), allow(dead_code))]
 fn written_backend(text: &str) -> Option<String> {
     let v: Value = serde_json::from_str(text).ok()?;
     let w = &v["written"];
     let path = w.as_str().or_else(|| w.get(0)?.as_str())?;
-    [".zarr.zip", ".zarr", ".h5"]
-        .iter()
-        .any(|s| path.ends_with(s))
-        .then(|| path.to_string())
+    (strip_backend_suffix(path) != path).then(|| path.to_string())
 }
 
 pub fn run_mcp(args: &McpArgs) -> Result<()> {
@@ -505,12 +502,6 @@ impl Arguments {
     /// format or open a view. Short options stand alone (`-r X`, not
     /// `-rX`), so none hides inside a cluster.
     fn options(&self) -> Result<Vec<String>> {
-        self.options_but(&[])
-    }
-
-    /// [`Self::options`], refusing `set` too: the flags the tool sets itself
-    /// from its own arguments (a second one would win over the tool's).
-    fn options_but(&self, set: &[&str]) -> Result<Vec<String>> {
         let v = self.strings("options")?;
         const TAKEN: &[&str] = &[
             "-o",
@@ -538,10 +529,6 @@ impl Arguments {
                 !TAKEN.contains(&name),
                 "{o} is not taken in `options`: outputs go to `out`, their format follows it, and no view opens here"
             );
-            anyhow::ensure!(
-                !set.contains(&name),
-                "{o} is not taken in `options`: the tool's own arguments say that"
-            );
         }
         Ok(v)
     }
@@ -554,16 +541,22 @@ fn argv<const N: usize>(words: [&str; N]) -> Vec<String> {
 /// `data-beans` itself, with `argv`. A binary replaced under the running
 /// server (`cargo install`) is run as the process's own image.
 fn command(argv: &[String]) -> Result<Command> {
-    let exe = std::env::current_exe().context("finding the data-beans binary")?;
-    let own = Path::new("/proc/self/exe");
-    let mut cmd = Command::new(if !exe.exists() && own.exists() {
-        own
-    } else {
-        &exe
-    });
+    let mut cmd = Command::new(own_exe()?);
     // `-v` so its log lines come back as progress.
     cmd.arg("-v").args(argv);
     Ok(cmd)
+}
+
+/// The data-beans binary this is: the process's own image when the file was
+/// replaced under it (`cargo install`).
+fn own_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("finding the data-beans binary")?;
+    let own = Path::new("/proc/self/exe");
+    Ok(if !exe.exists() && own.exists() {
+        own.to_path_buf()
+    } else {
+        exe
+    })
 }
 
 /// `data-beans` run with `argv`, a step that writes nothing, to its end;
@@ -1010,22 +1003,6 @@ fn qc(a: &Arguments, cx: &Call) -> Result<Value> {
     Ok(Value::Object(v))
 }
 
-/// How many indices an index spec (`0-9,20`) names, without listing them.
-fn index_count(spec: &str) -> Result<usize> {
-    let mut n = 0usize;
-    for token in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-        let width = match token.split_once('-') {
-            Some((lo, hi)) => {
-                let (lo, hi): (usize, usize) = (lo.trim().parse()?, hi.trim().parse()?);
-                hi.checked_sub(lo).map_or(0, |d| d.saturating_add(1))
-            }
-            None => 1,
-        };
-        n = n.saturating_add(width);
-    }
-    Ok(n)
-}
-
 #[cfg(feature = "plot")]
 fn plot(a: &Arguments, cx: &Call) -> Result<Vec<Content>> {
     let data = a.path("data")?;
@@ -1104,8 +1081,34 @@ fn import(a: &Arguments, cx: &Call) -> Result<Value> {
     Ok(v)
 }
 
-/// The most indices a selection may name.
-const MAX_SELECTED: usize = 10_000_000;
+/// `indices` as the CLI takes them: ranges (`0-9,20`) as given, a list
+/// folded into ranges.
+fn index_spec(v: &Value) -> Result<String> {
+    if let Value::String(spec) = v {
+        return Ok(spec.clone());
+    }
+    let mut ix: Vec<usize> = serde_json::from_value(v.clone()).context("reading `indices`")?;
+    ix.sort_unstable();
+    ix.dedup();
+    let mut runs: Vec<(usize, usize)> = vec![];
+    for i in ix {
+        match runs.last_mut() {
+            Some((_, end)) if *end + 1 == i => *end = i,
+            _ => runs.push((i, i)),
+        }
+    }
+    let spec: Vec<String> = runs
+        .iter()
+        .map(|&(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}-{b}")
+            }
+        })
+        .collect();
+    Ok(spec.join(","))
+}
 
 fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
     let rows = a.rows()?;
@@ -1122,60 +1125,30 @@ fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
         given.iter().filter(|&&g| g).count() == 1,
         "give one of `names`, `pattern` or `indices`"
     );
-    let mut exact = !a.flag("prefix_match")?;
-    // Names go to the command in a file, kept until it has run.
+    // The names go to the command in a file, kept until it has run.
     let file;
-    let mut names = a.strings("names")?;
-    if let Some(p) = a.str("pattern") {
-        let re = RegexBuilder::new(p)
-            .case_insensitive(true)
-            .build()
-            .context("reading `pattern`")?;
-        let all = data_beans(cx, &[names_command(rows).into(), data.clone()])?;
-        names = all
-            .lines()
-            .filter(|n| re.is_match(n))
-            .map(String::from)
-            .collect();
-        anyhow::ensure!(!names.is_empty(), "no {side} match `{p}`");
-        exact = true; // the names matched are the names meant
-    }
-    let n = if !names.is_empty() {
+    let what = if let Some(p) = a.str("pattern") {
+        // `--flag=value`, so a pattern cannot read as an option.
+        argv.push(format!("--pattern={p}"));
+        format!("the {side} of {data} matching {p}")
+    } else if let Some(v) = a.given("indices") {
+        let spec = index_spec(v)?;
+        argv.push(format!("--{}-indices={spec}", &side[..side.len() - 1]));
+        format!("{side} {spec} of {data}")
+    } else {
+        let names = a.strings("names")?;
+        anyhow::ensure!(!names.is_empty(), "`names` names none");
         file = tempfile::NamedTempFile::new()?;
         // Through the call, so the session script carries the names too.
         cx.write_file(file.path(), &(names.join("\n") + "\n"))?;
         argv.extend(["-f".into(), file.path().to_string_lossy().into_owned()]);
-        names.len()
-    } else {
-        let indices: Vec<usize> = match a.given("indices") {
-            Some(Value::String(spec)) => {
-                let count = index_count(spec)?;
-                anyhow::ensure!(
-                    count <= MAX_SELECTED,
-                    "{count} indices; at most {MAX_SELECTED}"
-                );
-                parse_index_spec(spec)?
-            }
-            _ => a.parse("indices")?.unwrap_or_default(),
-        };
-        anyhow::ensure!(!indices.is_empty(), "`indices` names none");
-        let i: Vec<String> = indices.iter().map(usize::to_string).collect();
-        argv.extend(["-i".into(), i.join(",")]);
-        indices.len()
+        if !a.flag("prefix_match")? {
+            argv.push("--exact-names".into());
+        }
+        format!("{} named {side} of {data}", names.len())
     };
-    if exact {
-        argv.push("--exact-names".into());
-    }
-    argv.extend(a.options_but(&[
-        "-i",
-        "-f",
-        "--row-indices",
-        "--column-indices",
-        "--name-file",
-        "--exact-names",
-        "--allow-prefix",
-    ])?);
-    written(cx, argv, &out, &format!("{n} {side} of {data}"), &[data])
+    argv.extend(a.options()?);
+    written(cx, argv, &out, &what, &[data])
 }
 
 fn merge(a: &Arguments, cx: &Call) -> Result<Value> {

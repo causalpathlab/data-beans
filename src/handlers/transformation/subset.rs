@@ -6,8 +6,9 @@ use crate::interactive::stat_tui::Side;
 use crate::interactive::ui::Tui;
 use crate::sparse_io::*;
 use crate::utilities::io_helpers::{
-    read_col_names, read_row_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
+    parse_index_spec_within, read_col_names, read_row_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
 };
+use crate::utilities::name_matching::names_matching;
 use crate::zarr_io::{apply_zip_flag, finalize_zarr_output, materialize_writable_backend};
 
 use legume_numeric::matrix::common_io::*;
@@ -97,7 +98,7 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
             Some(picked) => Some(picked),
             None => return Ok(()),
         },
-        None => args.column_indices.clone(),
+        None => None,
     };
 
     // Written off the screen: a `kill` meanwhile lets it finish.
@@ -117,6 +118,16 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
 
         let selected_columns = if let Some(idx) = columns_indices {
             info!("using {} column indices directly", idx.len());
+            idx
+        } else if let Some(spec) = &args.column_indices {
+            let idx = parse_index_spec_within(spec, original_ncol)?;
+            info!("using {} column indices", idx.len());
+            idx
+        } else if let Some(pattern) = &args.pattern {
+            let names = data.column_names()?;
+            let idx = names_matching(&names, pattern)?;
+            anyhow::ensure!(!idx.is_empty(), "no columns match `{pattern}`");
+            info!("`{pattern}` finds {} columns", idx.len());
             idx
         } else if let Some(column_file) = column_name_file {
             let col_names = read_col_names(column_file, MAX_COLUMN_NAME_IDX)?;
@@ -169,7 +180,7 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
             idx
         } else {
             return Err(anyhow::anyhow!(
-                "either `column-indices`, `name-file`, or `--interactive` must be provided"
+                "either `column-indices`, `name-file`, `pattern`, or `--interactive` must be provided"
             ));
         };
 
@@ -212,7 +223,7 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
             Some(picked) => Some(picked),
             None => return Ok(()),
         },
-        None => args.row_indices.clone(),
+        None => None,
     };
 
     // Written off the screen: a `kill` meanwhile lets it finish.
@@ -232,6 +243,16 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
 
         let selected_rows = if let Some(idx) = row_indices {
             info!("using {} row indices directly", idx.len());
+            idx
+        } else if let Some(spec) = &args.row_indices {
+            let idx = parse_index_spec_within(spec, original_nrow)?;
+            info!("using {} row indices", idx.len());
+            idx
+        } else if let Some(pattern) = &args.pattern {
+            let names = data.row_names()?;
+            let idx = names_matching(&names, pattern)?;
+            anyhow::ensure!(!idx.is_empty(), "no rows match `{pattern}`");
+            info!("`{pattern}` finds {} rows", idx.len());
             idx
         } else if let Some(row_file) = row_name_file {
             let row_names = read_row_names(row_file, MAX_ROW_NAME_IDX)?;
@@ -280,7 +301,7 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
             idx
         } else {
             return Err(anyhow::anyhow!(
-                "either `row-indices`, `name-file`, or `--interactive` must be provided"
+                "either `row-indices`, `name-file`, `pattern`, or `--interactive` must be provided"
             ));
         };
 

@@ -575,3 +575,17 @@ pub fn match_by_substring(
 
 #[cfg(test)]
 mod tests;
+
+/// The places of the names `pattern` (a regex, matched case-insensitively)
+/// finds in, in order.
+pub fn names_matching(names: &[Box<str>], pattern: &str) -> anyhow::Result<Vec<usize>> {
+    let re = regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .map_err(|e| anyhow::anyhow!("invalid pattern `{pattern}`: {e}"))?;
+    Ok(names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| re.is_match(n).then_some(i))
+        .collect())
+}

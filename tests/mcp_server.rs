@@ -442,11 +442,11 @@ fn every_tool_answers_or_refuses_as_it_should() {
             json!({ "data": "base.zarr.zip", "axis": "rows", "pattern": "^nope$", "out": "none" }),
             Refused("no rows match"),
         ),
-        // A selection flag of its own would win over the tool's.
+        // A selection flag of its own: the command refuses a second one.
         (
             "subset",
             json!({ "data": "base.zarr.zip", "axis": "rows", "indices": [0], "out": "x1", "options": ["-i", "1,2"] }),
-            Refused("the tool's own arguments"),
+            Refused("cannot be used multiple times"),
         ),
         // An output that is the input itself.
         (

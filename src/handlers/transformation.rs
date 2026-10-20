@@ -49,13 +49,19 @@ pub struct SubsetColumnsArgs {
     /// data file -- either `.zarr` or `.h5`
     pub data_file: Box<str>,
 
-    /// column indices to take: e.g., `0,1,2,3`
-    #[arg(short = 'i', long, value_delimiter = ',')]
-    pub column_indices: Option<Vec<usize>>,
+    /// column indices to take: singles and inclusive ranges, e.g. `0,1,2,3`,
+    /// `1-10`, or `1-20,50-55` (past the last column, cut)
+    #[arg(short = 'i', long, conflicts_with_all = ["name_file", "pattern", "interactive"])]
+    pub column_indices: Option<Box<str>>,
 
     /// column name file where each line is a column name
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, conflicts_with_all = ["pattern", "interactive"])]
     pub name_file: Option<Box<str>>,
+
+    /// the columns whose names this regex finds (case-insensitive), e.g.
+    /// `/count/spliced$` or `^MT-`
+    #[arg(long, conflicts_with = "interactive")]
+    pub pattern: Option<Box<str>>,
 
     /// pick the columns in a full-screen table: mark with Space, Enter to finish
     #[arg(short = 'I', long, default_value_t = false)]
@@ -114,13 +120,19 @@ pub struct SubsetRowsArgs {
     /// data file -- either `.zarr` or `.h5`
     pub data_file: Box<str>,
 
-    /// row indices to take: e.g., `0,1,2,3`
-    #[arg(short = 'i', long, value_delimiter = ',')]
-    pub row_indices: Option<Vec<usize>>,
+    /// row indices to take: singles and inclusive ranges, e.g. `0,1,2,3`,
+    /// `1-10`, or `1-20,50-55` (past the last row, cut)
+    #[arg(short = 'i', long, conflicts_with_all = ["name_file", "pattern", "interactive"])]
+    pub row_indices: Option<Box<str>>,
 
     /// row name file where each line is a row name
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, conflicts_with_all = ["pattern", "interactive"])]
     pub name_file: Option<Box<str>>,
+
+    /// the rows whose names this regex finds (case-insensitive), e.g.
+    /// `/count/spliced$` or `^MT-`
+    #[arg(long, conflicts_with = "interactive")]
+    pub pattern: Option<Box<str>>,
 
     /// pick the rows in a full-screen table: mark with Space, Enter to finish
     #[arg(short = 'I', long, default_value_t = false)]

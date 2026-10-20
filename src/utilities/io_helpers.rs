@@ -62,6 +62,19 @@ pub fn read_col_names(
 /// `0,2,5`, `1-10`, or `1-20,50-55`. Whitespace around tokens is ignored.
 /// Ranges are inclusive on both ends (`1-10` -> 1,2,...,10).
 pub fn parse_index_spec(spec: &str) -> anyhow::Result<Vec<usize>> {
+    let out: Vec<usize> = index_ranges(spec)?
+        .into_iter()
+        .flat_map(|(a, b)| a..=b)
+        .collect();
+    if out.is_empty() {
+        anyhow::bail!("no valid indices parsed from `{}`", spec);
+    }
+    Ok(out)
+}
+
+/// The inclusive ranges an index spec names, as [`parse_index_spec`] reads
+/// it, without listing their indices.
+pub fn index_ranges(spec: &str) -> anyhow::Result<Vec<(usize, usize)>> {
     let mut out = Vec::new();
     for token in spec.split(',') {
         let token = token.trim();
@@ -81,19 +94,36 @@ pub fn parse_index_spec(spec: &str) -> anyhow::Result<Vec<usize>> {
                 if start > end {
                     anyhow::bail!("range start {} exceeds end {} in `{}`", start, end, token);
                 }
-                out.extend(start..=end);
+                out.push((start, end));
             }
             None => {
                 let idx: usize = token
                     .parse()
                     .map_err(|_| anyhow::anyhow!("invalid index `{}`", token))?;
-                out.push(idx);
+                out.push((idx, idx));
             }
         }
     }
-    if out.is_empty() {
-        anyhow::bail!("no valid indices parsed from `{}`", spec);
-    }
+    Ok(out)
+}
+
+/// How many indices a spec names, without listing them: a range can be any
+/// size.
+pub fn index_count(spec: &str) -> anyhow::Result<usize> {
+    Ok(index_ranges(spec)?
+        .iter()
+        .fold(0usize, |n, (a, b)| n.saturating_add(b - a + 1)))
+}
+
+/// [`parse_index_spec`] on a side of `n` entries: ranges end at its end and
+/// indices past it are dropped, so no spec lists more than `n`.
+pub fn parse_index_spec_within(spec: &str, n: usize) -> anyhow::Result<Vec<usize>> {
+    let out: Vec<usize> = index_ranges(spec)?
+        .into_iter()
+        .filter(|&(a, _)| a < n)
+        .flat_map(|(a, b)| a..=b.min(n - 1))
+        .collect();
+    anyhow::ensure!(!out.is_empty(), "no index in `{spec}` is below {n}");
     Ok(out)
 }
 
@@ -135,5 +165,24 @@ mod tests {
         assert!(parse_index_spec("5-1").is_err());
         assert!(parse_index_spec("abc").is_err());
         assert!(parse_index_spec("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod index_spec_tests {
+    use super::{index_count, parse_index_spec_within};
+
+    #[test]
+    fn ranges_are_counted_and_cut_at_the_end() {
+        assert_eq!(index_count("0-9,20").unwrap(), 11);
+        assert_eq!(index_count("0-1000000000000").unwrap(), 1_000_000_000_001);
+        // A huge range on a side of 5 lists 5, not a trillion.
+        assert_eq!(
+            parse_index_spec_within("0-1000000000000", 5).unwrap(),
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(parse_index_spec_within("3,7,1-2", 5).unwrap(), [3, 1, 2]);
+        assert!(parse_index_spec_within("9-12", 5).is_err());
+        assert!(index_count("5-2").is_err());
     }
 }

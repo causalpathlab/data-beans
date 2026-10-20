@@ -97,8 +97,8 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # Detachable sessions for the views; no pictures, so no graphics.
 legume-tui = { version = "0.3.2", optional = true, default-features = false, features = ["clap", "logs"] }
 # Pinned to a commit until 0.1.0 is on crates.io.
-# Pinned to a commit until 0.1.0 is on crates.io.
-legume-mcp = { version = "0.1.0", git = "https://github.com/causalpathlab/legume-mcp", rev = "bce87e5", optional = true }
+# Its `tui` view (`data-beans mcp watch`) comes on with data-beans' `tui`.
+legume-mcp = { version = "0.1", optional = true }
 legume-plot = { version = "0.3.2", optional = true }
 base64 = { version = "0.22", optional = true }
 
@@ -107,5 +107,5 @@ base64 = { version = "0.22", optional = true }
 # tests/detach_session.rs.
 legume-tui = { version = "0.3.2", default-features = false, features = ["testing"] }
 # tests/mcp_server.rs follows a server through the watch pane.
-legume-mcp = { version = "0.1.0", git = "https://github.com/causalpathlab/legume-mcp", rev = "bce87e5", features = ["tui"] }
+legume-mcp = { version = "0.1", features = ["tui"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
