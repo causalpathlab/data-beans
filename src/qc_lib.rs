@@ -145,7 +145,7 @@ fn band_scale(v: f32, log1p: bool) -> f32 {
 }
 
 /// [`RobustBand`] of `values` (the `consider`ed ones, when given); `None`
-/// when none is finite.
+/// when none is finite, or when they have no spread (a MAD of 0).
 pub fn robust_band(
     values: &[f32],
     n_mads: f32,
@@ -169,7 +169,13 @@ pub fn robust_band(
     let median = median_in_place(&mut xs);
 
     let mut dev: Vec<f32> = xs.iter().map(|&v| (v - median).abs()).collect();
-    let mad = (median_in_place(&mut dev) * 1.4826).max(1e-8);
+    let mad = median_in_place(&mut dev) * 1.4826;
+    // No spread: more than half the values are one value (a mito fraction
+    // of 0 in most nuclei, say). A band of width 0 would call every other
+    // value an outlier, so there is none.
+    if mad <= 0.0 {
+        return None;
+    }
 
     Some(RobustBand {
         median,
@@ -838,6 +844,17 @@ mod qc_tests {
         // upper tail must not flag a low value
         let keep_up = robust_outlier_keep(&v, 3.0, Tail::Upper, true, None);
         assert!(keep_up[5], "lower outlier kept under Tail::Upper");
+    }
+
+    #[test]
+    fn no_spread_flags_no_one() {
+        // Most cells read no mito at all: the MAD is 0, and a cell with one
+        // mito read is no outlier for it.
+        let mut v = vec![0.0f32; 60];
+        v.extend([0.01, 0.02, 0.05, 0.3]);
+        assert!(robust_band(&v, 5.0, false, None).is_none());
+        let keep = robust_outlier_keep(&v, 5.0, Tail::Upper, false, None);
+        assert!(keep.iter().all(|&k| k));
     }
 
     #[test]

@@ -525,7 +525,7 @@ pub(crate) fn batch_file(effective_output: &str) -> String {
 
 /// Whether paths `a` and `b` name the same file: compared resolved when
 /// they exist, as written (made absolute) when not.
-fn same_file(a: &str, b: &str) -> bool {
+pub(crate) fn same_file(a: &str, b: &str) -> bool {
     let resolve = |p: &str| std::fs::canonicalize(p).or_else(|_| std::path::absolute(p));
     matches!((resolve(a), resolve(b)), (Ok(x), Ok(y)) if x == y)
 }

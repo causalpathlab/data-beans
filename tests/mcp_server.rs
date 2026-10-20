@@ -405,20 +405,33 @@ fn every_tool_answers_or_refuses_as_it_should() {
             Refused("`n_mads` is a number"),
         ),
         (
-            "plot",
-            json!({ "data": "base.zarr.zip", "kind": "violin" }),
-            Refused("qc or stat"),
-        ),
-        (
             "import",
             json!({ "command": "rm-rf", "input": "m.mtx" }),
             Refused("one of"),
         ),
-        // m.mtx sits beside `m`: anything named m.* is taken.
+        // m.mtx sits beside `m`, but it is the input, and stays.
+        (
+            "import",
+            json!({ "command": "from-mtx", "input": "m.mtx", "out": "m" }),
+            Ok(|v| v["written"].as_str().unwrap().ends_with("m.zarr.zip")),
+        ),
+        // The same again: m.zarr.zip is there now, and is no input.
         (
             "import",
             json!({ "command": "from-mtx", "input": "m.mtx", "out": "m" }),
             Refused("not replacing"),
+        ),
+        // An output that is the input itself.
+        (
+            "convert",
+            json!({ "data": "base.zarr.zip", "out": "base.zarr.zip" }),
+            Refused("is an input"),
+        ),
+        // Beside its input under the same name, in another format.
+        (
+            "convert",
+            json!({ "data": "base.zarr.zip", "out": "base.zarr" }),
+            Ok(|v| v["written"].as_str().unwrap().ends_with("base.zarr")),
         ),
         (
             "import",
@@ -477,6 +490,11 @@ fn every_tool_answers_or_refuses_as_it_should() {
                 assert!(text.contains(why), "{tool} {args}: {text}");
             }
         }
+    }
+
+    if cfg!(feature = "plot") {
+        let r = c.call("plot", json!({ "data": "base.zarr.zip", "kind": "violin" }));
+        assert!(r.unwrap_err().contains("qc or stat"));
     }
 
     // An unknown tool is a protocol error.

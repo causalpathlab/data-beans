@@ -17,7 +17,7 @@
 //! name goes in that day's folder; `import` notes its input's source in
 //! `data/README.md`.
 
-use crate::handlers::merging::batch_file;
+use crate::handlers::merging::{batch_file, same_file};
 use crate::hdf5_io::strip_backend_suffix;
 use crate::sparse_io::SparseIoBackend;
 use crate::utilities::io_helpers::parse_index_spec;
@@ -307,14 +307,14 @@ impl Handler for DataBeans {
                 let mut argv = argv(["subsample", &data]);
                 argv.extend(a.numbers(&["cells", "cell_frac", "genes", "gene_frac", "seed"])?);
                 let what = format!("cells and genes drawn at random from {data}");
-                written(cx, argv, &out, &what)?
+                written(cx, argv, &out, &what, &[data])?
             }
             "split" => split(&a, cx)?,
             "convert" => {
                 let data = a.path("data")?;
                 let out = a.backend_out(cx, &named(&data, "converted"))?;
                 let what = format!("{data} in another format");
-                written(cx, argv(["convert", &data]), &out, &what)?
+                written(cx, argv(["convert", &data]), &out, &what, &[data])?
             }
             "merge" => merge(&a, cx)?,
             _ => anyhow::bail!("no tool {name}"),
@@ -345,10 +345,15 @@ impl Arguments {
         Ok(p)
     }
 
+    /// Paths for a command that takes a list of them, which it also splits
+    /// at commas.
     fn paths(&self, key: &str) -> Result<Vec<String>> {
         let v = self.strings(key)?;
         if let Some(p) = v.iter().find(|p| p.starts_with('-')) {
             anyhow::bail!("`{key}` {p}: write it as ./{p}");
+        }
+        if let Some(p) = v.iter().find(|p| p.contains(',')) {
+            anyhow::bail!("`{key}` {p}: a path with a comma cannot go in a list; rename it");
         }
         Ok(v)
     }
@@ -415,7 +420,7 @@ impl Arguments {
         let dir = cx
             .results_dir()
             .context("`out` is required: this server keeps no results folder")?;
-        (1..)
+        (1..10_000)
             .map(|k| match k {
                 1 => dir.join(format!("{name}{ext}")),
                 k => dir.join(format!("{name}-{k}{ext}")),
@@ -542,27 +547,44 @@ fn fresh(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run `argv`, a command that writes the backend `out` (made of `what`),
-/// with `-o`; say where the backend is and how big.
-fn written(cx: &Call, argv: Vec<String>, out: &str, what: &str) -> Result<Value> {
-    Ok(Value::Object(written_with(cx, argv, out, what, &[])?.0))
+/// Run `argv`, a command that writes the backend `out` (made of `what`)
+/// from `inputs`, with `-o`; say where the backend is and how big.
+fn written(
+    cx: &Call,
+    argv: Vec<String>,
+    out: &str,
+    what: &str,
+    inputs: &[String],
+) -> Result<Value> {
+    Ok(Value::Object(
+        written_with(cx, argv, out, what, inputs, &[])?.0,
+    ))
 }
 
 /// [`written`], with `also` written beside it; and what the command
-/// printed. Nothing named after the output (`{stem}.*`) may exist beside
-/// it: data-beans clears the backend and its working copy before writing,
-/// and writes its side files (batch labels, an importer's metadata) over
-/// whatever is there. The side files it wrote come back as `also`.
+/// printed. The output must not be an input, and nothing else named after
+/// it (`{stem}.*`) may exist beside it: data-beans clears the backend and
+/// its working copy before writing, and writes its side files (batch
+/// labels, an importer's metadata) over whatever is there. The side files
+/// it wrote come back as `also`.
 fn written_with(
     cx: &Call,
     mut argv: Vec<String>,
     out: &str,
     what: &str,
+    inputs: &[String],
     also: &[&str],
 ) -> Result<(Map<String, Value>, String)> {
     let target = backend_target(out)?;
+    let is_input = |p: &str| inputs.iter().any(|i| same_file(i, p));
+    for p in [&target.effective, &target.working, &target.found] {
+        anyhow::ensure!(!is_input(p), "{p} is an input: choose another `out`");
+    }
     let stem = strip_backend_suffix(&target.effective).to_string();
-    let before = outputs_beside(&stem)?;
+    let before: Vec<String> = outputs_beside(&stem)?
+        .into_iter()
+        .filter(|p| !is_input(p))
+        .collect();
     anyhow::ensure!(
         before.is_empty(),
         "{} exist beside {out}; not replacing them: choose another `out`",
@@ -583,7 +605,7 @@ fn written_with(
     // Nothing was there before, so the rest there now was written too.
     let side: Vec<String> = outputs_beside(&stem)?
         .into_iter()
-        .filter(|p| *p != written)
+        .filter(|p| *p != written && !is_input(p))
         .collect();
     let mut v = Map::new();
     v.insert("written".into(), json!(written));
@@ -672,7 +694,7 @@ fn names(a: &Arguments, cx: &Call) -> Result<Value> {
     for (i, n) in text.lines().enumerate() {
         total += 1;
         if pattern.as_ref().is_none_or(|re| re.is_match(n)) {
-            if (offset..offset + limit).contains(&matched) {
+            if (offset..offset.saturating_add(limit)).contains(&matched) {
                 page.push(json!({ "index": i, "name": n }));
             }
             matched += 1;
@@ -713,7 +735,7 @@ fn statistics(a: &Arguments, cx: &Call) -> Result<Value> {
     let dim = if a.rows()? { "row" } else { "column" };
     let mut argv = argv(["statistics", &data.join(","), "-s", dim]);
     if let Some(p) = a.str("row_pattern") {
-        argv.extend(["-r".into(), p.into()]);
+        argv.push(format!("--row-name-pattern={p}"));
     }
     if let Some(out) = a.str("out") {
         anyhow::ensure!(out.ends_with(".parquet"), "`out` is a .parquet file");
@@ -892,7 +914,17 @@ fn qc(a: &Arguments, cx: &Call) -> Result<Value> {
     let what = format!("the cells of {data} that cell QC keeps");
     // Without `out` a dry run: only the summary, and the report if asked.
     let (mut v, printed) = match (a.given("out"), report) {
-        (Some(_), _) => written_with(cx, argv, &a.path("out")?, &what, report.as_slice())?,
+        (Some(_), _) => {
+            let out = a.path("out")?;
+            written_with(
+                cx,
+                argv,
+                &out,
+                &what,
+                std::slice::from_ref(&data),
+                report.as_slice(),
+            )?
+        }
         (None, Some(r)) => {
             let what = format!("per-cell QC metrics and verdicts of {data}");
             (Map::new(), data_beans_making(cx, &argv, &[r], &what)?)
@@ -951,12 +983,13 @@ fn plot(a: &Arguments, cx: &Call) -> Result<Vec<Content>> {
     let temp;
     let kept = a.given("out").is_some() || cx.results_dir().is_some();
     let file = if kept {
-        a.out_or(cx, (&named(&data, kind), ".png"), |c| Path::new(c).exists())?
+        let file = a.out_or(cx, (&named(&data, kind), ".png"), |c| Path::new(c).exists())?;
+        fresh(&file)?;
+        file
     } else {
         temp = tempfile::Builder::new().suffix(".png").tempfile()?;
         temp.path().to_string_lossy().into_owned()
     };
-    fresh(&file)?;
     argv.extend(["-o".into(), file.clone()]);
     if kept {
         data_beans_making(cx, &argv, &[&file], &format!("the {kind} figure of {data}"))?;
@@ -981,9 +1014,6 @@ fn import(a: &Arguments, cx: &Call) -> Result<Value> {
         import_commands()
     );
     let input = a.path("input")?;
-    // Where the input came from, in the project's data/README.md.
-    let source = a.str("source").unwrap_or("a local file, source not given");
-    cx.provenance(Path::new(&input), source);
     // The input's own suffixes (`.mtx.gz`, `.h5ad`) go.
     let file = Path::new(&input).file_name().map(|n| n.to_string_lossy());
     let stem = file
@@ -994,7 +1024,12 @@ fn import(a: &Arguments, cx: &Call) -> Result<Value> {
     let what = format!("{input} as a backend ({command})");
     let mut argv = argv([&command, &input]);
     argv.extend(a.options()?);
-    written(cx, argv, &out, &what)
+    let v = written(cx, argv, &out, &what, std::slice::from_ref(&input))?;
+    // Where the input came from, in the project's data/README.md, once it
+    // is in.
+    let source = a.str("source").unwrap_or("a local file, source not given");
+    cx.provenance(Path::new(&input), source);
+    Ok(v)
 }
 
 fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
@@ -1030,7 +1065,7 @@ fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
     let side = if rows { "rows" } else { "columns" };
     let n = names.len().max(indices.len());
     argv.extend(a.options()?);
-    written(cx, argv, &out, &format!("{n} {side} of {data}"))
+    written(cx, argv, &out, &format!("{n} {side} of {data}"), &[data])
 }
 
 fn merge(a: &Arguments, cx: &Call) -> Result<Value> {
@@ -1041,12 +1076,12 @@ fn merge(a: &Arguments, cx: &Call) -> Result<Value> {
     let batches = batch_file(&backend_target(&out)?.effective);
     let what = format!("{} merged", data.join(" + "));
     let mut argv = argv(["merge-backend"]);
-    argv.extend(data);
+    argv.extend(data.iter().cloned());
     if a.flag("common_rows")? {
         argv.push("--common-rows".into());
     }
     argv.extend(a.options()?);
-    let mut v = written_with(cx, argv, &out, &what, &[&batches])?.0;
+    let mut v = written_with(cx, argv, &out, &what, &data, &[&batches])?.0;
     v.insert("batches".into(), json!(absolute(&batches)));
     Ok(Value::Object(v))
 }

@@ -12,7 +12,7 @@ use data_beans::qc_lib::{
 };
 use data_beans::sparse_io::{open_sparse_matrix, SparseIo, SparseIoBackend};
 use data_beans::sparse_io_vector::SparseIoVec;
-use data_beans::zarr_io::{finalize_output, prepare_output};
+use data_beans::zarr_io::{finalize_output, output_target, prepare_output};
 use legume_numeric::matrix::common_io::write_lines;
 use log::info;
 use std::sync::Arc;
@@ -131,6 +131,7 @@ impl CellQc {
 pub struct Metric<'a> {
     pub name: &'static str,
     /// What a figure calls it.
+    #[cfg_attr(not(feature = "plot"), allow(dead_code))]
     pub label: &'static str,
     pub values: &'a [f32],
     pub count: bool,
@@ -219,6 +220,16 @@ pub fn run_cell_qc(args: &CellQcArgs) -> anyhow::Result<()> {
     let Some(output) = &args.output else {
         return Ok(());
     };
+    anyhow::ensure!(!keep_cells.is_empty(), "QC keeps no cells; nothing written");
+    // The output is cleared before the input is read: it must not be it.
+    let target = output_target(output, args.backend.clone(), args.zip)?;
+    for p in [&target.effective, &target.working, &target.found] {
+        anyhow::ensure!(
+            !crate::handlers::merging::same_file(&args.data_file, p),
+            "the output {p} is the input {}: give -o another name",
+            args.data_file
+        );
+    }
     let rows = matrix.row_names()?;
     let out_rows: Vec<Box<str>> = keep_rows.iter().map(|&r| rows[r].clone()).collect();
     let out_cells: Vec<Box<str>> = keep_cells.iter().map(|&c| cells[c].clone()).collect();
@@ -254,7 +265,11 @@ fn summary(qc: &CellQc, kept_cells: usize, kept_features: usize) -> Vec<Box<str>
     say("cells", report.train_keep.len().to_string());
     say("cells_kept", kept_cells.to_string());
     say("near_empty", near_empty.to_string());
-    say("outliers", report.n_cells_dropped.to_string());
+    // Dropped as outliers, apart from the near-empty: what the figure shows.
+    let outliers = (report.near_empty.iter().zip(&report.train_keep))
+        .filter(|&(&e, &k)| !e && !k)
+        .count();
+    say("outliers", outliers.to_string());
     say("features", report.feature_keep.len().to_string());
     say("features_kept", kept_features.to_string());
 
