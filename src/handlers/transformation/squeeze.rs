@@ -1,7 +1,8 @@
 use super::{RowAlignMode, RunSqueezeArgs};
 use crate::handlers::explore::{off_screen, open_session};
 use crate::handlers::merging::{
-    find_aligned_rows, generate_unique_batch_names, run_merge_backend, MergeBackendArgs,
+    find_aligned_rows, generate_unique_batch_names, run_merge_backend, write_batches_and_finalize,
+    MergeBackendArgs,
 };
 use crate::hdf5_io::*;
 use crate::interactive::cutoff_tui::{choose_cutoffs, choose_cutoffs_in, AxisView, CutoffPicker};
@@ -296,9 +297,9 @@ fn run_merge_then_squeeze(
         all_triplets.len()
     );
 
-    // `output_prefix` keeps naming the sidecars; the backend itself takes the
-    // `.zarr.zip` the rest of the tool produces, written as a directory here and
-    // zipped once everything below has finished with it.
+    // The backend takes the `.zarr.zip` the rest of the tool produces, written
+    // as a directory here and zipped once everything below has finished with
+    // it; its batch labels take its name without the backend suffix.
     let (backend, _) = resolve_backend_file(output_prefix, None)?;
     let effective_output = apply_zip_flag(output_prefix, cmd_args.zip, &backend);
     let (backend, backend_file) = resolve_backend_file(&effective_output, Some(backend))?;
@@ -349,20 +350,10 @@ fn run_merge_then_squeeze(
         final_data.num_columns().unwrap()
     );
 
-    // Write batch membership file
-    let batch_memb_file = format!("{}.batch.gz", output_prefix);
+    drop(final_data);
     let batch_map: HashMap<Box<str>, Box<str>> =
         column_names.into_iter().zip(column_batch_names).collect();
-    let default_batch = basename(output_prefix)?;
-    let final_col_names = final_data.column_names()?;
-    let final_batch_names: Vec<Box<str>> = final_col_names
-        .iter()
-        .map(|k| batch_map.get(k).unwrap_or(&default_batch).clone())
-        .collect();
-    write_lines(&final_batch_names, &batch_memb_file)?;
-
-    drop(final_data);
-    finalize_zarr_output(&backend_file, &effective_output)?;
+    write_batches_and_finalize(&effective_output, &backend_file, &backend, &batch_map)?;
 
     info!("Squeeze and merge (union) complete!");
     Ok(())
