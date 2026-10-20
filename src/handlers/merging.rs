@@ -297,7 +297,6 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         ncol: usize,
         nnz: u64,
         col_offset: u64,
-        nnz_offset: u64,
         /// Under `--common-rows`, each row's place among the common rows.
         row_map: Option<Vec<Option<u64>>>,
     }
@@ -306,7 +305,10 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
     let mut row_names: Vec<Box<str>> = vec![];
     let mut column_names: Vec<Box<str>> = vec![];
     let mut column_batch_names: Vec<Box<str>> = vec![];
+    // Under `--common-rows`: each batch's row names, and its row index to
+    // count the common rows' entries.
     let mut batch_rows: Vec<Vec<Box<str>>> = vec![];
+    let mut batch_indptr: Vec<Vec<u64>> = vec![];
     let mut col_offset: u64 = 0;
     let mut metas: Vec<Metadata> = Vec::with_capacity(num_batches);
 
@@ -330,6 +332,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
 
         if args.common_rows {
             batch_rows.push(data.row_names()?);
+            batch_indptr.push(data.row_indptr().to_vec());
         } else if batch_idx == 0 {
             row_names = data.row_names()?;
         } else {
@@ -358,7 +361,6 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
             ncol,
             nnz: nnz as u64,
             col_offset,
-            nnz_offset: 0,
             row_map: None,
         });
 
@@ -374,7 +376,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
             .enumerate()
             .map(|(i, n)| (n.as_ref(), i as u64))
             .collect();
-        for (h, rows) in batches.iter_mut().zip(&batch_rows) {
+        for ((h, rows), indptr) in batches.iter_mut().zip(&batch_rows).zip(&batch_indptr) {
             let mut seen = vec![false; row_names.len()];
             // A name a backend repeats keeps its first row only.
             let map: Vec<Option<u64>> = rows
@@ -387,29 +389,23 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
             if map.iter().enumerate().all(|(r, m)| *m == Some(r as u64)) {
                 continue; // these are the common rows, in order
             }
-            // The rows kept hold this many entries: the resident row indptr says.
-            let src = open_sparse_matrix(&h.path, &h.backend)?;
-            let indptr = src.row_indptr();
+            // The rows kept hold this many entries: the row index says.
             anyhow::ensure!(
                 indptr.len() == rows.len() + 1,
                 "{} has no by-row index to count its common rows' entries",
                 h.path
             );
-            h.nnz = (0..rows.len())
-                .filter(|&r| map[r].is_some())
-                .map(|r| indptr[r + 1] - indptr[r])
+            h.nnz = map
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.is_some())
+                .map(|(r, _)| indptr[r + 1] - indptr[r])
                 .sum();
             h.row_map = Some(map);
         }
     }
-    let mut nnz_offset: u64 = 0;
-    for h in batches.iter_mut() {
-        h.nnz_offset = nnz_offset;
-        nnz_offset += h.nnz;
-    }
-
     let total_ncol = col_offset as usize;
-    let total_nnz = nnz_offset as usize;
+    let total_nnz = batches.iter().map(|h| h.nnz).sum::<u64>() as usize;
     let total_nrow = row_names.len();
     info!(
         "Found {} columns/barcodes across {} batches (total nnz = {})",
@@ -428,6 +424,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
     out.begin_streaming_csc((total_nrow, total_ncol, total_nnz))?;
 
     let prog_bar = styled_progress_bar(num_batches as u64, "batches");
+    let mut nnz_offset: u64 = 0;
     for h in &batches {
         let src = open_sparse_matrix(&h.path, &h.backend)?;
         let jobs = create_jobs(h.ncol, total_nrow, args.block_size);
@@ -460,11 +457,12 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         let (local_colptr, row_indices, values) = build_csc_slab(triplets_batch, h.ncol);
         out.append_csc_slab(
             h.col_offset,
-            h.nnz_offset,
+            nnz_offset,
             &local_colptr,
             &row_indices,
             &values,
         )?;
+        nnz_offset += h.nnz;
 
         prog_bar.inc(1);
     }
@@ -519,6 +517,12 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A merge's batch labels: `{output}.batch.gz`, the output without its
+/// backend suffix.
+pub(crate) fn batch_file(effective_output: &str) -> String {
+    format!("{}.batch.gz", strip_backend_suffix(effective_output))
+}
+
 /// Whether paths `a` and `b` name the same file: compared resolved when
 /// they exist, as written (made absolute) when not.
 fn same_file(a: &str, b: &str) -> bool {
@@ -538,7 +542,8 @@ pub(crate) fn write_batches_and_finalize(
     batch_map: &HashMap<Box<str>, Box<str>>,
 ) -> anyhow::Result<()> {
     let stem = strip_backend_suffix(effective_output);
-    // The name itself, dots and all (`sample.v2`), not cut at its last dot.
+    // The output's name itself, dots and all (`sample.v2`), not cut at its
+    // last dot.
     let default_batch: Box<str> = std::path::Path::new(stem)
         .file_name()
         .map_or_else(|| stem.into(), |n| n.to_string_lossy().into());
@@ -547,7 +552,7 @@ pub(crate) fn write_batches_and_finalize(
         .iter()
         .map(|k| batch_map.get(k).unwrap_or(&default_batch).clone())
         .collect();
-    write_lines(&labels, &format!("{stem}.batch.gz"))?;
+    write_lines(&labels, &batch_file(effective_output))?;
     finalize_zarr_output(backend_file, effective_output)
 }
 

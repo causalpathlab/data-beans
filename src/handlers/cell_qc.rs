@@ -43,10 +43,13 @@ pub struct CellQcArgs {
     pub block_size: Option<usize>,
 }
 
+/// The mito pattern `qc` and `plot qc` start from, where senna's and
+/// pinto's QC has none; an empty `--qc-mito-pattern=` turns it off.
+pub const MITO: &str = "(?i)^MT-";
+
 /// A backend's QC: what [`compute_qc`] made of it, under which config.
 pub struct CellQc {
     pub matrix: Arc<dyn SparseIo<IndexIter = Vec<usize>>>,
-    pub cells: Vec<Box<str>>,
     pub cfg: QcConfig,
     pub report: QcReport,
 }
@@ -57,6 +60,10 @@ impl CellQc {
         qc: &QcArgs,
         block_size: Option<usize>,
     ) -> anyhow::Result<Self> {
+        let mut qc = qc.clone();
+        if qc.qc_mito_pattern.as_deref() == Some("") {
+            qc.qc_mito_pattern = None;
+        }
         let cfg = qc
             .to_config()
             .ok_or_else(|| anyhow::anyhow!("--no-qc leaves nothing to do"))?;
@@ -66,10 +73,8 @@ impl CellQc {
         let mut data = SparseIoVec::new();
         data.push(matrix.clone(), None)?;
         let report = compute_qc(&data, &cfg, block_size)?;
-        let cells = data.column_names()?;
         Ok(Self {
             matrix,
-            cells,
             cfg,
             report,
         })
@@ -79,19 +84,29 @@ impl CellQc {
     pub fn metrics(&self) -> Vec<Metric<'_>> {
         let (r, cfg) = (&self.report, &self.cfg);
         let mut v = vec![
-            Metric::counts("n_genes", &r.n_genes, cfg.mad_on_n_genes),
-            Metric::counts("total_counts", &r.total_counts, cfg.mad_on_counts),
+            Metric::counts("n_genes", "detected genes", &r.n_genes, cfg.mad_on_n_genes),
+            Metric::counts(
+                "total_counts",
+                "total counts",
+                &r.total_counts,
+                cfg.mad_on_counts,
+            ),
         ];
         if let Some(f) = &r.mito_frac {
             v.push(Metric::fraction(
-                "mito_frac",
+                ("mito_frac", "mitochondrial fraction"),
                 f,
                 cfg.mad_on_mito,
                 cfg.mito_max_frac,
             ));
         }
         if let Some(f) = &r.ribo_frac {
-            v.push(Metric::fraction("ribo_frac", f, false, cfg.ribo_max_frac));
+            v.push(Metric::fraction(
+                ("ribo_frac", "ribosomal fraction"),
+                f,
+                false,
+                cfg.ribo_max_frac,
+            ));
         }
         v
     }
@@ -102,12 +117,21 @@ impl CellQc {
         let consider: Vec<bool> = self.report.near_empty.iter().map(|&e| !e).collect();
         robust_band(m.values, self.cfg.n_mads, m.count, Some(&consider)).map(|b| b.raw(m.count))
     }
+
+    /// The edge of `m`'s band QC drops cells past, when it does: its floor
+    /// for a count, its ceiling for a fraction.
+    pub fn edge(&self, m: &Metric) -> Option<f32> {
+        let band = self.band(m).filter(|_| m.banded)?;
+        Some(if m.count { band.lo } else { band.hi })
+    }
 }
 
 /// A per-cell metric: a count, banded on the log1p scale and held from
 /// below, or a fraction, banded as is and held from above (and capped).
 pub struct Metric<'a> {
     pub name: &'static str,
+    /// What a figure calls it.
+    pub label: &'static str,
     pub values: &'a [f32],
     pub count: bool,
     /// Whether QC drops cells outside its band.
@@ -116,9 +140,10 @@ pub struct Metric<'a> {
 }
 
 impl<'a> Metric<'a> {
-    fn counts(name: &'static str, values: &'a [f32], banded: bool) -> Self {
+    fn counts(name: &'static str, label: &'static str, values: &'a [f32], banded: bool) -> Self {
         Self {
             name,
+            label,
             values,
             count: true,
             banded,
@@ -126,9 +151,15 @@ impl<'a> Metric<'a> {
         }
     }
 
-    fn fraction(name: &'static str, values: &'a [f32], banded: bool, cap: Option<f32>) -> Self {
+    fn fraction(
+        (name, label): (&'static str, &'static str),
+        values: &'a [f32],
+        banded: bool,
+        cap: Option<f32>,
+    ) -> Self {
         Self {
             name,
+            label,
             values,
             count: false,
             banded,
@@ -136,13 +167,12 @@ impl<'a> Metric<'a> {
         }
     }
 
-    /// The edge of `band` QC holds the metric to: its floor for a count,
-    /// its ceiling for a fraction.
-    pub fn edge(&self, band: RobustBand) -> f32 {
+    /// What its edge is, and the side of it a dropped cell is on.
+    pub fn bound(&self) -> (&'static str, &'static str) {
         if self.count {
-            band.lo
+            ("min", "below")
         } else {
-            band.hi
+            ("max", "above")
         }
     }
 
@@ -168,9 +198,14 @@ impl<'a> Metric<'a> {
 
 pub fn run_cell_qc(args: &CellQcArgs) -> anyhow::Result<()> {
     let qc = CellQc::compute(&args.data_file, &args.qc, args.block_size)?;
-    let (matrix, cells, report) = (&qc.matrix, &qc.cells, &qc.report);
+    let (matrix, report) = (&qc.matrix, &qc.report);
+    // The cell names, read only when something is written with them.
+    let cells = match args.qc.qc_report.is_some() || args.output.is_some() {
+        true => matrix.column_names()?,
+        false => vec![],
+    };
     if let Some(path) = &args.qc.qc_report {
-        write_qc_report(path, cells, report)?;
+        write_qc_report(path, &cells, report)?;
         info!("wrote the per-cell report: {path}");
     }
 
@@ -235,16 +270,11 @@ fn summary(qc: &CellQc, kept_cells: usize, kept_features: usize) -> Vec<Box<str>
         let name = m.name;
         if let Some(band) = qc.band(&m) {
             say(&format!("{name}.median"), m.shown(band.median));
-            if m.banded {
-                let edge = m.edge(band);
-                let (bound, side) = if m.count {
-                    ("min", "below")
-                } else {
-                    ("max", "above")
-                };
-                say(&format!("{name}.{bound}"), m.shown(edge));
-                say(&format!("{name}.{side}"), past(&m, edge).to_string());
-            }
+        }
+        if let Some(edge) = qc.edge(&m) {
+            let (bound, side) = m.bound();
+            say(&format!("{name}.{bound}"), m.shown(edge));
+            say(&format!("{name}.{side}"), past(&m, edge).to_string());
         }
         if let Some(cap) = m.cap {
             say(&format!("{name}.cap"), cap.to_string());

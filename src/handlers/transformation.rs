@@ -68,8 +68,16 @@ pub struct SubsetColumnsArgs {
     #[arg(short = 'd', long, default_value = "@")]
     pub delimiter: char,
 
-    /// enable prefix matching (stored name is prefix of query or vice versa)
-    #[arg(long, default_value_t = true)]
+    /// enable prefix matching (stored name is prefix of query or vice
+    /// versa); `--allow-prefix=false` turns it off, as `--exact-names` does
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = true
+    )]
     pub allow_prefix: bool,
 
     /// Match names exactly (plus the delimiter base key): no prefix matching.
@@ -125,8 +133,16 @@ pub struct SubsetRowsArgs {
     #[arg(short = 'd', long, default_value = "@")]
     pub delimiter: char,
 
-    /// enable prefix matching (stored name is prefix of query or vice versa)
-    #[arg(long, default_value_t = true)]
+    /// enable prefix matching (stored name is prefix of query or vice
+    /// versa); `--allow-prefix=false` turns it off, as `--exact-names` does
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = true
+    )]
     pub allow_prefix: bool,
 
     /// Match names exactly (plus the delimiter base key): no prefix matching.

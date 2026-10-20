@@ -4,14 +4,15 @@
 //! million cells make an image, not a million SVG elements.
 
 use crate::handlers::analysis::{HistStat, StatDim};
-use crate::handlers::cell_qc::{CellQc, Metric};
-use crate::handlers::explore::{open_data, side_stats};
-use crate::interactive::stat_tui::Side;
+use crate::handlers::cell_qc::CellQc;
+use crate::hdf5_io::resolve_backend_file;
+use crate::qc::{collect_column_stat, collect_row_stat};
+use crate::sparse_io::open_sparse_matrix;
 use base64::Engine;
 use clap::{Args, Subcommand};
 use data_beans::qc_lib::QcArgs;
 use legume_plot::rasterize::{rasterize_group_png, Extent, PointShape, RadiusSpec};
-use legume_plot::Rgb;
+use legume_plot::{escape_xml as escape, FigureFormats, Rgb};
 use log::info;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -26,7 +27,10 @@ pub struct PlotArgs {
 pub enum PlotKind {
     /// Cell QC: each metric's histogram with the edge QC held it to, and
     /// total counts against detected genes, cells coloured by verdict
-    #[command(mut_args(|a| a.hide(false)))]
+    #[command(
+        mut_args(|a| a.hide(false)),
+        mut_arg("qc_mito_pattern", |a| a.default_value(crate::handlers::cell_qc::MITO))
+    )]
     Qc(PlotQcArgs),
     /// The histogram of one statistic over the rows or the columns
     Stat(PlotStatArgs),
@@ -84,70 +88,78 @@ const PANEL_H: f32 = 340.0;
 const TITLE_H: f32 = 44.0;
 
 pub fn run_plot(args: &PlotArgs) -> anyhow::Result<()> {
-    let (svg, w, h, output) = match &args.kind {
+    let (fig, output) = match &args.kind {
         PlotKind::Qc(a) => {
             let qc = CellQc::compute(&a.data_file, &a.qc, a.block_size)?;
-            let (svg, w, h) = qc_figure(&qc, &a.data_file)?;
-            (svg, w, h, &a.output)
+            (qc_figure(&qc, &a.data_file)?, &a.output)
         }
-        PlotKind::Stat(a) => {
-            let data = open_data(std::slice::from_ref(&a.data_file), false)?;
-            let side = match a.stat_dim {
-                StatDim::Row => Side::Rows,
-                StatDim::Column => Side::Columns,
-            };
-            let set = side_stats(&data, side, None, a.block_size, None)?;
-            let (k, label) = match a.stat {
-                HistStat::Nnz => (0, "non-zeros"),
-                HistStat::Sum => (1, "total"),
-                HistStat::Mean => (2, "mean"),
-                HistStat::Sd => (3, "sd"),
-            };
-            let what = match a.stat_dim {
-                StatDim::Row => "row",
-                StatDim::Column => "column",
-            };
-            let mut fig = Figure::new(1, 1, &format!("{}: {label} per {what}", a.data_file));
-            let groups = [Group {
-                label: format!("{} {what}s", set.names.len()),
-                color: KEPT,
-                values: set.values[k].clone(),
-            }];
-            let xlabel = format!("{label} per {what}");
-            fig.histogram(0, (&xlabel, &format!("{what}s")), &groups, true, &[]);
-            let (w, h) = (fig.w, fig.h);
-            (fig.finish(), w, h, &a.output)
-        }
+        PlotKind::Stat(a) => (stat_figure(a)?, &a.output),
     };
-    write_figure(&svg, w, h, output)?;
+    write_figure(fig, output)?;
     info!("wrote {output}");
     Ok(())
 }
 
-/// Write `svg` as the format `output` names.
-fn write_figure(svg: &str, w: u32, h: u32, output: &str) -> anyhow::Result<()> {
+/// Write `fig` as the format `output`'s extension names.
+fn write_figure(fig: Figure, output: &str) -> anyhow::Result<()> {
+    let (w, h) = (fig.w, fig.h);
     let path = Path::new(output);
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("png") => legume_plot::render_png(svg, w, h, path),
-        Some("pdf") => legume_plot::render_pdf(svg, path),
-        Some("svg") => Ok(std::fs::write(path, svg)?),
-        _ => anyhow::bail!("{output}: name a .png, .svg or .pdf file"),
-    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let want = FigureFormats {
+        svg: ext == "svg",
+        png: ext == "png",
+        pdf: ext == "pdf",
+    };
+    anyhow::ensure!(
+        want.svg || want.png || want.pdf,
+        "{output}: name a .png, .svg or .pdf file"
+    );
+    let base = path.with_extension("");
+    legume_plot::write_figure(&fig.finish(), w, h, &base.to_string_lossy(), want)?;
+    Ok(())
+}
+
+/// The histogram of one row or column statistic.
+fn stat_figure(a: &PlotStatArgs) -> anyhow::Result<Figure> {
+    let (backend, file) = resolve_backend_file(&a.data_file, None)?;
+    let data = open_sparse_matrix(&file, &backend)?;
+    let (what, values) = match a.stat_dim {
+        StatDim::Row => (
+            "row",
+            a.stat
+                .values(&collect_row_stat(data.as_ref(), a.block_size)?),
+        ),
+        StatDim::Column => (
+            "column",
+            a.stat
+                .values(&collect_column_stat(data.as_ref(), a.block_size)?),
+        ),
+    };
+    let label = format!("{} per {what}", a.stat.metric());
+    let mut fig = Figure::new(1, 1, &format!("{}: {label}", a.data_file));
+    let all = Series {
+        label: format!("{} {what}s", values.len()),
+        color: KEPT,
+        values,
+    };
+    fig.histogram(0, (&label, &format!("{what}s")), &[all], true, &[]);
+    Ok(fig)
 }
 
 /// The QC figure: a histogram per metric, stacked by verdict, with its
 /// band edge and cap; then total counts against detected genes.
-fn qc_figure(qc: &CellQc, title: &str) -> anyhow::Result<(String, u32, u32)> {
+fn qc_figure(qc: &CellQc, title: &str) -> anyhow::Result<Figure> {
     let r = &qc.report;
     let n = r.train_keep.len();
     let near_empty: Vec<usize> = (0..n).filter(|&c| r.near_empty[c]).collect();
     let outlier: Vec<usize> = (0..n)
         .filter(|&c| !r.near_empty[c] && !r.train_keep[c])
         .collect();
-    let kept: Vec<usize> = (0..n)
-        .filter(|&c| !r.near_empty[c] && r.train_keep[c])
-        .collect();
-    let verdicts = [
+    let kept = r.emit_idx_unmasked();
+    let verdicts: [(String, Rgb, &Vec<usize>); 3] = [
         (format!("kept {}", kept.len()), KEPT, &kept),
         (format!("outlier {}", outlier.len()), OUTLIER, &outlier),
         (
@@ -156,16 +168,20 @@ fn qc_figure(qc: &CellQc, title: &str) -> anyhow::Result<(String, u32, u32)> {
             &near_empty,
         ),
     ];
-    let by_verdict = |values: &[f32]| -> Vec<Group> {
+    // Each verdict's cells, as what `of` makes of a cell.
+    fn by_verdict<T>(
+        verdicts: &[(String, Rgb, &Vec<usize>)],
+        of: impl Fn(usize) -> T,
+    ) -> Vec<Series<T>> {
         verdicts
             .iter()
-            .map(|(label, color, idx)| Group {
+            .map(|(label, color, idx)| Series {
                 label: label.clone(),
                 color: *color,
-                values: idx.iter().map(|&c| values[c]).collect(),
+                values: idx.iter().map(|&c| of(c)).collect(),
             })
             .collect()
-    };
+    }
 
     let metrics = qc.metrics();
     let panels = metrics.len() + 1;
@@ -183,11 +199,11 @@ fn qc_figure(qc: &CellQc, title: &str) -> anyhow::Result<(String, u32, u32)> {
     );
     for (i, m) in metrics.iter().enumerate() {
         let mut marks = vec![];
-        if let Some(band) = qc.band(m).filter(|_| m.banded) {
+        if let Some(edge) = qc.edge(m) {
             marks.push(Mark {
-                at: m.edge(band),
+                at: edge,
                 color: EDGE,
-                label: if m.count { "min" } else { "max" },
+                label: m.bound().0,
             });
         }
         if let Some(cap) = m.cap {
@@ -197,55 +213,19 @@ fn qc_figure(qc: &CellQc, title: &str) -> anyhow::Result<(String, u32, u32)> {
                 label: "cap",
             });
         }
-        let xlabel = axis_label(m);
-        fig.histogram(
-            i,
-            (&xlabel, "cells"),
-            &by_verdict(m.values),
-            m.count,
-            &marks,
-        );
+        let groups = by_verdict(&verdicts, |c| m.values[c]);
+        fig.histogram(i, (m.label, "cells"), &groups, m.count, &marks);
     }
-    let points = |idx: &[usize]| -> Vec<(f32, f32)> {
-        idx.iter()
-            .map(|&c| (r.total_counts[c], r.n_genes[c]))
-            .collect()
-    };
-    let layers: Vec<Layer> = verdicts
-        .iter()
-        .map(|(label, color, idx)| Layer {
-            label: label.clone(),
-            color: *color,
-            points: points(idx),
-        })
-        .collect();
+    let layers = by_verdict(&verdicts, |c| (r.total_counts[c], r.n_genes[c]));
     fig.scatter(metrics.len(), "total counts", "detected genes", &layers)?;
-    let (w, h) = (fig.w, fig.h);
-    Ok((fig.finish(), w, h))
+    Ok(fig)
 }
 
-fn axis_label(m: &Metric) -> String {
-    match m.name {
-        "n_genes" => "detected genes".into(),
-        "total_counts" => "total counts".into(),
-        "mito_frac" => "mitochondrial fraction".into(),
-        "ribo_frac" => "ribosomal fraction".into(),
-        other => other.into(),
-    }
-}
-
-/// Values drawn in one colour.
-struct Group {
+/// Values (or points) drawn in one colour.
+struct Series<T> {
     label: String,
     color: Rgb,
-    values: Vec<f32>,
-}
-
-/// Points drawn in one colour.
-struct Layer {
-    label: String,
-    color: Rgb,
-    points: Vec<(f32, f32)>,
+    values: Vec<T>,
 }
 
 /// A vertical line at a value, labelled.
@@ -253,6 +233,15 @@ struct Mark {
     at: f32,
     color: Rgb,
     label: &'static str,
+}
+
+/// `v` on a log10(x+1) axis when `log`, else as is.
+fn scale(v: f32, log: bool) -> f32 {
+    if log {
+        (v.max(0.0) + 1.0).log10()
+    } else {
+        v
+    }
 }
 
 /// An axis: the data range it shows, on a log10(x+1) scale or as is.
@@ -265,7 +254,7 @@ struct Axis {
 
 impl Axis {
     fn fit(values: impl Iterator<Item = f32>, log: bool) -> Self {
-        let t = |v: f32| if log { (v.max(0.0) + 1.0).log10() } else { v };
+        let t = |v: f32| scale(v, log);
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
         for v in values.filter(|v| v.is_finite()) {
             lo = lo.min(t(v));
@@ -286,11 +275,7 @@ impl Axis {
     }
 
     fn t(self, v: f32) -> f32 {
-        if self.log {
-            (v.max(0.0) + 1.0).log10()
-        } else {
-            v
-        }
+        scale(v, self.log)
     }
 
     /// Where `v` falls, 0 at `lo` to 1 at `hi`.
@@ -363,10 +348,6 @@ fn short(x: f32) -> String {
 
 fn rgb((r, g, b): Rgb) -> String {
     format!("rgb({r},{g},{b})")
-}
-
-fn escape(s: &str) -> String {
-    legume_plot::escape_xml(s)
 }
 
 /// A grid of panels, written as SVG.
@@ -484,7 +465,7 @@ impl Figure {
         &mut self,
         i: usize,
         (xlabel, ylabel): (&str, &str),
-        groups: &[Group],
+        groups: &[Series<f32>],
         log: bool,
         marks: &[Mark],
     ) {
@@ -567,19 +548,24 @@ impl Figure {
         i: usize,
         xlabel: &str,
         ylabel: &str,
-        layers: &[Layer],
+        layers: &[Series<(f32, f32)>],
     ) -> anyhow::Result<()> {
         let a = self.area(i);
-        let all = || layers.iter().flat_map(|l| l.points.iter());
+        let all = || layers.iter().flat_map(|l| l.values.iter());
         let x = Axis::fit(all().map(|p| p.0), true);
         let y = Axis::fit(all().map(|p| p.1), true);
         let ext = Extent {
             w: a.w.round() as u32,
             h: a.h.round() as u32,
         };
-        let n: usize = layers.iter().map(|l| l.points.len()).sum();
+        let n: usize = layers.iter().map(|l| l.values.len()).sum();
         let radius = if n > 100_000 { 0.8 } else { 1.8 };
-        for Layer { color, points, .. } in layers {
+        for Series {
+            color,
+            values: points,
+            ..
+        } in layers
+        {
             if points.is_empty() {
                 continue;
             }

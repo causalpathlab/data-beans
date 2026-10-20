@@ -285,13 +285,17 @@ fn rows_matching(cmd_args: &RunStatArgs, data: &SparseIoVec) -> anyhow::Result<O
 #[clap(rename_all = "lowercase")]
 pub enum HistStat {
     Nnz,
+    // `statistics` heads its columns tot, mu and sig.
+    #[value(alias = "tot")]
     Sum,
+    #[value(alias = "mu")]
     Mean,
+    #[value(alias = "sig")]
     Sd,
 }
 
 impl HistStat {
-    fn metric(&self) -> &'static str {
+    pub(crate) fn metric(&self) -> &'static str {
         match self {
             HistStat::Nnz => "nnz",
             HistStat::Sum => "sum",
@@ -302,7 +306,7 @@ impl HistStat {
 
     /// Pull the chosen statistic out of a running-stat accumulator (works for
     /// both the row and column variants via the shared `RunningStatOps` trait).
-    fn values<S: RunningStatOps<f32, Output = Vec<f32>>>(&self, s: &S) -> Vec<f32> {
+    pub(crate) fn values<S: RunningStatOps<f32, Output = Vec<f32>>>(&self, s: &S) -> Vec<f32> {
         match self {
             HistStat::Nnz => s.count_positives(),
             HistStat::Sum => s.sum(),

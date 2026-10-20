@@ -97,6 +97,16 @@ fn backend(dir: &Path) {
     assert!(status.success());
 }
 
+/// A server in a fresh directory holding the `backend` fixture, past its
+/// handshake.
+fn setup() -> (tempfile::TempDir, Client) {
+    let dir = tempfile::tempdir().unwrap();
+    backend(dir.path());
+    let mut c = Client::start(dir.path());
+    c.request("initialize", json!({ "protocolVersion": "2025-06-18" }));
+    (dir, c)
+}
+
 #[test]
 fn tools_read_derive_and_refuse_to_replace() {
     let dir = tempfile::tempdir().unwrap();
@@ -204,10 +214,7 @@ fn tools_read_derive_and_refuse_to_replace() {
 
 #[test]
 fn qc_plot_and_merge_on_common_rows() {
-    let dir = tempfile::tempdir().unwrap();
-    backend(dir.path());
-    let mut c = Client::start(dir.path());
-    c.request("initialize", json!({}));
+    let (dir, mut c) = setup();
 
     // C2 and C3 hold one entry each, under the near-empty floor of 2; C0
     // and C1 hold two, with MT-CO1 1 of 6 counts and MT-ND1 2 of 8.
@@ -262,10 +269,7 @@ fn qc_plot_and_merge_on_common_rows() {
 
 #[test]
 fn unnamed_outputs_go_to_the_results_folder_and_the_records() {
-    let dir = tempfile::tempdir().unwrap();
-    backend(dir.path());
-    let mut c = Client::start(dir.path());
-    c.request("initialize", json!({}));
+    let (dir, mut c) = setup();
 
     let imported = c
         .call(
@@ -291,8 +295,209 @@ fn unnamed_outputs_go_to_the_results_folder_and_the_records() {
         .unwrap()
         .ends_with("m.imported.subsample-2.zarr.zip"));
 
+    // A figure's number goes before its extension.
+    if cfg!(feature = "plot") {
+        for want in ["m.imported.qc.png", "m.imported.qc-2.png"] {
+            let r = c.request(
+                "tools/call",
+                json!({ "name": "plot", "arguments": { "data": path } }),
+            );
+            let text = r["result"]["content"][1]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(text.contains(want), "{r}");
+        }
+    }
+
     let index = std::fs::read_to_string(dir.path().join("results/INDEX.tsv")).unwrap();
     assert!(index.contains("m.imported.subsample-2.zarr.zip"));
     let readme = std::fs::read_to_string(dir.path().join("data/README.md")).unwrap();
     assert!(readme.contains("the test's fixture"));
+}
+
+/// What a call should come to.
+enum Want {
+    /// Not an error, and the check holds on its structured content.
+    Ok(fn(&Value) -> bool),
+    /// A tool error (not a protocol one) whose text has this in it.
+    Refused(&'static str),
+}
+
+#[test]
+fn every_tool_answers_or_refuses_as_it_should() {
+    use Want::{Ok, Refused};
+    let (_dir, mut c) = setup();
+
+    // Every schema is an object whose required keys are among its properties.
+    let tools = c.request("tools/list", json!({}));
+    for t in tools["result"]["tools"].as_array().unwrap() {
+        let s = &t["inputSchema"];
+        assert_eq!(s["type"], "object", "{}", t["name"]);
+        for k in s["required"].as_array().into_iter().flatten() {
+            assert!(
+                s["properties"].get(k.as_str().unwrap()).is_some(),
+                "{}: {k}",
+                t["name"]
+            );
+        }
+    }
+
+    let cases: Vec<(&str, Value, Want)> = vec![
+        (
+            "info",
+            json!({ "data": "missing.zarr.zip" }),
+            Refused("failed"),
+        ),
+        ("info", json!({ "data": "-x" }), Refused("write it as ./-x")),
+        (
+            "list_contents",
+            json!({ "file": "base.zarr.zip" }),
+            Ok(|_| true),
+        ),
+        (
+            "names",
+            json!({ "data": "base.zarr.zip", "axis": "columns", "offset": 3, "limit": 5 }),
+            Ok(|v| v["names"].as_array().unwrap().len() == 1),
+        ),
+        (
+            "names",
+            json!({ "data": "base.zarr.zip", "axis": "sideways" }),
+            Refused("rows or columns"),
+        ),
+        (
+            "names",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "pattern": "(" }),
+            Refused("pattern"),
+        ),
+        (
+            "statistics",
+            json!({ "data": ["base.zarr.zip"], "axis": "columns", "limit": 0 }),
+            Ok(|v| v["top"].as_array().unwrap().len() == 1),
+        ),
+        (
+            "statistics",
+            json!({ "data": ["base.zarr.zip"], "axis": "rows", "sort_by": "median" }),
+            Refused("median"),
+        ),
+        (
+            "statistics",
+            json!({ "data": ["base.zarr.zip"], "axis": "rows", "out": "s.parquet" }),
+            Ok(|v| v["written"].as_str().unwrap().ends_with("s.parquet")),
+        ),
+        (
+            "statistics",
+            json!({ "data": ["base.zarr.zip"], "axis": "rows", "out": "s.parquet" }),
+            Refused("not replacing"),
+        ),
+        (
+            "values",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "indices": "0-100000000000" }),
+            Refused("at most 100"),
+        ),
+        (
+            "values",
+            json!({ "data": "base.zarr.zip", "axis": "rows" }),
+            Refused("one of them"),
+        ),
+        (
+            "qc",
+            json!({ "data": "base.zarr.zip", "n_mads": "three" }),
+            Refused("`n_mads` is a number"),
+        ),
+        (
+            "plot",
+            json!({ "data": "base.zarr.zip", "kind": "violin" }),
+            Refused("qc or stat"),
+        ),
+        (
+            "import",
+            json!({ "command": "rm-rf", "input": "m.mtx" }),
+            Refused("one of"),
+        ),
+        // m.mtx sits beside `m`: anything named m.* is taken.
+        (
+            "import",
+            json!({ "command": "from-mtx", "input": "m.mtx", "out": "m" }),
+            Refused("not replacing"),
+        ),
+        (
+            "import",
+            json!({ "command": "from-mtx", "input": "m.mtx", "out": "y", "options": ["--qc-report=z"] }),
+            Refused("not taken"),
+        ),
+        (
+            "subset",
+            json!({ "data": "base.zarr.zip", "axis": "columns", "indices": [0, 1, 2], "out": "three" }),
+            Ok(|v| v["info"]["columns"] == 3),
+        ),
+        (
+            "subsample",
+            json!({ "data": "base.zarr.zip", "cells": "2", "out": "s2" }),
+            Refused("is a number"),
+        ),
+        (
+            "subsample",
+            json!({ "data": "base.zarr.zip", "cells": 2, "out": "s2" }),
+            Ok(|v| v["info"]["columns"] == 2),
+        ),
+        (
+            "split",
+            json!({ "data": "base.zarr.zip", "folds": 2, "out": "cv" }),
+            Ok(|v| v["written"].as_array().unwrap().len() == 4),
+        ),
+        (
+            "split",
+            json!({ "data": "base.zarr.zip", "folds": 2, "out": "cv" }),
+            Refused("not replacing"),
+        ),
+        (
+            "merge",
+            json!({ "data": ["base.zarr.zip"] }),
+            Refused("two or more"),
+        ),
+        (
+            "notebook",
+            json!({ "kind": "observation", "text": "every tool checked" }),
+            Ok(|_| true),
+        ),
+    ];
+    for (tool, args, want) in cases {
+        let r = c.request("tools/call", json!({ "name": tool, "arguments": args }));
+        // A tool's failure is a result, never a protocol error.
+        assert!(r.get("error").is_none(), "{tool} {args}: {r}");
+        let r = &r["result"];
+        let text = r["content"][0]["text"].as_str().unwrap_or_default();
+        match want {
+            Ok(check) => {
+                assert_eq!(r["isError"], false, "{tool} {args}: {text}");
+                assert!(check(&r["structuredContent"]), "{tool} {args}: {r}");
+            }
+            Refused(why) => {
+                assert_eq!(r["isError"], true, "{tool} {args}: {r}");
+                assert!(text.contains(why), "{tool} {args}: {text}");
+            }
+        }
+    }
+
+    // An unknown tool is a protocol error.
+    let r = c.request(
+        "tools/call",
+        json!({ "name": "no_such_tool", "arguments": {} }),
+    );
+    assert!(r.get("error").is_some(), "{r}");
+}
+
+#[test]
+fn a_cancelled_call_gets_no_answer_and_the_server_goes_on() {
+    let (_dir, mut c) = setup();
+    let id = 1000;
+    let call = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": "info", "arguments": { "data": "base.zarr.zip" } } });
+    let cancel = json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": { "requestId": id } });
+    writeln!(c.stdin, "{call}\n{cancel}").unwrap();
+    // The ping is answered; whatever comes before it is not the call's
+    // answer unless the call finished before the cancel arrived.
+    let pong = c.request("ping", json!({}));
+    assert!(pong.get("result").is_some(), "{pong}");
 }

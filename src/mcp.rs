@@ -17,11 +17,12 @@
 //! name goes in that day's folder; `import` notes its input's source in
 //! `data/README.md`.
 
-use crate::hdf5_io::{resolve_backend_file, strip_backend_suffix};
+use crate::handlers::merging::batch_file;
+use crate::hdf5_io::strip_backend_suffix;
 use crate::sparse_io::SparseIoBackend;
 use crate::utilities::io_helpers::parse_index_spec;
 use crate::utilities::name_matching::match_by_substring;
-use crate::zarr_io::apply_zip_flag;
+use crate::zarr_io::{output_target, OutputTarget};
 use anyhow::{Context, Result};
 use clap::Args;
 use legume_mcp::{Call, Content, Handler, ServerInfo, ToolSpec};
@@ -81,8 +82,8 @@ fn import_commands() -> Vec<&'static str> {
 }
 
 /// The cell-QC settings `qc` and `plot` share, and `data`.
-fn qc_properties(data: &Value) -> Map<String, Value> {
-    let Value::Object(m) = json!({
+fn qc_properties(data: &Value) -> Value {
+    json!({
         "data": data,
         "mito_pattern": { "type": "string", "description": "Regex over feature names for mitochondrial genes (default (?i)^MT-; empty turns the mito metric off)" },
         "n_mads": { "type": "number", "exclusiveMinimum": 0, "description": "Band half-width in MADs (default 5; smaller drops more)" },
@@ -94,10 +95,7 @@ fn qc_properties(data: &Value) -> Map<String, Value> {
         "ribo_max_frac": { "type": "number", "description": "Hard cap on the ribo fraction, 0..1" },
         "feature_min_cells": { "type": "integer", "minimum": 0, "description": "Also drop features detected in fewer cells (default 0, off)" },
         "auto_cutoff": { "type": "boolean", "description": "Also drop cells below the trough between ambient and real cells' detected genes" },
-    }) else {
-        unreachable!()
-    };
-    m
+    })
 }
 
 fn tools() -> Vec<ToolSpec> {
@@ -173,9 +171,9 @@ fn tools() -> Vec<ToolSpec> {
             schema(
                 {
                     let mut p = qc_properties(&data);
-                    p.insert("report".into(), json!({ "type": "string", "description": "A .tsv(.gz) for the per-cell metrics and verdicts; must not exist" }));
-                    p.insert("out".into(), json!({ "type": "string", "description": "Output for the kept cells; must not exist. Omit for a dry run" }));
-                    Value::Object(p)
+                    p["report"] = json!({ "type": "string", "description": "A .tsv(.gz) for the per-cell metrics and verdicts; must not exist" });
+                    p["out"] = json!({ "type": "string", "description": "Output for the kept cells; must not exist. Omit for a dry run" });
+                    p
                 },
                 &["data"],
             ),
@@ -187,11 +185,11 @@ fn tools() -> Vec<ToolSpec> {
             schema(
                 {
                     let mut p = qc_properties(&data);
-                    p.insert("kind".into(), json!({ "type": "string", "enum": ["qc", "stat"] }));
-                    p.insert("axis".into(), json!({ "type": "string", "enum": ["rows", "columns"], "description": "For kind stat (default columns)" }));
-                    p.insert("stat".into(), json!({ "type": "string", "enum": ["nnz", "tot", "mu", "sig"], "description": "For kind stat (default nnz)" }));
-                    p.insert("out".into(), json!({ "type": "string", "description": "A .png, .svg or .pdf to keep; must not exist" }));
-                    Value::Object(p)
+                    p["kind"] = json!({ "type": "string", "enum": ["qc", "stat"] });
+                    p["axis"] = json!({ "type": "string", "enum": ["rows", "columns"], "description": "For kind stat (default columns)" });
+                    p["stat"] = json!({ "type": "string", "enum": ["nnz", "tot", "mu", "sig"], "description": "For kind stat (default nnz)" });
+                    p["out"] = json!({ "type": "string", "description": "A .png, .svg or .pdf to keep; must not exist" });
+                    p
                 },
                 &["data"],
             ),
@@ -309,14 +307,14 @@ impl Handler for DataBeans {
                 let mut argv = argv(["subsample", &data]);
                 argv.extend(a.numbers(&["cells", "cell_frac", "genes", "gene_frac", "seed"])?);
                 let what = format!("cells and genes drawn at random from {data}");
-                written(cx, &a, argv, &out, &what)?
+                written(cx, argv, &out, &what)?
             }
             "split" => split(&a, cx)?,
             "convert" => {
                 let data = a.path("data")?;
                 let out = a.backend_out(cx, &named(&data, "converted"))?;
                 let what = format!("{data} in another format");
-                written(cx, &a, argv(["convert", &data]), &out, &what)?
+                written(cx, argv(["convert", &data]), &out, &what)?
             }
             "merge" => merge(&a, cx)?,
             _ => anyhow::bail!("no tool {name}"),
@@ -355,13 +353,16 @@ impl Arguments {
         Ok(v)
     }
 
+    /// `key`'s value, when it is given and not null.
+    fn given(&self, key: &str) -> Option<&Value> {
+        self.0.get(key).filter(|v| !v.is_null())
+    }
+
     fn parse<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
-        match self.0.get(key) {
-            None | Some(Value::Null) => Ok(None),
-            Some(v) => serde_json::from_value(v.clone())
-                .map(Some)
-                .with_context(|| format!("reading `{key}`")),
-        }
+        self.given(key)
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .with_context(|| format!("reading `{key}`"))
     }
 
     fn flag(&self, key: &str) -> Result<bool> {
@@ -376,8 +377,8 @@ impl Arguments {
     fn numbers(&self, keys: &[&str]) -> Result<Vec<String>> {
         let mut v = vec![];
         for k in keys {
-            match self.0.get(*k) {
-                None | Some(Value::Null) => {}
+            match self.given(k) {
+                None => {}
                 Some(n @ Value::Number(_)) => {
                     v.extend([format!("--{}", k.replace('_', "-")), n.to_string()])
                 }
@@ -399,10 +400,16 @@ impl Arguments {
         Ok(self.parse("limit")?.unwrap_or(100).clamp(1, MAX_LIMIT))
     }
 
-    /// `out`, or, when the agent names none, `name` in today's results
-    /// folder, `-2`, `-3`… added while `taken` says a name is in use.
-    fn out_or(&self, cx: &Call, name: &str, taken: impl Fn(&str) -> bool) -> Result<String> {
-        if self.0.get("out").is_some_and(|v| !v.is_null()) {
+    /// `out`, or, when the agent names none, `{name}{ext}` in today's
+    /// results folder, `-2`, `-3`… added to `name` (before `ext`) while
+    /// `taken` says a name is in use.
+    fn out_or(
+        &self,
+        cx: &Call,
+        (name, ext): (&str, &str),
+        taken: impl Fn(&str) -> bool,
+    ) -> Result<String> {
+        if self.given("out").is_some() {
             return self.path("out");
         }
         let dir = cx
@@ -410,8 +417,8 @@ impl Arguments {
             .context("`out` is required: this server keeps no results folder")?;
         (1..)
             .map(|k| match k {
-                1 => dir.join(name),
-                k => dir.join(format!("{name}-{k}")),
+                1 => dir.join(format!("{name}{ext}")),
+                k => dir.join(format!("{name}-{k}{ext}")),
             })
             .map(|p| p.to_string_lossy().into_owned())
             .find(|p| !taken(p))
@@ -421,9 +428,9 @@ impl Arguments {
     /// [`Self::out_or`] for a backend: a name is taken when what the command
     /// would write for it exists.
     fn backend_out(&self, cx: &Call, name: &str) -> Result<String> {
-        self.out_or(cx, name, |c| {
-            backend_paths(c).map_or(true, |(t, w, _)| {
-                Path::new(&t).exists() || Path::new(&w).exists()
+        self.out_or(cx, (name, ""), |c| {
+            backend_target(c).map_or(true, |t| {
+                outputs_beside(strip_backend_suffix(&t.effective)).map_or(true, |v| !v.is_empty())
             })
         })
     }
@@ -436,6 +443,9 @@ impl Arguments {
         const TAKEN: &[&str] = &[
             "-o",
             "--output",
+            "--output-directory",
+            "--qc-report",
+            "--save-histogram",
             "--backend",
             "--no-zip",
             "-I",
@@ -480,16 +490,22 @@ fn command(argv: &[String]) -> Result<Command> {
     Ok(cmd)
 }
 
-/// `data-beans` run with `argv`, to its end; its stdout.
+/// `data-beans` run with `argv`, a step that writes nothing, to its end;
+/// its stdout. The records keep the call, not the command.
 fn data_beans(cx: &Call, argv: &[String]) -> Result<String> {
-    cx.run(command(argv)?)
+    cx.run_reading(command(argv)?)
 }
 
 /// [`data_beans`] for a step that writes `outputs`: the project's records
 /// list each with `what` (what was made, from what), and a replay skips the
 /// step when they all exist.
-fn data_beans_making(cx: &Call, argv: &[String], outputs: &[&str], what: &str) -> Result<String> {
-    let outputs: Vec<PathBuf> = outputs.iter().map(PathBuf::from).collect();
+fn data_beans_making(
+    cx: &Call,
+    argv: &[String],
+    outputs: &[impl AsRef<Path>],
+    what: &str,
+) -> Result<String> {
+    let outputs: Vec<PathBuf> = outputs.iter().map(|p| p.as_ref().to_path_buf()).collect();
     cx.run_making(command(argv)?, &outputs, what)
 }
 
@@ -504,15 +520,11 @@ fn named(data: &str, tool: &str) -> String {
     format!("{stem}.{tool}")
 }
 
-/// Where a backend-writing command given `-o out` writes: its target (the
-/// archive, the `.zarr` directory or the `.h5`), its working copy, and
-/// whether it zips.
-fn backend_paths(out: &str) -> Result<(String, String, bool)> {
-    let zip = !out.ends_with(".zarr");
-    // Resolved as the command resolves it, under its default `--backend zarr`.
-    let target = apply_zip_flag(out, zip, &SparseIoBackend::Zarr);
-    let (_, working) = resolve_backend_file(&target, Some(SparseIoBackend::Zarr))?;
-    Ok((target.to_string(), working.to_string(), zip))
+/// Where a backend-writing command given `-o out` writes, as it resolves
+/// it under its default `--backend zarr`; zipped unless `out` names a
+/// `.zarr` directory.
+fn backend_target(out: &str) -> Result<OutputTarget> {
+    output_target(out, SparseIoBackend::Zarr, !out.ends_with(".zarr"))
 }
 
 fn absolute(p: &str) -> String {
@@ -531,43 +543,53 @@ fn fresh(path: &str) -> Result<()> {
 }
 
 /// Run `argv`, a command that writes the backend `out` (made of `what`),
-/// with `-o` and the tool's `options`; say where the backend is and how big.
-fn written(cx: &Call, a: &Arguments, argv: Vec<String>, out: &str, what: &str) -> Result<Value> {
-    Ok(Value::Object(written_with(cx, a, argv, out, what, &[])?.0))
+/// with `-o`; say where the backend is and how big.
+fn written(cx: &Call, argv: Vec<String>, out: &str, what: &str) -> Result<Value> {
+    Ok(Value::Object(written_with(cx, argv, out, what, &[])?.0))
 }
 
 /// [`written`], with `also` written beside it; and what the command
-/// printed. Neither the backend nor its working copy may exist: data-beans
-/// clears both before writing.
+/// printed. Nothing named after the output (`{stem}.*`) may exist beside
+/// it: data-beans clears the backend and its working copy before writing,
+/// and writes its side files (batch labels, an importer's metadata) over
+/// whatever is there. The side files it wrote come back as `also`.
 fn written_with(
     cx: &Call,
-    a: &Arguments,
     mut argv: Vec<String>,
     out: &str,
     what: &str,
     also: &[&str],
 ) -> Result<(Map<String, Value>, String)> {
-    let (target, working, zip) = backend_paths(out)?;
-    fresh(&target)?;
-    fresh(&working)?;
+    let target = backend_target(out)?;
+    let stem = strip_backend_suffix(&target.effective).to_string();
+    let before = outputs_beside(&stem)?;
+    anyhow::ensure!(
+        before.is_empty(),
+        "{} exist beside {out}; not replacing them: choose another `out`",
+        before.join(", ")
+    );
     // The full name, so the command cannot resolve it otherwise (`subset`
     // keeps an extensionless output in its input's format).
-    argv.extend(["-o".into(), target.clone()]);
-    if !zip {
+    argv.extend(["-o".into(), target.effective.to_string()]);
+    // A `.zarr` directory asked for, as `backend_target` resolved it.
+    if out.ends_with(".zarr") {
         argv.push("--no-zip".into());
     }
-    argv.extend(a.options()?);
-    // The archive for a `.zarr.zip` target, else the file written.
-    let path = if target.ends_with(".zarr.zip") {
-        &target
-    } else {
-        &working
-    };
-    let mut outputs = vec![path.as_str()];
+    let path: &str = &target.found;
+    let mut outputs = vec![path];
     outputs.extend(also);
     let printed = data_beans_making(cx, &argv, &outputs, what)?;
+    let written = absolute(path);
+    // Nothing was there before, so the rest there now was written too.
+    let side: Vec<String> = outputs_beside(&stem)?
+        .into_iter()
+        .filter(|p| *p != written)
+        .collect();
     let mut v = Map::new();
-    v.insert("written".into(), json!(absolute(path)));
+    v.insert("written".into(), json!(written));
+    if !side.is_empty() {
+        v.insert("also".into(), json!(side));
+    }
     v.insert("info".into(), summary(cx, path)?);
     Ok((v, printed))
 }
@@ -822,25 +844,26 @@ fn values(a: &Arguments, cx: &Call) -> Result<Value> {
 /// The `--qc-*` flags for the cell-QC settings among `a`.
 fn qc_flags(a: &Arguments) -> Result<Vec<String>> {
     let mut v = vec![];
-    let mito = a.str("mito_pattern").unwrap_or("(?i)^MT-");
-    if !mito.is_empty() {
+    // The command starts from (?i)^MT-; an empty pattern turns it off.
+    if let Some(mito) = a.str("mito_pattern") {
         v.push(format!("--qc-mito-pattern={mito}"));
     }
-    let flags = [
+    // `--flag=value`, so a value cannot read as an option.
+    if let Some(ribo) = a.str("ribo_pattern") {
+        v.push(format!("--qc-ribo-pattern={ribo}"));
+    }
+    let numbers = [
         ("n_mads", "--qc-mads"),
         ("min_cell_nnz", "--qc-min-cell-nnz"),
         ("mito_max_frac", "--qc-mito-max-frac"),
-        ("ribo_pattern", "--qc-ribo-pattern"),
         ("ribo_max_frac", "--qc-ribo-max-frac"),
         ("feature_min_cells", "--qc-feature-min-cells"),
     ];
-    // `--flag=value`, so a value cannot read as an option.
-    for (key, flag) in flags {
-        match a.0.get(key) {
-            None | Some(Value::Null) => {}
-            Some(Value::String(x)) => v.push(format!("{flag}={x}")),
+    for (key, flag) in numbers {
+        match a.given(key) {
+            None => {}
             Some(n @ Value::Number(_)) => v.push(format!("{flag}={n}")),
-            Some(other) => anyhow::bail!("`{key}` takes no {other}"),
+            Some(other) => anyhow::bail!("`{key}` is a number, not {other}"),
         }
     }
     for (key, flag) in [
@@ -868,21 +891,16 @@ fn qc(a: &Arguments, cx: &Call) -> Result<Value> {
     }
     let what = format!("the cells of {data} that cell QC keeps");
     // Without `out` a dry run: only the summary, and the report if asked.
-    let (mut v, printed) = match a.str("out") {
-        Some(_) => {
-            let out = a.path("out")?;
-            written_with(cx, a, argv, &out, &what, report.as_slice())?
+    let (mut v, printed) = match (a.given("out"), report) {
+        (Some(_), _) => written_with(cx, argv, &a.path("out")?, &what, report.as_slice())?,
+        (None, Some(r)) => {
+            let what = format!("per-cell QC metrics and verdicts of {data}");
+            (Map::new(), data_beans_making(cx, &argv, &[r], &what)?)
         }
-        None => match report {
-            Some(r) => {
-                let what = format!("per-cell QC metrics and verdicts of {data}");
-                (Map::new(), data_beans_making(cx, &argv, &[r], &what)?)
-            }
-            None => (Map::new(), data_beans(cx, &argv)?),
-        },
+        (None, None) => (Map::new(), data_beans(cx, &argv)?),
     };
     v.extend(key_values(&printed));
-    if let Some(report) = a.str("report") {
+    if let Some(report) = report {
         v.insert("report".into(), json!(absolute(report)));
     }
     Ok(Value::Object(v))
@@ -907,39 +925,33 @@ fn index_count(spec: &str) -> Result<usize> {
 #[cfg(feature = "plot")]
 fn plot(a: &Arguments, cx: &Call) -> Result<Vec<Content>> {
     let data = a.path("data")?;
-    let mut argv = match a.str("kind").unwrap_or("qc") {
+    let kind = a.str("kind").unwrap_or("qc");
+    let mut argv = match kind {
         "qc" => {
             let mut v = argv(["plot", "qc", &data]);
             v.extend(qc_flags(a)?);
             v
         }
         "stat" => {
-            let dim = match a.str("axis").unwrap_or("columns") {
-                "rows" | "row" => "row",
-                "columns" | "column" => "column",
-                other => anyhow::bail!("`axis` is rows or columns, not {other}"),
-            };
-            // The names `statistics` reports them by.
-            let stat = match a.str("stat").unwrap_or("nnz") {
-                "nnz" => "nnz",
-                "tot" => "sum",
-                "mu" => "mean",
-                "sig" => "sd",
-                other => anyhow::bail!("`stat` is nnz, tot, mu or sig, not {other}"),
-            };
+            // Columns unless `axis` says rows.
+            let rows = a.given("axis").is_some() && a.rows()?;
+            let dim = if rows { "row" } else { "column" };
+            // The names `statistics` reports them by, which `--stat` takes too.
+            let stat = a.str("stat").unwrap_or("nnz");
+            anyhow::ensure!(
+                ["nnz", "tot", "mu", "sig"].contains(&stat),
+                "`stat` is nnz, tot, mu or sig, not {stat}"
+            );
             argv(["plot", "stat", &data, "-s", dim, "--stat", stat])
         }
         other => anyhow::bail!("`kind` is qc or stat, not {other}"),
     };
     // A figure in `out`'s format, else a PNG in the results folder; a
     // server keeping no records shows it to the agent only.
-    let kind = a.str("kind").unwrap_or("qc");
     let temp;
-    let kept = a.0.get("out").is_some_and(|v| !v.is_null()) || cx.results_dir().is_some();
+    let kept = a.given("out").is_some() || cx.results_dir().is_some();
     let file = if kept {
-        a.out_or(cx, &format!("{}.png", named(&data, kind)), |c| {
-            Path::new(c).exists()
-        })?
+        a.out_or(cx, (&named(&data, kind), ".png"), |c| Path::new(c).exists())?
     } else {
         temp = tempfile::Builder::new().suffix(".png").tempfile()?;
         temp.path().to_string_lossy().into_owned()
@@ -980,11 +992,14 @@ fn import(a: &Arguments, cx: &Call) -> Result<Value> {
         .unwrap_or("data");
     let out = a.backend_out(cx, &format!("{stem}.imported"))?;
     let what = format!("{input} as a backend ({command})");
-    written(cx, a, argv([&command, &input]), &out, &what)
+    let mut argv = argv([&command, &input]);
+    argv.extend(a.options()?);
+    written(cx, argv, &out, &what)
 }
 
 fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
-    let command = if a.rows()? {
+    let rows = a.rows()?;
+    let command = if rows {
         "subset-rows"
     } else {
         "subset-columns"
@@ -1012,44 +1027,40 @@ fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
     if !a.flag("prefix_match")? {
         argv.push("--exact-names".into());
     }
-    let side = if a.rows()? { "rows" } else { "columns" };
+    let side = if rows { "rows" } else { "columns" };
     let n = names.len().max(indices.len());
-    written(cx, a, argv, &out, &format!("{n} {side} of {data}"))
+    argv.extend(a.options()?);
+    written(cx, argv, &out, &format!("{n} {side} of {data}"))
 }
 
 fn merge(a: &Arguments, cx: &Call) -> Result<Value> {
     let data = a.paths("data")?;
     anyhow::ensure!(data.len() >= 2, "`data` takes two or more backends");
-    // A name is taken when the backend or its batch labels are there.
-    let batches_of = |out: &str| format!("{}.batch.gz", strip_backend_suffix(out));
-    let out = a.out_or(cx, &named(&data[0], "merged"), |c| {
-        backend_paths(c).map_or(true, |(t, w, _)| {
-            Path::new(&t).exists() || Path::new(&w).exists()
-        }) || Path::new(&batches_of(c)).exists()
-    })?;
+    let out = a.backend_out(cx, &named(&data[0], "merged"))?;
     // merge-backend's batch labels, beside the backend.
-    let batches = batches_of(&out);
-    fresh(&batches)?;
+    let batches = batch_file(&backend_target(&out)?.effective);
     let what = format!("{} merged", data.join(" + "));
     let mut argv = argv(["merge-backend"]);
     argv.extend(data);
     if a.flag("common_rows")? {
         argv.push("--common-rows".into());
     }
-    let mut v = written_with(cx, a, argv, &out, &what, &[&batches])?.0;
+    argv.extend(a.options()?);
+    let mut v = written_with(cx, argv, &out, &what, &[&batches])?.0;
     v.insert("batches".into(), json!(absolute(&batches)));
     Ok(Value::Object(v))
 }
 
-/// The entries beside `prefix` that split writes for it:
-/// `{prefix}.{train,test}*` or `{prefix}.fold*`.
-fn split_outputs(prefix: &str) -> Result<Vec<String>> {
-    let stem = Path::new(prefix)
+/// The entries beside `stem` named after it (`{stem}.*`): what a command
+/// writing under that name leaves there (a backend and its working copy,
+/// batch labels, an importer's metadata, split's halves).
+fn outputs_beside(stem: &str) -> Result<Vec<String>> {
+    let name = Path::new(stem)
         .file_name()
         .context("`out` names no file")?
         .to_string_lossy()
         .into_owned();
-    let parent = Path::new(prefix)
+    let parent = Path::new(stem)
         .parent()
         .filter(|d| !d.as_os_str().is_empty());
     let dir = std::path::absolute(parent.unwrap_or(Path::new(".")))?;
@@ -1062,11 +1073,8 @@ fn split_outputs(prefix: &str) -> Result<Vec<String>> {
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| {
-            n.strip_prefix(stem.as_str()).is_some_and(|r| {
-                [".train", ".test", ".fold"]
-                    .iter()
-                    .any(|s| r.starts_with(s))
-            })
+            n.strip_prefix(name.as_str())
+                .is_some_and(|r| r.starts_with('.'))
         })
         .map(|n| dir.join(n).to_string_lossy().into_owned())
         .collect();
@@ -1076,10 +1084,10 @@ fn split_outputs(prefix: &str) -> Result<Vec<String>> {
 
 fn split(a: &Arguments, cx: &Call) -> Result<Value> {
     let data = a.path("data")?;
-    let prefix = a.out_or(cx, &named(&data, "split"), |c| {
-        split_outputs(c).map_or(true, |v| !v.is_empty())
+    let prefix = a.out_or(cx, (&named(&data, "split"), ""), |c| {
+        outputs_beside(c).map_or(true, |v| !v.is_empty())
     })?;
-    let before = split_outputs(&prefix)?;
+    let before = outputs_beside(&prefix)?;
     anyhow::ensure!(
         before.is_empty(),
         "{} exist beside {prefix}; not replacing them: choose another `out`",
@@ -1098,13 +1106,12 @@ fn split(a: &Arguments, cx: &Call) -> Result<Value> {
     let mut argv = argv(["split", &data, "-o", &prefix]);
     argv.extend(a.numbers(&["test_frac", "folds", "seed"])?);
     argv.extend(a.options()?);
-    let outputs: Vec<&str> = halves.iter().map(String::as_str).collect();
     data_beans_making(
         cx,
         &argv,
-        &outputs,
+        &halves,
         &format!("cells of {data} split for testing"),
     )?;
     // Nothing was there before, so all there is now was written.
-    Ok(json!({ "written": split_outputs(&prefix)? }))
+    Ok(json!({ "written": outputs_beside(&prefix)? }))
 }

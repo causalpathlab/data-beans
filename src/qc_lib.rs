@@ -135,6 +135,15 @@ impl RobustBand {
     }
 }
 
+/// A value on the scale its band is fitted on: `ln(1 + v)` for counts.
+fn band_scale(v: f32, log1p: bool) -> f32 {
+    if log1p {
+        v.max(0.0).ln_1p()
+    } else {
+        v
+    }
+}
+
 /// [`RobustBand`] of `values` (the `consider`ed ones, when given); `None`
 /// when none is finite.
 pub fn robust_band(
@@ -143,7 +152,7 @@ pub fn robust_band(
     log1p: bool,
     consider: Option<&[bool]>,
 ) -> Option<RobustBand> {
-    let xform = |v: f32| if log1p { v.max(0.0).ln_1p() } else { v };
+    let xform = |v: f32| band_scale(v, log1p);
 
     // Band statistics computed over the considered subset only.
     let mut xs: Vec<f32> = values
@@ -188,7 +197,7 @@ pub fn robust_outlier_keep(
     let Some(band) = robust_band(values, n_mads, log1p, consider) else {
         return vec![true; n];
     };
-    let xform = |v: f32| if log1p { v.max(0.0).ln_1p() } else { v };
+    let xform = |v: f32| band_scale(v, log1p);
     let (lo, hi) = (band.lo, band.hi);
     values
         .iter()

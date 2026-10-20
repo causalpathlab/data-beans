@@ -667,7 +667,8 @@ enum Commands {
                       it was held to and how many cells fell outside. With -o, writes the kept\n\
                       cells (and features, under --qc-feature-min-cells) to a new backend;\n\
                       --qc-report writes the per-cell metrics and verdicts.",
-        mut_args(|a| a.hide(false))
+        mut_args(|a| a.hide(false)),
+        mut_arg("qc_mito_pattern", |a| a.default_value(crate::handlers::cell_qc::MITO))
     )]
     Qc(CellQcArgs),
 
@@ -753,3 +754,34 @@ fn interactive_session_help(more: &str) -> String {
 const STDOUT_IN_A_SESSION: &str = "Written to stdout, the result goes to the session's \
                                    terminal, and the part written while detached is lost; \
                                    give -o a file to keep it. ";
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Cli;
+    use clap::{ArgAction, CommandFactory};
+
+    /// A flag that is on by default must have a way off: a bare `SetTrue`
+    /// flag defaulting to true cannot be turned off from the command line
+    /// (`--qc-mad-on-genes` and `--allow-prefix` were), so such a flag
+    /// takes a value (`--flag=false`) instead.
+    #[test]
+    fn no_flag_is_stuck_on() {
+        fn walk(cmd: &clap::Command, path: &str, stuck: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                let on = arg.get_default_values().iter().any(|v| v == "true");
+                if on && matches!(arg.get_action(), ArgAction::SetTrue) {
+                    stuck.push(format!("{path} --{}", arg.get_id()));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), stuck);
+            }
+        }
+        let mut stuck = vec![];
+        walk(&Cli::command(), "data-beans", &mut stuck);
+        assert!(
+            stuck.is_empty(),
+            "flags that cannot be turned off: {stuck:?}"
+        );
+    }
+}

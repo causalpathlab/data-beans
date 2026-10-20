@@ -97,7 +97,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # Detachable sessions for the views; no pictures, so no graphics.
 legume-tui = { version = "0.3.2", optional = true, default-features = false, features = ["clap", "logs"] }
 # Pinned to a commit until 0.1.0 is on crates.io.
-legume-mcp = { version = "0.1.0", git = "https://github.com/causalpathlab/legume-mcp", rev = "b0fec5e", optional = true }
+legume-mcp = { version = "0.1.0", git = "https://github.com/causalpathlab/legume-mcp", rev = "6020312", optional = true }
 legume-plot = { version = "0.3.2", optional = true }
 base64 = { version = "0.22", optional = true }
 
