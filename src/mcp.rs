@@ -119,6 +119,7 @@ fn qc_properties(data: &Value) -> Value {
         "min_cell_nnz": { "type": "integer", "minimum": 0, "description": "Near-empty floor on detected features (default 2)" },
         "mad_on_genes": { "type": "boolean", "description": "Band on detected genes (default true)" },
         "mad_on_counts": { "type": "boolean", "description": "Band on total counts (default true)" },
+        "mad_on_mito": { "type": "boolean", "description": "Band on the mito fraction (default true); false leaves only mito_max_frac, if given" },
         "mito_max_frac": { "type": "number", "description": "Hard cap on the mito fraction, 0..1" },
         "ribo_pattern": { "type": "string", "description": "Regex for ribosomal genes, e.g. (?i)^RP[SL]" },
         "ribo_max_frac": { "type": "number", "description": "Hard cap on the ribo fraction, 0..1" },
@@ -238,12 +239,16 @@ fn tools() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "subset",
-            "A new backend with only the named (or indexed) rows or columns. Names match exactly unless `prefix_match`.",
+            "A new backend with only some rows or columns, chosen by one of: `names` (exact unless `prefix_match`), `pattern` (a case-insensitive regex over the names, e.g. /count/spliced$), or `indices` (0-based, as a list or as text with ranges, e.g. \"0-19612,20000\").",
             schema(
                 json!({
                     "data": data, "axis": axis,
                     "names": { "type": "array", "items": { "type": "string" } },
-                    "indices": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+                    "pattern": { "type": "string" },
+                    "indices": { "description": "0-based indices: a list, or text with ranges (0-9,20)", "anyOf": [
+                        { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+                        { "type": "string" }
+                    ] },
                     "prefix_match": { "type": "boolean" },
                     "out": out, "options": options,
                 }),
@@ -500,6 +505,12 @@ impl Arguments {
     /// format or open a view. Short options stand alone (`-r X`, not
     /// `-rX`), so none hides inside a cluster.
     fn options(&self) -> Result<Vec<String>> {
+        self.options_but(&[])
+    }
+
+    /// [`Self::options`], refusing `set` too: the flags the tool sets itself
+    /// from its own arguments (a second one would win over the tool's).
+    fn options_but(&self, set: &[&str]) -> Result<Vec<String>> {
         let v = self.strings("options")?;
         const TAKEN: &[&str] = &[
             "-o",
@@ -526,6 +537,10 @@ impl Arguments {
             anyhow::ensure!(
                 !TAKEN.contains(&name),
                 "{o} is not taken in `options`: outputs go to `out`, their format follows it, and no view opens here"
+            );
+            anyhow::ensure!(
+                !set.contains(&name),
+                "{o} is not taken in `options`: the tool's own arguments say that"
             );
         }
         Ok(v)
@@ -947,6 +962,7 @@ fn qc_flags(a: &Arguments) -> Result<Vec<String>> {
     for (key, flag) in [
         ("mad_on_genes", "--qc-mad-on-genes"),
         ("mad_on_counts", "--qc-mad-on-counts"),
+        ("mad_on_mito", "--qc-mad-on-mito"),
     ] {
         if let Some(on) = a.parse::<bool>(key)? {
             v.push(format!("{flag}={on}"));
@@ -1088,39 +1104,77 @@ fn import(a: &Arguments, cx: &Call) -> Result<Value> {
     Ok(v)
 }
 
+/// The most indices a selection may name.
+const MAX_SELECTED: usize = 10_000_000;
+
 fn subset(a: &Arguments, cx: &Call) -> Result<Value> {
     let rows = a.rows()?;
-    let command = if rows {
-        "subset-rows"
+    let (command, side) = if rows {
+        ("subset-rows", "rows")
     } else {
-        "subset-columns"
+        ("subset-columns", "columns")
     };
     let data = a.path("data")?;
     let out = a.backend_out(cx, &named(&data, "subset"))?;
     let mut argv = argv([command, &data]);
-    let names = a.strings("names")?;
-    let indices: Vec<usize> = a.parse("indices")?.unwrap_or_default();
-    // The names go to the command in a file, kept until it has run.
+    let given = ["names", "pattern", "indices"].map(|k| a.given(k).is_some());
+    anyhow::ensure!(
+        given.iter().filter(|&&g| g).count() == 1,
+        "give one of `names`, `pattern` or `indices`"
+    );
+    let mut exact = !a.flag("prefix_match")?;
+    // Names go to the command in a file, kept until it has run.
     let file;
-    match (names.is_empty(), indices.is_empty()) {
-        (false, true) => {
-            file = tempfile::NamedTempFile::new()?;
-            // Through the call, so the session script carries the names too.
-            cx.write_file(file.path(), &(names.join("\n") + "\n"))?;
-            argv.extend(["-f".into(), file.path().to_string_lossy().into_owned()]);
-        }
-        (true, false) => {
-            let i: Vec<String> = indices.iter().map(usize::to_string).collect();
-            argv.extend(["-i".into(), i.join(",")]);
-        }
-        _ => anyhow::bail!("give `names` or `indices`, one of them"),
+    let mut names = a.strings("names")?;
+    if let Some(p) = a.str("pattern") {
+        let re = RegexBuilder::new(p)
+            .case_insensitive(true)
+            .build()
+            .context("reading `pattern`")?;
+        let all = data_beans(cx, &[names_command(rows).into(), data.clone()])?;
+        names = all
+            .lines()
+            .filter(|n| re.is_match(n))
+            .map(String::from)
+            .collect();
+        anyhow::ensure!(!names.is_empty(), "no {side} match `{p}`");
+        exact = true; // the names matched are the names meant
     }
-    if !a.flag("prefix_match")? {
+    let n = if !names.is_empty() {
+        file = tempfile::NamedTempFile::new()?;
+        // Through the call, so the session script carries the names too.
+        cx.write_file(file.path(), &(names.join("\n") + "\n"))?;
+        argv.extend(["-f".into(), file.path().to_string_lossy().into_owned()]);
+        names.len()
+    } else {
+        let indices: Vec<usize> = match a.given("indices") {
+            Some(Value::String(spec)) => {
+                let count = index_count(spec)?;
+                anyhow::ensure!(
+                    count <= MAX_SELECTED,
+                    "{count} indices; at most {MAX_SELECTED}"
+                );
+                parse_index_spec(spec)?
+            }
+            _ => a.parse("indices")?.unwrap_or_default(),
+        };
+        anyhow::ensure!(!indices.is_empty(), "`indices` names none");
+        let i: Vec<String> = indices.iter().map(usize::to_string).collect();
+        argv.extend(["-i".into(), i.join(",")]);
+        indices.len()
+    };
+    if exact {
         argv.push("--exact-names".into());
     }
-    let side = if rows { "rows" } else { "columns" };
-    let n = names.len().max(indices.len());
-    argv.extend(a.options()?);
+    argv.extend(a.options_but(&[
+        "-i",
+        "-f",
+        "--row-indices",
+        "--column-indices",
+        "--name-file",
+        "--exact-names",
+        "--allow-prefix",
+    ])?);
     written(cx, argv, &out, &format!("{n} {side} of {data}"), &[data])
 }
 

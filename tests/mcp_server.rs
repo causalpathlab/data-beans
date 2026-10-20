@@ -426,6 +426,28 @@ fn every_tool_answers_or_refuses_as_it_should() {
             json!({ "command": "from-mtx", "input": "m.mtx", "out": "m" }),
             Refused("not replacing"),
         ),
+        // Rows by pattern, and by a range of indices.
+        (
+            "subset",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "pattern": "^g[23]$", "out": "g23" }),
+            Ok(|v| v["info"]["rows"] == 2),
+        ),
+        (
+            "subset",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "indices": "0-2", "out": "first3" }),
+            Ok(|v| v["info"]["rows"] == 3),
+        ),
+        (
+            "subset",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "pattern": "^nope$", "out": "none" }),
+            Refused("no rows match"),
+        ),
+        // A selection flag of its own would win over the tool's.
+        (
+            "subset",
+            json!({ "data": "base.zarr.zip", "axis": "rows", "indices": [0], "out": "x1", "options": ["-i", "1,2"] }),
+            Refused("the tool's own arguments"),
+        ),
         // An output that is the input itself.
         (
             "convert",
@@ -542,7 +564,7 @@ fn a_person_follows_the_server_and_leaves_the_agent_a_note() {
         .expect("the server's watch folder");
     assert_eq!(server.meta.server, "data-beans");
     let mut pane = AgentPane::new(&server.dir, true).unwrap();
-    let screen = |pane: &AgentPane| {
+    let screen = |pane: &mut AgentPane| {
         let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
         t.draw(|f| pane.render(f.area(), f.buffer_mut())).unwrap();
         t.backend().to_string()

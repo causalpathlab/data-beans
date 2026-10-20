@@ -786,6 +786,22 @@ pub struct QcArgs {
     pub qc_mad_on_counts: bool,
 
     #[arg(
+        long = "qc-mad-on-mito",
+        hide = true,
+        // `--qc-mad-on-mito=false` turns it off; a bare flag leaves it on.
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = true,
+        help = "MAD-outlier drop on the mito fraction, given --qc-mito-pattern",
+        long_help = "Drop cells whose mito fraction is above `median + --qc-mads * MAD * 1.4826`.\n\
+                     On whenever --qc-mito-pattern is given. `--qc-mad-on-mito=false` leaves\n\
+                     only the hard cap, --qc-mito-max-frac, when one is given."
+    )]
+    pub qc_mad_on_mito: bool,
+
+    #[arg(
         long = "qc-auto-cutoff",
         hide = true,
         default_value_t = false,
@@ -819,7 +835,7 @@ impl QcArgs {
             // selects the rows to measure.
             mad_on_n_genes: self.qc_mad_on_genes,
             mad_on_counts: self.qc_mad_on_counts,
-            mad_on_mito: self.qc_mito_pattern.is_some(),
+            mad_on_mito: self.qc_mito_pattern.is_some() && self.qc_mad_on_mito,
             feature_min_cells: self.qc_feature_min_cells,
             drop_outliers: true,
             // Off by default: the near-empty floor plus the model's own
