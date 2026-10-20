@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.10.1"
+version = "0.10.2"
 rust-version = "1.91"
 # Ship only the sources, README and license: nothing else in the working tree
 # (data stores, saved name lists, scratch files) can end up on crates.io.
@@ -97,7 +97,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # Detachable sessions for the views; no pictures, so no graphics.
 legume-tui = { version = "0.3.2", optional = true, default-features = false, features = ["clap", "logs"] }
 # Its `tui` view (`data-beans mcp watch`) comes on with data-beans' `tui`.
-legume-mcp = { version = "0.3", optional = true }
+legume-mcp = { version = "0.4", optional = true }
 legume-plot = { version = "0.3.2", optional = true }
 base64 = { version = "0.22", optional = true }
 
@@ -106,5 +106,5 @@ base64 = { version = "0.22", optional = true }
 # tests/detach_session.rs.
 legume-tui = { version = "0.3.2", default-features = false, features = ["testing"] }
 # tests/mcp_server.rs follows a server through the watch pane.
-legume-mcp = { version = "0.3", features = ["tui"] }
+legume-mcp = { version = "0.4", features = ["tui"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
