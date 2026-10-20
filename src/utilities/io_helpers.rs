@@ -112,7 +112,8 @@ pub fn index_ranges(spec: &str) -> anyhow::Result<Vec<(usize, usize)>> {
 pub fn index_count(spec: &str) -> anyhow::Result<usize> {
     Ok(index_ranges(spec)?
         .iter()
-        .fold(0usize, |n, (a, b)| n.saturating_add(b - a + 1)))
+        // b >= a; a range to usize::MAX would wrap `b - a + 1` to 0.
+        .fold(0usize, |n, (a, b)| n.saturating_add((b - a).saturating_add(1))))
 }
 
 /// [`parse_index_spec`] on a side of `n` entries: ranges end at its end and
@@ -176,6 +177,8 @@ mod index_spec_tests {
     fn ranges_are_counted_and_cut_at_the_end() {
         assert_eq!(index_count("0-9,20").unwrap(), 11);
         assert_eq!(index_count("0-1000000000000").unwrap(), 1_000_000_000_001);
+        let to_max = format!("0-{}", usize::MAX);
+        assert_eq!(index_count(&to_max).unwrap(), usize::MAX);
         // A huge range on a side of 5 lists 5, not a trillion.
         assert_eq!(
             parse_index_spec_within("0-1000000000000", 5).unwrap(),
