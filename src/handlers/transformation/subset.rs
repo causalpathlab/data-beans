@@ -6,8 +6,9 @@ use crate::interactive::stat_tui::Side;
 use crate::interactive::ui::Tui;
 use crate::sparse_io::*;
 use crate::utilities::io_helpers::{
-    read_col_names, read_row_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
+    parse_index_spec_within, read_col_names, read_row_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
 };
+use crate::utilities::name_matching::names_matching;
 use crate::zarr_io::{apply_zip_flag, finalize_zarr_output, materialize_writable_backend};
 
 use legume_numeric::matrix::common_io::*;
@@ -97,7 +98,13 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
             Some(picked) => Some(picked),
             None => return Ok(()),
         },
-        None => args.column_indices.clone(),
+        // By index or pattern: resolved on the input before staging, so a
+        // selection that fails copies nothing.
+        None => early_columns(
+            args.column_indices.as_deref(),
+            args.pattern.as_deref(),
+            &args.data_file,
+        )?,
     };
 
     // Written off the screen: a `kill` meanwhile lets it finish.
@@ -169,7 +176,7 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
             idx
         } else {
             return Err(anyhow::anyhow!(
-                "either `column-indices`, `name-file`, or `--interactive` must be provided"
+                "either `column-indices`, `name-file`, `pattern`, or `--interactive` must be provided"
             ));
         };
 
@@ -212,7 +219,13 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
             Some(picked) => Some(picked),
             None => return Ok(()),
         },
-        None => args.row_indices.clone(),
+        // By index or pattern: resolved on the input before staging, so a
+        // selection that fails copies nothing.
+        None => early_rows(
+            args.row_indices.as_deref(),
+            args.pattern.as_deref(),
+            &args.data_file,
+        )?,
     };
 
     // Written off the screen: a `kill` meanwhile lets it finish.
@@ -280,7 +293,7 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
             idx
         } else {
             return Err(anyhow::anyhow!(
-                "either `row-indices`, `name-file`, or `--interactive` must be provided"
+                "either `row-indices`, `name-file`, `pattern`, or `--interactive` must be provided"
             ));
         };
 
@@ -364,3 +377,52 @@ pub fn reorder_rows(args: &ReorderRowsArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 #[path = "subset/tests.rs"]
 mod tests;
+
+/// The columns `-i` or `--pattern` selects in `data_file`, read without
+/// staging anything; none when neither is given.
+fn early_columns(
+    spec: Option<&str>,
+    pattern: Option<&str>,
+    data_file: &str,
+) -> anyhow::Result<Option<Vec<usize>>> {
+    early(spec, pattern, data_file, Side::Columns)
+}
+
+/// [`early_columns`] for rows.
+fn early_rows(
+    spec: Option<&str>,
+    pattern: Option<&str>,
+    data_file: &str,
+) -> anyhow::Result<Option<Vec<usize>>> {
+    early(spec, pattern, data_file, Side::Rows)
+}
+
+fn early(
+    spec: Option<&str>,
+    pattern: Option<&str>,
+    data_file: &str,
+    side: Side,
+) -> anyhow::Result<Option<Vec<usize>>> {
+    if spec.is_none() && pattern.is_none() {
+        return Ok(None);
+    }
+    let data = open_sparse_matrix_by_path(data_file)?;
+    let (what, n) = match side {
+        Side::Columns => ("columns", data.num_columns().unwrap_or(0)),
+        Side::Rows => ("rows", data.num_rows().unwrap_or(0)),
+    };
+    let idx = if let Some(spec) = spec {
+        parse_index_spec_within(spec, n)?
+    } else {
+        let pattern = pattern.unwrap_or_default();
+        let names = match side {
+            Side::Columns => data.column_names()?,
+            Side::Rows => data.row_names()?,
+        };
+        let idx = names_matching(&names, pattern)?;
+        anyhow::ensure!(!idx.is_empty(), "no {what} match `{pattern}`");
+        idx
+    };
+    info!("selected {} {what}", idx.len());
+    Ok(Some(idx))
+}

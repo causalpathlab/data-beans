@@ -114,6 +114,76 @@ fn median_in_place(xs: &mut [f32]) -> f32 {
     xs[mid]
 }
 
+/// The robust band [`robust_outlier_keep`] tests against: `median ± n_mads ·
+/// MAD · 1.4826`, on the `log1p` scale when asked.
+#[derive(Clone, Copy, Debug)]
+pub struct RobustBand {
+    pub median: f32,
+    pub lo: f32,
+    pub hi: f32,
+}
+
+impl RobustBand {
+    /// The band on the values' own scale, undoing `log1p`.
+    pub fn raw(self, log1p: bool) -> Self {
+        let back = |v: f32| if log1p { v.exp_m1() } else { v };
+        Self {
+            median: back(self.median),
+            lo: back(self.lo),
+            hi: back(self.hi),
+        }
+    }
+}
+
+/// A value on the scale its band is fitted on: `ln(1 + v)` for counts.
+fn band_scale(v: f32, log1p: bool) -> f32 {
+    if log1p {
+        v.max(0.0).ln_1p()
+    } else {
+        v
+    }
+}
+
+/// [`RobustBand`] of `values` (the `consider`ed ones, when given); `None`
+/// when none is finite, or when they have no spread (a MAD of 0).
+pub fn robust_band(
+    values: &[f32],
+    n_mads: f32,
+    log1p: bool,
+    consider: Option<&[bool]>,
+) -> Option<RobustBand> {
+    let xform = |v: f32| band_scale(v, log1p);
+
+    // Band statistics computed over the considered subset only.
+    let mut xs: Vec<f32> = values
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| consider.is_none_or(|c| c[*i]))
+        .map(|(_, &v)| xform(v))
+        .filter(|v| v.is_finite())
+        .collect();
+    if xs.is_empty() {
+        return None;
+    }
+    // O(n) median via quickselect (no full sort).
+    let median = median_in_place(&mut xs);
+
+    let mut dev: Vec<f32> = xs.iter().map(|&v| (v - median).abs()).collect();
+    let mad = median_in_place(&mut dev) * 1.4826;
+    // No spread: more than half the values are one value (a mito fraction
+    // of 0 in most nuclei, say). A band of width 0 would call every other
+    // value an outlier, so there is none.
+    if mad <= 0.0 {
+        return None;
+    }
+
+    Some(RobustBand {
+        median,
+        lo: median - n_mads * mad,
+        hi: median + n_mads * mad,
+    })
+}
+
 /// Robust outlier keep-mask: `keep[i] = false` when `values[i]` falls
 /// outside `median ± n_mads · MAD · 1.4826` on the requested `tail`.
 /// Count-like metrics should pass `log1p = true` so the band is symmetric
@@ -130,30 +200,11 @@ pub fn robust_outlier_keep(
     consider: Option<&[bool]>,
 ) -> Vec<bool> {
     let n = values.len();
-    if n == 0 {
-        return vec![];
-    }
-    let xform = |v: f32| if log1p { v.max(0.0).ln_1p() } else { v };
-
-    // Band statistics computed over the considered subset only.
-    let mut xs: Vec<f32> = values
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| consider.is_none_or(|c| c[*i]))
-        .map(|(_, &v)| xform(v))
-        .filter(|v| v.is_finite())
-        .collect();
-    if xs.is_empty() {
+    let Some(band) = robust_band(values, n_mads, log1p, consider) else {
         return vec![true; n];
-    }
-    // O(n) median via quickselect (no full sort).
-    let median = median_in_place(&mut xs);
-
-    let mut dev: Vec<f32> = xs.iter().map(|&v| (v - median).abs()).collect();
-    let mad = (median_in_place(&mut dev) * 1.4826).max(1e-8);
-
-    let lo = median - n_mads * mad;
-    let hi = median + n_mads * mad;
+    };
+    let xform = |v: f32| band_scale(v, log1p);
+    let (lo, hi) = (band.lo, band.hi);
     values
         .iter()
         .map(|&raw| {
@@ -701,6 +752,11 @@ pub struct QcArgs {
     #[arg(
         long = "qc-mad-on-genes",
         hide = true,
+        // `--qc-mad-on-genes=false` turns it off; a bare flag leaves it on.
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
         default_value_t = true,
         help = "MAD-outlier drop on the per-cell detected-feature count",
         long_help = "Drop cells whose detected-feature count falls outside `median +/- --qc-mads * MAD * 1.4826`.\n\
@@ -717,12 +773,33 @@ pub struct QcArgs {
     #[arg(
         long = "qc-mad-on-counts",
         hide = true,
+        // `--qc-mad-on-counts=false` turns it off; a bare flag leaves it on.
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
         default_value_t = true,
         help = "MAD-outlier drop on per-cell total counts",
         long_help = "Drop cells whose total count falls outside `median +/- --qc-mads * MAD * 1.4826`.\n\
                      ON by default; see --qc-mad-on-genes."
     )]
     pub qc_mad_on_counts: bool,
+
+    #[arg(
+        long = "qc-mad-on-mito",
+        hide = true,
+        // `--qc-mad-on-mito=false` turns it off; a bare flag leaves it on.
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = true,
+        help = "MAD-outlier drop on the mito fraction, given --qc-mito-pattern",
+        long_help = "Drop cells whose mito fraction is above `median + --qc-mads * MAD * 1.4826`.\n\
+                     On whenever --qc-mito-pattern is given. `--qc-mad-on-mito=false` leaves\n\
+                     only the hard cap, --qc-mito-max-frac, when one is given."
+    )]
+    pub qc_mad_on_mito: bool,
 
     #[arg(
         long = "qc-auto-cutoff",
@@ -758,7 +835,7 @@ impl QcArgs {
             // selects the rows to measure.
             mad_on_n_genes: self.qc_mad_on_genes,
             mad_on_counts: self.qc_mad_on_counts,
-            mad_on_mito: self.qc_mito_pattern.is_some(),
+            mad_on_mito: self.qc_mito_pattern.is_some() && self.qc_mad_on_mito,
             feature_min_cells: self.qc_feature_min_cells,
             drop_outliers: true,
             // Off by default: the near-empty floor plus the model's own
@@ -783,6 +860,17 @@ mod qc_tests {
         // upper tail must not flag a low value
         let keep_up = robust_outlier_keep(&v, 3.0, Tail::Upper, true, None);
         assert!(keep_up[5], "lower outlier kept under Tail::Upper");
+    }
+
+    #[test]
+    fn no_spread_flags_no_one() {
+        // Most cells read no mito at all: the MAD is 0, and a cell with one
+        // mito read is no outlier for it.
+        let mut v = vec![0.0f32; 60];
+        v.extend([0.01, 0.02, 0.05, 0.3]);
+        assert!(robust_band(&v, 5.0, false, None).is_none());
+        let keep = robust_outlier_keep(&v, 5.0, Tail::Upper, false, None);
+        assert!(keep.iter().all(|&k| k));
     }
 
     #[test]

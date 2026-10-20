@@ -5,6 +5,8 @@ mod column_subset;
 mod convert;
 mod handlers;
 mod hdf5_io;
+#[cfg(feature = "mcp")]
+mod mcp;
 // The interactive views live in the library (feature "tui") so downstream
 // crates can build on them; the CLI uses the same module.
 use data_beans::interactive;
@@ -28,6 +30,7 @@ use crate::handlers::builders::{
     run_build_from_fragments, run_build_from_mtx, run_build_from_zarr_triplets, FromFragmentsArgs,
     FromMtxArgs, FromZarrArgs,
 };
+use crate::handlers::cell_qc::{run_cell_qc, CellQcArgs};
 #[cfg(feature = "hdf5")]
 use crate::handlers::exporters::{run_export_to_h5ad, ToH5adArgs};
 use crate::handlers::exporters::{run_export_to_mtx, ToMtxArgs};
@@ -164,6 +167,13 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Statistics(args) => {
             run_stat(args)?;
         }
+        #[cfg(feature = "plot")]
+        Commands::Plot(args) => {
+            crate::handlers::plotting::run_plot(args)?;
+        }
+        Commands::Qc(args) => {
+            run_cell_qc(args)?;
+        }
         Commands::Histogram(args) => {
             run_histogram(args)?;
         }
@@ -203,6 +213,8 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::MergeBackend(args) => {
             run_merge_backend(args)?;
         }
+        #[cfg(feature = "mcp")]
+        Commands::Mcp(args) => mcp::run_mcp(args)?,
         Commands::Attach(args) => legume_tui::cli::attach(&TOOL, args)?,
         Commands::Sessions => legume_tui::cli::sessions(&TOOL)?,
         Commands::Kill(args) => legume_tui::cli::kill(&TOOL, args)?,
@@ -645,6 +657,34 @@ enum Commands {
     Statistics(RunStatArgs),
 
     #[command(
+        about = "Cell QC: near-empty floor and MAD outliers, as senna and pinto apply it",
+        long_about = "Run the cell QC senna and pinto apply, with the same --qc-* flags, on one backend.\n\
+                      Cells below the near-empty floor (--qc-min-cell-nnz) and cells outside the\n\
+                      robust band `median +/- --qc-mads * MAD * 1.4826` on detected features and total\n\
+                      counts (and the mito fraction, given --qc-mito-pattern) are dropped.\n\
+                      \n\
+                      Prints the outcome: cells and features kept, each metric's median, the band\n\
+                      it was held to and how many cells fell outside. With -o, writes the kept\n\
+                      cells (and features, under --qc-feature-min-cells) to a new backend;\n\
+                      --qc-report writes the per-cell metrics and verdicts.",
+        mut_args(|a| a.hide(false)),
+        mut_arg("qc_mito_pattern", |a| a.default_value(crate::handlers::cell_qc::MITO))
+    )]
+    Qc(CellQcArgs),
+
+    #[cfg(feature = "plot")]
+    #[command(
+        about = "Figures of a backend's QC or statistics (.png, .svg, .pdf)",
+        long_about = "Draw a backend's figures:\n\
+                      - `plot qc`: each QC metric's histogram, stacked by verdict, with the edge\n\
+                        QC held it to (the same --qc-* flags as `qc`), and total counts against\n\
+                        detected genes, cells coloured kept, outlier or near-empty;\n\
+                      - `plot stat`: the histogram of one row or column statistic.\n\
+                      The output's extension picks the format."
+    )]
+    Plot(crate::handlers::plotting::PlotArgs),
+
+    #[command(
         about = "ASCII log-scale histogram of a row/column statistic",
         long_about = "Print an ASCII log10(x+1) histogram of a statistic.\n\
                       It covers the per-feature (row) and per-cell (column) axes.\n\
@@ -657,6 +697,17 @@ enum Commands {
         visible_alias = "hist"
     )]
     Histogram(RunHistogramArgs),
+
+    #[cfg(feature = "mcp")]
+    #[command(
+        about = "Serve the commands to an agent over MCP (stdio)",
+        long_about = "Serve data-beans to an agent as Model Context Protocol tools over stdio\n\
+                      (`claude mcp add data-beans -- data-beans mcp`). Its tools read a\n\
+                      backend's size, names, statistics and values, and build new backends\n\
+                      by import, subset, subsample, split, convert and merge. No tool\n\
+                      replaces an existing file; squeeze, which rewrites its input, is left out."
+    )]
+    Mcp(mcp::McpArgs),
 
     #[command(
         about = "Return to a detached data-beans view",
@@ -703,3 +754,34 @@ fn interactive_session_help(more: &str) -> String {
 const STDOUT_IN_A_SESSION: &str = "Written to stdout, the result goes to the session's \
                                    terminal, and the part written while detached is lost; \
                                    give -o a file to keep it. ";
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Cli;
+    use clap::{ArgAction, CommandFactory};
+
+    /// A flag that is on by default must have a way off: a bare `SetTrue`
+    /// flag defaulting to true cannot be turned off from the command line
+    /// (`--qc-mad-on-genes` and `--allow-prefix` were), so such a flag
+    /// takes a value (`--flag=false`) instead.
+    #[test]
+    fn no_flag_is_stuck_on() {
+        fn walk(cmd: &clap::Command, path: &str, stuck: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                let on = arg.get_default_values().iter().any(|v| v == "true");
+                if on && matches!(arg.get_action(), ArgAction::SetTrue) {
+                    stuck.push(format!("{path} --{}", arg.get_id()));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), stuck);
+            }
+        }
+        let mut stuck = vec![];
+        walk(&Cli::command(), "data-beans", &mut stuck);
+        assert!(
+            stuck.is_empty(),
+            "flags that cannot be turned off: {stuck:?}"
+        );
+    }
+}

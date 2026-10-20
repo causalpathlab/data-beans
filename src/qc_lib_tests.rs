@@ -17,6 +17,7 @@ fn default_args() -> QcArgs {
         qc_histogram: false,
         qc_mad_on_genes: true,
         qc_mad_on_counts: true,
+        qc_mad_on_mito: true,
         qc_auto_cutoff: false,
     }
 }

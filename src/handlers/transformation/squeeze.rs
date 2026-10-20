@@ -488,6 +488,7 @@ fn run_squeeze_then_merge(
         // The merge writes what the user asked squeeze for, so it takes
         // squeeze's own zip decision rather than always leaving a directory.
         zip: cmd_args.zip,
+        common_rows: false,
         do_squeeze: false,
         row_nnz_cutoff: 0,
         column_nnz_cutoff: 0,

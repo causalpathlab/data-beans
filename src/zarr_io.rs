@@ -132,6 +132,40 @@ pub fn apply_zip_flag(output: &str, zip: bool, backend: &SparseIoBackend) -> Box
     }
 }
 
+/// Where a handler given `-o output` writes, before it writes anything.
+pub struct OutputTarget {
+    /// The output as the handler takes it: `.zarr.zip` added under zip.
+    pub effective: Box<str>,
+    pub backend: SparseIoBackend,
+    /// The file the backend is written to (the un-zipped `.zarr` directory
+    /// for a `.zarr.zip` target).
+    pub working: Box<str>,
+    /// What the user finds once [`finalize_output`] has run: the archive for
+    /// a `.zarr.zip` target, else the working file.
+    pub found: Box<str>,
+}
+
+/// [`OutputTarget`] for `output`, touching nothing.
+pub fn output_target(
+    output: &str,
+    backend: SparseIoBackend,
+    zip: bool,
+) -> anyhow::Result<OutputTarget> {
+    let effective = apply_zip_flag(output, zip, &backend);
+    let (backend, working) = crate::hdf5_io::resolve_backend_file(&effective, Some(backend))?;
+    let found = if effective.ends_with(".zarr.zip") {
+        effective.clone()
+    } else {
+        working.clone()
+    };
+    Ok(OutputTarget {
+        effective,
+        backend,
+        working,
+        found,
+    })
+}
+
 /// Resolve the output target for a handler that writes a fresh backend, and
 /// clear any pre-existing file at that path. Returns
 /// `(effective_output, backend, working_file)`, where `working_file` is the
@@ -142,15 +176,13 @@ pub fn prepare_output(
     backend: SparseIoBackend,
     zip: bool,
 ) -> anyhow::Result<(Box<str>, SparseIoBackend, Box<str>)> {
-    use crate::hdf5_io::resolve_backend_file;
     use legume_numeric::matrix::common_io::remove_file;
 
-    let effective_output = apply_zip_flag(output, zip, &backend);
-    let (backend, working_file) = resolve_backend_file(&effective_output, Some(backend))?;
-    if std::path::Path::new(working_file.as_ref()).exists() {
-        remove_file(&working_file)?;
+    let t = output_target(output, backend, zip)?;
+    if std::path::Path::new(t.working.as_ref()).exists() {
+        remove_file(&t.working)?;
     }
-    Ok((effective_output, backend, working_file))
+    Ok((t.effective, t.backend, t.working))
 }
 
 /// Finalize a handler's output: re-zip the working `.zarr` directory when the

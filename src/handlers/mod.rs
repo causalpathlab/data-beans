@@ -1,8 +1,11 @@
 pub mod analysis;
 pub mod builders;
+pub mod cell_qc;
 pub mod explore;
 pub mod exporters;
 pub mod inspection;
 pub mod listing;
 pub mod merging;
+#[cfg(feature = "plot")]
+pub mod plotting;
 pub mod transformation;

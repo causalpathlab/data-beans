@@ -12,7 +12,6 @@ use legume_numeric::matrix::common_io::*;
 use legume_numeric::matrix::membership::Membership;
 use legume_numeric::matrix::traits::RunningStatOps;
 use log::{info, warn};
-use regex::Regex;
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 #[clap(rename_all = "lowercase")]
@@ -263,14 +262,9 @@ fn rows_matching(cmd_args: &RunStatArgs, data: &SparseIoVec) -> anyhow::Result<O
     let Some(pattern) = &cmd_args.row_name_pattern else {
         return Ok(None);
     };
-    let re = Regex::new(&format!("(?i){}", pattern))
-        .map_err(|e| anyhow::anyhow!("invalid --row-name-pattern: {e}"))?;
     let row_names = data.row_names()?;
-    let selected: Vec<usize> = row_names
-        .iter()
-        .enumerate()
-        .filter_map(|(i, name)| re.is_match(name).then_some(i))
-        .collect();
+    let selected = crate::utilities::name_matching::names_matching(&row_names, pattern)
+        .map_err(|e| anyhow::anyhow!("--row-name-pattern: {e}"))?;
     info!(
         "Row pattern '{}' matched {}/{} rows",
         pattern,
@@ -285,13 +279,17 @@ fn rows_matching(cmd_args: &RunStatArgs, data: &SparseIoVec) -> anyhow::Result<O
 #[clap(rename_all = "lowercase")]
 pub enum HistStat {
     Nnz,
+    // `statistics` heads its columns tot, mu and sig.
+    #[value(alias = "tot")]
     Sum,
+    #[value(alias = "mu")]
     Mean,
+    #[value(alias = "sig")]
     Sd,
 }
 
 impl HistStat {
-    fn metric(&self) -> &'static str {
+    pub(crate) fn metric(&self) -> &'static str {
         match self {
             HistStat::Nnz => "nnz",
             HistStat::Sum => "sum",
@@ -302,7 +300,7 @@ impl HistStat {
 
     /// Pull the chosen statistic out of a running-stat accumulator (works for
     /// both the row and column variants via the shared `RunningStatOps` trait).
-    fn values<S: RunningStatOps<f32, Output = Vec<f32>>>(&self, s: &S) -> Vec<f32> {
+    pub(crate) fn values<S: RunningStatOps<f32, Output = Vec<f32>>>(&self, s: &S) -> Vec<f32> {
         match self {
             HistStat::Nnz => s.count_positives(),
             HistStat::Sum => s.sum(),

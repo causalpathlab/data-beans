@@ -4,7 +4,7 @@ use crate::interactive::stat_tui::Side;
 use crate::interactive::ui::Tui;
 use crate::sparse_io::*;
 use crate::utilities::io_helpers::{
-    parse_index_spec, read_col_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
+    parse_index_spec_within, read_col_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
 };
 use crate::utilities::name_matching::match_by_substring;
 use clap::Args;
@@ -225,9 +225,7 @@ pub fn take_columns(args: &TakeColumnsArgs) -> anyhow::Result<()> {
             let column_names: Vec<Box<str>> = columns.iter().map(|&i| names[i].clone()).collect();
             (data.read_columns_dmatrix(columns)?, column_names)
         } else if let Some(columns) = columns {
-            let columns = parse_index_spec(&columns)?;
-            let n_columns = data.num_columns().unwrap_or(0);
-            let columns: Vec<usize> = columns.into_iter().filter(|&i| i < n_columns).collect();
+            let columns = parse_index_spec_within(&columns, data.num_columns().unwrap_or(0))?;
 
             if columns.is_empty() {
                 return Err(anyhow::anyhow!("invalid indexes"));
@@ -308,9 +306,7 @@ pub fn take_rows(args: &TakeRowsArgs) -> anyhow::Result<()> {
             let row_names: Vec<Box<str>> = rows.iter().map(|&i| names[i].clone()).collect();
             (data_backend.read_rows_dmatrix(rows)?, row_names)
         } else if let Some(rows) = rows {
-            let rows = parse_index_spec(&rows)?;
-            let n_rows = data_backend.num_rows().unwrap_or(0);
-            let rows: Vec<usize> = rows.into_iter().filter(|&i| i < n_rows).collect();
+            let rows = parse_index_spec_within(&rows, data_backend.num_rows().unwrap_or(0))?;
 
             if rows.is_empty() {
                 return Err(anyhow::anyhow!("invalid indexes"));
