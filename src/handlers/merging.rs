@@ -71,6 +71,16 @@ pub struct MergeBackendArgs {
     #[arg(
         long,
         default_value_t = false,
+        help = "Keep only the rows every backend has",
+        long_help = "Keep only the rows (features) every backend has, matched by name,\n\
+                     in the first backend's order. Without it, the backends must have\n\
+                     the same rows in the same order."
+    )]
+    pub common_rows: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
         help = "Squeeze sparse rows/columns",
         long_help = "Enable squeezing to remove rows and columns with too few non-zeros.\n\
                      This can help reduce file size and improve performance."
@@ -285,16 +295,19 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         path: Box<str>,
         backend: SparseIoBackend,
         ncol: usize,
+        nnz: u64,
         col_offset: u64,
         nnz_offset: u64,
+        /// Under `--common-rows`, each row's place among the common rows.
+        row_map: Option<Vec<Option<u64>>>,
     }
 
     let mut batches: Vec<BatchHandle> = Vec::with_capacity(num_batches);
     let mut row_names: Vec<Box<str>> = vec![];
     let mut column_names: Vec<Box<str>> = vec![];
     let mut column_batch_names: Vec<Box<str>> = vec![];
+    let mut batch_rows: Vec<Vec<Box<str>>> = vec![];
     let mut col_offset: u64 = 0;
-    let mut nnz_offset: u64 = 0;
     let mut metas: Vec<Metadata> = Vec::with_capacity(num_batches);
 
     for (batch_idx, data_file) in args.data_files.iter().enumerate() {
@@ -315,14 +328,16 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
             .num_non_zeros()
             .ok_or_else(|| anyhow::anyhow!("missing nnz in {}", data_file))?;
 
-        if batch_idx == 0 {
+        if args.common_rows {
+            batch_rows.push(data.row_names()?);
+        } else if batch_idx == 0 {
             row_names = data.row_names()?;
         } else {
             info!("checking if the row names are consistent");
             anyhow::ensure!(
                 row_names == data.row_names()?,
                 "{} has other row names than {}: merge-backend needs the same rows, in order; \
-                 subset them to common rows first",
+                 subset them to common rows first, or pass --common-rows",
                 data_file,
                 args.data_files[0]
             );
@@ -341,12 +356,56 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
             path: data_file.clone(),
             backend,
             ncol,
+            nnz: nnz as u64,
             col_offset,
-            nnz_offset,
+            nnz_offset: 0,
+            row_map: None,
         });
 
         col_offset += ncol as u64;
-        nnz_offset += nnz as u64;
+    }
+
+    if args.common_rows {
+        row_names = common_names(&batch_rows);
+        anyhow::ensure!(!row_names.is_empty(), "the backends share no row names");
+        info!("{} rows common to all backends", row_names.len());
+        let place: HashMap<&str, u64> = row_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_ref(), i as u64))
+            .collect();
+        for (h, rows) in batches.iter_mut().zip(&batch_rows) {
+            let mut seen = vec![false; row_names.len()];
+            // A name a backend repeats keeps its first row only.
+            let map: Vec<Option<u64>> = rows
+                .iter()
+                .map(|n| {
+                    let i = *place.get(n.as_ref())?;
+                    (!std::mem::replace(&mut seen[i as usize], true)).then_some(i)
+                })
+                .collect();
+            if map.iter().enumerate().all(|(r, m)| *m == Some(r as u64)) {
+                continue; // these are the common rows, in order
+            }
+            // The rows kept hold this many entries: the resident row indptr says.
+            let src = open_sparse_matrix(&h.path, &h.backend)?;
+            let indptr = src.row_indptr();
+            anyhow::ensure!(
+                indptr.len() == rows.len() + 1,
+                "{} has no by-row index to count its common rows' entries",
+                h.path
+            );
+            h.nnz = (0..rows.len())
+                .filter(|&r| map[r].is_some())
+                .map(|r| indptr[r + 1] - indptr[r])
+                .sum();
+            h.row_map = Some(map);
+        }
+    }
+    let mut nnz_offset: u64 = 0;
+    for h in batches.iter_mut() {
+        h.nnz_offset = nnz_offset;
+        nnz_offset += h.nnz;
     }
 
     let total_ncol = col_offset as usize;
@@ -382,8 +441,15 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
             .map(|(lb, ub)| -> anyhow::Result<Vec<(u64, u64, f32)>> {
                 let (_, _, t) = src.read_triplets_by_columns((*lb..*ub).collect())?;
                 let lb_u64 = *lb as u64;
+                let row_map = h.row_map.as_deref();
                 Ok(t.into_iter()
-                    .map(move |(i, j_local, x)| (i, j_local + lb_u64, x))
+                    .filter_map(move |(i, j_local, x)| {
+                        let i = match row_map {
+                            Some(m) => m[i as usize]?,
+                            None => i,
+                        };
+                        Some((i, j_local + lb_u64, x))
+                    })
                     .collect())
             })
             .collect::<anyhow::Result<Vec<_>>>()?
@@ -483,6 +549,23 @@ pub(crate) fn write_batches_and_finalize(
         .collect();
     write_lines(&labels, &format!("{stem}.batch.gz"))?;
     finalize_zarr_output(backend_file, effective_output)
+}
+
+/// The names in every list, in the first list's order, each once.
+fn common_names(lists: &[Vec<Box<str>>]) -> Vec<Box<str>> {
+    let Some((first, rest)) = lists.split_first() else {
+        return vec![];
+    };
+    let others: Vec<rustc_hash::FxHashSet<&str>> = rest
+        .iter()
+        .map(|l| l.iter().map(|n| n.as_ref()).collect())
+        .collect();
+    let mut seen = rustc_hash::FxHashSet::default();
+    first
+        .iter()
+        .filter(|&n| others.iter().all(|o| o.contains(n.as_ref())) && seen.insert(n.as_ref()))
+        .cloned()
+        .collect()
 }
 
 pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {

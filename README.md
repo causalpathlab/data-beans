@@ -32,3 +32,24 @@ Here, we implement a wrapper for sparse matrix backends for swift data access by
         ├── indices (column indices)
         └── indptr (row pointers)
 ```
+
+## For an agent (MCP)
+
+`data-beans mcp` serves the commands as [Model Context Protocol](https://modelcontextprotocol.io) tools over stdio:
+
+```sh
+claude mcp add data-beans -- data-beans mcp
+```
+
+The read tools are `info`, `names`, `statistics`, `values` and `list_contents`. `qc` runs the cell QC senna and pinto apply (near-empty floor, MAD bands on detected genes, total counts and the mito fraction): without `out` it reports the bands and what they would drop, with `out` it writes the kept cells. `plot` returns the QC figure, or a statistic's histogram, as an image. The write tools, `import`, `subset`, `subsample`, `split`, `convert` and `merge` (with `common_rows` for backends whose rows differ), build new backends. Each write goes to an `out` that must not exist yet: no tool replaces a file, and `squeeze`, which rewrites its input, is not offered.
+
+The server keeps the project's records the way legume-mcp lays them out, after [Noble (2009), *A quick guide to organizing computational biology projects*, PLoS Comput Biol 5(7):e1000424](https://doi.org/10.1371/journal.pcbi.1000424): every step that writes goes into the day's `results/<date>/runall.sh`, which replays the session, and into `results/INDEX.tsv`; outputs the agent does not name go in `results/<date>/`; `import` notes where its input came from in `data/README.md`. `LEGUME_MCP_JOURNAL=off` turns the records off.
+
+The same QC and figures are on the command line:
+
+```sh
+data-beans qc data.zarr.zip --qc-mito-pattern '(?i)^MT-'            # summary only
+data-beans qc data.zarr.zip --qc-mito-pattern '(?i)^MT-' -o clean   # and the kept cells
+data-beans plot qc data.zarr.zip --qc-mito-pattern '(?i)^MT-' -o qc.png
+data-beans plot stat data.zarr.zip -s row --stat sum -o genes.png
+```

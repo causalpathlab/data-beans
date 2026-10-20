@@ -47,6 +47,7 @@ fn merge_args(files: &[&str], output: &str) -> MergeBackendArgs {
         backend: SparseIoBackend::Zarr,
         output: output.into(),
         zip: false,
+        common_rows: false,
         do_squeeze: false,
         row_nnz_cutoff: 0,
         column_nnz_cutoff: 0,

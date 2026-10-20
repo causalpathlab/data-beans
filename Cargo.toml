@@ -27,7 +27,7 @@ path = "src/sim_main.rs"
 required-features = ["sim"]
 
 [features]
-default = ["aux", "tui", "tensor", "ndarray"]
+default = ["aux", "tui", "tensor", "ndarray", "mcp", "plot"]
 # Read sparse data into dense candle `Tensor`s (`read_*_tensor`). Off, no
 # candle is linked: for crates that only need matrices.
 tensor = ["legume-numeric/tensor"]
@@ -41,6 +41,12 @@ aux = []
 # `data_beans::interactive` for downstream crates building their own. The
 # views run in legume-tui sessions, which a dropped connection leaves running.
 tui = ["dep:ratatui", "dep:legume-tui"]
+# `data-beans mcp`: the commands as Model Context Protocol tools for an
+# agent, over stdio.
+mcp = ["dep:legume-mcp"]
+# `data-beans plot`: QC and statistics figures (PNG, SVG, PDF) through
+# legume-plot, and the MCP `plot` tool.
+plot = ["dep:legume-plot", "dep:base64"]
 alg = ["aux"]
 sim = ["alg"]
 # Pulls in libhdf5 — opt-in so installs on hosts without HDF5 headers still
@@ -90,6 +96,10 @@ statrs = { version = "0.18", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 # Detachable sessions for the views; no pictures, so no graphics.
 legume-tui = { version = "0.3.2", optional = true, default-features = false, features = ["clap", "logs"] }
+# Pinned to a commit until 0.1.0 is on crates.io.
+legume-mcp = { version = "0.1.0", git = "https://github.com/causalpathlab/legume-mcp", rev = "b0fec5e", optional = true }
+legume-plot = { version = "0.3.2", optional = true }
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 # The crate's harness, driving the views through pseudo-terminals in
