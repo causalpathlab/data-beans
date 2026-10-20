@@ -24,7 +24,7 @@ use crate::utilities::io_helpers::parse_index_spec;
 use crate::utilities::name_matching::match_by_substring;
 use crate::zarr_io::{output_target, OutputTarget};
 use anyhow::{Context, Result};
-use clap::Args;
+use clap::{Args, Subcommand};
 use legume_mcp::{Call, Content, Handler, ServerInfo, ToolSpec};
 use regex::RegexBuilder;
 use serde_json::{json, Map, Value};
@@ -32,7 +32,32 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Args, Debug)]
-pub struct McpArgs {}
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub then: Option<McpCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpCommand {
+    /// Watch a data-beans MCP server while an agent uses it: its calls as
+    /// they come, each one's log and result, the notebook; s stops the
+    /// selected call, n leaves the agent a note, o opens what a call wrote
+    /// in the statistics explorer
+    #[cfg(feature = "tui")]
+    Watch(WatchArgs),
+}
+
+#[cfg(feature = "tui")]
+#[derive(Args, Debug)]
+pub struct WatchArgs {
+    /// the server's watch folder (as `ls $XDG_RUNTIME_DIR/legume-mcp`
+    /// lists them); without it, the one live server, or a pick among them
+    pub server: Option<PathBuf>,
+
+    /// watch only: no stop, no notes
+    #[arg(long)]
+    pub watch_only: bool,
+}
 
 const INSTRUCTIONS: &str = "\
 data-beans stores sparse single-cell matrices, features (genes, peaks) as \
@@ -62,7 +87,11 @@ convert and merge. Each writes to `out`, which must not exist yet: no tool \
 replaces a file. Leave `out` out and the output goes in today's results \
 folder, named after its input and the tool. Outputs are .zarr.zip archives \
 unless `out` ends in .zarr (a directory) or .h5. Paths are resolved against \
-the server's working directory; results give the paths written.";
+the server's working directory; results give the paths written.
+
+A person may be watching (`data-beans mcp watch`): a \"Note from the user\" \
+in a result is theirs to you; take it into account. A call they stopped \
+fails with \"stopped by the user\": do not run it again unasked.";
 
 /// The most entries a read returns, and the most a `values` call takes.
 const MAX_LIMIT: usize = 1000;
@@ -272,7 +301,34 @@ fn tools() -> Vec<ToolSpec> {
     ]
 }
 
-pub fn run_mcp(_args: &McpArgs) -> Result<()> {
+/// What o opens on a call: a backend it wrote, in the statistics explorer.
+#[cfg(feature = "tui")]
+fn open(call: &legume_mcp::watch::view::CallView) -> Option<Command> {
+    let written = written_backend(&call.text)?;
+    let mut cmd = Command::new(std::env::current_exe().ok()?);
+    cmd.args(["statistics", &written, "-s", "column", "--interactive"]);
+    Some(cmd)
+}
+
+/// The backend a result says it wrote (`written`, or the first of a list),
+/// when it is one.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
+fn written_backend(text: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let w = &v["written"];
+    let path = w.as_str().or_else(|| w.get(0)?.as_str())?;
+    [".zarr.zip", ".zarr", ".h5"]
+        .iter()
+        .any(|s| path.ends_with(s))
+        .then(|| path.to_string())
+}
+
+pub fn run_mcp(args: &McpArgs) -> Result<()> {
+    #[cfg(feature = "tui")]
+    if let Some(McpCommand::Watch(w)) = &args.then {
+        let tool = &crate::interactive::TOOL;
+        return legume_mcp::watch::view::run(tool, w.server.clone(), !w.watch_only, open);
+    }
     let info = ServerInfo {
         name: "data-beans".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -1149,4 +1205,27 @@ fn split(a: &Arguments, cx: &Call) -> Result<Value> {
     )?;
     // Nothing was there before, so all there is now was written.
     Ok(json!({ "written": outputs_beside(&prefix)? }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::written_backend;
+
+    #[test]
+    fn a_result_opens_the_backend_it_wrote() {
+        let one = r#"{ "written": "/p/results/x.subset.zarr.zip", "info": {} }"#;
+        assert_eq!(
+            written_backend(one).as_deref(),
+            Some("/p/results/x.subset.zarr.zip")
+        );
+        let halves = r#"{ "written": ["/p/cv.test.zarr.zip", "/p/cv.train.zarr.zip"] }"#;
+        assert_eq!(
+            written_backend(halves).as_deref(),
+            Some("/p/cv.test.zarr.zip")
+        );
+        // A figure, a table, a read: nothing to open in the explorer.
+        assert_eq!(written_backend(r#"{ "written": "/p/qc.png" }"#), None);
+        assert_eq!(written_backend(r#"{ "rows": 3 }"#), None);
+        assert_eq!(written_backend("[image/png, 3 bytes]"), None);
+    }
 }

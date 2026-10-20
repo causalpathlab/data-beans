@@ -40,7 +40,7 @@ aux = []
 # Full-screen terminal views (ratatui): the CLI's interactive sessions, and
 # `data_beans::interactive` for downstream crates building their own. The
 # views run in legume-tui sessions, which a dropped connection leaves running.
-tui = ["dep:ratatui", "dep:legume-tui"]
+tui = ["dep:ratatui", "dep:legume-tui", "legume-mcp?/tui"]
 # `data-beans mcp`: the commands as Model Context Protocol tools for an
 # agent, over stdio.
 mcp = ["dep:legume-mcp"]
@@ -97,7 +97,8 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # Detachable sessions for the views; no pictures, so no graphics.
 legume-tui = { version = "0.3.2", optional = true, default-features = false, features = ["clap", "logs"] }
 # Pinned to a commit until 0.1.0 is on crates.io.
-legume-mcp = { version = "0.1.0", git = "https://github.com/causalpathlab/legume-mcp", rev = "6020312", optional = true }
+# Its `watch` view, on a branch of the local checkout until it is merged.
+legume-mcp = { version = "0.1.0", path = "../legume-mcp-view", optional = true }
 legume-plot = { version = "0.3.2", optional = true }
 base64 = { version = "0.22", optional = true }
 
@@ -105,3 +106,6 @@ base64 = { version = "0.22", optional = true }
 # The crate's harness, driving the views through pseudo-terminals in
 # tests/detach_session.rs.
 legume-tui = { version = "0.3.2", default-features = false, features = ["testing"] }
+# tests/mcp_server.rs follows a server through the watch pane.
+legume-mcp = { version = "0.1.0", path = "../legume-mcp-view", features = ["tui"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

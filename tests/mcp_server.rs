@@ -21,9 +21,14 @@ struct Client {
 
 impl Client {
     fn start(dir: &Path) -> Self {
+        Self::start_with(dir, &[])
+    }
+
+    fn start_with(dir: &Path, env: &[(&str, &Path)]) -> Self {
         let mut child = Command::new(EXE)
             .arg("mcp")
             .current_dir(dir)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -518,4 +523,62 @@ fn a_cancelled_call_gets_no_answer_and_the_server_goes_on() {
     // answer unless the call finished before the cancel arrived.
     let pong = c.request("ping", json!({}));
     assert!(pong.get("result").is_some(), "{pong}");
+}
+
+#[test]
+fn a_person_follows_the_server_and_leaves_the_agent_a_note() {
+    use legume_mcp::watch::{self, view::AgentPane, view::Handled};
+    use ratatui::{backend::TestBackend, crossterm::event::KeyCode, Terminal};
+
+    let dir = tempfile::tempdir().unwrap();
+    backend(dir.path());
+    let base = dir.path().join("watch");
+    let mut c = Client::start_with(dir.path(), &[("LEGUME_MCP_WATCH", &base)]);
+    c.request("initialize", json!({}));
+    c.call("info", json!({ "data": "base.zarr.zip" })).unwrap();
+
+    let server = watch::live_in(&base)
+        .pop()
+        .expect("the server's watch folder");
+    assert_eq!(server.meta.server, "data-beans");
+    let mut pane = AgentPane::new(&server.dir, true).unwrap();
+    let screen = |pane: &AgentPane| {
+        let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        t.draw(|f| pane.render(f.area(), f.buffer_mut())).unwrap();
+        t.backend().to_string()
+    };
+    let shows = |pane: &mut AgentPane, want: &str| {
+        for _ in 0..200 {
+            pane.poll();
+            if screen(pane).contains(want) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the pane never showed {want}:\n{}", screen(pane));
+    };
+    shows(&mut pane, "info");
+
+    // The person leaves a note; the agent's next result carries it.
+    pane.key(KeyCode::Char('n').into());
+    for ch in "use exact names".chars() {
+        pane.key(KeyCode::Char(ch).into());
+    }
+    pane.key(KeyCode::Enter.into());
+    let r = c.request(
+        "tools/call",
+        json!({ "name": "subset", "arguments": { "data": "base.zarr.zip", "axis": "rows", "names": ["G2"], "out": "g2" } }),
+    );
+    assert!(
+        r.to_string()
+            .contains("Note from the user: use exact names"),
+        "{r}"
+    );
+    shows(&mut pane, "subset");
+
+    // Opened, the subset hands over what it wrote.
+    match pane.key(KeyCode::Char('o').into()) {
+        Handled::Open(call) => assert!(call.text.contains("g2.zarr.zip"), "{}", call.text),
+        _ => panic!("o opens the subset"),
+    }
 }
