@@ -1,4 +1,4 @@
-use super::{log_feature_type_histogram, run_squeeze_if_needed};
+use super::{keep_import, log_feature_type_histogram, Squeeze};
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
 use crate::utilities::name_matching::{
@@ -79,8 +79,13 @@ pub struct FromMtxArgs {
     /// Omit for auto-scaling by feature count.
     #[arg(long)]
     pub block_size: Option<usize>,
+
+    #[command(flatten)]
+    pub view: crate::handlers::explore::PlanArgs,
 }
 pub fn run_build_from_mtx(args: &FromMtxArgs) -> anyhow::Result<()> {
+    // The session first: hosted, the build runs there.
+    let session = args.view.session("from-mtx")?;
     let mtx_file = args.mtx.as_ref();
     let row_file = args.row.as_ref();
     let col_file = args.col.as_ref();
@@ -268,13 +273,15 @@ pub fn run_build_from_mtx(args: &FromMtxArgs) -> anyhow::Result<()> {
         }
     }
 
-    run_squeeze_if_needed(
-        args.do_squeeze,
-        args.row_nnz_cutoff,
-        args.column_nnz_cutoff,
-        args.block_size,
-        &backend_file,
-    )?;
+    let squeeze = Squeeze {
+        on: args.do_squeeze,
+        rows: args.row_nnz_cutoff,
+        columns: args.column_nnz_cutoff,
+        block_size: args.block_size,
+    };
+    if !keep_import("from-mtx", session.as_ref(), squeeze, &backend_file)? {
+        return Ok(());
+    }
 
     finalize_zarr_output(&backend_file, &effective_output)?;
     info!("done");

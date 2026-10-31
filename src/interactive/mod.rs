@@ -8,6 +8,10 @@
 //!   [`ui::Binned`], [`ui::HistPlot`], and [`ui::MirrorPlot`] for two series
 //!   around one zero line.
 //! - [`qc_tui`]: `qc`'s view: cell QC rules moved on their histograms.
+//! - [`list_tui`]: a list to browse, flat (names) or a tree (a file's
+//!   hierarchy): filter, mark, write, copy.
+//! - [`plan_tui`]: what a command is about to write, with its settings on
+//!   keys: Enter writes, `q` does not.
 //! - [`stat_tui`]: table-and-histogram explorer over plain name and value
 //!   columns, optionally marking entries and handing them back.
 //!
@@ -19,6 +23,8 @@
 //! drops. [`ui::run_screen`] runs a view in a plain session of its own
 //! (`legume_tui::Session::plain`).
 
+pub mod list_tui;
+pub mod plan_tui;
 pub mod qc_tui;
 pub mod stat_tui;
 pub mod ui;

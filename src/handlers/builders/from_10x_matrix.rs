@@ -1,4 +1,4 @@
-use super::run_squeeze_if_needed;
+use super::{keep_import, Squeeze};
 use crate::convert::{build_from_h5_matrix, MatrixLayout};
 use crate::sparse_io::*;
 use crate::sparse_util::*;
@@ -181,8 +181,13 @@ pub struct From10xMatrixArgs {
                      Omit it for auto-scaling by feature count."
     )]
     pub block_size: Option<usize>,
+
+    #[command(flatten)]
+    pub view: crate::handlers::explore::PlanArgs,
 }
 pub fn run_build_from_10x_matrix(args: &From10xMatrixArgs) -> anyhow::Result<()> {
+    // The session first: hosted, the build runs there.
+    let session = args.view.session("from10x-matrix")?;
     let (effective_output, backend, backend_file) =
         prepare_output(&args.output, args.backend.clone(), args.zip)?;
 
@@ -206,13 +211,15 @@ pub fn run_build_from_10x_matrix(args: &From10xMatrixArgs) -> anyhow::Result<()>
         &backend,
     )?;
 
-    run_squeeze_if_needed(
-        args.do_squeeze,
-        args.row_nnz_cutoff,
-        args.column_nnz_cutoff,
-        args.block_size,
-        &backend_file,
-    )?;
+    let squeeze = Squeeze {
+        on: args.do_squeeze,
+        rows: args.row_nnz_cutoff,
+        columns: args.column_nnz_cutoff,
+        block_size: args.block_size,
+    };
+    if !keep_import("from10x-matrix", session.as_ref(), squeeze, &backend_file)? {
+        return Ok(());
+    }
     finalize_output(&backend_file, &effective_output)?;
     info!("done");
     Ok(())

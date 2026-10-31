@@ -14,6 +14,10 @@ use rayon::prelude::*;
 
 use rustc_hash::FxHashMap as HashMap;
 
+#[path = "merge_plan.rs"]
+mod plan;
+pub use crate::handlers::explore::PlanArgs;
+
 #[derive(Args, Debug)]
 pub struct AlignDataArgs {
     /// data file -- either `.zarr` or `.h5`
@@ -27,6 +31,9 @@ pub struct AlignDataArgs {
     /// output directory
     #[arg(short, long, required = true)]
     pub output_directory: Box<str>,
+
+    #[command(flatten)]
+    pub view: PlanArgs,
 }
 
 #[derive(Args, Debug)]
@@ -110,6 +117,9 @@ pub struct MergeBackendArgs {
         help = "Cells per rayon job (omit for auto-scaling by feature count)"
     )]
     pub block_size: Option<usize>,
+
+    #[command(flatten)]
+    pub view: PlanArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -236,6 +246,9 @@ pub struct MergeMtxArgs {
                      Omit it for auto-scaling by feature count."
     )]
     pub block_size: Option<usize>,
+
+    #[command(flatten)]
+    pub view: PlanArgs,
 }
 
 /// Sort triplets into CSC layout and split into (colptr, row indices, values).
@@ -270,7 +283,12 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         info!("no need to merge one file");
         return Ok(());
     }
+    plan::merge_backend(args)
+}
 
+/// `merge-backend` with the rows and squeeze decided: `common_rows` keeps
+/// the rows every file has, `squeeze` drops sparse rows and columns after.
+fn merge_backend(args: &MergeBackendArgs, common_rows: bool, squeeze: bool) -> anyhow::Result<()> {
     let num_batches = args.data_files.len();
     info!("merging over {} batches ...", num_batches);
 
@@ -330,7 +348,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
             .num_non_zeros()
             .ok_or_else(|| anyhow::anyhow!("missing nnz in {}", data_file))?;
 
-        if args.common_rows {
+        if common_rows {
             batch_rows.push(data.row_names()?);
             batch_indptr.push(data.row_indptr().to_vec());
         } else if batch_idx == 0 {
@@ -367,7 +385,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         col_offset += ncol as u64;
     }
 
-    if args.common_rows {
+    if common_rows {
         row_names = common_names(&batch_rows);
         anyhow::ensure!(!row_names.is_empty(), "the backends share no row names");
         info!("{} rows common to all backends", row_names.len());
@@ -488,7 +506,7 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         .zip(column_batch_names)
         .collect::<HashMap<_, _>>();
 
-    if args.do_squeeze {
+    if squeeze {
         squeeze_in_place(
             &backend_file,
             args.row_nnz_cutoff,
@@ -559,6 +577,20 @@ fn common_names(lists: &[Vec<Box<str>>]) -> Vec<Box<str>> {
 }
 
 pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
+    plan::merge_mtx(args)
+}
+
+/// The MTX file sets under `merge-mtx`'s directories, one batch each.
+pub(crate) struct MtxSets {
+    pub(crate) batch_names: Vec<String>,
+    pub(crate) mtx_files: Vec<Box<str>>,
+    pub(crate) row_files: Vec<Box<str>>,
+    pub(crate) col_files: Vec<Box<str>>,
+}
+
+/// Find each directory's (and subdirectory's) matrix, feature and barcode
+/// files.
+fn find_mtx_sets(args: &MergeMtxArgs) -> anyhow::Result<MtxSets> {
     let directories = args.data_directories.clone();
 
     let mut mtx_files = vec![];
@@ -653,6 +685,22 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
         }
     }
 
+    Ok(MtxSets {
+        batch_names,
+        mtx_files,
+        row_files,
+        col_files,
+    })
+}
+
+/// `merge-mtx` over the file sets found, squeezed after when `squeeze`.
+fn merge_mtx(args: &MergeMtxArgs, sets: MtxSets, squeeze: bool) -> anyhow::Result<()> {
+    let MtxSets {
+        batch_names,
+        mtx_files,
+        row_files,
+        col_files,
+    } = sets;
     let num_batches = batch_names.len();
 
     info!("merging over {} batches ...", num_batches);
@@ -821,7 +869,7 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
         .zip(column_batch_names)
         .collect::<HashMap<_, _>>();
 
-    if args.do_squeeze {
+    if squeeze {
         squeeze_in_place(
             &backend_file,
             args.row_nnz_cutoff,
@@ -885,14 +933,19 @@ pub fn generate_unique_batch_names(files: &[Box<str>]) -> anyhow::Result<Vec<Box
 }
 
 pub fn align_backends(args: &AlignDataArgs) -> anyhow::Result<()> {
+    plan::align_data(args)
+}
+
+/// `align-data` over `num_types` data types.
+fn align_data(args: &AlignDataArgs, num_types: usize) -> anyhow::Result<()> {
     let n_data = args.data_files.len();
-    let n_data_columns = n_data.div_ceil(args.num_data_types);
-    let n_expected = n_data_columns * args.num_data_types;
+    let n_data_columns = n_data.div_ceil(num_types);
+    let n_expected = n_data_columns * num_types;
 
     if n_expected != n_data {
         return Err(anyhow::anyhow!(format!(
             "Should be multiple of {}: actual data files {} < expected {}",
-            args.num_data_types, n_data, n_expected
+            num_types, n_data, n_expected
         )));
     }
 

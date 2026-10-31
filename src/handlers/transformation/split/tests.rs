@@ -167,6 +167,7 @@ fn the_halves_partition_the_cells_and_keep_their_values() -> anyhow::Result<()> 
         backend: SparseIoBackend::Zarr,
         output: out.to_str().expect("utf8").into(),
         zip: false,
+        view: crate::handlers::explore::PlanArgs::batch(),
     })?;
 
     let src = open_sparse_matrix(input.to_str().expect("utf8"), &SparseIoBackend::Zarr)?;

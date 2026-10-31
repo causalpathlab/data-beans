@@ -37,7 +37,9 @@ Here, we implement a wrapper for sparse matrix backends for swift data access by
 
 One rule decides, for every command with a view:
 
-- `qc` and `stat` open their view on a terminal, and run straight through otherwise;
+- `qc`, `stat` and `histogram` open their view on a terminal, and run straight through otherwise;
+- `row-names`, `column-names`, `list-h5` and `list-zarr` open a browser on a terminal in place of printing (a file `-o` is still written);
+- `merge-backend`, `merge-mtx`, `align-data`, `subsample`, `split` and every `from-*` show a plan of what they write (or wrote) first, and write only on Enter;
 - `columns`, `rows`, `subset` and `subset-*` open the explorer to pick from only when the command line selects nothing;
 - `--batch-process`, or `DATA_BEANS_BATCH=1` in the environment, asks for no view: put `export DATA_BEANS_BATCH=1` at the top of a script started from a terminal, whose commands would otherwise take it for yours;
 - a terminal is stdin and stdout both a terminal, and not `TERM=dumb`. Without one (output redirected, say) a view is skipped with one line on stderr; a picker with nothing to pick from stops and names the flags that select instead.
@@ -48,7 +50,11 @@ Results go to stdout and nothing else does: logs, the QC histograms, the skipped
 
 `qc` also does what `squeeze` did: its nnz floors are `--qc-min-cell-nnz` (cells) and `--qc-feature-min-cells` (genes), and `--qc-auto-cutoff` puts both at the trough of their histograms. Several files (`qc a.zarr.zip,b.zarr.zip`) are pooled first, as `merge-backend` merges them (`--common-rows` keeps the genes all share), and QC'd as one; the output comes with their batch labels.
 
-`stat` explores per-row or per-column statistics; `s` saves its figure (the four histograms and mean against sd, marked entries in the accent).
+`stat` explores per-row or per-column statistics; `s` saves its figure (the four histograms and mean against sd, marked entries in the accent). `histogram` opens the same explorer on the `--stat` and `--dim` asked.
+
+**Names and trees.** `row-names` and `column-names` list a matrix's names, `list-h5` and `list-zarr` a file's hierarchy (Enter or the arrows open and close a group). `/` filters (a regular expression when the text is one), Space marks, `a` marks every entry shown, `w` writes the marked entries (or, with none marked, those shown; a tree's as paths) and `y` copies them.
+
+**Plans.** Before a command writes, its plan says what it will make: `merge-backend` and `merge-mtx` each input's rows and columns, how many rows every input has and how many only some, and the output's size (`c` keeps the common rows, `s` squeezes after); `align-data` each file's data type and column group, and the rows and columns each keeps (`r` sets the data types); `subsample` the size it draws (`n` cells, `g` genes, `s` seed); `split` each fold's train and test cells (`t` test fraction, `k` folds, `s` seed, `g` grid under `--coord`). After a `from-*` build, the import preview shows its rows' and columns' non-zeros on log bins with where the squeeze cutoffs fall (`s` squeeze, `r` and `c` the cutoffs); `q` there deletes the build. A plan that cannot be written says why, and Enter waits; elsewhere `q` writes nothing.
 
 In kitty, iTerm2, WezTerm and Ghostty the plots are the figure itself, drawn as images; other terminals get text plots. `DATA_BEANS_TUI_IMAGES=0` keeps text, `=1` asks any terminal. `--figure` writes the same figure without the view, and the MCP `qc` and `statistics` tools return it to an agent.
 

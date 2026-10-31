@@ -27,6 +27,44 @@ pub fn open_session(
     Ok(TOOL.session(screen, &args.options(true))?)
 }
 
+/// Whether a command that writes shows its plan first, and how that view
+/// runs as a session.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct PlanArgs {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Write straight away: no plan first, even on a terminal",
+        long_help = "On a terminal, a plan of what will be written opens first: the inputs\n\
+                     and what they share, the output and its size, and the settings on keys,\n\
+                     each change redrawing the plan. Enter writes with the settings shown; q\n\
+                     writes nothing. --batch-process (or no terminal) writes straight away."
+    )]
+    pub batch_process: bool,
+
+    #[command(flatten)]
+    pub session: legume_tui::cli::SessionArgs,
+}
+
+impl PlanArgs {
+    /// Straight through, for a command run by another.
+    pub fn batch() -> Self {
+        Self {
+            batch_process: true,
+            ..Self::default()
+        }
+    }
+
+    /// The session `command`'s plan opens in, opened before any work; none
+    /// when it writes straight away.
+    pub fn session(&self, command: &str) -> anyhow::Result<Option<legume_tui::Session>> {
+        if !crate::interactive::opens_view(command, self.batch_process) {
+            return Ok(None);
+        }
+        open_session(command, &self.session).map(Some)
+    }
+}
+
 /// Run `f`, a command's work after its views, off the screen of `tui` when
 /// there is one: a `kill` meanwhile lets it finish.
 pub fn off_screen<T>(

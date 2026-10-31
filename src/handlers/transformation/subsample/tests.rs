@@ -32,6 +32,7 @@ fn args(input: &str, output: &str) -> SubsampleArgs {
         backend: SparseIoBackend::Zarr,
         output: output.into(),
         zip: false,
+        view: crate::handlers::explore::PlanArgs::batch(),
     }
 }
 

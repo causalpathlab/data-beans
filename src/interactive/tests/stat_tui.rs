@@ -473,3 +473,16 @@ fn s_saves_the_statistics_figure_with_the_marks() {
         "the mark reaches the figure"
     );
 }
+
+/// `histogram -s mean` opens on mean, sorted by it, on its top entry.
+#[test]
+fn on_stat_opens_sorted_by_that_statistic_at_the_top() {
+    let e = explorer().on_stat(2);
+    assert_eq!((e.stat, e.by_name, e.descending), (2, false, true));
+    assert_eq!((e.cursor, e.offset), (0, 0));
+    let means: Vec<f32> = e.view.iter().map(|&i| e.values[2][i]).collect();
+    assert!(means.windows(2).all(|w| w[0] >= w[1]), "{means:?}");
+    // nnz, already shown, keeps the order (no flip).
+    let e = explorer().on_stat(0);
+    assert!(e.descending);
+}

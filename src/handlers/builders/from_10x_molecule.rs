@@ -1,4 +1,4 @@
-use super::run_squeeze_if_needed;
+use super::{keep_import, Squeeze};
 use crate::convert::{write_10x_matrix, TenxMatrix};
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
@@ -122,6 +122,9 @@ pub struct From10xMoleculeArgs {
                      Omit it for auto-scaling by feature count."
     )]
     pub block_size: Option<usize>,
+
+    #[command(flatten)]
+    pub view: crate::handlers::explore::PlanArgs,
 }
 /// A library `--library-type` keeps.
 struct Library {
@@ -131,6 +134,8 @@ struct Library {
 }
 
 pub fn run_build_from_10x_molecule(args: &From10xMoleculeArgs) -> anyhow::Result<()> {
+    // The session first: hosted, the build runs there.
+    let session = args.view.session("from10x-molecule")?;
     let file = hdf5::File::open(args.h5_file.to_string())?;
     info!("Opened molecule_info.h5: {}", args.h5_file);
 
@@ -349,13 +354,15 @@ pub fn run_build_from_10x_molecule(args: &From10xMoleculeArgs) -> anyhow::Result
     )?;
 
     // 7. Squeeze if needed
-    run_squeeze_if_needed(
-        args.do_squeeze,
-        args.row_nnz_cutoff,
-        args.column_nnz_cutoff,
-        args.block_size,
-        &backend_file,
-    )?;
+    let squeeze = Squeeze {
+        on: args.do_squeeze,
+        rows: args.row_nnz_cutoff,
+        columns: args.column_nnz_cutoff,
+        block_size: args.block_size,
+    };
+    if !keep_import("from10x-molecule", session.as_ref(), squeeze, &backend_file)? {
+        return Ok(());
+    }
     finalize_output(&backend_file, &effective_output)?;
     info!("done");
     Ok(())
@@ -453,6 +460,7 @@ mod tests {
             row_nnz_cutoff: 1,
             column_nnz_cutoff: 1,
             block_size: None,
+            view: crate::handlers::explore::PlanArgs::batch(),
         };
         run_build_from_10x_molecule(&args).unwrap();
         let data = open_sparse_matrix(

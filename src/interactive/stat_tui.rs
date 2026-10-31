@@ -319,6 +319,15 @@ impl<'a> StatExplorer<'a> {
         explorer
     }
 
+    /// Open on statistic `s` (nnz, sum, mean, sd), sorted by it.
+    pub fn on_stat(mut self, s: usize) -> Self {
+        if s < STATS.len() && s != self.stat {
+            self.choose_stat(s);
+            (self.cursor, self.offset) = (0, 0);
+        }
+        self
+    }
+
     fn selected(&self) -> Option<usize> {
         self.view.get(self.cursor).copied()
     }
