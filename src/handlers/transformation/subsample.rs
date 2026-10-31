@@ -8,6 +8,11 @@ use rand::rngs::SmallRng;
 use rand::seq::index::sample;
 use rand::SeedableRng;
 
+use crate::handlers::explore::{off_screen, PlanArgs};
+use crate::interactive::plan_tui::{plan_in, Control, Plan, PlanView, Planner, Setting};
+use crate::interactive::ui::Tui;
+use crate::zarr_io::output_path;
+
 #[derive(Args, Debug)]
 pub struct SubsampleArgs {
     /// data file -- `.zarr`, `.zarr.zip`, or `.h5`
@@ -44,6 +49,9 @@ pub struct SubsampleArgs {
     /// keep a `.zarr` directory instead of producing a `.zarr.zip` archive
     #[arg(long = "no-zip", default_value_t = true, action = clap::ArgAction::SetFalse)]
     pub zip: bool,
+
+    #[command(flatten)]
+    pub view: PlanArgs,
 }
 
 /// Randomly subsample cells and/or genes into a new, smaller backend.
@@ -52,6 +60,7 @@ pub struct SubsampleArgs {
 /// size rather than the input — handy for carving quick test/demo datasets
 /// out of a large backend. An unset dimension keeps all of its entries.
 pub fn run_subsample(args: &SubsampleArgs) -> anyhow::Result<()> {
+    let session = args.view.session("subsample")?;
     let (backend_in, file_in) = resolve_backend_file(&args.data_file, None)?;
     let data = open_sparse_matrix(&file_in, &backend_in)?;
 
@@ -62,13 +71,129 @@ pub fn run_subsample(args: &SubsampleArgs) -> anyhow::Result<()> {
         .num_columns()
         .ok_or_else(|| anyhow::anyhow!("backend has no `ncol`"))?;
 
-    let n_cells = resolve_target(args.cells, args.cell_frac, ncol, "cells")?;
-    let n_genes = resolve_target(args.genes, args.gene_frac, nrow, "genes")?;
+    let mut n_cells = resolve_target(args.cells, args.cell_frac, ncol, "cells")?;
+    let mut n_genes = resolve_target(args.genes, args.gene_frac, nrow, "genes")?;
+    let mut seed = args.seed;
+    let mut tui = session.as_ref().map(Tui::new);
+    if let Some(tui) = tui.as_mut() {
+        let size = Size {
+            nrow,
+            ncol,
+            nnz: data.num_non_zeros(),
+        };
+        match choose(tui, args, size, (n_cells, n_genes, seed))? {
+            Some(c) => (n_cells, n_genes, seed) = c,
+            None => {
+                info!("subsample: cancelled; nothing written");
+                return Ok(());
+            }
+        }
+    }
     if n_cells.is_none() && n_genes.is_none() {
         anyhow::bail!("specify at least one of --cells / --cell-frac / --genes / --gene-frac");
     }
+    off_screen(tui.as_mut(), || {
+        write_subsample(args, &*data, (nrow, ncol), (n_cells, n_genes), seed)
+    })
+}
 
-    let mut rng = SmallRng::seed_from_u64(args.seed);
+/// The input's size, for the plan.
+#[derive(Debug, Clone, Copy)]
+struct Size {
+    nrow: usize,
+    ncol: usize,
+    nnz: Option<usize>,
+}
+
+/// Cells and genes to keep (`None`: all) and the seed.
+type Draw = (Option<usize>, Option<usize>, u64);
+
+/// A count from a setting: whole, at least 1, at most `total`.
+fn count(s: &Setting, what: &str, total: usize) -> anyhow::Result<Option<usize>> {
+    match s.number() {
+        None => Ok(None),
+        Some(v) if v.fract() == 0.0 && v >= 1.0 => Ok(Some((v as usize).min(total))),
+        Some(v) => anyhow::bail!("{what} is a whole number, at least 1; not {v}"),
+    }
+}
+
+fn draw_of(s: &[Setting], size: Size) -> anyhow::Result<Draw> {
+    let cells = count(&s[0], "cells (n)", size.ncol)?;
+    let genes = count(&s[1], "genes (g)", size.nrow)?;
+    let seed = match s[2].number() {
+        Some(v) if v.fract() == 0.0 && v >= 0.0 => v as u64,
+        Some(v) => anyhow::bail!("the seed (s) is a whole number; not {v}"),
+        None => 42,
+    };
+    Ok((cells, genes, seed))
+}
+
+/// What `draw` keeps of an input of `size`.
+fn plan_of(output: &str, size: Size, (cells, genes, seed): Draw) -> Plan {
+    let (rows, cols) = (genes.unwrap_or(size.nrow), cells.unwrap_or(size.ncol));
+    let share = rows as f64 / size.nrow.max(1) as f64 * cols as f64 / size.ncol.max(1) as f64;
+    let entries =
+        |n: Option<usize>, f: f64| n.map_or("?".into(), |n| format!("{:.0}", n as f64 * f));
+    Plan {
+        columns: ["", "rows", "columns", "entries"]
+            .map(String::from)
+            .to_vec(),
+        rows: vec![
+            vec![
+                "input".into(),
+                size.nrow.to_string(),
+                size.ncol.to_string(),
+                entries(size.nnz, 1.0),
+            ],
+            vec![
+                output.into(),
+                rows.to_string(),
+                cols.to_string(),
+                format!("≈ {}", entries(size.nnz, share)),
+            ],
+        ],
+        notes: vec![format!(
+            "{rows} of {} rows and {cols} of {} columns at random, seed {seed}; \
+             the entries scale with both",
+            size.nrow, size.ncol
+        )],
+        blocked: (cells.is_none() && genes.is_none())
+            .then(|| "set the cells (n) or the genes (g) to keep".into()),
+    }
+}
+
+/// Show the plan of `draw` on `tui`; the draw it ended on, or `None` when
+/// cancelled.
+fn choose(
+    tui: &mut Tui<'_>,
+    args: &SubsampleArgs,
+    size: Size,
+    (cells, genes, seed): Draw,
+) -> anyhow::Result<Option<Draw>> {
+    let output = output_path(&args.output, args.zip, &args.backend);
+    let controls = vec![
+        Control::number('n', "cells", cells.map(|n| n as f64)),
+        Control::number('g', "genes", genes.map(|n| n as f64)),
+        Control::number('s', "seed", Some(seed as f64)),
+    ];
+    let planner: Planner =
+        Box::new(move |s: &[Setting]| Ok(plan_of(&output, size, draw_of(s, size)?)));
+    let view = PlanView::new("subsample", &args.data_file, "write", controls, planner);
+    match plan_in(tui, view)? {
+        Some(s) => draw_of(&s, size).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Write the subsample `draw` picks.
+fn write_subsample(
+    args: &SubsampleArgs,
+    data: &dyn SparseIo<IndexIter = Vec<usize>>,
+    (nrow, ncol): (usize, usize),
+    (n_cells, n_genes): (Option<usize>, Option<usize>),
+    seed: u64,
+) -> anyhow::Result<()> {
+    let mut rng = SmallRng::seed_from_u64(seed);
 
     // Sample ascending index sets so the output preserves the original order.
     let cell_idx = sample_sorted(&mut rng, ncol, n_cells);
@@ -78,7 +203,7 @@ pub fn run_subsample(args: &SubsampleArgs) -> anyhow::Result<()> {
         "subsampling to {} genes x {} cells (seed {})",
         gene_idx.len(),
         cell_idx.len(),
-        args.seed
+        seed
     );
 
     let out_nrow = gene_idx.len();
@@ -97,7 +222,7 @@ pub fn run_subsample(args: &SubsampleArgs) -> anyhow::Result<()> {
     // monotone and the columns keep their order without a per-column sort.
     let row_filter = (gene_idx.len() < nrow).then_some(gene_idx.as_slice());
     let (_, _, nnz) = crate::column_subset::stream_column_selection(
-        &*data,
+        data,
         &cell_idx,
         row_filter,
         &out_row_names,

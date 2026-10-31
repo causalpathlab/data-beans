@@ -133,6 +133,7 @@ fn pool(args: &CellQcArgs) -> anyhow::Result<Option<Pool>> {
         row_nnz_cutoff: 0,
         column_nnz_cutoff: 0,
         block_size: args.block_size,
+        view: crate::handlers::explore::PlanArgs::batch(),
     })?;
     Ok(Some(Pool { _dir: dir, file }))
 }

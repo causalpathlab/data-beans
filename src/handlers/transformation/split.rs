@@ -48,6 +48,12 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rustc_hash::FxHashMap as HashMap;
 
+use crate::handlers::explore::{off_screen, PlanArgs};
+use crate::interactive::ui::Tui;
+
+#[path = "split_plan.rs"]
+mod plan;
+
 #[derive(Args, Debug)]
 pub struct SplitArgs {
     /// data file -- `.zarr`, `.zarr.zip`, or `.h5`
@@ -96,6 +102,19 @@ pub struct SplitArgs {
     /// keep `.zarr` directories instead of producing `.zarr.zip` archives
     #[arg(long = "no-zip", default_value_t = true, action = clap::ArgAction::SetFalse)]
     pub zip: bool,
+
+    #[command(flatten)]
+    pub view: PlanArgs,
+}
+
+/// How the cells are split: what `--test-frac`, `--folds`, `--grid` and
+/// `--seed` say, or what the plan ended on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Choice {
+    test_frac: Option<f64>,
+    folds: Option<usize>,
+    grid: usize,
+    seed: u64,
 }
 
 /// Split a backend into train and test halves by cell, or into K folds.
@@ -103,22 +122,64 @@ pub struct SplitArgs {
 /// Every cell lands in exactly one side (or exactly one fold's test half), so
 /// the halves are disjoint and together cover the input — checked, not assumed.
 pub fn run_split(args: &SplitArgs) -> anyhow::Result<()> {
+    let session = args.view.session("split")?;
     let (backend_in, file_in) = resolve_backend_file(&args.data_file, None)?;
     let data = open_sparse_matrix(&file_in, &backend_in)?;
     let n_columns = data
         .num_columns()
         .ok_or_else(|| anyhow::anyhow!("backend has no `ncol`"))?;
     let column_names = data.column_names()?;
-
-    // The unit that gets shuffled and assigned as a whole. One column each by
-    // default, one grid tile under `--coord`, one label under `--groups`.
-    // Everything below is identical in all three cases, which is why grouped
-    // splitting costs nothing extra to support.
-    let column_groups: Vec<Vec<usize>> = match (args.coord.as_deref(), args.groups.as_deref()) {
-        (Some(path), _) => column_groups_from_grid(path, args, &column_names)?,
-        (_, Some(path)) => column_groups_from_table(path, &column_names)?,
-        _ => (0..n_columns).map(|i| vec![i]).collect(),
+    let mut choice = Choice {
+        test_frac: args.test_frac,
+        folds: args.folds,
+        grid: args.grid,
+        seed: args.seed,
     };
+    let mut tui = session.as_ref().map(Tui::new);
+    if let Some(tui) = tui.as_mut() {
+        match plan::choose(tui, args, &column_names, choice)? {
+            Some(c) => choice = c,
+            None => {
+                info!("split: cancelled; nothing written");
+                return Ok(());
+            }
+        }
+    }
+    let splits = split_columns(args, &column_names, choice)?;
+    off_screen(tui.as_mut(), || {
+        write_splits(args, &*data, n_columns, &splits, choice)
+    })
+}
+
+/// The cells of each train and test half: their columns, by fold.
+type Splits = Vec<(Vec<usize>, Vec<usize>)>;
+
+/// The units shuffled and assigned whole, under `choice`: one column each
+/// by default, one grid tile under `--coord`, one label under `--groups`.
+/// Everything after is the same in all three cases, which is why grouped
+/// splitting costs nothing extra to support.
+fn column_groups(
+    args: &SplitArgs,
+    column_names: &[Box<str>],
+    grid: usize,
+) -> anyhow::Result<Vec<Vec<usize>>> {
+    Ok(match (args.coord.as_deref(), args.groups.as_deref()) {
+        (Some(path), _) => {
+            let coord_columns = args.coord_columns.clone().unwrap_or_else(|| vec![1, 2]);
+            column_groups_from_grid(path, grid, &coord_columns, column_names)?
+        }
+        (_, Some(path)) => column_groups_from_table(path, column_names)?,
+        _ => (0..column_names.len()).map(|i| vec![i]).collect(),
+    })
+}
+
+/// The halves `choice` makes of the columns of `column_names`.
+fn split_columns(
+    args: &SplitArgs,
+    column_names: &[Box<str>],
+    choice: Choice,
+) -> anyhow::Result<Splits> {
+    let column_groups = column_groups(args, column_names, choice.grid)?;
     // Two, not one: a single group cannot be divided, and `--test-frac` would
     // reach `clamp(1, 0)` and panic. One group is a real outcome of a coarse
     // `--grid` or a `--groups` table with a single label, so it gets a message
@@ -134,17 +195,37 @@ pub fn run_split(args: &SplitArgs) -> anyhow::Result<()> {
     // Group ids first, then the columns they cover: the partition never sees a
     // column, so a grouped split cannot leak one across the boundary by
     // construction rather than by a later check.
-    let splits: Vec<(Vec<usize>, Vec<usize>)> =
-        partition_groups(column_groups.len(), args.test_frac, args.folds, args.seed)?
-            .into_iter()
-            .map(|(train_groups, test_groups)| {
-                (
-                    columns_in_groups(&column_groups, &train_groups),
-                    columns_in_groups(&column_groups, &test_groups),
-                )
-            })
-            .collect();
+    Ok(partition_groups(
+        column_groups.len(),
+        choice.test_frac,
+        choice.folds,
+        choice.seed,
+    )?
+    .into_iter()
+    .map(|(train_groups, test_groups)| {
+        (
+            columns_in_groups(&column_groups, &train_groups),
+            columns_in_groups(&column_groups, &test_groups),
+        )
+    })
+    .collect())
+}
 
+/// `{output}.train` and `{output}.test`, or `{output}.fold{k}.*` for folds.
+fn half_name(args: &SplitArgs, choice: Choice, fold: usize, half: &str) -> String {
+    match choice.folds {
+        Some(_) => format!("{}.fold{fold}.{half}", args.output),
+        None => format!("{}.{half}", args.output),
+    }
+}
+
+fn write_splits(
+    args: &SplitArgs,
+    data: &dyn SparseIo<IndexIter = Vec<usize>>,
+    n_columns: usize,
+    splits: &Splits,
+    choice: Choice,
+) -> anyhow::Result<()> {
     for (fold, (train_columns, test_columns)) in splits.iter().enumerate() {
         anyhow::ensure!(
             train_columns.len() + test_columns.len() == n_columns,
@@ -152,12 +233,9 @@ pub fn run_split(args: &SplitArgs) -> anyhow::Result<()> {
             train_columns.len(),
             test_columns.len()
         );
-        let tag = |half: &str| match args.folds {
-            Some(_) => format!("{}.fold{fold}.{half}", args.output),
-            None => format!("{}.{half}", args.output),
-        };
-        write_half(&*data, train_columns, &tag("train"), args)?;
-        write_half(&*data, test_columns, &tag("test"), args)?;
+        let tag = |half: &str| half_name(args, choice, fold, half);
+        write_half(data, train_columns, &tag("train"), args)?;
+        write_half(data, test_columns, &tag("test"), args)?;
         info!(
             "fold {fold}: {} train cells, {} test cells",
             train_columns.len(),
@@ -186,18 +264,17 @@ fn columns_in_groups(column_groups: &[Vec<usize>], picked: &[usize]) -> Vec<usiz
 /// Empty tiles simply do not appear.
 fn column_groups_from_grid(
     path: &str,
-    args: &SplitArgs,
+    tiles_per_axis: usize,
+    coord_columns: &[usize],
     column_names: &[Box<str>],
 ) -> anyhow::Result<Vec<Vec<usize>>> {
-    let tiles_per_axis = args.grid;
     anyhow::ensure!(tiles_per_axis >= 2, "--grid must be at least 2");
-    let coord_columns = args.coord_columns.clone().unwrap_or_else(|| vec![1, 2]);
     anyhow::ensure!(
         coord_columns.len() == 2,
         "--coord-columns needs exactly two indices; got {}",
         coord_columns.len()
     );
-    let coords = read_coords(path, &coord_columns)?;
+    let coords = read_coords(path, coord_columns)?;
 
     let mut coord_of_column: Vec<(f64, f64)> = Vec::with_capacity(column_names.len());
     let mut n_missing = 0usize;

@@ -1,4 +1,4 @@
-use super::{log_feature_type_histogram, run_squeeze_if_needed};
+use super::{keep_import, log_feature_type_histogram, Squeeze};
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
 use crate::sparse_util::*;
@@ -125,8 +125,13 @@ pub struct FromH5adArgs {
                      Omit it for auto-scaling by feature count."
     )]
     pub block_size: Option<usize>,
+
+    #[command(flatten)]
+    pub view: crate::handlers::explore::PlanArgs,
 }
 pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
+    // The session first: hosted, the build runs there.
+    let session = args.view.session("from-h5ad")?;
     let file = hdf5::File::open(args.h5ad_file.to_string())?;
     info!("Opened AnnData h5ad file: {}", args.h5ad_file);
 
@@ -340,13 +345,15 @@ pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
     write_lines(&lines, &meta_file)?;
     info!("Wrote {}", meta_file);
 
-    run_squeeze_if_needed(
-        args.do_squeeze,
-        args.row_nnz_cutoff,
-        args.column_nnz_cutoff,
-        args.block_size,
-        &backend_file,
-    )?;
+    let squeeze = Squeeze {
+        on: args.do_squeeze,
+        rows: args.row_nnz_cutoff,
+        columns: args.column_nnz_cutoff,
+        block_size: args.block_size,
+    };
+    if !keep_import("from-h5ad", session.as_ref(), squeeze, &backend_file)? {
+        return Ok(());
+    }
     finalize_zarr_output(&backend_file, &effective_output)?;
     info!("done");
     Ok(())

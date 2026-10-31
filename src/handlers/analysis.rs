@@ -319,6 +319,16 @@ pub enum HistStat {
 }
 
 impl HistStat {
+    /// Its place in the explorer's statistics (nnz, sum, mean, sd).
+    fn index(&self) -> usize {
+        match self {
+            HistStat::Nnz => 0,
+            HistStat::Sum => 1,
+            HistStat::Mean => 2,
+            HistStat::Sd => 3,
+        }
+    }
+
     pub(crate) fn metric(&self) -> &'static str {
         match self {
             HistStat::Nnz => "nnz",
@@ -373,12 +383,30 @@ pub struct RunHistogramArgs {
     /// optional prefix; also writes raw values to {prefix}.{row,col}_{stat}.txt
     #[arg(short, long)]
     pub output: Option<Box<str>>,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Print the histograms and stop: no explorer, even on a terminal",
+        long_help = "On a terminal, the statistics open in the explorer instead of being printed:\n\
+                     a sortable, filterable table of every row or column beside a histogram of\n\
+                     nnz, sum, mean or sd, on the --stat and --dim asked (Tab switches sides).\n\
+                     --output values are still written. --batch-process (or no terminal)\n\
+                     prints the histograms and stops."
+    )]
+    pub batch_process: bool,
+
+    #[command(flatten)]
+    pub session: legume_tui::cli::SessionArgs,
 }
 
 /// Print an ASCII log-scale histogram of a per-row and/or per-column statistic
 /// (default nnz) — the summary `qc --qc-histogram` prints for its nnz floors,
 /// as a standalone command over any statistic.
 pub fn run_histogram(cmd_args: &RunHistogramArgs) -> anyhow::Result<()> {
+    if crate::interactive::opens_view("histogram", cmd_args.batch_process) {
+        return explore_histogram(cmd_args);
+    }
     let (backend, data_file) = resolve_backend_file(&cmd_args.data_file, None)?;
     let mut data = open_sparse_matrix(&data_file, &backend)?;
     if cmd_args.preload {
@@ -405,6 +433,53 @@ pub fn run_histogram(cmd_args: &RunHistogramArgs) -> anyhow::Result<()> {
         write_stat_values(cmd_args.output.as_deref(), "col", metric, &vals)?;
     }
 
+    Ok(())
+}
+
+/// `histogram` on a terminal: the explorer on the statistic and side asked
+/// (columns for `both`, rows a Tab away), with `--output`'s values written
+/// first.
+fn explore_histogram(cmd_args: &RunHistogramArgs) -> anyhow::Result<()> {
+    let session = open_session("histogram", &cmd_args.session)?;
+    let mut tui = Tui::new(&session);
+    let data = open_data(std::slice::from_ref(&cmd_args.data_file), cmd_args.preload)?;
+    let block = cmd_args.block_size;
+    let metric = cmd_args.stat.metric();
+    let (side, both) = match cmd_args.dim {
+        HistDim::Row => (Side::Rows, false),
+        HistDim::Column => (Side::Columns, false),
+        HistDim::Both => (Side::Columns, true),
+    };
+    let (first, mut other) = off_screen(Some(&mut tui), || {
+        let first = side_stats(&data, side, None, block, None)?;
+        let other = both
+            .then(|| side_stats(&data, Side::Rows, None, block, None))
+            .transpose()?;
+        let k = cmd_args.stat.index();
+        let prefix = cmd_args.output.as_deref();
+        if let Some(rows) = &other {
+            write_stat_values(prefix, "row", metric, &rows.values[k])?;
+        }
+        let dim = if side == Side::Rows { "row" } else { "col" };
+        write_stat_values(prefix, dim, metric, &first.values[k])?;
+        Ok((first, other))
+    })?;
+    let data = &data;
+    // The other side as computed for `both`, else on the first Tab.
+    let loader = Box::new(move |s| match other.take() {
+        Some(rows) => Ok(rows),
+        None => side_stats(data, s, None, block, None),
+    });
+    let explorer = StatExplorer::new(
+        &cmd_args.data_file,
+        side,
+        first,
+        Some(loader),
+        Some(values_reader(data)),
+        Purpose::Explore,
+    )
+    .on_stat(cmd_args.stat.index());
+    explore_in(&mut tui, explorer)?;
     Ok(())
 }
 

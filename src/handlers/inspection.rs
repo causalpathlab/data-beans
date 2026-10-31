@@ -1,5 +1,6 @@
 use crate::handlers::explore::{off_screen, open_session, pick_entries};
 use crate::hdf5_io::*;
+use crate::interactive::list_tui::{browse_in, ListView};
 use crate::interactive::picks;
 use crate::interactive::stat_tui::Side;
 use crate::interactive::ui::Tui;
@@ -90,6 +91,20 @@ pub struct TakeColumnNamesArgs {
     /// output file
     #[arg(short, long, default_value = "stdout")]
     pub output: Box<str>,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Print the names and stop: no browser, even on a terminal",
+        long_help = "On a terminal, the names open in a browser instead of being printed: `/`\n\
+                     filters, Space marks, `w` writes the marked (or shown) names, `y` copies\n\
+                     them. A file --output is still written. --batch-process (or no terminal)\n\
+                     prints or writes them and stops."
+    )]
+    pub batch_process: bool,
+
+    #[command(flatten)]
+    pub session: legume_tui::cli::SessionArgs,
 }
 
 #[derive(Args, Debug)]
@@ -100,6 +115,20 @@ pub struct TakeRowNamesArgs {
     /// output file
     #[arg(short, long, default_value = "stdout")]
     pub output: Box<str>,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Print the names and stop: no browser, even on a terminal",
+        long_help = "On a terminal, the names open in a browser instead of being printed: `/`\n\
+                     filters, Space marks, `w` writes the marked (or shown) names, `y` copies\n\
+                     them. A file --output is still written. --batch-process (or no terminal)\n\
+                     prints or writes them and stops."
+    )]
+    pub batch_process: bool,
+
+    #[command(flatten)]
+    pub session: legume_tui::cli::SessionArgs,
 }
 
 /// Write a matrix as TSV with optional row/column names.
@@ -143,24 +172,69 @@ fn write_named_tsv(
 }
 
 pub fn take_column_names(cmd_args: &TakeColumnNamesArgs) -> anyhow::Result<()> {
-    let output = cmd_args.output.clone();
-    let (backend, input) = resolve_backend_file(&cmd_args.data_file, None)?;
-    let data = open_sparse_matrix(&input, &backend)?;
-    let col_names = data.column_names()?;
-    write_lines(&col_names, &output)?;
-
-    Ok(())
+    let names = Names {
+        command: "column-names",
+        what: "columns",
+        data_file: &cmd_args.data_file,
+        output: &cmd_args.output,
+        batch: cmd_args.batch_process,
+        session: &cmd_args.session,
+    };
+    names.run(|data| data.column_names())
 }
 
 pub fn take_row_names(cmd_args: &TakeRowNamesArgs) -> anyhow::Result<()> {
-    let output = cmd_args.output.clone();
-    let (backend, input) = resolve_backend_file(&cmd_args.data_file, None)?;
-    let data = open_sparse_matrix(&input, &backend)?;
+    let names = Names {
+        command: "row-names",
+        what: "rows",
+        data_file: &cmd_args.data_file,
+        output: &cmd_args.output,
+        batch: cmd_args.batch_process,
+        session: &cmd_args.session,
+    };
+    names.run(|data| data.row_names())
+}
 
-    let row_names = data.row_names()?;
-    write_lines(&row_names, &output)?;
+/// `row-names` or `column-names`: the names to `output`, then, on a
+/// terminal, in a browser (which replaces printing them to stdout).
+struct Names<'a> {
+    command: &'static str,
+    what: &'static str,
+    data_file: &'a str,
+    output: &'a str,
+    batch: bool,
+    session: &'a legume_tui::cli::SessionArgs,
+}
 
-    Ok(())
+impl Names<'_> {
+    fn run(
+        &self,
+        names_of: impl FnOnce(&dyn SparseIo<IndexIter = Vec<usize>>) -> anyhow::Result<Vec<Box<str>>>,
+    ) -> anyhow::Result<()> {
+        let view = crate::interactive::opens_view(self.command, self.batch);
+        // The session first: hosted, the names are read there.
+        let session = view
+            .then(|| open_session(self.command, self.session))
+            .transpose()?;
+        let (backend, input) = resolve_backend_file(self.data_file, None)?;
+        let data = open_sparse_matrix(&input, &backend)?;
+        let names = names_of(data.as_ref())?;
+        let to_stdout = self.output.eq_ignore_ascii_case("stdout");
+        if !(view && to_stdout) {
+            write_lines(&names, self.output)?;
+        }
+        let Some(session) = session else {
+            return Ok(());
+        };
+        let stem = basename(self.data_file).unwrap_or_else(|_| self.data_file.into());
+        let write_to = format!("{stem}.{}.txt", self.what);
+        let title = format!("{} · {}", self.data_file, self.what);
+        let mut tui = Tui::new(&session);
+        browse_in(
+            &mut tui,
+            ListView::names("names", &title, &names, &write_to),
+        )
+    }
 }
 
 pub fn show_info(cmd_args: &InfoArgs) -> anyhow::Result<()> {

@@ -52,6 +52,7 @@ fn merge_args(files: &[&str], output: &str) -> MergeBackendArgs {
         row_nnz_cutoff: 0,
         column_nnz_cutoff: 0,
         block_size: None,
+        view: PlanArgs::batch(),
     }
 }
 

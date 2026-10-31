@@ -108,6 +108,17 @@ pub fn open_zarr_store(path: &str) -> anyhow::Result<Arc<dyn ZReadStorageTraits>
     open_zarr_store_rw(path).map(|(r, _)| r)
 }
 
+/// The file `-o output` ends as, under `--no-zip` (`zip` false) and
+/// `--backend`: `x.zarr.zip`, `x.zarr` or `x.h5`, for a plan to name.
+pub fn output_path(output: &str, zip: bool, backend: &SparseIoBackend) -> String {
+    let effective = apply_zip_flag(output, zip, backend);
+    if effective.ends_with(".zarr.zip") {
+        return effective.to_string();
+    }
+    crate::hdf5_io::resolve_backend_file(&effective, Some(backend.clone()))
+        .map_or_else(|_| effective.to_string(), |(_, f)| f.to_string())
+}
+
 /// If `zip` is true and the target is zarr, ensure the output path ends with
 /// `.zarr.zip`; otherwise pass through unchanged.
 ///

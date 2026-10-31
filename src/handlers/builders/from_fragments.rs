@@ -1,4 +1,4 @@
-use super::run_squeeze_if_needed;
+use super::{keep_import, Squeeze};
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
 use crate::zarr_io::*;
@@ -109,6 +109,9 @@ pub struct FromFragmentsArgs {
 
     #[arg(long)]
     pub block_size: Option<usize>,
+
+    #[command(flatten)]
+    pub view: crate::handlers::explore::PlanArgs,
 }
 
 /// Build backend from a (sc)ATAC/histone fragments TSV file.
@@ -119,6 +122,8 @@ pub struct FromFragmentsArgs {
 /// either user-supplied peaks (`--peaks`) or fixed-width genome tiles
 /// (`--bin-size`).
 pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> {
+    // The session first: hosted, the build runs there.
+    let session = args.view.session("from-fragments")?;
     use rustc_hash::FxHashMap as HashMap;
     use std::io::BufRead;
 
@@ -435,13 +440,15 @@ pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> 
     out.register_row_names_vec(&row_names);
     out.register_column_names_vec(&col_names);
 
-    run_squeeze_if_needed(
-        args.do_squeeze,
-        args.row_nnz_cutoff,
-        args.column_nnz_cutoff,
-        args.block_size,
-        &backend_file,
-    )?;
+    let squeeze = Squeeze {
+        on: args.do_squeeze,
+        rows: args.row_nnz_cutoff,
+        columns: args.column_nnz_cutoff,
+        block_size: args.block_size,
+    };
+    if !keep_import("from-fragments", session.as_ref(), squeeze, &backend_file)? {
+        return Ok(());
+    }
     finalize_zarr_output(&backend_file, &effective_output)?;
     info!("done");
     Ok(())
@@ -966,6 +973,7 @@ mod tests {
             row_nnz_cutoff: 1,
             column_nnz_cutoff: 1,
             block_size: None,
+            view: crate::handlers::explore::PlanArgs::batch(),
         };
 
         run_build_from_fragments(&args).unwrap();
@@ -1040,6 +1048,7 @@ mod tests {
             row_nnz_cutoff: 1,
             column_nnz_cutoff: 1,
             block_size: None,
+            view: crate::handlers::explore::PlanArgs::batch(),
         };
 
         run_build_from_fragments(&args).unwrap();
@@ -1085,6 +1094,7 @@ mod tests {
             row_nnz_cutoff: 1,
             column_nnz_cutoff: 1,
             block_size: None,
+            view: crate::handlers::explore::PlanArgs::batch(),
         };
 
         run_build_from_fragments(&args).unwrap();
@@ -1171,6 +1181,7 @@ mod tests {
             row_nnz_cutoff: 1,
             column_nnz_cutoff: 1,
             block_size: None,
+            view: crate::handlers::explore::PlanArgs::batch(),
         };
         let par = FromFragmentsArgs {
             output: out_p.into(),
@@ -1186,6 +1197,7 @@ mod tests {
             row_nnz_cutoff: base.row_nnz_cutoff,
             column_nnz_cutoff: base.column_nnz_cutoff,
             block_size: base.block_size,
+            view: crate::handlers::explore::PlanArgs::batch(),
         };
         run_pair_and_compare(base, par);
     }
@@ -1224,6 +1236,7 @@ mod tests {
             row_nnz_cutoff: 1,
             column_nnz_cutoff: 1,
             block_size: None,
+            view: crate::handlers::explore::PlanArgs::batch(),
         };
         let par = FromFragmentsArgs {
             output: out_p.into(),
@@ -1239,6 +1252,7 @@ mod tests {
             row_nnz_cutoff: base.row_nnz_cutoff,
             column_nnz_cutoff: base.column_nnz_cutoff,
             block_size: base.block_size,
+            view: crate::handlers::explore::PlanArgs::batch(),
         };
         run_pair_and_compare(base, par);
     }
