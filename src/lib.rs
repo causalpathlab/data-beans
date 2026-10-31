@@ -1,10 +1,13 @@
 pub mod column_subset; // stream a column/row selection into a new backend
 pub mod convert; // data format conversion (h5/zarr → backend)
+#[cfg(feature = "figure")]
+pub mod figure; // figures as SVG, written as PDF and PNG, shown as terminal images
 pub mod hdf5_io; // HDF5/h5ad reading helpers
 #[cfg(feature = "tui")]
 pub mod interactive; // full-screen terminal views (ratatui): screens, histograms, pickers
-pub mod qc; // QC primitives: squeeze + streaming stat collectors (CLI + faba)
+pub mod qc; // QC primitives: nnz cuts, histograms, streaming stat collectors (CLI + faba)
 pub mod qc_lib; // cell-axis QC (MAD outliers + near-empty floor); lib-only, senna/pinto
+pub mod qc_rules; // cell QC as rules one moves: edges, what each removes, flags
 pub mod sparse_backend; // storage backends (zarr, hdf5)
 pub mod sparse_data_visitors; // visitor
 pub mod sparse_io; // traits for sparse matrix

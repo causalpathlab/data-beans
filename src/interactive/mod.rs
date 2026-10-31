@@ -7,7 +7,7 @@
 //!   [`ui::run_screen`], and histograms: [`ui::Scale`], [`ui::Binning`],
 //!   [`ui::Binned`], [`ui::HistPlot`], and [`ui::MirrorPlot`] for two series
 //!   around one zero line.
-//! - [`cutoff_tui`]: row and column nnz cutoff picker over plain nnz vectors.
+//! - [`qc_tui`]: `qc`'s view: cell QC rules moved on their histograms.
 //! - [`stat_tui`]: table-and-histogram explorer over plain name and value
 //!   columns, optionally marking entries and handing them back.
 //!
@@ -19,20 +19,112 @@
 //! drops. [`ui::run_screen`] runs a view in a plain session of its own
 //! (`legume_tui::Session::plain`).
 
-pub mod cutoff_tui;
+pub mod qc_tui;
 pub mod stat_tui;
 pub mod ui;
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 
-/// Whether a full-screen session can run: both stdin and stdout are a terminal.
-/// Otherwise callers fall back to the line prompts below.
+/// Set, to anything but empty or `0`, to run every command straight through
+/// as `--batch-process` does: for a script or pipeline started from a
+/// terminal, which its commands would otherwise take for the user's.
+pub const BATCH_ENV: &str = "DATA_BEANS_BATCH";
+
+/// Whether a full-screen view can run: stdin and stdout are a terminal, and
+/// one that can draw it (`TERM` is not `dumb`).
 pub fn tui_available() -> bool {
-    io::stdin().is_terminal() && io::stdout().is_terminal()
+    can_draw(
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+        std::env::var("TERM").ok().as_deref(),
+    )
+}
+
+fn can_draw(tty: bool, term: Option<&str>) -> bool {
+    tty && term != Some("dumb")
+}
+
+/// Why a command runs without its view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoView {
+    /// `--batch-process`, or [`BATCH_ENV`].
+    Batch,
+    /// No terminal to draw it on.
+    NoTerminal,
+}
+
+/// The one rule every command's view follows: batch when asked (`flag`, or
+/// `env`, the value of [`BATCH_ENV`]), else a view where there is a
+/// terminal (`terminal`).
+fn decide(flag: bool, env: Option<&str>, terminal: bool) -> Result<(), NoView> {
+    let asked = flag || env.is_some_and(|v| !v.is_empty() && v != "0");
+    match (asked, terminal) {
+        (true, _) => Err(NoView::Batch),
+        (false, false) => Err(NoView::NoTerminal),
+        (false, true) => Ok(()),
+    }
+}
+
+fn decide_here(flag: bool) -> Result<(), NoView> {
+    decide(
+        flag,
+        std::env::var(BATCH_ENV).ok().as_deref(),
+        tui_available(),
+    )
+}
+
+/// The line said when `command`'s view is skipped for want of a terminal.
+fn no_terminal_line(command: &str) -> String {
+    format!(
+        "{command}: no terminal to draw a view on (stdin or stdout is not one, or \
+         TERM=dumb): running straight through; --batch-process or {BATCH_ENV}=1 \
+         does this without this line"
+    )
+}
+
+/// Whether `command` opens its view, for a command that runs without one
+/// too (`qc`, `stat`): not when batch is asked (`batch`, its
+/// `--batch-process`, or [`BATCH_ENV`]), and only on a terminal. A view
+/// skipped for want of a terminal (output redirected, say) is said in one
+/// line on stderr, so the switch is never silent; asked for, it is quiet.
+pub fn opens_view(command: &str, batch: bool) -> bool {
+    match decide_here(batch) {
+        Ok(()) => true,
+        Err(NoView::Batch) => false,
+        Err(NoView::NoTerminal) => {
+            eprintln!("{}", no_terminal_line(command));
+            false
+        }
+    }
+}
+
+/// Whether `command` picks its rows or columns in the explorer, for a
+/// command that takes them on the command line too (`columns`, `subset-rows`,
+/// ...): only when the command line `selected` none. Then batch asked
+/// (`batch`, or [`BATCH_ENV`]) or no terminal is an error naming
+/// `options`, what selects them instead.
+pub fn picks(command: &str, batch: bool, selected: bool, options: &str) -> anyhow::Result<bool> {
+    if selected {
+        return Ok(false);
+    }
+    match decide_here(batch) {
+        Ok(()) => Ok(true),
+        Err(why) => anyhow::bail!("{}", pick_refused(command, options, why)),
+    }
+}
+
+fn pick_refused(command: &str, options: &str, why: NoView) -> String {
+    match why {
+        NoView::Batch => {
+            format!("{command}: give {options}; run in batch, it has no view to pick them in")
+        }
+        NoView::NoTerminal => {
+            format!("{command}: give {options}, or run it on a terminal to pick them in a view")
+        }
+    }
 }
 
 /// The tool data-beans' sessions belong to: they are named
-/// `data-beans-squeeze-1`, `data-beans-stat-2`, and `data-beans attach`
+/// `data-beans-qc-1`, `data-beans-stat-2`, and `data-beans attach`
 /// finds them.
 pub const TOOL: legume_tui::Tool = legume_tui::Tool::new("data-beans");
 
@@ -65,69 +157,6 @@ pub fn session_help(lead: Option<&str>, more: &str) -> String {
         None => help,
     };
     legume_tui::cli::session_help(&TOOL, help)
-}
-
-/// User action after viewing histogram or other interactive prompts
-#[derive(Debug, Clone)]
-pub enum UserAction {
-    Proceed,
-    AdjustCutoffs(usize, usize),
-    Cancel,
-}
-
-/// Prompt user for action in interactive mode after showing histogram
-pub fn prompt_user_action(
-    current_row_cutoff: usize,
-    current_col_cutoff: usize,
-) -> anyhow::Result<UserAction> {
-    println!("\nOptions:");
-    println!("  [p] Proceed with current cutoffs");
-    println!("  [a] Adjust cutoffs");
-    println!("  [c] Cancel");
-    print!("\nChoose an option (p/a/c): ");
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let choice = input.trim().to_lowercase();
-
-    match choice.as_str() {
-        "p" | "proceed" | "y" | "yes" => Ok(UserAction::Proceed),
-        "c" | "cancel" | "n" | "no" => Ok(UserAction::Cancel),
-        "a" | "adjust" => {
-            let new_row_cutoff = prompt_cutoff_value("row", current_row_cutoff)?;
-            let new_col_cutoff = prompt_cutoff_value("column", current_col_cutoff)?;
-            Ok(UserAction::AdjustCutoffs(new_row_cutoff, new_col_cutoff))
-        }
-        _ => {
-            println!("Invalid choice. Cancelling operation.");
-            Ok(UserAction::Cancel)
-        }
-    }
-}
-
-/// Prompt user for a single cutoff value
-fn prompt_cutoff_value(label: &str, current: usize) -> anyhow::Result<usize> {
-    print!("\nEnter new {} nnz cutoff (current: {}): ", label, current);
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-
-    let value = input.trim().parse::<usize>().unwrap_or(current);
-    Ok(value)
-}
-
-/// Simple yes/no confirmation prompt
-pub fn confirm(message: &str) -> anyhow::Result<bool> {
-    print!("{} (y/n): ", message);
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let choice = input.trim().to_lowercase();
-
-    Ok(matches!(choice.as_str(), "y" | "yes"))
 }
 
 #[cfg(test)]

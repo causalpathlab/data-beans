@@ -454,3 +454,22 @@ fn the_session_keys_stay_on_screen_at_80_columns() {
     assert!(top.contains("ctrl+alt+s switch"), "{top:?}");
     assert!(top.contains("subset"), "the badge is kept: {top:?}");
 }
+
+#[test]
+fn s_saves_the_statistics_figure_with_the_marks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = StatExplorer::new("toy", Side::Rows, rows(), None, None, Purpose::Explore);
+    press(&mut e, KeyCode::Char(' '));
+    press(&mut e, KeyCode::Char('s'));
+    for _ in 0..60 {
+        press(&mut e, KeyCode::Backspace);
+    }
+    let name = dir.path().join("fig").to_string_lossy().into_owned();
+    type_text(&mut e, &name);
+    press(&mut e, KeyCode::Enter);
+    assert!(dir.path().join("fig.pdf").exists() && dir.path().join("fig.png").exists());
+    assert!(
+        e.figure_svg().contains("1 marked"),
+        "the mark reaches the figure"
+    );
+}

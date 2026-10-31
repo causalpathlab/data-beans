@@ -1,7 +1,8 @@
-use super::{run_squeeze, ReorderRowsArgs, RowAlignMode, RunSqueezeArgs};
+use super::{squeeze_in_place, ReorderRowsArgs};
 use super::{SubsetArgs, SubsetColumnsArgs, SubsetRowsArgs};
 use crate::handlers::explore::{off_screen, open_session, pick_entries, pick_rows_and_columns};
 use crate::hdf5_io::*;
+use crate::interactive::picks;
 use crate::interactive::stat_tui::Side;
 use crate::interactive::ui::Tui;
 use crate::sparse_io::*;
@@ -59,26 +60,6 @@ fn zip_like_input(input: &str, output: &str) -> bool {
     input.ends_with(".zarr.zip") && !output.ends_with(".zarr")
 }
 
-fn build_squeeze_args(output_file: Box<str>, args_cols: usize, args_rows: usize) -> RunSqueezeArgs {
-    RunSqueezeArgs {
-        data_files: vec![output_file],
-        // The caller already resolved the path and re-zips it itself.
-        zip: false,
-        row_nnz_cutoff: args_rows,
-        column_nnz_cutoff: args_cols,
-        block_size: None,
-        preload: true,
-        show_histogram: false,
-        save_histogram: None,
-        dry_run: false,
-        interactive: false,
-        auto_cutoff: false,
-        output: None,
-        row_align: RowAlignMode::Common,
-        session: Default::default(),
-    }
-}
-
 /// Subset columns from a sparse matrix data file
 ///
 /// This function takes a subset of columns from the input data file and writes
@@ -87,8 +68,12 @@ fn build_squeeze_args(output_file: Box<str>, args_cols: usize, args_rows: usize)
 /// remove rows/columns with too few non-zero entries.
 pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
     // The picker's session first: hosted, the rest runs in the session.
-    let session = args
-        .interactive
+    // Nothing selected: picked in the explorer.
+    let selected =
+        args.column_indices.is_some() || args.name_file.is_some() || args.pattern.is_some();
+    let options = "--column-indices, --name-file or --pattern";
+    let picking = picks("subset-columns", args.batch_process, selected, options)?;
+    let session = picking
         .then(|| open_session("subset-columns", &args.session))
         .transpose()?;
     let mut tui = session.as_ref().map(Tui::new);
@@ -111,7 +96,7 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
     off_screen(tui.as_mut(), || {
         let column_name_file = args.name_file.clone();
 
-        let zip = if args.interactive {
+        let zip = if picking {
             zip_like_input(&args.data_file, &args.output)
         } else {
             args.zip
@@ -176,7 +161,7 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
             idx
         } else {
             return Err(anyhow::anyhow!(
-                "either `column-indices`, `name-file`, `pattern`, or `--interactive` must be provided"
+                "either `column-indices`, `name-file` or `pattern` must be provided"
             ));
         };
 
@@ -185,13 +170,12 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
         drop(data);
 
         if args.do_squeeze {
-            info!("Squeeze the backend data {}", output_file);
-            let squeeze_args = build_squeeze_args(
-                output_file.clone(),
-                args.column_nnz_cutoff,
+            squeeze_in_place(
+                &output_file,
                 args.row_nnz_cutoff,
-            );
-            run_squeeze(&squeeze_args)?;
+                args.column_nnz_cutoff,
+                None,
+            )?;
         }
 
         finalize_zarr_output(&output_file, &effective_output)?;
@@ -208,8 +192,11 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
 /// remove rows/columns with too few non-zero entries.
 pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
     // The picker's session first: hosted, the rest runs in the session.
-    let session = args
-        .interactive
+    // Nothing selected: picked in the explorer.
+    let selected = args.row_indices.is_some() || args.name_file.is_some() || args.pattern.is_some();
+    let options = "--row-indices, --name-file or --pattern";
+    let picking = picks("subset-rows", args.batch_process, selected, options)?;
+    let session = picking
         .then(|| open_session("subset-rows", &args.session))
         .transpose()?;
     let mut tui = session.as_ref().map(Tui::new);
@@ -232,7 +219,7 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
     off_screen(tui.as_mut(), || {
         let row_name_file = args.name_file.clone();
 
-        let zip = if args.interactive {
+        let zip = if picking {
             zip_like_input(&args.data_file, &args.output)
         } else {
             args.zip
@@ -293,7 +280,7 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
             idx
         } else {
             return Err(anyhow::anyhow!(
-                "either `row-indices`, `name-file`, `pattern`, or `--interactive` must be provided"
+                "either `row-indices`, `name-file` or `pattern` must be provided"
             ));
         };
 
@@ -302,13 +289,12 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
         drop(data);
 
         if args.do_squeeze {
-            info!("Squeeze the backend data {}", output_file);
-            let squeeze_args = build_squeeze_args(
-                output_file.clone(),
-                args.column_nnz_cutoff,
+            squeeze_in_place(
+                &output_file,
                 args.row_nnz_cutoff,
-            );
-            run_squeeze(&squeeze_args)?;
+                args.column_nnz_cutoff,
+                None,
+            )?;
         }
 
         finalize_zarr_output(&output_file, &effective_output)?;
@@ -324,6 +310,10 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
 /// same format as the input with just those. A side with nothing marked is
 /// kept whole.
 pub fn subset(args: &SubsetArgs) -> anyhow::Result<()> {
+    // It only picks: with nothing to pick in, the commands that take the
+    // selection on the command line are named.
+    let options = "the rows and columns to subset-rows and subset-columns instead";
+    picks("subset", args.batch_process, false, options)?;
     // The picker's session first: hosted, the rest runs in the session.
     let session = open_session("subset", &args.session)?;
     let mut tui = Tui::new(&session);

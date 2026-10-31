@@ -1,5 +1,6 @@
 use crate::handlers::explore::{off_screen, open_session, pick_entries};
 use crate::hdf5_io::*;
+use crate::interactive::picks;
 use crate::interactive::stat_tui::Side;
 use crate::interactive::ui::Tui;
 use crate::sparse_io::*;
@@ -40,13 +41,13 @@ pub struct TakeColumnsArgs {
     #[arg(short = 'n', long, value_delimiter = ',')]
     pub column_names: Option<Vec<Box<str>>>,
 
-    /// pick the columns in a full-screen table: mark with Space, Enter to finish
-    #[arg(short = 'I', long, default_value_t = false)]
-    pub interactive: bool,
-
     /// output `parquet` file
     #[arg(short, long, default_value = "stdout")]
     pub output: Box<str>,
+
+    /// never open the explorer: what to take is given on the command line
+    #[arg(long, default_value_t = false)]
+    pub batch_process: bool,
 
     #[command(flatten)]
     pub session: legume_tui::cli::SessionArgs,
@@ -69,13 +70,13 @@ pub struct TakeRowsArgs {
     #[arg(short = 'n', long, value_delimiter = ',')]
     pub row_names: Option<Vec<Box<str>>>,
 
-    /// pick the rows in a full-screen table: mark with Space, Enter to finish
-    #[arg(short = 'I', long, default_value_t = false)]
-    pub interactive: bool,
-
     /// output `parquet` file
     #[arg(short, long, default_value = "stdout")]
     pub output: Box<str>,
+
+    /// never open the explorer: what to take is given on the command line
+    #[arg(long, default_value_t = false)]
+    pub batch_process: bool,
 
     #[command(flatten)]
     pub session: legume_tui::cli::SessionArgs,
@@ -194,8 +195,11 @@ pub fn show_info(cmd_args: &InfoArgs) -> anyhow::Result<()> {
 
 pub fn take_columns(args: &TakeColumnsArgs) -> anyhow::Result<()> {
     // The picker's session first: hosted, the rest runs in the session.
-    let session = args
-        .interactive
+    // Nothing selected: picked in the explorer.
+    let selected =
+        args.column_indices.is_some() || args.name_file.is_some() || args.column_names.is_some();
+    let options = "--column-indices, --name-file or --column-names";
+    let session = picks("columns", args.batch_process, selected, options)?
         .then(|| open_session("columns", &args.session))
         .transpose()?;
     let mut tui = session.as_ref().map(Tui::new);
@@ -248,7 +252,7 @@ pub fn take_columns(args: &TakeColumnsArgs) -> anyhow::Result<()> {
             (data.read_columns_dmatrix(matched_indices)?, column_names)
         } else {
             return Err(anyhow::anyhow!(
-                "either `column-indices`, `name-file`, `column-names`, or `--interactive` must be provided"
+                "either `column-indices`, `name-file` or `column-names` must be provided"
             ));
         };
 
@@ -276,8 +280,11 @@ pub fn take_columns(args: &TakeColumnsArgs) -> anyhow::Result<()> {
 
 pub fn take_rows(args: &TakeRowsArgs) -> anyhow::Result<()> {
     // The picker's session first: hosted, the rest runs in the session.
-    let session = args
-        .interactive
+    // Nothing selected: picked in the explorer.
+    let selected =
+        args.row_indices.is_some() || args.name_file.is_some() || args.row_names.is_some();
+    let options = "--row-indices, --name-file or --row-names";
+    let session = picks("rows", args.batch_process, selected, options)?
         .then(|| open_session("rows", &args.session))
         .transpose()?;
     let mut tui = session.as_ref().map(Tui::new);
@@ -329,7 +336,7 @@ pub fn take_rows(args: &TakeRowsArgs) -> anyhow::Result<()> {
             (data_backend.read_rows_dmatrix(matched_indices)?, row_names)
         } else {
             return Err(anyhow::anyhow!(
-                "either `row-indices`, `name-file`, `row-names`, or `--interactive` must be provided"
+                "either `row-indices`, `name-file` or `row-names` must be provided"
             ));
         };
 

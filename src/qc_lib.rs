@@ -303,6 +303,21 @@ pub fn compute_qc_exempting(
     block_size: Option<usize>,
     exempt: Option<&[bool]>,
 ) -> anyhow::Result<QcReport> {
+    let m = compute_qc_metrics(data, cfg, block_size, cfg.feature_min_cells > 0)?;
+    Ok(qc_from_metrics(m, cfg, exempt))
+}
+
+/// The per-cell (and, with `feature_cells`, per-feature) metrics QC
+/// decides on, measured once: detected features and total counts per
+/// cell, the mito and ribo fractions where `cfg` names their patterns, and
+/// how many cells detect each feature. [`cell_verdicts`] decides on them
+/// under any config with those patterns, without reading the data again.
+pub fn compute_qc_metrics(
+    data: &SparseIoVec,
+    cfg: &QcConfig,
+    block_size: Option<usize>,
+    feature_cells: bool,
+) -> anyhow::Result<QcMetrics> {
     let row_names = data.row_names()?;
 
     // Per-cell totals across all rows (nnz = n_genes, tot = total_counts).
@@ -335,25 +350,21 @@ pub fn compute_qc_exempting(
     let mito_frac = frac_for(&cfg.mito_pattern)?;
     let ribo_frac = frac_for(&cfg.ribo_pattern)?;
 
-    // Feature axis stat (only when feature QC is enabled).
-    let feature_n_cells = if cfg.feature_min_cells > 0 {
+    // Feature axis stat (only when asked).
+    let feature_n_cells = if feature_cells {
         Some(collect_row_stat_across_vec(data, block_size)?.count_positives())
     } else {
         None
     };
 
-    Ok(qc_from_metrics(
-        QcMetrics {
-            n_genes,
-            total_counts,
-            mito_frac,
-            ribo_frac,
-            feature_n_cells,
-            n_rows: data.num_rows(),
-        },
-        cfg,
-        exempt,
-    ))
+    Ok(QcMetrics {
+        n_genes,
+        total_counts,
+        mito_frac,
+        ribo_frac,
+        feature_n_cells,
+        n_rows: data.num_rows(),
+    })
 }
 
 /// Modality-agnostic cell QC for a [`SparseIoStack`]: per-cell `n_genes` /
@@ -394,16 +405,39 @@ pub fn compute_qc_stack(
     ))
 }
 
-/// Pre-computed per-cell / per-feature metrics fed to [`qc_from_metrics`].
+/// Pre-computed per-cell / per-feature metrics fed to [`cell_verdicts`].
 /// Lets the single-modality and stacked QC paths share one decision rule.
-struct QcMetrics {
-    n_genes: Vec<f32>,
-    total_counts: Vec<f32>,
-    mito_frac: Option<Vec<f32>>,
-    ribo_frac: Option<Vec<f32>>,
-    /// `None` when feature-axis QC is disabled.
-    feature_n_cells: Option<Vec<f32>>,
-    n_rows: usize,
+#[derive(Clone, Debug)]
+pub struct QcMetrics {
+    pub n_genes: Vec<f32>,
+    pub total_counts: Vec<f32>,
+    pub mito_frac: Option<Vec<f32>>,
+    pub ribo_frac: Option<Vec<f32>>,
+    /// Cells detecting each feature; `None` when not measured.
+    pub feature_n_cells: Option<Vec<f32>>,
+    pub n_rows: usize,
+}
+
+/// What [`cell_verdicts`] decides: the cells kept in training, the
+/// near-empty ones, and the features kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verdicts {
+    pub train_keep: Vec<bool>,
+    pub near_empty: Vec<bool>,
+    pub feature_keep: Vec<bool>,
+    pub n_cells_dropped: usize,
+    pub n_features_dropped: usize,
+    /// The rules would have dropped every cell, or every feature, and the
+    /// guardrail kept them all.
+    pub guarded: bool,
+}
+
+impl Verdicts {
+    /// Whether cell `c` reaches the output: kept in training and not
+    /// near-empty.
+    pub fn emitted(&self, c: usize) -> bool {
+        self.train_keep[c] && !self.near_empty[c]
+    }
 }
 
 /// Apply the two-tier QC decision (near-empty floor + MAD outliers) to
@@ -417,6 +451,56 @@ struct QcMetrics {
 /// never near-empty, never dropped. Their exclusion from OUTPUT is a separate
 /// concern handled by the caller.
 fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcReport {
+    // The histogram + cutoff, optionally printed.
+    if cfg.drop_outliers && (cfg.auto_cell_cutoff || cfg.qc_histogram) {
+        let suggested = crate::qc::suggest_nnz_cutoff(&m.n_genes);
+        // Display cutoff: the trough suggestion if found, else the
+        // near-empty floor (what the non-auto tier would use).
+        let shown = suggested.unwrap_or(cfg.min_cell_nnz);
+        crate::qc::eprint_nnz_summary("Cell", "nnz", &m.n_genes, shown, suggested);
+    }
+    let v = cell_verdicts(&m, cfg, exempt);
+    let QcMetrics {
+        n_genes,
+        total_counts,
+        mito_frac,
+        ribo_frac,
+        ..
+    } = m;
+    QcReport {
+        train_keep: v.train_keep,
+        near_empty: v.near_empty,
+        feature_keep: v.feature_keep,
+        n_genes,
+        total_counts,
+        mito_frac,
+        ribo_frac,
+        n_cells_dropped: v.n_cells_dropped,
+        n_features_dropped: v.n_features_dropped,
+    }
+}
+
+/// The [`QcReport`] of metrics measured once ([`compute_qc_metrics`]),
+/// as [`compute_qc`] makes it: the histogram printed when `cfg` asks.
+pub fn qc_report(m: QcMetrics, cfg: &QcConfig) -> QcReport {
+    qc_from_metrics(m, cfg, None)
+}
+
+/// The two-tier QC decision (near-empty floor + MAD outliers) on `m`
+/// under `cfg`, printing nothing: what [`compute_qc`] decides, for a view
+/// that decides again as its settings change. `exempt` as in
+/// [`compute_qc_exempting`].
+pub fn cell_verdicts(m: &QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> Verdicts {
+    verdicts(m, cfg, exempt, true)
+}
+
+/// [`cell_verdicts`] without the guardrails' warnings, for a view that
+/// decides again at every key and shows [`Verdicts::guarded`] itself.
+pub(crate) fn cell_verdicts_quiet(m: &QcMetrics, cfg: &QcConfig) -> Verdicts {
+    verdicts(m, cfg, None, false)
+}
+
+fn verdicts(m: &QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>, warn: bool) -> Verdicts {
     let QcMetrics {
         n_genes,
         total_counts,
@@ -425,6 +509,7 @@ fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcR
         feature_n_cells,
         n_rows,
     } = m;
+    let n_rows = *n_rows;
     let n_cols = n_genes.len();
 
     let is_exempt = |c: usize| exempt.is_some_and(|e| e[c]);
@@ -450,7 +535,7 @@ fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcR
         let mut bands: Vec<Vec<bool>> = Vec::new();
         if cfg.mad_on_n_genes {
             bands.push(robust_outlier_keep(
-                &n_genes,
+                n_genes,
                 cfg.n_mads,
                 Tail::Lower,
                 true,
@@ -459,7 +544,7 @@ fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcR
         }
         if cfg.mad_on_counts {
             bands.push(robust_outlier_keep(
-                &total_counts,
+                total_counts,
                 cfg.n_mads,
                 Tail::Lower,
                 true,
@@ -503,19 +588,11 @@ fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcR
         // is authoritative — there is NO redundant `min_cell_nnz` floor on it.
         // When the data is unimodal the trough search returns `None`, so no auto
         // cutoff is applied and the near-empty floor / MAD tiers stand alone.
-        // The histogram + cutoff are optionally printed.
-        if cfg.auto_cell_cutoff || cfg.qc_histogram {
-            let suggested = crate::qc::suggest_nnz_cutoff(&n_genes);
-            // Display cutoff: the trough suggestion if found, else the
-            // near-empty floor (what the non-auto tier would use).
-            let shown = suggested.unwrap_or(cfg.min_cell_nnz);
-            crate::qc::print_nnz_summary("Cell", "nnz", &n_genes, shown, suggested);
-            if cfg.auto_cell_cutoff {
-                if let Some(cut) = suggested {
-                    for (c, &g) in n_genes.iter().enumerate() {
-                        if (g as usize) < cut {
-                            outlier[c] = true;
-                        }
+        if cfg.auto_cell_cutoff {
+            if let Some(cut) = crate::qc::suggest_nnz_cutoff(n_genes) {
+                for (c, &g) in n_genes.iter().enumerate() {
+                    if (g as usize) < cut {
+                        outlier[c] = true;
                     }
                 }
             }
@@ -526,13 +603,17 @@ fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcR
     let mut n_cells_dropped = outlier.iter().filter(|&&o| o).count();
 
     // Guardrail: never produce an empty matrix.
+    let mut guarded = false;
     if n_cols > 0 && n_cells_dropped >= n_cols {
-        warn!(
-            "QC would drop all {} cells — keeping all (check thresholds)",
-            n_cols
-        );
+        if warn {
+            warn!(
+                "QC would drop all {} cells — keeping all (check thresholds)",
+                n_cols
+            );
+        }
         train_keep = vec![true; n_cols];
         n_cells_dropped = 0;
+        guarded = true;
     }
 
     // Feature axis (only when feature_n_cells was computed).
@@ -544,7 +625,10 @@ fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcR
                 .collect();
             let dropped = keep.iter().filter(|&&k| !k).count();
             if !keep.is_empty() && dropped >= keep.len() {
-                warn!("QC would drop all features — keeping all");
+                if warn {
+                    warn!("QC would drop all features — keeping all");
+                }
+                guarded = true;
                 (vec![true; keep.len()], 0)
             } else {
                 (keep, dropped)
@@ -553,16 +637,13 @@ fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcR
         None => (vec![true; n_rows], 0),
     };
 
-    QcReport {
+    Verdicts {
         train_keep,
         near_empty,
         feature_keep,
-        n_genes,
-        total_counts,
-        mito_frac,
-        ribo_frac,
         n_cells_dropped,
         n_features_dropped,
+        guarded,
     }
 }
 
@@ -824,9 +905,11 @@ impl QcArgs {
             n_mads: self.qc_mads,
             min_cell_nnz: self.qc_min_cell_nnz,
             min_counts_per_cell: self.qc_min_counts,
-            mito_pattern: self.qc_mito_pattern.clone(),
+            // An empty pattern names no genes: the metric is off, not a
+            // regex that finds every gene.
+            mito_pattern: self.qc_mito_pattern.clone().filter(|p| !p.is_empty()),
             mito_max_frac: self.qc_mito_max_frac,
-            ribo_pattern: self.qc_ribo_pattern.clone(),
+            ribo_pattern: self.qc_ribo_pattern.clone().filter(|p| !p.is_empty()),
             ribo_max_frac: self.qc_ribo_max_frac,
             // MAD gates are ON by default and settable. They were hardcoded
             // `false` here with no CLI path, which also made `--qc-mads` a dead
@@ -835,7 +918,11 @@ impl QcArgs {
             // selects the rows to measure.
             mad_on_n_genes: self.qc_mad_on_genes,
             mad_on_counts: self.qc_mad_on_counts,
-            mad_on_mito: self.qc_mito_pattern.is_some() && self.qc_mad_on_mito,
+            mad_on_mito: self
+                .qc_mito_pattern
+                .as_deref()
+                .is_some_and(|p| !p.is_empty())
+                && self.qc_mad_on_mito,
             feature_min_cells: self.qc_feature_min_cells,
             drop_outliers: true,
             // Off by default: the near-empty floor plus the model's own

@@ -190,3 +190,12 @@ fn log_histogram_marks_cutoff_bin_when_positive() {
         "a positive cutoff should mark exactly the first bin at/above it"
     );
 }
+
+#[test]
+fn printed_ranges_keep_three_significant_digits() {
+    assert_eq!(fmt_sig(0.000412), "0.000412");
+    assert_eq!(fmt_sig(0.0731), "0.0731");
+    assert_eq!(fmt_sig(2.4567), "2.46");
+    assert_eq!(fmt_sig(145.0), "145");
+    assert_eq!(fmt_sig(1234.5), "1234");
+}

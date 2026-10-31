@@ -6,7 +6,8 @@
 //! selected entry is marked on the histogram with its rank.
 //!
 //! Entries can be marked: `v` shows the marked entries' values against the
-//! other side, `w` saves the marked names, and when picking (for
+//! other side, `w` saves the marked names, `s` saves the statistics figure
+//! (the marked entries in the accent, the cursor with its rank), and when picking (for
 //! `subset-*` and `rows`/`columns`) Enter hands the marked entries back.
 //! While exploring, Tab switches between rows and columns, computing the
 //! other side the first time.
@@ -24,7 +25,11 @@ use super::ui::{
     header, help_line, input_line, median, panel, run_screen, title_bar, Binned, HistPlot, Scale,
     Screen, Tui, ACCENTED, DIM, HIGHLIGHT, PLAIN,
 };
+use crate::figure::stat::{draw_stat, figure as stat_figure, StatData};
+use crate::figure::term::PlotImage;
+use crate::figure::{free_name, save, taken, Canvas};
 use crate::qc::fmt_stat;
+use ratatui_image::picker::Picker;
 
 /// Statistics in table order.
 const STATS: [&str; 4] = ["nnz", "sum", "mean", "sd"];
@@ -85,7 +90,7 @@ pub type ValuesReader<'a> = Box<dyn FnMut(Side, &[usize]) -> anyhow::Result<Valu
 /// What the explorer is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
-    /// Look around (`stat --interactive`); Tab switches sides.
+    /// Look around (`stat` on a terminal); Tab switches sides.
     Explore,
     /// Mark entries of the starting side for a command labelled `verb`;
     /// Enter returns them.
@@ -142,6 +147,7 @@ enum Input {
     Filter,
     SaveNames,
     SaveValues,
+    SaveFigure,
 }
 
 enum Mode {
@@ -246,6 +252,14 @@ pub struct StatExplorer<'a> {
     picked: Option<Picked>,
     /// The detach and switch keys, for the title bar.
     session_keys: Vec<(String, String)>,
+    /// The terminal's image support, asked once per attach, and whether
+    /// images are wanted (`i`).
+    picker: Option<Picker>,
+    picked_at: Option<u64>,
+    images: bool,
+    /// The histogram as an image, and what it was drawn for.
+    plot: PlotImage,
+    plotted: Option<(usize, Option<usize>, usize, Side)>,
 }
 
 impl<'a> StatExplorer<'a> {
@@ -294,6 +308,11 @@ impl<'a> StatExplorer<'a> {
             quit: false,
             picked: None,
             session_keys: super::session_keys(),
+            picker: None,
+            picked_at: None,
+            images: true,
+            plot: PlotImage::default(),
+            plotted: None,
         };
         explorer.reorder();
         explorer.refilter(None);
@@ -484,6 +503,38 @@ impl<'a> StatExplorer<'a> {
         });
     }
 
+    /// The statistics figure of the side on screen, the marked entries in
+    /// the accent and the cursor's entry with its rank.
+    fn figure_svg(&self) -> String {
+        let v = &self.values;
+        let cursor = self.selected().map(|i| (i, &*self.names[i]));
+        stat_figure(&StatData {
+            title: &self.title,
+            side: self.side.name(),
+            values: [&v[0], &v[1], &v[2], &v[3]],
+            marked: Some(&self.marked),
+            cursor,
+        })
+    }
+
+    fn save_figure(&mut self, name: &str) {
+        self.status = Some(match save(&self.figure_svg(), name) {
+            Ok(paths) => format!("saved {}", paths.join(", ")),
+            Err(e) => format!("could not save {name}: {e}"),
+        });
+    }
+
+    /// Ask the attached terminal for images, once per attach.
+    fn refresh_picker(&mut self) {
+        let attach = legume_tui::attaches();
+        if self.picked_at == Some(attach) {
+            return;
+        }
+        self.picked_at = Some(attach);
+        self.picker = legume_tui::current().and_then(crate::figure::term::picker);
+        self.plot.invalidate();
+    }
+
     fn save_values(&mut self, path: &str) {
         let Some(view) = &self.values_view else {
             return;
@@ -537,6 +588,14 @@ impl<'a> StatExplorer<'a> {
                     Input::Filter => {}
                     Input::SaveNames => self.save_names(&text),
                     Input::SaveValues => self.save_values(&text),
+                    Input::SaveFigure if taken(text.trim()) => {
+                        // Never over a file: the next free name, offered.
+                        let name = text.trim().to_string();
+                        self.status = Some(format!("{name} is already there; not replacing it"));
+                        self.mode = Mode::Typing(Input::SaveFigure, free_name(&name));
+                        return;
+                    }
+                    Input::SaveFigure => self.save_figure(text.trim()),
                 }
                 self.mode = self.resting_mode(&input);
                 return;
@@ -586,6 +645,15 @@ impl<'a> StatExplorer<'a> {
             KeyCode::Char('w') => {
                 let path = format!("{}.txt", self.side.name());
                 self.mode = Mode::Typing(Input::SaveNames, path);
+            }
+            KeyCode::Char('s') => {
+                let stem = super::qc_tui::stem(&self.title).replace([',', ' '], "_");
+                let name = free_name(&format!("{stem}_{}_stats", self.side.name()));
+                self.mode = Mode::Typing(Input::SaveFigure, name);
+            }
+            KeyCode::Char('i') if self.picker.is_some() => {
+                self.images = !self.images;
+                self.plot.invalidate();
             }
             KeyCode::Tab | KeyCode::BackTab => self.request_switch(),
             KeyCode::Char('x') => {
@@ -706,7 +774,7 @@ impl<'a> StatExplorer<'a> {
         frame.render_stateful_widget(table, area, &mut state);
     }
 
-    fn render_hist(&self, frame: &mut Frame, area: Rect) {
+    fn render_hist(&mut self, frame: &mut Frame, area: Rect) {
         let stat = STATS[self.stat];
         let block = panel(format!(" {stat} "), false);
         let inner = block.inner(area);
@@ -737,6 +805,34 @@ impl<'a> StatExplorer<'a> {
             ]));
         }
         frame.render_widget(Paragraph::new(lines), summary);
+
+        // As the figure's own panel where the terminal draws images: made
+        // again when the statistic, the cursor, the marks or the side change.
+        if let Some(picker) = self.picker.as_ref().filter(|_| self.images) {
+            let marks = self.marked.iter().filter(|&&m| m).count();
+            let now = (self.stat, selected, marks, self.side);
+            if self.plotted != Some(now) {
+                self.plot.invalidate();
+                self.plotted = Some(now);
+            }
+            let v = &self.values;
+            let data = StatData {
+                title: &self.title,
+                side: self.side.name(),
+                values: [&v[0], &v[1], &v[2], &v[3]],
+                marked: Some(&self.marked),
+                cursor: selected.map(|i| (i, &*self.names[i])),
+            };
+            let stat = self.stat;
+            let drawn = self.plot.render(frame, plot, picker, |w, h| {
+                let mut c = Canvas::new(w, h);
+                draw_stat(&data, stat, &mut c, (0.0, 0.0, w, h));
+                c.finish()
+            });
+            if drawn {
+                return;
+            }
+        }
 
         let bins = self.hist.bins;
         HistPlot {
@@ -830,6 +926,11 @@ impl<'a> StatExplorer<'a> {
             Mode::Typing(Input::Filter, text) => {
                 input_line("filter /", text, &[("Enter", "keep"), ("Esc", "clear")])
             }
+            Mode::Typing(Input::SaveFigure, text) => input_line(
+                "save the figure as (.pdf + .png): ",
+                text,
+                &[("Enter", "save"), ("Esc", "back")],
+            ),
             Mode::Typing(_, text) => {
                 input_line("save to ", text, &[("Enter", "write"), ("Esc", "back")])
             }
@@ -867,6 +968,10 @@ impl<'a> StatExplorer<'a> {
                     keys.push(("v", "values"));
                 }
                 keys.push(("w", "save names"));
+                keys.push(("s", "save figure"));
+                if self.picker.is_some() {
+                    keys.push(("i", "image/text"));
+                }
                 keys.push(("x/y", "scale"));
                 match self.other {
                     Other::Ready(..) => keys.push(("Tab", other)),
@@ -975,6 +1080,7 @@ impl Screen for StatExplorer<'_> {
     }
 
     fn render(&mut self, frame: &mut Frame) {
+        self.refresh_picker();
         let [top, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),

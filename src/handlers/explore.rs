@@ -131,7 +131,7 @@ pub fn pick_entries(
     verb: &'static str,
 ) -> anyhow::Result<Option<Vec<usize>>> {
     if !tui_available() {
-        anyhow::bail!("--interactive needs a terminal");
+        anyhow::bail!("picking needs a terminal");
     }
     let data = open_data(&[data_file.into()], false)?;
     let first = side_stats(&data, side, None, None, None)?;

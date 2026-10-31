@@ -219,7 +219,7 @@ fn tools_read_derive_and_refuse_to_replace() {
 }
 
 #[test]
-fn qc_plot_and_merge_on_common_rows() {
+fn qc_figures_and_merge_on_common_rows() {
     let (dir, mut c) = setup();
 
     // C2 and C3 hold one entry each, under the near-empty floor of 2; C0
@@ -228,6 +228,12 @@ fn qc_plot_and_merge_on_common_rows() {
     assert_eq!(dry["cells"], 4);
     assert_eq!(dry["near_empty"], 2);
     assert_eq!(dry["cells_kept"], 2);
+    // What it looked at, absolute, for the watcher's `o`.
+    let looked = dry["data"].as_str().unwrap();
+    assert!(
+        Path::new(looked).is_absolute() && looked.ends_with("base.zarr.zip"),
+        "{dry}"
+    );
     assert!(dry.get("written").is_none());
     assert!(dry["mito_frac"]["median"].is_number());
     let kept = c
@@ -239,15 +245,42 @@ fn qc_plot_and_merge_on_common_rows() {
     assert_eq!(kept["info"]["columns"], 2);
     assert!(dir.path().join("qc.tsv").exists());
 
-    if cfg!(feature = "plot") {
-        let r = c.request(
-            "tools/call",
-            json!({ "name": "plot", "arguments": { "data": "base.zarr.zip", "out": "qc.png" } }),
+    // The QC figure of a dry run, and the statistics figure, come back as
+    // images and are kept where asked.
+    for (tool, args, file) in [
+        (
+            "qc",
+            json!({ "data": "base.zarr.zip", "figure": "qc.png" }),
+            "qc.png",
+        ),
+        (
+            "statistics",
+            json!({ "data": ["base.zarr.zip"], "axis": "rows", "figure": "genes.pdf" }),
+            "genes.pdf",
+        ),
+    ] {
+        let r = c.request("tools/call", json!({ "name": tool, "arguments": args }));
+        let r = &r["result"];
+        assert_eq!(r["isError"], false, "{r}");
+        assert!(
+            r["structuredContent"]["figure"]
+                .as_str()
+                .unwrap()
+                .ends_with(file),
+            "{r}"
         );
-        let content = &r["result"]["content"];
-        assert_eq!(content[0]["type"], "image");
-        assert_eq!(content[0]["mimeType"], "image/png");
-        assert!(dir.path().join("qc.png").exists());
+        assert!(dir.path().join(file).exists());
+        let images: Vec<&Value> = r["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["type"] == "image")
+            .collect();
+        // A PDF is kept, not shown.
+        assert_eq!(images.len(), usize::from(file.ends_with(".png")), "{r}");
+        if let Some(image) = images.first() {
+            assert_eq!(image["mimeType"], "image/png");
+        }
     }
 
     let sub = c
@@ -271,6 +304,20 @@ fn qc_plot_and_merge_on_common_rows() {
         .as_str()
         .unwrap()
         .ends_with("both.batch.gz"));
+
+    // qc pools the same two first, then decides on all eight cells; with
+    // no floors, it keeps them all, labelled by batch.
+    let pooled = c
+        .call(
+            "qc",
+            json!({ "data": ["base.zarr.zip", "sub.zarr.zip"], "common_rows": true, "out": "pooled",
+                    "min_cell_nnz": 0, "mad_on_genes": false, "mad_on_counts": false, "mito_pattern": "" }),
+        )
+        .unwrap();
+    assert_eq!(pooled["cells"], 8, "{pooled}");
+    assert_eq!(pooled["features"], 2, "{pooled}");
+    let labels = dir.path().join("pooled.batch.gz");
+    assert!(labels.exists(), "{pooled}");
 }
 
 #[test]
@@ -302,17 +349,11 @@ fn unnamed_outputs_go_to_the_results_folder_and_the_records() {
         .ends_with("m.imported.subsample-2.zarr.zip"));
 
     // A figure's number goes before its extension.
-    if cfg!(feature = "plot") {
-        for want in ["m.imported.qc.png", "m.imported.qc-2.png"] {
-            let r = c.request(
-                "tools/call",
-                json!({ "name": "plot", "arguments": { "data": path } }),
-            );
-            let text = r["result"]["content"][1]["text"]
-                .as_str()
-                .unwrap_or_default();
-            assert!(text.contains(want), "{r}");
-        }
+    for want in ["m.imported.qc.png", "m.imported.qc-2.png"] {
+        let r = c
+            .call("qc", json!({ "data": path, "figure": true }))
+            .unwrap();
+        assert!(r["figure"].as_str().unwrap().ends_with(want), "{r}");
     }
 
     let index = std::fs::read_to_string(dir.path().join("results/INDEX.tsv")).unwrap();
@@ -650,10 +691,27 @@ fn every_tool_answers_or_refuses_as_it_should() {
         }
     }
 
-    if cfg!(feature = "plot") {
-        let r = c.call("plot", json!({ "data": "base.zarr.zip", "kind": "violin" }));
-        assert!(r.unwrap_err().contains("qc or stat"));
-    }
+    let r = c.call("qc", json!({ "data": "base.zarr.zip", "figure": 3 }));
+    assert!(r.unwrap_err().contains("true or a file name"));
+    let r = c.call(
+        "statistics",
+        json!({ "data": ["base.zarr.zip"], "axis": "rows", "figure": "x.txt" }),
+    );
+    assert!(r.unwrap_err().contains(".png, .pdf or .svg"));
+    let r = c.call(
+        "qc",
+        json!({ "data": "base.zarr.zip", "out": "k", "background": true, "figure": true }),
+    );
+    assert!(r.unwrap_err().contains("comes back with the call"));
+    // The plot tool is gone: its figures come from qc and statistics.
+    let r = c.request(
+        "tools/call",
+        json!({ "name": "plot", "arguments": { "data": "base.zarr.zip" } }),
+    );
+    assert!(
+        r.get("error").is_some() || r["result"]["isError"] == true,
+        "{r}"
+    );
 
     // An unknown tool is a protocol error.
     let r = c.request(

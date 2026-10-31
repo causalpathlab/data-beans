@@ -71,10 +71,46 @@ fn the_session_paragraph_names_the_keys_and_the_subcommands() {
 
 #[test]
 fn an_optional_views_paragraph_says_so_first() {
-    let lead = "With --interactive, its view runs as a session.";
+    let lead = "On a terminal, unless --batch-process, its view runs as a session.";
     let text = session_help(Some(lead), "More.");
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat.starts_with(lead), "{text}");
     assert!(flat.ends_with("More."), "{text}");
     assert!(text.lines().all(|l| l.chars().count() <= 70), "{text}");
+}
+
+#[test]
+fn one_rule_decides_every_view() {
+    use NoView::*;
+    // Batch when asked, by the flag or the environment.
+    assert_eq!(decide(true, None, true), Err(Batch));
+    assert_eq!(decide(false, Some("1"), true), Err(Batch));
+    assert_eq!(decide(false, Some("yes"), true), Err(Batch));
+    // Set empty or to 0, the environment asks nothing.
+    assert_eq!(decide(false, Some(""), true), Ok(()));
+    assert_eq!(decide(false, Some("0"), true), Ok(()));
+    // Else a view where there is a terminal.
+    assert_eq!(decide(false, None, true), Ok(()));
+    assert_eq!(decide(false, None, false), Err(NoTerminal));
+    // A terminal that cannot draw one is none.
+    assert!(can_draw(true, Some("xterm-256color")) && can_draw(true, None));
+    assert!(!can_draw(true, Some("dumb")) && !can_draw(false, Some("xterm")));
+}
+
+#[test]
+fn what_is_said_names_the_way_out() {
+    let line = no_terminal_line("stat");
+    assert!(
+        line.starts_with("stat: ") && line.contains("--batch-process") && line.contains(BATCH_ENV)
+    );
+    let refused = pick_refused("rows", "--row-names", NoView::NoTerminal);
+    assert!(
+        refused.contains("give --row-names") && refused.contains("terminal"),
+        "{refused}"
+    );
+    let refused = pick_refused("rows", "--row-names", NoView::Batch);
+    assert!(
+        refused.contains("give --row-names") && refused.contains("batch"),
+        "{refused}"
+    );
 }

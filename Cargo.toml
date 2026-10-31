@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.10.2"
+version = "0.10.9"
 rust-version = "1.91"
 # Ship only the sources, README and license: nothing else in the working tree
 # (data stores, saved name lists, scratch files) can end up on crates.io.
@@ -27,7 +27,7 @@ path = "src/sim_main.rs"
 required-features = ["sim"]
 
 [features]
-default = ["aux", "tui", "tensor", "ndarray", "mcp", "plot"]
+default = ["aux", "tui", "tensor", "ndarray", "mcp", "figure"]
 # Read sparse data into dense candle `Tensor`s (`read_*_tensor`). Off, no
 # candle is linked: for crates that only need matrices.
 tensor = ["legume-numeric/tensor"]
@@ -39,14 +39,16 @@ ndarray = ["dep:ndarray", "legume-numeric/ndarray", "zarrs/ndarray", "zarrs/tran
 aux = []
 # Full-screen terminal views (ratatui): the CLI's interactive sessions, and
 # `data_beans::interactive` for downstream crates building their own. The
-# views run in legume-tui sessions, which a dropped connection leaves running.
-tui = ["dep:ratatui", "dep:legume-tui", "legume-mcp?/tui"]
+# views run in legume-tui sessions, which a dropped connection leaves running,
+# and draw their figures as images where the terminal has an image protocol.
+tui = ["figure", "dep:ratatui", "dep:legume-tui", "legume-tui/graphics", "dep:ratatui-image", "legume-mcp?/tui"]
 # `data-beans mcp`: the commands as Model Context Protocol tools for an
 # agent, over stdio.
 mcp = ["dep:legume-mcp"]
-# `data-beans plot`: QC and statistics figures (PNG, SVG, PDF) through
-# legume-plot, and the MCP `plot` tool.
-plot = ["dep:legume-plot", "dep:base64"]
+# Figures (`data_beans::figure`): the QC and statistics figures `qc` and
+# `stat` write with --figure (PDF and PNG), save from their views, and return
+# to an agent as images.
+figure = ["dep:usvg", "dep:resvg", "dep:svg2pdf", "dep:image"]
 alg = ["aux"]
 sim = ["alg"]
 # Pulls in libhdf5 — opt-in so installs on hosts without HDF5 headers still
@@ -94,17 +96,23 @@ num_cpus = "1.16.0"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 statrs = { version = "0.18", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
-# Detachable sessions for the views; no pictures, so no graphics.
-legume-tui = { version = "0.3.2", optional = true, default-features = false, features = ["clap", "logs"] }
+# Detachable sessions for the views.
+legume-tui = { version = "0.3.15", optional = true, default-features = false, features = ["clap", "logs"] }
 # Its `tui` view (`data-beans mcp watch`) comes on with data-beans' `tui`.
 legume-mcp = { version = "0.4", optional = true }
-legume-plot = { version = "0.3.2", optional = true }
-base64 = { version = "0.22", optional = true }
+# Figures: one SVG per figure, written as PDF and PNG.
+usvg = { version = "0.45", optional = true }
+resvg = { version = "0.45", optional = true, default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+svg2pdf = { version = "0.13", optional = true, default-features = false, features = ["text"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+# The views' figures as terminal images (kitty, iTerm2, sixel); the version
+# legume-tui's `graphics` picks with.
+ratatui-image = { version = "11.1", optional = true, default-features = false, features = ["crossterm"] }
 
 [dev-dependencies]
 # The crate's harness, driving the views through pseudo-terminals in
 # tests/detach_session.rs.
-legume-tui = { version = "0.3.2", default-features = false, features = ["testing"] }
+legume-tui = { version = "0.3.15", default-features = false, features = ["testing"] }
 # tests/mcp_server.rs follows a server through the watch pane.
 legume-mcp = { version = "0.4", features = ["tui"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

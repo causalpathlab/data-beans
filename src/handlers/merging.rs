@@ -1,4 +1,4 @@
-use crate::handlers::transformation::{run_squeeze, RowAlignMode, RunSqueezeArgs};
+use crate::handlers::transformation::squeeze_in_place;
 use crate::hdf5_io::*;
 use crate::sparse_data_visitors::styled_progress_bar;
 use crate::sparse_io::*;
@@ -489,27 +489,12 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
         .collect::<HashMap<_, _>>();
 
     if args.do_squeeze {
-        info!("Squeeze the backend data {}", backend_file);
-        let squeeze_args = RunSqueezeArgs {
-            // Squeezing in place on a path the caller already resolved: the
-            // zip decision was made there, so nothing is re-zipped here.
-            zip: false,
-            data_files: vec![backend_file.clone()],
-            row_nnz_cutoff: args.row_nnz_cutoff,
-            column_nnz_cutoff: args.column_nnz_cutoff,
-            block_size: args.block_size,
-            preload: true,
-            show_histogram: false,
-            save_histogram: None,
-            dry_run: false,
-            interactive: false,
-            auto_cutoff: false,
-            output: None,
-            row_align: RowAlignMode::Common,
-            session: Default::default(),
-        };
-
-        run_squeeze(&squeeze_args)?;
+        squeeze_in_place(
+            &backend_file,
+            args.row_nnz_cutoff,
+            args.column_nnz_cutoff,
+            args.block_size,
+        )?;
     }
 
     write_batches_and_finalize(&effective_output, &backend_file, &backend, &batch_map)?;
@@ -837,27 +822,12 @@ pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
         .collect::<HashMap<_, _>>();
 
     if args.do_squeeze {
-        info!("Squeeze the backend data {}", backend_file);
-        let squeeze_args = RunSqueezeArgs {
-            // Squeezing in place on a path the caller already resolved: the
-            // zip decision was made there, so nothing is re-zipped here.
-            zip: false,
-            data_files: vec![backend_file.clone().into_boxed_str()],
-            row_nnz_cutoff: args.row_nnz_cutoff,
-            column_nnz_cutoff: args.column_nnz_cutoff,
-            block_size: args.block_size,
-            preload: true,
-            show_histogram: false,
-            save_histogram: None,
-            dry_run: false,
-            interactive: false,
-            auto_cutoff: false,
-            output: None,
-            row_align: RowAlignMode::Common,
-            session: Default::default(),
-        };
-
-        run_squeeze(&squeeze_args)?;
+        squeeze_in_place(
+            &backend_file,
+            args.row_nnz_cutoff,
+            args.column_nnz_cutoff,
+            args.block_size,
+        )?;
     }
 
     write_batches_and_finalize(&effective_output, &backend_file, &backend, &batch_map)?;
@@ -912,53 +882,6 @@ pub fn generate_unique_batch_names(files: &[Box<str>]) -> anyhow::Result<Vec<Box
         .collect();
 
     Ok(unique_names)
-}
-
-/// Find common or union rows across multiple sparse matrices
-pub fn find_aligned_rows(
-    data_vec: &[&dyn SparseIo<IndexIter = Vec<usize>>],
-    mode: RowAlignMode,
-) -> anyhow::Result<Vec<Box<str>>> {
-    use rayon::prelude::*;
-    use rustc_hash::FxHashMap as HashMap;
-
-    let fully_shared = data_vec.len();
-    let mut row_counts: HashMap<Box<str>, usize> = HashMap::default();
-
-    // Count occurrences of each row across all files
-    for data in data_vec {
-        for row_name in data.row_names()? {
-            *row_counts.entry(row_name).or_default() += 1;
-        }
-    }
-
-    // Filter based on mode
-    let mut aligned_rows: Vec<Box<str>> = match mode {
-        RowAlignMode::Common => {
-            // Intersection: only rows present in ALL files
-            row_counts
-                .into_iter()
-                .filter_map(|(row, count)| {
-                    if count == fully_shared {
-                        Some(row)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        }
-        RowAlignMode::Union => {
-            // Union: rows present in ANY file
-            row_counts.into_keys().collect()
-        }
-    };
-
-    if aligned_rows.is_empty() {
-        return Err(anyhow::anyhow!("No rows found for alignment"));
-    }
-
-    aligned_rows.par_sort();
-    Ok(aligned_rows)
 }
 
 pub fn align_backends(args: &AlignDataArgs) -> anyhow::Result<()> {

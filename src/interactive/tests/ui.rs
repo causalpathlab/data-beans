@@ -36,17 +36,20 @@ fn compact_labels() {
 }
 
 #[test]
-fn log_lower_edges_match_the_printed_histogram_bins() {
-    // Log keys round, so bin k starts at the first count whose key reaches k.
-    let b = Binning::new(Scale::Log, 1e6, true);
-    for k in 0..60 {
-        let e = b.lower_edge(k);
-        assert!(crate::qc::log_bin_key(e as f64) >= k, "k={k} e={e}");
-        assert!(
-            e == 0 || crate::qc::log_bin_key((e - 1) as f64) < k,
-            "k={k} e={e}"
-        );
-    }
+fn log_bins_read_values_on_the_shared_axis() {
+    // Means mostly below 1 spread over the bins, not into the first few.
+    let means: Vec<f32> = (1..=400).map(|i| 0.001 * 1.02f32.powi(i)).collect();
+    let binned = Binned::new(&means, Scale::Log);
+    let filled = binned.counts.iter().filter(|&&c| c > 0).count();
+    assert!(filled >= 40, "{filled} of {} bins", binned.counts.len());
+    // Ticks at round values.
+    let ticks = binned.bins.ticks(binned.kmin, binned.kmax());
+    assert!(ticks.iter().any(|&(_, v)| v == 0.01), "{ticks:?}");
+    let (kmin, kmax) = (binned.kmin, binned.kmax());
+    assert!(
+        ticks.iter().all(|&(k, _)| (kmin..=kmax + 1).contains(&k)),
+        "{ticks:?}"
+    );
 }
 
 #[test]
@@ -225,4 +228,13 @@ fn a_mirror_grows_one_side_up_and_the_other_down() {
     assert!(rows[6].trim_start().starts_with('4'), "{rows:?}");
     assert!(rows[8].contains('A'));
     assert!(rows[7].contains('▲'));
+}
+
+#[test]
+fn base64_pads_as_the_standard_does() {
+    assert_eq!(base64(b""), "");
+    assert_eq!(base64(b"f"), "Zg==");
+    assert_eq!(base64(b"fo"), "Zm8=");
+    assert_eq!(base64(b"foo"), "Zm9v");
+    assert_eq!(base64(b"--qc-mads=3"), "LS1xYy1tYWRzPTM=");
 }
