@@ -1,14 +1,16 @@
+use crate::hdf5_io::resolve_backend_file;
+use crate::qc::{squeeze_by_nnz, SqueezeCutoffs};
+use crate::sparse_io::open_sparse_matrix;
 use clap::Args;
+use log::info;
 
 mod convert;
 mod split;
-mod squeeze;
 mod subsample;
 mod subset;
 
 pub use convert::*;
 pub use split::*;
-pub use squeeze::*;
 pub use subsample::*;
 pub use subset::*;
 
@@ -40,6 +42,11 @@ pub struct SubsetArgs {
     #[arg(short, long, required = true)]
     pub output: Box<str>,
 
+    /// never open the explorer; subset only picks there, so it stops,
+    /// naming subset-rows and subset-columns, which take a selection
+    #[arg(long, default_value_t = false)]
+    pub batch_process: bool,
+
     #[command(flatten)]
     pub session: legume_tui::cli::SessionArgs,
 }
@@ -51,21 +58,21 @@ pub struct SubsetColumnsArgs {
 
     /// column indices to take: singles and inclusive ranges, e.g. `0,1,2,3`,
     /// `1-10`, or `1-20,50-55` (past the last column, cut)
-    #[arg(short = 'i', long, conflicts_with_all = ["name_file", "pattern", "interactive"])]
+    #[arg(short = 'i', long, conflicts_with_all = ["name_file", "pattern"])]
     pub column_indices: Option<Box<str>>,
 
     /// column name file where each line is a column name
-    #[arg(short = 'f', long, conflicts_with_all = ["pattern", "interactive"])]
+    #[arg(short = 'f', long, conflicts_with = "pattern")]
     pub name_file: Option<Box<str>>,
 
     /// the columns whose names this regex finds (case-insensitive), e.g.
     /// `/count/spliced$` or `^MT-`
-    #[arg(long, conflicts_with = "interactive")]
+    #[arg(long)]
     pub pattern: Option<Box<str>>,
 
-    /// pick the columns in a full-screen table: mark with Space, Enter to finish
-    #[arg(short = 'I', long, default_value_t = false)]
-    pub interactive: bool,
+    /// never open the explorer: what to keep is given on the command line
+    #[arg(long, default_value_t = false)]
+    pub batch_process: bool,
 
     #[command(flatten)]
     pub session: legume_tui::cli::SessionArgs,
@@ -122,21 +129,21 @@ pub struct SubsetRowsArgs {
 
     /// row indices to take: singles and inclusive ranges, e.g. `0,1,2,3`,
     /// `1-10`, or `1-20,50-55` (past the last row, cut)
-    #[arg(short = 'i', long, conflicts_with_all = ["name_file", "pattern", "interactive"])]
+    #[arg(short = 'i', long, conflicts_with_all = ["name_file", "pattern"])]
     pub row_indices: Option<Box<str>>,
 
     /// row name file where each line is a row name
-    #[arg(short = 'f', long, conflicts_with_all = ["pattern", "interactive"])]
+    #[arg(short = 'f', long, conflicts_with = "pattern")]
     pub name_file: Option<Box<str>>,
 
     /// the rows whose names this regex finds (case-insensitive), e.g.
     /// `/count/spliced$` or `^MT-`
-    #[arg(long, conflicts_with = "interactive")]
+    #[arg(long)]
     pub pattern: Option<Box<str>>,
 
-    /// pick the rows in a full-screen table: mark with Space, Enter to finish
-    #[arg(short = 'I', long, default_value_t = false)]
-    pub interactive: bool,
+    /// never open the explorer: what to keep is given on the command line
+    #[arg(long, default_value_t = false)]
+    pub batch_process: bool,
 
     #[command(flatten)]
     pub session: legume_tui::cli::SessionArgs,
@@ -186,136 +193,30 @@ pub struct SubsetRowsArgs {
     pub zip: bool,
 }
 
-#[derive(Args, Debug)]
-#[command(about)]
-pub struct RunSqueezeArgs {
-    /// data files -- either `.zarr` or `.h5`
-    #[arg(required = true, value_delimiter = ',')]
-    pub data_files: Vec<Box<str>>,
-
-    /// number of non-zero cutoff for rows
-    #[arg(short, long, default_value = "0")]
-    pub row_nnz_cutoff: usize,
-
-    /// number of non-zero cutoff for columns
-    #[arg(short, long, default_value = "0")]
-    pub column_nnz_cutoff: usize,
-
-    /// Cells per rayon job. Omit for auto-scaling by feature count.
-    #[arg(long)]
-    pub block_size: Option<usize>,
-
-    /// keep data on the streaming read path instead of preloading it
-    ///
-    /// `default_value_t = true` with no `SetFalse` action used to make this
-    /// flag decorative: there was no way to turn preloading off at all.
-    #[arg(
-        long = "no-preload",
-        alias = "no-preload-data",
-        default_value_t = true,
-        action = clap::ArgAction::SetFalse,
-        help = "Skip preloading; stream reads instead (preloading is the default)",
-        long_help = "Skip preloading column data into memory before squeezing.\n\
-                     Preloading (the default) is faster but costs 12 bytes per\n\
-                     non-zero, and is skipped automatically over the\n\
-                     LEGUME_PRELOAD_BUDGET_BYTES budget."
-    )]
-    pub preload: bool,
-
-    /// show nnz histogram before squeezing
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Show ASCII histogram of row/column nnz distributions",
-        long_help = "Display log1p-transformed ASCII histograms.\n\
-                     They cover row and column non-zero counts, before squeezing.\n\
-                     Use them to pick appropriate cutoff values."
-    )]
-    pub show_histogram: bool,
-
-    /// save histogram data to files
-    #[arg(
-        long,
-        help = "Output file prefix for saving histogram data",
-        long_help = "Save histogram data to {prefix}.row_nnz.txt and {prefix}.col_nnz.txt files.\n\
-                     Each file contains nnz counts that can be used for further analysis."
-    )]
-    pub save_histogram: Option<Box<str>>,
-
-    /// dry run - only show histograms without performing squeeze
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Preview mode - show histograms without squeezing",
-        long_help = "Only display histograms and statistics without actually performing the squeeze operation.\n\
-                     Useful for determining appropriate cutoff values."
-    )]
-    pub dry_run: bool,
-
-    /// interactive mode - prompt user after showing histogram
-    #[arg(
-        short,
-        long,
-        default_value_t = false,
-        help = "Interactive mode - pick cutoffs on a live histogram before squeezing",
-        long_help = "On a terminal, opens a full-screen view of the row and column nnz histograms.\n\
-                     Move each cutoff with the arrow keys (or type a value) and watch what it drops,\n\
-                     then press Enter to squeeze or q to cancel.\n\
-                     Without a terminal (piped input), falls back to text prompts\n\
-                     and prints the histogram (as --show-histogram)."
-    )]
-    pub interactive: bool,
-
-    /// auto cutoff - apply the suggested (trough) cutoff without prompting
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Apply the suggested (histogram trough) nnz cutoff headlessly (no prompt)",
-        long_help = "Resolve row and column cutoffs automatically, then squeeze.\n\
-                     The cutoffs sit at the trough of the log(1+nnz) histogram. No prompt is shown.\n\
-                     \n\
-                     Explicit --row-nnz-cutoff and --column-nnz-cutoff still win,\n\
-                     per dimension. So you can pin one axis and auto the other.\n\
-                     Combine with --dry-run to preview the cutoffs without writing."
-    )]
-    pub auto_cutoff: bool,
-
-    /// output file for squeezed data
-    #[arg(
-        short,
-        long,
-        help = "Output file for squeezed data",
-        long_help = "Save squeezed data to a new file instead of modifying in-place.\n\
-                     With multiple inputs,\n\
-                     all files will be squeezed and merged into {output}.{backend}.\n\
-                     If not specified,\n\
-                     modifies files in-place (requires confirmation in interactive mode)."
-    )]
-    pub output: Option<Box<str>>,
-
-    /// keep a `.zarr` directory instead of producing a `.zarr.zip` archive
-    #[arg(long = "no-zip", default_value_t = true, action = clap::ArgAction::SetFalse)]
-    pub zip: bool,
-
-    /// row alignment strategy for merging multiple files
-    #[arg(
-        long,
-        value_enum,
-        default_value = "common",
-        help = "Row alignment strategy when merging multiple files",
-        long_help = "How to align rows across files after squeezing:\n\
-                     - common: Keep only rows present in ALL files (intersection)\n\
-                     - union: Keep rows present in ANY file (union, fills missing with zeros)"
-    )]
-    pub row_align: RowAlignMode,
-
-    #[command(flatten)]
-    pub session: legume_tui::cli::SessionArgs,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
-#[clap(rename_all = "lowercase")]
-pub enum RowAlignMode {
-    Common,
-    Union,
+/// Cut, in place, the rows and columns of the backend at `backend_file`
+/// with fewer than `row` and `column` non-zeros: the `--squeeze` of the
+/// commands that build or derive a backend. The path is one the caller
+/// resolved and finalizes itself, so nothing is zipped here.
+pub fn squeeze_in_place(
+    backend_file: &str,
+    row: usize,
+    column: usize,
+    block_size: Option<usize>,
+) -> anyhow::Result<()> {
+    info!("Squeeze the backend data {backend_file}");
+    let (backend, file) = resolve_backend_file(backend_file, None)?;
+    let data = open_sparse_matrix(&file, &backend)?;
+    squeeze_by_nnz(
+        data.as_ref(),
+        SqueezeCutoffs { row, column },
+        block_size,
+        true,
+    )?;
+    let data = open_sparse_matrix(&file, &backend)?;
+    info!(
+        "after squeeze -- data: {} rows x {} columns",
+        data.num_rows().unwrap_or_default(),
+        data.num_columns().unwrap_or_default()
+    );
+    Ok(())
 }

@@ -5,7 +5,8 @@
 //! subcommand leaves a `.zarr.zip`. A pipeline that feeds one subcommand's
 //! output to the next then breaks on the path alone.
 
-use super::super::{ReorderRowsArgs, RunSqueezeArgs, SubsetColumnsArgs, SubsetRowsArgs};
+use super::super::{ReorderRowsArgs, SubsetColumnsArgs, SubsetRowsArgs};
+use crate::handlers::cell_qc::CellQcArgs;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -24,9 +25,9 @@ struct Reorder {
     args: ReorderRowsArgs,
 }
 #[derive(Parser)]
-struct Squeeze {
+struct Qc {
     #[command(flatten)]
-    args: RunSqueezeArgs,
+    args: CellQcArgs,
 }
 
 #[test]
@@ -38,7 +39,7 @@ fn an_edit_handler_zips_its_output_like_every_builder_does() {
             .args
             .zip
     );
-    assert!(Squeeze::parse_from(["x", "in.zarr.zip"]).args.zip);
+    assert!(Qc::parse_from(["x", "in.zarr.zip", "-o", "out"]).args.zip);
 }
 
 #[test]

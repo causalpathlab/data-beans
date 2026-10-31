@@ -1,11 +1,12 @@
 use crate::handlers::explore::{off_screen, open_data, open_session, side_stats, values_reader};
 use crate::hdf5_io::*;
 use crate::interactive::stat_tui::{explore_in, Purpose, Side, StatExplorer};
-use crate::interactive::tui_available;
 use crate::interactive::ui::Tui;
 use crate::qc::*;
 use crate::sparse_io::*;
 use crate::sparse_io_vector::*;
+use data_beans::figure::save as save_figure;
+use data_beans::figure::stat::{figure as stat_figure, StatData};
 
 use clap::{Args, ValueEnum};
 use legume_numeric::matrix::common_io::*;
@@ -35,10 +36,9 @@ pub struct RunStatArgs {
         short,
         long,
         value_enum,
-        required_unless_present = "interactive",
-        help = "Statistics dimension (row or column)",
-        long_help = "Choose whether to compute statistics over rows or columns.\n\
-                     Optional with --interactive, which starts on columns (Tab switches)."
+        help = "Statistics dimension (row or column; default column)",
+        long_help = "Choose whether to compute statistics over rows or columns (default\n\
+                     column). The explorer starts on this side; Tab switches."
     )]
     pub stat_dim: Option<StatDim>,
 
@@ -105,16 +105,28 @@ pub struct RunStatArgs {
     pub output: Box<str>,
 
     #[arg(
-        short,
         long,
         default_value_t = false,
-        help = "Explore the statistics in a full-screen table and histogram",
-        long_help = "After computing, open a sortable, filterable table of every row or column\n\
-                     beside a histogram of nnz, sum, mean, or sd (log, sqrt, or linear scales).\n\
-                     A file --output is still written; printing to stdout is skipped.\n\
-                     Not available with --column-group-file."
+        help = "Run straight through: no explorer, even on a terminal",
+        long_help = "On a terminal, the statistics open in the explorer once computed: a\n\
+                     sortable, filterable table of every row or column beside a histogram of\n\
+                     nnz, sum, mean or sd. A file --output is still written; printing to stdout\n\
+                     is skipped. --batch-process (or no terminal) prints or writes them and\n\
+                     stops. --column-group-file always runs straight through."
     )]
-    pub interactive: bool,
+    pub batch_process: bool,
+
+    /// write the statistics figure under this name: `NAME.pdf` and
+    /// `NAME.png`, or the one file NAME names when it ends in .pdf, .png or
+    /// .svg
+    #[arg(
+        long,
+        long_help = "Write the statistics figure under this name: the histograms of nnz, sum,\n\
+                     mean and sd over the rows or columns, and mean against sd with the\n\
+                     Poisson line. NAME.pdf and NAME.png, or the one file NAME names when it\n\
+                     ends in .pdf, .png or .svg. Not available with --column-group-file."
+    )]
+    pub figure: Option<Box<str>>,
 
     #[command(flatten)]
     pub session: legume_tui::cli::SessionArgs,
@@ -140,7 +152,7 @@ pub fn run_stat(cmd_args: &RunStatArgs) -> anyhow::Result<()> {
     // Several files keep their column (barcode) names distinct.
     let data = open_data(&cmd_args.data_files, cmd_args.preload)?;
 
-    // Only --interactive may leave it out; it starts on columns.
+    // Columns unless rows are asked for.
     let dim = cmd_args.stat_dim.clone().unwrap_or(StatDim::Column);
     if dim == StatDim::Row {
         if let Some(column_group_file) = &cmd_args.column_group_file {
@@ -187,8 +199,8 @@ pub fn run_stat(cmd_args: &RunStatArgs) -> anyhow::Result<()> {
                 group_names
             );
 
-            if cmd_args.interactive {
-                warn!("--interactive is not available with --column-group-file; skipping it");
+            if cmd_args.figure.is_some() {
+                warn!("--figure is not available with --column-group-file; skipping it");
             }
             if cmd_args.output.eq_ignore_ascii_case("stdout") {
                 for (g, row_stat) in group_names.iter().zip(group_stats.iter()) {
@@ -228,6 +240,27 @@ pub fn run_stat(cmd_args: &RunStatArgs) -> anyhow::Result<()> {
     let first = off_screen(tui.as_mut().filter(|_| output.is_some()), || {
         side_stats(&data, side, select_rows, cmd_args.block_size, output)
     })?;
+    if let Some(name) = &cmd_args.figure {
+        let title = cmd_args
+            .data_files
+            .iter()
+            .map(|f| basename(f).unwrap_or_else(|_| f.clone()).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let v = &first.values;
+        let svg = stat_figure(&StatData {
+            title: &title,
+            side: match side {
+                Side::Rows => "rows",
+                Side::Columns => "columns",
+            },
+            values: [&v[0], &v[1], &v[2], &v[3]],
+            marked: None,
+            cursor: None,
+        });
+        let paths = off_screen(tui.as_mut(), || save_figure(&svg, name))?;
+        info!("wrote the statistics figure: {}", paths.join(", "));
+    }
     if let Some(tui) = tui.as_mut() {
         let title = cmd_args.data_files.join(", ");
         let data = &data;
@@ -248,12 +281,9 @@ pub fn run_stat(cmd_args: &RunStatArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether to open the explorer: `--interactive`, on a terminal.
+/// Whether to open the explorer: on a terminal, unless `--batch-process`.
 fn wants_explorer(cmd_args: &RunStatArgs) -> bool {
-    if cmd_args.interactive && !tui_available() {
-        warn!("--interactive needs a terminal; skipping the explorer");
-    }
-    cmd_args.interactive && tui_available()
+    crate::interactive::opens_view("stat", cmd_args.batch_process)
 }
 
 /// Rows whose names match `--row-name-pattern` (case-insensitive), if given;
@@ -324,7 +354,7 @@ pub struct RunHistogramArgs {
     /// data file -- `.zarr`, `.zarr.zip`, or `.h5`
     pub data_file: Box<str>,
 
-    /// statistic to histogram (log10(x+1) scale)
+    /// statistic to histogram (log-spaced bins)
     #[arg(short, long, value_enum, default_value = "nnz")]
     pub stat: HistStat,
 
@@ -346,7 +376,7 @@ pub struct RunHistogramArgs {
 }
 
 /// Print an ASCII log-scale histogram of a per-row and/or per-column statistic
-/// (default nnz) — the same summary `squeeze --show-histogram` shows, exposed
+/// (default nnz) — the summary `qc --qc-histogram` prints for its nnz floors,
 /// as a standalone command over any statistic.
 pub fn run_histogram(cmd_args: &RunHistogramArgs) -> anyhow::Result<()> {
     let (backend, data_file) = resolve_backend_file(&cmd_args.data_file, None)?;

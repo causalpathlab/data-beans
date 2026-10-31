@@ -6,6 +6,4 @@ pub mod exporters;
 pub mod inspection;
 pub mod listing;
 pub mod merging;
-#[cfg(feature = "plot")]
-pub mod plotting;
 pub mod transformation;

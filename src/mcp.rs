@@ -6,8 +6,7 @@
 //! stdout carries the protocol, a child's log lines come back as progress,
 //! and a cancelled call kills its child. Reads return what the child printed,
 //! parsed and cut to a page. Writes take an `out` that must not exist yet:
-//! no tool replaces a file, and `squeeze`, which rewrites its input, is not
-//! offered.
+//! no tool replaces a file.
 //!
 //! The project's records are legume-mcp's, laid out after Noble (2009), "A
 //! quick guide to organizing computational biology projects", PLoS Comput
@@ -75,9 +74,12 @@ floor, then robust MAD bands on detected genes, total counts and the mito \
 fraction). Call it without `out` first: it reports each metric's median, the \
 band and how many cells fall outside, and writes nothing. Adjust n_mads or \
 the caps until the drops are what the data warrant, then call it with `out` \
-to write the kept cells as a new backend. plot shows the same settings as a \
-figure (histograms with the band edges, counts against genes by verdict), \
-so look at it before and after tuning.
+to write the kept cells as a new backend. Pass `figure` to see the same \
+settings as a figure, returned as an image: each rule's histogram with its \
+edge, the cells it alone removes, counts against genes, and the removed \
+cells by the rules they fail; look at it before and after tuning. \
+statistics takes `figure` too: the histograms of nnz, sum, mean and sd, and \
+mean against sd.
 
 Derive new backends with import (mtx, zarr triplets, fragments, h5ad, 10x; \
 say in `source` where the input came from), subset, subsample, split, \
@@ -110,7 +112,7 @@ fn import_commands() -> Vec<&'static str> {
     v
 }
 
-/// The cell-QC settings `qc` and `plot` share, and `data`.
+/// The cell-QC settings `qc` takes, and `data`.
 fn qc_properties(data: &Value) -> Value {
     json!({
         "data": data,
@@ -144,6 +146,7 @@ fn tools() -> Vec<ToolSpec> {
         "description": "Run in the background: the job's id comes back at once, and job_status / job_wait follow it (for big stores)"
     });
     let limit = json!({ "type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "Entries to return (default 100)" });
+    let figure = json!({ "type": ["boolean", "string"], "description": "Also the figure, returned as an image: true for a PNG in today's results folder, or a new .png, .pdf or .svg to write" });
     vec![
         ToolSpec::new(
             "info",
@@ -170,7 +173,7 @@ fn tools() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "statistics",
-            "Per-row or per-column statistics (nnz, tot, mu, sig) over one or more backends: quantiles of each, and the top entries by `sort_by`. With `out` (.parquet), the full table is written there instead.",
+            "Per-row or per-column statistics (nnz, tot, mu, sig) over one or more backends: quantiles of each, and the top entries by `sort_by`. With `out` (.parquet), the full table is written there instead. With `figure`, also the histograms of nnz, sum, mean and sd and mean against sd (with the Poisson line), as an image.",
             schema(
                 json!({
                     "data": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
@@ -180,6 +183,7 @@ fn tools() -> Vec<ToolSpec> {
                     "ascending": { "type": "boolean" },
                     "limit": limit,
                     "out": { "type": "string", "description": "A .parquet file for the full table; must not exist" },
+                    "figure": figure,
                 }),
                 &["data", "axis"],
             ),
@@ -201,29 +205,16 @@ fn tools() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "qc",
-            "Cell QC as senna and pinto apply it: cells below the near-empty floor, or outside `median ± n_mads·MAD` on log detected genes and log total counts (from below) or on the mito fraction (from above), are dropped. Returns the counts kept and dropped and, per metric, its median, band and the cells outside it. Without `out` nothing is written; with it, the kept cells go to a new backend.",
+            "Cell QC as senna and pinto apply it: cells below the near-empty floor, or outside `median ± n_mads·MAD` on log detected genes and log total counts (from below) or on the mito fraction (from above), are dropped; genes detected in fewer than `feature_min_cells` cells too. The nnz floors (`min_cell_nnz` on cells, `feature_min_cells` on genes) are what squeeze used to cut. Several backends in `data` are pooled first (merged, all rows or `common_rows`) and QC'd as one; the output then has their batch labels. Returns the counts kept and dropped and, per metric, its median, band and the cells outside it. Without `out` nothing is written; with it, the kept cells go to a new backend. With `figure`, also the QC figure as an image: each rule's histogram (all cells, those passing the other rules, those only it removes) with its edge, counts against genes coloured by mito with removed cells ringed, cells per gene, and the removed cells by the rules they fail.",
             schema(
                 {
                     let mut p = qc_properties(&data);
+                    p["data"] = json!({ "type": ["string", "array"], "items": { "type": "string" }, "description": "A backend, or several to pool and QC as one" });
+                    p["common_rows"] = json!({ "type": "boolean", "description": "Pooling several backends, keep only the rows (genes) all have" });
                     p["report"] = json!({ "type": "string", "description": "A .tsv(.gz) for the per-cell metrics and verdicts; must not exist" });
                     p["out"] = json!({ "type": "string", "description": "Output for the kept cells; must not exist. Omit for a dry run" });
+                    p["figure"] = figure.clone();
                     p["background"] = background.clone();
-                    p
-                },
-                &["data"],
-            ),
-        ),
-        #[cfg(feature = "plot")]
-        ToolSpec::new(
-            "plot",
-            "A figure, returned as an image (unless `out` is an .svg or .pdf). kind qc (default): each QC metric's histogram, stacked kept/outlier/near-empty, with the edge QC held it to, and total counts against detected genes by verdict; it takes the qc settings, so plot before and after tuning them. kind stat: the histogram of one statistic over rows or columns, on a log10(x+1) axis. With `out` (.png, .svg or .pdf) the figure is kept there too.",
-            schema(
-                {
-                    let mut p = qc_properties(&data);
-                    p["kind"] = json!({ "type": "string", "enum": ["qc", "stat"] });
-                    p["axis"] = json!({ "type": "string", "enum": ["rows", "columns"], "description": "For kind stat (default columns)" });
-                    p["stat"] = json!({ "type": "string", "enum": ["nnz", "tot", "mu", "sig"], "description": "For kind stat (default nnz)" });
-                    p["out"] = json!({ "type": "string", "description": "A .png, .svg or .pdf to keep; must not exist" });
                     p
                 },
                 &["data"],
@@ -314,12 +305,52 @@ fn tools() -> Vec<ToolSpec> {
     ]
 }
 
-/// What o opens on a call: a backend it wrote, in the statistics explorer.
+/// What o opens on a call: a `qc` call in the QC view, on the data it
+/// looked at with the agent's settings, for the person to try others on
+/// (its Enter writes only where they say; `c` copies the flags, for a note
+/// back); else a backend the call wrote, in the statistics explorer. On the
+/// watcher's terminal either view opens by itself.
 fn open(call: &legume_mcp::watch::view::CallView) -> Option<Command> {
-    let written = written_backend(&call.text)?;
+    let qc = match call.tool.as_str() {
+        "qc" => qc_view_argv(&call.args, &call.text),
+        _ => None,
+    };
+    let words = match qc {
+        Some(words) => words,
+        None => {
+            let written = written_backend(&call.text)?;
+            argv(["statistics", &written, "-s", "column"])
+        }
+    };
     let mut cmd = Command::new(own_exe().ok()?);
-    cmd.args(["statistics", &written, "-s", "column", "--interactive"]);
+    cmd.args(words);
     Some(cmd)
+}
+
+/// The `qc` command line of the view on what a `qc` call looked at: the
+/// data as its result names them (absolute, so the watcher may be anywhere),
+/// the settings as the call gave them, and no output. `None` for a call
+/// that did not come to a result.
+fn qc_view_argv(args: &Value, text: &str) -> Option<Vec<String>> {
+    let v: Value = serde_json::Deserializer::from_str(text)
+        .into_iter()
+        .next()?
+        .ok()?;
+    let data: Vec<&str> = match &v["data"] {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    if data.is_empty() {
+        return None;
+    }
+    let a = Arguments(args.clone());
+    let mut argv = argv(["qc", &data.join(",")]);
+    if data.len() > 1 && a.flag("common_rows").ok()? {
+        argv.push("--common-rows".into());
+    }
+    argv.extend(qc_flags(&a).ok()?);
+    Some(argv)
 }
 
 /// The backend a result says it wrote (`written`, or the first of a list),
@@ -364,11 +395,9 @@ impl Handler for DataBeans {
             "info" => summary(cx, &a.path("data")?)?,
             "list_contents" => return list_contents(&a, cx),
             "names" => names(&a, cx)?,
-            "statistics" => statistics(&a, cx)?,
+            "statistics" => return statistics(&a, cx),
             "values" => values(&a, cx)?,
-            "qc" => qc(&a, cx)?,
-            #[cfg(feature = "plot")]
-            "plot" => return plot(&a, cx),
+            "qc" => return qc(&a, cx),
             "import" => import(&a, cx)?,
             "subset" => subset(&a, cx)?,
             "subsample" => {
@@ -499,19 +528,98 @@ impl Arguments {
         if self.given("out").is_some() {
             return self.path("out");
         }
-        let dir = cx
-            .results_dir()
+        cx.results_dir()
             .context("`out` is required: this server keeps no results folder")?;
-        (1..10_000)
-            .map(|k| match k {
-                1 => dir.join(format!("{name}{ext}")),
-                k => dir.join(format!("{name}-{k}{ext}")),
-            })
-            .map(|p| p.to_string_lossy().into_owned())
-            .find(|p| !held(cx, &[p]) && !taken(p))
-            .context("no free name in the results folder")
+        results_name(cx, (name, ext), taken)
     }
 
+    /// Where `figure` asks a tool's figure to go: the new .png, .pdf or .svg
+    /// it names, or, for `true`, `{name}.png` in today's results folder; a
+    /// server keeping no results folder shows that one to the agent only.
+    fn figure(&self, cx: &Call, name: &str) -> Result<Option<Figure>> {
+        match self.given("figure") {
+            None | Some(Value::Bool(false)) => Ok(None),
+            Some(Value::Bool(true)) => Ok(Some(match cx.results_dir() {
+                Some(_) => Figure {
+                    path: results_name(cx, (name, ".png"), |c| Path::new(c).exists())?,
+                    kept: true,
+                    _temp: None,
+                },
+                None => {
+                    let temp = tempfile::Builder::new()
+                        .suffix(".png")
+                        .tempfile()?
+                        .into_temp_path();
+                    Figure {
+                        path: temp.to_string_lossy().into_owned(),
+                        kept: false,
+                        _temp: Some(temp),
+                    }
+                }
+            })),
+            Some(Value::String(_)) => {
+                let path = self.path("figure")?;
+                anyhow::ensure!(
+                    [".png", ".pdf", ".svg"].iter().any(|e| path.ends_with(e)),
+                    "`figure` {path}: a .png, .pdf or .svg"
+                );
+                fresh(&path)?;
+                Ok(Some(Figure {
+                    path,
+                    kept: true,
+                    _temp: None,
+                }))
+            }
+            Some(other) => anyhow::bail!("`figure` is true or a file name, not {other}"),
+        }
+    }
+}
+
+/// A free `{name}{ext}` in today's results folder: `-2`, `-3`… added to
+/// `name` (before `ext`) while `taken` says a name is in use, or a running
+/// job writes it.
+fn results_name(
+    cx: &Call,
+    (name, ext): (&str, &str),
+    taken: impl Fn(&str) -> bool,
+) -> Result<String> {
+    let dir = cx
+        .results_dir()
+        .context("this server keeps no results folder")?;
+    (1..10_000)
+        .map(|k| match k {
+            1 => dir.join(format!("{name}{ext}")),
+            k => dir.join(format!("{name}-{k}{ext}")),
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+        .find(|p| !held(cx, &[p]) && !taken(p))
+        .context("no free name in the results folder")
+}
+
+/// A figure a tool writes: where, and whether it is kept (else a temporary
+/// file, gone with this).
+struct Figure {
+    path: String,
+    kept: bool,
+    _temp: Option<tempfile::TempPath>,
+}
+
+impl Figure {
+    /// The figure for the agent: the image itself where it is a PNG, and
+    /// where it is kept.
+    fn contents(&self, v: &mut Map<String, Value>) -> Result<Vec<Content>> {
+        if self.kept {
+            v.insert("figure".into(), json!(absolute(&self.path)));
+        }
+        let mut out = vec![];
+        if self.path.ends_with(".png") {
+            out.push(Content::Png(std::fs::read(&self.path)?));
+        }
+        Ok(out)
+    }
+}
+
+impl Arguments {
     /// [`Self::out_or`] for a backend: a name is taken when what the command
     /// would write for it exists.
     fn backend_out(&self, cx: &Call, name: &str) -> Result<String> {
@@ -538,8 +646,6 @@ impl Arguments {
             "--save-histogram",
             "--backend",
             "--no-zip",
-            "-I",
-            "--interactive",
             "--",
         ];
         for o in &v {
@@ -575,6 +681,8 @@ fn command(argv: &[String]) -> Result<Command> {
     // child's stderr, and one would push the error itself out of them.
     cmd.env("RUST_BACKTRACE", "0")
         .env("RUST_LIB_BACKTRACE", "0");
+    // Never a view: an agent has no terminal to work one.
+    cmd.env(crate::interactive::BATCH_ENV, "1");
     Ok(cmd)
 }
 
@@ -909,20 +1017,37 @@ fn header(line: Option<&str>) -> Vec<&str> {
         .collect()
 }
 
-fn statistics(a: &Arguments, cx: &Call) -> Result<Value> {
+fn statistics(a: &Arguments, cx: &Call) -> Result<Vec<Content>> {
     let data = a.paths("data")?;
     anyhow::ensure!(!data.is_empty(), "`data` is required");
     let dim = if a.rows()? { "row" } else { "column" };
-    let mut argv = argv(["statistics", &data.join(","), "-s", dim]);
+    let mut argv = argv(["statistics", &data.join(","), "-s", dim, "--batch-process"]);
     if let Some(p) = a.str("row_pattern") {
         argv.push(format!("--row-name-pattern={p}"));
     }
+    let figure = a.figure(cx, &named(&data[0], &format!("{dim}_statistics")))?;
+    if let Some(f) = &figure {
+        argv.push(format!("--figure={}", f.path));
+    }
+    let what = format!("{dim} statistics of {}", data.join(", "));
     if let Some(out) = a.str("out") {
         anyhow::ensure!(out.ends_with(".parquet"), "`out` is a .parquet file");
-        let what = format!("{dim} statistics of {}", data.join(", "));
-        return to_file(cx, argv, out, &what);
+        let Value::Object(mut v) = to_file(cx, argv, out, &what)? else {
+            unreachable!("to_file answers with an object");
+        };
+        let images = figure
+            .as_ref()
+            .map(|f| f.contents(&mut v))
+            .transpose()?
+            .unwrap_or_default();
+        return Ok(std::iter::once(Content::Json(Value::Object(v)))
+            .chain(images)
+            .collect());
     }
-    let text = data_beans(cx, &argv)?;
+    let text = match figure.as_ref().filter(|f| f.kept) {
+        Some(f) => data_beans_making(cx, &argv, &[&f.path], &format!("the figure of the {what}"))?,
+        None => data_beans(cx, &argv)?,
+    };
     let mut lines = text.lines();
     let header = header(lines.next());
     let stats = header.get(1..).unwrap_or_default();
@@ -979,7 +1104,19 @@ fn statistics(a: &Arguments, cx: &Call) -> Result<Value> {
         .iter()
         .map(|(l, _)| record(&header, l.split('\t')))
         .collect();
-    Ok(json!({ "count": count, "quantiles": quantiles, "sort_by": sort_by, "top": top }))
+    let mut v = Map::new();
+    v.insert("count".into(), json!(count));
+    v.insert("quantiles".into(), Value::Object(quantiles));
+    v.insert("sort_by".into(), json!(sort_by));
+    v.insert("top".into(), json!(top));
+    let images = figure
+        .as_ref()
+        .map(|f| f.contents(&mut v))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(std::iter::once(Content::Json(Value::Object(v)))
+        .chain(images)
+        .collect())
 }
 
 fn values(a: &Arguments, cx: &Call) -> Result<Value> {
@@ -1083,97 +1220,82 @@ fn qc_flags(a: &Arguments) -> Result<Vec<String>> {
     Ok(v)
 }
 
-fn qc(a: &Arguments, cx: &Call) -> Result<Value> {
-    let data = a.path("data")?;
-    let mut argv = argv(["qc", &data]);
+fn qc(a: &Arguments, cx: &Call) -> Result<Vec<Content>> {
+    // One backend, or several to pool.
+    let inputs = match a.given("data") {
+        Some(Value::Array(_)) => a.paths("data")?,
+        _ => vec![a.path("data")?],
+    };
+    anyhow::ensure!(!inputs.is_empty(), "`data` is required");
+    let data = inputs.join(",");
+    let mut argv = argv(["qc", &data, "--batch-process"]);
+    if inputs.len() > 1 && a.flag("common_rows")? {
+        argv.push("--common-rows".into());
+    }
     argv.extend(qc_flags(a)?);
     let report = a.str("report");
     if let Some(report) = report {
         fresh(report)?;
         argv.push(format!("--qc-report={report}"));
     }
-    let what = format!("the cells of {data} that cell QC keeps");
+    let background = a.flag("background")?;
     anyhow::ensure!(
-        a.given("out").is_some() || !a.flag("background")?,
+        a.given("out").is_some() || !background,
         "`background` runs a qc that writes `out`; a dry run answers in the call"
     );
-    // Without `out` a dry run: only the summary, and the report if asked.
-    let (mut v, printed) = match (a.given("out"), report) {
-        (Some(_), _) => {
+    let figure = a.figure(cx, &named(&inputs[0], "qc"))?;
+    anyhow::ensure!(
+        figure.is_none() || !background,
+        "`figure` comes back with the call: leave out `background`, or ask for the figure on a dry run first"
+    );
+    if let Some(f) = &figure {
+        argv.push(format!("--figure={}", f.path));
+    }
+    // Besides `out`: the report and a kept figure.
+    let mut also: Vec<&str> = report.into_iter().collect();
+    if let Some(f) = figure.as_ref().filter(|f| f.kept) {
+        also.push(&f.path);
+    }
+    let what = format!("the cells of {data} that cell QC keeps");
+    // Without `out` a dry run: only the summary, and the report and figure
+    // if asked.
+    let (mut v, printed) = match a.given("out") {
+        Some(_) => {
             let out = a.path("out")?;
-            written_with(
-                cx,
-                a.flag("background")?,
-                argv,
-                &out,
-                &what,
-                std::slice::from_ref(&data),
-                report.as_slice(),
-            )?
+            // A pool's output comes with its batch labels.
+            let batches = batch_file(&backend_target(&out)?.effective);
+            if inputs.len() > 1 {
+                also.push(&batches);
+            }
+            written_with(cx, background, argv, &out, &what, &inputs, &also)?
         }
-        (None, Some(r)) => {
-            let what = format!("per-cell QC metrics and verdicts of {data}");
-            (Map::new(), data_beans_making(cx, &argv, &[r], &what)?)
+        None if also.is_empty() => (Map::new(), data_beans(cx, &argv)?),
+        None => {
+            let what = format!("cell QC of {data}: its report or figure");
+            (Map::new(), data_beans_making(cx, &argv, &also, &what)?)
         }
-        (None, None) => (Map::new(), data_beans(cx, &argv)?),
     };
     v.extend(key_values(&printed));
+    // What it looked at, absolute: for the watcher's `o`, wherever it runs.
+    let looked: Vec<String> = inputs.iter().map(|p| absolute(p)).collect();
+    v.insert(
+        "data".into(),
+        match looked.len() {
+            1 => json!(looked[0]),
+            _ => json!(looked),
+        },
+    );
     if let Some(report) = report {
         v.insert("report".into(), json!(absolute(report)));
     }
-    Ok(Value::Object(v))
-}
-
-#[cfg(feature = "plot")]
-fn plot(a: &Arguments, cx: &Call) -> Result<Vec<Content>> {
-    let data = a.path("data")?;
-    let kind = a.str("kind").unwrap_or("qc");
-    let mut argv = match kind {
-        "qc" => {
-            let mut v = argv(["plot", "qc", &data]);
-            v.extend(qc_flags(a)?);
-            v
-        }
-        "stat" => {
-            // Columns unless `axis` says rows.
-            let rows = a.given("axis").is_some() && a.rows()?;
-            let dim = if rows { "row" } else { "column" };
-            // The names `statistics` reports them by, which `--stat` takes too.
-            let stat = a.str("stat").unwrap_or("nnz");
-            anyhow::ensure!(
-                ["nnz", "tot", "mu", "sig"].contains(&stat),
-                "`stat` is nnz, tot, mu or sig, not {stat}"
-            );
-            argv(["plot", "stat", &data, "-s", dim, "--stat", stat])
-        }
-        other => anyhow::bail!("`kind` is qc or stat, not {other}"),
-    };
-    // A figure in `out`'s format, else a PNG in the results folder; a
-    // server keeping no records shows it to the agent only.
-    let temp;
-    let kept = a.given("out").is_some() || cx.results_dir().is_some();
-    let file = if kept {
-        let file = a.out_or(cx, (&named(&data, kind), ".png"), |c| Path::new(c).exists())?;
-        fresh(&file)?;
-        file
-    } else {
-        temp = tempfile::Builder::new().suffix(".png").tempfile()?;
-        temp.path().to_string_lossy().into_owned()
-    };
-    argv.extend(["-o".into(), file.clone()]);
-    if kept {
-        data_beans_making(cx, &argv, &[&file], &format!("the {kind} figure of {data}"))?;
-    } else {
-        data_beans(cx, &argv)?;
-    }
-    let mut v = vec![];
-    if file.ends_with(".png") {
-        v.push(Content::Png(std::fs::read(&file)?));
-    }
-    if kept {
-        v.push(Content::Json(json!({ "written": absolute(&file) })));
-    }
-    Ok(v)
+    let images = figure
+        .as_ref()
+        .map(|f| f.contents(&mut v))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(std::iter::once(Content::Json(Value::Object(v)))
+        .chain(images)
+        .collect())
 }
 
 fn import(a: &Arguments, cx: &Call) -> Result<Value> {
@@ -1390,7 +1512,36 @@ fn split(a: &Arguments, cx: &Call) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::written_backend;
+    use super::{qc_view_argv, written_backend};
+    use serde_json::json;
+
+    #[test]
+    fn o_on_a_qc_call_opens_its_view_with_the_agent_settings() {
+        let args =
+            json!({ "data": "pbmc.zarr.zip", "n_mads": 3, "mito_pattern": "^mt-", "out": "kept" });
+        let text = r#"{ "cells": 10, "data": "/p/pbmc.zarr.zip" }"#;
+        assert_eq!(
+            qc_view_argv(&args, text).unwrap(),
+            [
+                "qc",
+                "/p/pbmc.zarr.zip",
+                "--qc-mito-pattern=^mt-",
+                "--qc-mads=3"
+            ]
+        );
+        // A pool, its rows as the call aligned them; never the call's out.
+        let args = json!({ "data": ["a", "b"], "common_rows": true });
+        let text = r#"{ "data": ["/p/a", "/p/b"] }"#;
+        assert_eq!(
+            qc_view_argv(&args, text).unwrap(),
+            ["qc", "/p/a,/p/b", "--common-rows"]
+        );
+        // A call that failed has no result to open.
+        assert_eq!(
+            qc_view_argv(&json!({ "data": "x" }), "Error: no such file"),
+            None
+        );
+    }
 
     /// The README gives the instructions for clients that do not pass them
     /// on: they must be the server's, word for word.

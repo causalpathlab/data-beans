@@ -10,6 +10,12 @@ use log::warn;
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 
+// The binary compiles its own copy of this module and reads only part of
+// the axis.
+#[allow(dead_code)]
+pub mod axis;
+pub use axis::Axis;
+
 use rustc_hash::FxHashMap as HashMap;
 
 #[derive(Clone)]
@@ -423,12 +429,6 @@ pub fn suggest_nnz_cutoff(nnz: &[f32]) -> Option<usize> {
     favors_cut.then_some(cutoff)
 }
 
-/// Key of the log10(x+1) histogram bin holding `x`: `round(10 * log10(x + 1))`,
-/// so bins are a tenth of a decade wide.
-pub fn log_bin_key(x: f64) -> i32 {
-    ((x + 1.0).log10() * 10.0).round() as i32
-}
-
 /// `part` as a percentage of `total` (0 when there is nothing).
 pub fn pct(part: usize, total: usize) -> f64 {
     if total > 0 {
@@ -448,49 +448,49 @@ pub fn median_of_sorted(sorted: &[f32]) -> f32 {
     }
 }
 
-/// One log10(x+1) histogram bin, carrying the real value range that fell into it
+/// One bin of a printed histogram that holds values, with the real range
+/// of the values that fell into it.
 struct HistBin {
     val_min: f32,
     val_max: f32,
-    log_val: f64,
     count: usize,
     is_cutoff: bool,
 }
 
-/// Create histogram with log10(x+1) binning, tracking the real value range per
-/// bin. Works on any non-negative statistic (nnz, sum, mean, sd); the ranges
-/// stay exact `f32` so count-like stats still print as integers.
+/// Bins of a printed histogram across its values' range.
+const PRINTED_BINS: usize = 40;
+
+/// A histogram of `values` on the log [`Axis`] every histogram shares, its
+/// bins that hold values with their real ranges. Works on any non-negative
+/// statistic (nnz, sum, mean, sd); the ranges stay exact `f32` so
+/// count-like stats still print as integers.
 fn create_log_histogram(values: &[f32], cutoff: usize) -> Vec<HistBin> {
-    let cutoff_log = log_bin_key(cutoff as f64);
-
-    // Bin key represents log10(x+1)*10 as integer; value is (count, min, max)
-    let mut bins: std::collections::BTreeMap<i32, (usize, f32, f32)> =
-        std::collections::BTreeMap::new();
-
-    for &val in values {
-        let log_val = log_bin_key(val as f64);
-        let entry = bins
-            .entry(log_val)
-            .or_insert((0, f32::INFINITY, f32::NEG_INFINITY));
-        entry.0 += 1;
-        entry.1 = entry.1.min(val);
-        entry.2 = entry.2.max(val);
+    let axis = Axis::fit(values, true).including(cutoff as f64);
+    let mut bins: Vec<(usize, f32, f32)> =
+        vec![(0, f32::INFINITY, f32::NEG_INFINITY); PRINTED_BINS];
+    for &val in values.iter().filter(|v| v.is_finite()) {
+        let b = &mut bins[axis.bin(val as f64, PRINTED_BINS)];
+        b.0 += 1;
+        b.1 = b.1.min(val);
+        b.2 = b.2.max(val);
     }
-
-    // Mark the first bin at or above the cutoff so the arrow always renders,
-    // even when no value's log bucket exactly matches cutoff_log. With no
-    // cutoff (cutoff == 0, e.g. the `histogram` command) nothing is marked.
+    // Mark the first bin at or above the cutoff that holds values, so the
+    // arrow always renders. With no cutoff (cutoff == 0, e.g. the
+    // `histogram` command) nothing is marked.
     let cutoff_bin = (cutoff > 0)
-        .then(|| bins.keys().copied().find(|&b| b >= cutoff_log))
+        .then(|| {
+            let at = axis.bin(cutoff as f64, PRINTED_BINS);
+            (at..PRINTED_BINS).find(|&k| bins[k].0 > 0)
+        })
         .flatten();
-
     bins.into_iter()
-        .map(|(bin, (count, val_min, val_max))| HistBin {
+        .enumerate()
+        .filter(|(_, b)| b.0 > 0)
+        .map(|(k, (count, val_min, val_max))| HistBin {
             val_min,
             val_max,
-            log_val: bin as f64 / 10.0,
             count,
-            is_cutoff: Some(bin) == cutoff_bin,
+            is_cutoff: Some(k) == cutoff_bin,
         })
         .collect()
 }
@@ -506,12 +506,23 @@ pub fn fmt_stat(v: f32, decimals: usize) -> String {
     }
 }
 
-/// Print summary statistics + an ASCII log10(x+1) histogram of a per-row or
+/// A value as a printed histogram's range shows it: whole numbers as they
+/// are, others to three significant digits (0.000412, 0.0731, 2.45).
+fn fmt_sig(v: f32) -> String {
+    if v.fract() == 0.0 {
+        return (v as i64).to_string();
+    }
+    let places = (2 - (v.abs() as f64).log10().floor() as i32).max(0) as usize;
+    format!("{:.*}", places, v)
+}
+
+/// Print summary statistics + an ASCII log-binned histogram of a per-row or
 /// per-column statistic vector (`metric` names it, e.g. "nnz", "sum", "mean").
 /// A non-zero `cutoff` marks the cutoff bin and reports how much it removes;
 /// an optional `suggested` value reports the trough suggestion.
 ///
-/// Used by `data-beans squeeze --show-histogram` and `data-beans histogram`.
+/// Used by `data-beans histogram`, whose result it is; `qc --qc-histogram`
+/// prints the same on stderr ([`eprint_nnz_summary`]).
 pub fn print_nnz_summary(
     label: &str,
     metric: &str,
@@ -519,6 +530,45 @@ pub fn print_nnz_summary(
     cutoff: usize,
     suggested: Option<usize>,
 ) {
+    let _ = write_nnz_summary(
+        &mut std::io::stdout().lock(),
+        label,
+        metric,
+        values,
+        cutoff,
+        suggested,
+    );
+}
+
+/// [`print_nnz_summary`] on stderr: for a histogram that is a diagnostic
+/// beside a command's result (`qc --qc-histogram`, senna's and pinto's QC),
+/// not the result itself, so stdout carries only the result.
+pub fn eprint_nnz_summary(
+    label: &str,
+    metric: &str,
+    values: &[f32],
+    cutoff: usize,
+    suggested: Option<usize>,
+) {
+    let _ = write_nnz_summary(
+        &mut std::io::stderr().lock(),
+        label,
+        metric,
+        values,
+        cutoff,
+        suggested,
+    );
+}
+
+/// [`print_nnz_summary`] to `out`.
+pub fn write_nnz_summary(
+    out: &mut impl std::io::Write,
+    label: &str,
+    metric: &str,
+    values: &[f32],
+    cutoff: usize,
+    suggested: Option<usize>,
+) -> std::io::Result<()> {
     const MAX_BAR_WIDTH: usize = 50; // Maximum width for histogram bars
 
     let total = values.len();
@@ -538,31 +588,34 @@ pub fn print_nnz_summary(
     sorted.sort_unstable_by(f32::total_cmp);
     let median = median_of_sorted(&sorted);
 
-    println!("{} {} distribution:", label, metric);
-    println!("  Total: {}", total);
-    println!(
+    writeln!(out, "{} {} distribution:", label, metric)?;
+    writeln!(out, "  Total: {}", total)?;
+    writeln!(
+        out,
         "  Min: {}, Max: {}, Mean: {:.2}, Median: {:.2}",
         fmt_stat(min, 2),
         fmt_stat(max, 2),
         mean,
         median
-    );
+    )?;
     if cutoff > 0 {
-        println!(
+        writeln!(
+            out,
             "  Cutoff: {} (removes {} / {} = {:.2}%)",
             cutoff, below_cutoff, total, pct_removed
-        );
+        )?;
     }
     if let Some(s) = suggested {
         let below_s = values.iter().filter(|&&x| below_nnz_cutoff(x, s)).count();
         let pct_s = pct(below_s, total);
-        println!(
+        writeln!(
+            out,
             "  Suggested cutoff (histogram trough of {}): {} (would remove {} / {} = {:.2}%)",
             metric, s, below_s, total, pct_s
-        );
+        )?;
     }
 
-    // Create histogram with log10(x+1) bins, tracking the real value range per bin
+    // Log-spaced bins, tracking the real value range per bin
     let hist = create_log_histogram(values, cutoff);
 
     // Scale bar width on log10(count+1) so a few outlier bins don't flatten the rest
@@ -572,10 +625,11 @@ pub fn print_nnz_summary(
         .fold(0.0_f64, f64::max)
         .max(1e-9);
 
-    println!(
-        "  Histogram (x: actual {m} range [log10({m}+1)], bar: log10(count+1)):",
+    writeln!(
+        out,
+        "  Histogram (x: {m} in log-spaced bins, each its range; bar: log10(count+1)):",
         m = metric
-    );
+    )?;
     for b in hist {
         let marker = if b.is_cutoff { " <-- CUTOFF" } else { "" };
         let log_count = ((b.count as f64) + 1.0).log10();
@@ -583,15 +637,13 @@ pub fn print_nnz_summary(
         let bar_width = if b.count > 0 { bar_width.max(1) } else { 0 };
         let bar = "█".repeat(bar_width);
         let range = if b.val_min == b.val_max {
-            fmt_stat(b.val_min, 2)
+            fmt_sig(b.val_min)
         } else {
-            format!("{}-{}", fmt_stat(b.val_min, 2), fmt_stat(b.val_max, 2))
+            format!("{}-{}", fmt_sig(b.val_min), fmt_sig(b.val_max))
         };
-        println!(
-            "    {:>9} [{:>4.2}]: {:>6} {}{}",
-            range, b.log_val, b.count, bar, marker
-        );
+        writeln!(out, "    {:>17}: {:>6} {}{}", range, b.count, bar, marker)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]

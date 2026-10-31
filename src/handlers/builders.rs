@@ -41,28 +41,13 @@ pub(super) fn run_squeeze_if_needed(
     block_size: Option<usize>,
     backend_file: &str,
 ) -> anyhow::Result<()> {
-    use crate::handlers::transformation::{run_squeeze, RowAlignMode, RunSqueezeArgs};
     if do_squeeze {
-        info!("Squeeze the backend data {}", backend_file);
-        let squeeze_args = RunSqueezeArgs {
-            // Squeezing in place on a path the caller already resolved: the
-            // zip decision was made there, so nothing is re-zipped here.
-            zip: false,
-            data_files: vec![backend_file.into()],
+        crate::handlers::transformation::squeeze_in_place(
+            backend_file,
             row_nnz_cutoff,
             column_nnz_cutoff,
             block_size,
-            preload: true,
-            show_histogram: false,
-            save_histogram: None,
-            dry_run: false,
-            interactive: false,
-            auto_cutoff: false,
-            output: None,
-            row_align: RowAlignMode::Common,
-            session: Default::default(),
-        };
-        run_squeeze(&squeeze_args)?;
+        )?;
     }
     Ok(())
 }

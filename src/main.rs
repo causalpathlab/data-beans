@@ -43,12 +43,12 @@ use crate::handlers::merging::{
     align_backends, run_merge_backend, run_merge_mtx, AlignDataArgs, MergeBackendArgs, MergeMtxArgs,
 };
 use crate::handlers::transformation::{
-    reorder_rows, run_convert, run_split, run_squeeze, run_subsample, subset, subset_columns,
-    subset_rows, ConvertArgs, ReorderRowsArgs, RunSqueezeArgs, SplitArgs, SubsampleArgs,
-    SubsetArgs, SubsetColumnsArgs, SubsetRowsArgs,
+    reorder_rows, run_convert, run_split, run_subsample, subset, subset_columns, subset_rows,
+    ConvertArgs, ReorderRowsArgs, SplitArgs, SubsampleArgs, SubsetArgs, SubsetColumnsArgs,
+    SubsetRowsArgs,
 };
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use interactive::{session_help, TOOL};
 
 fn main() -> anyhow::Result<()> {
@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
     // exits here, before any of data-beans' own work.
     legume_tui::serve_if_host();
 
-    let cli = Cli::parse();
+    let cli = cli_from(&Cli::command().get_matches());
 
     if cli.verbose {
         std::env::set_var("RUST_LOG", "info");
@@ -105,6 +105,18 @@ fn hold_error(error: &anyhow::Error) {
         }
         Err(_) => session.leave(&format!("{error:#}")),
     }
+}
+
+/// The command line, and what clap knows beyond its values: whether `qc`
+/// was given its gene rule, which its --qc-auto-cutoff then leaves alone.
+fn cli_from(matches: &clap::ArgMatches) -> Cli {
+    let mut cli = Cli::from_arg_matches(matches).unwrap_or_else(|e| e.exit());
+    if let Commands::Qc(args) = &mut cli.commands {
+        args.gene_rule_given = matches.subcommand_matches("qc").is_some_and(|m| {
+            m.value_source("qc_feature_min_cells") == Some(clap::parser::ValueSource::CommandLine)
+        });
+    }
+    cli
 }
 
 /// True if any cause in the error chain is a `BrokenPipe` I/O error.
@@ -167,18 +179,11 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Statistics(args) => {
             run_stat(args)?;
         }
-        #[cfg(feature = "plot")]
-        Commands::Plot(args) => {
-            crate::handlers::plotting::run_plot(args)?;
-        }
         Commands::Qc(args) => {
             run_cell_qc(args)?;
         }
         Commands::Histogram(args) => {
             run_histogram(args)?;
-        }
-        Commands::Squeeze(args) => {
-            run_squeeze(args)?;
         }
         Commands::Columns(args) => {
             take_columns(args)?;
@@ -419,10 +424,10 @@ enum Commands {
              Useful for extracting subsets for visualization or analysis.\n\
              \n\
              {}",
-            interactive_session_help(STDOUT_IN_A_SESSION)
+            view_session_help(PICKS, STDOUT_IN_A_SESSION)
         ),
-        mut_arg("no_detach", |a| a.requires("interactive")),
-        mut_arg("session", |a| a.requires("interactive"))
+        mut_arg("no_detach", |a| a.conflicts_with("batch_process")),
+        mut_arg("session", |a| a.conflicts_with("batch_process"))
     )]
     Columns(TakeColumnsArgs),
 
@@ -436,10 +441,10 @@ enum Commands {
              it will output a transposed (`column x selected_row`) matrix.\n\
              \n\
              {}",
-            interactive_session_help(STDOUT_IN_A_SESSION)
+            view_session_help(PICKS, STDOUT_IN_A_SESSION)
         ),
-        mut_arg("no_detach", |a| a.requires("interactive")),
-        mut_arg("session", |a| a.requires("interactive"))
+        mut_arg("no_detach", |a| a.conflicts_with("batch_process")),
+        mut_arg("session", |a| a.conflicts_with("batch_process"))
     )]
     Rows(TakeRowsArgs),
 
@@ -472,7 +477,9 @@ enum Commands {
                  a write under way finishes first. The title bar shows the detach \
                  and switch keys, the footer the others."
             )
-        )
+        ),
+        mut_arg("no_detach", |a| a.conflicts_with("batch_process")),
+        mut_arg("session", |a| a.conflicts_with("batch_process"))
     )]
     Subset(SubsetArgs),
 
@@ -483,10 +490,10 @@ enum Commands {
              Allows for focused analysis on selected features.\n\
              \n\
              {}",
-            interactive_session_help("")
+            view_session_help(PICKS, "")
         ),
-        mut_arg("no_detach", |a| a.requires("interactive")),
-        mut_arg("session", |a| a.requires("interactive"))
+        mut_arg("no_detach", |a| a.conflicts_with("batch_process")),
+        mut_arg("session", |a| a.conflicts_with("batch_process"))
     )]
     SubsetColumns(SubsetColumnsArgs),
 
@@ -497,10 +504,10 @@ enum Commands {
              Allows for focused analysis on selected samples/observations.\n\
              \n\
              {}",
-            interactive_session_help("")
+            view_session_help(PICKS, "")
         ),
-        mut_arg("no_detach", |a| a.requires("interactive")),
-        mut_arg("session", |a| a.requires("interactive"))
+        mut_arg("no_detach", |a| a.conflicts_with("batch_process")),
+        mut_arg("session", |a| a.conflicts_with("batch_process"))
     )]
     SubsetRows(SubsetRowsArgs),
 
@@ -613,26 +620,6 @@ enum Commands {
     MergeBackend(MergeBackendArgs),
 
     #[command(
-        about = "Squeeze out sparse rows/columns",
-        long_about = format!(
-            "Squeeze out rows and columns with too few non-zeros.\n\
-             It will overwrite the original (be careful) and save the indices kept.\n\
-             \n\
-             {}",
-            session_help(
-                Some("With --interactive, every file is squeezed in one session; \
-                      the session flags need it."),
-                "A `kill` cancels the picker as q does; a squeeze under way finishes \
-                 first, and the files after it are left as they are. \
-                 The title bar shows the detach and switch keys, the footer the others."
-            )
-        ),
-        mut_arg("no_detach", |a| a.requires("interactive")),
-        mut_arg("session", |a| a.requires("interactive"))
-    )]
-    Squeeze(RunSqueezeArgs),
-
-    #[command(
         about = "Show basic matrix info",
         long_about = "Show basic information of a sparse matrix. If output header is provided,\n\
                       row and column names will be saved."
@@ -648,48 +635,67 @@ enum Commands {
              (4) `sig` - standard deviation `σ`.\n\
              \n\
              {}",
-            interactive_session_help("")
+            view_session_help(
+                "On a terminal the statistics open in the explorer, unless --batch-process \
+                 or DATA_BEANS_BATCH=1 (for a whole script).",
+                ""
+            )
         ),
         visible_alias = "stat",
-        mut_arg("no_detach", |a| a.requires("interactive")),
-        mut_arg("session", |a| a.requires("interactive"))
+        mut_arg("no_detach", |a| a.conflicts_with("batch_process")),
+        mut_arg("session", |a| a.conflicts_with("batch_process"))
     )]
     Statistics(RunStatArgs),
 
     #[command(
         about = "Cell QC: near-empty floor and MAD outliers, as senna and pinto apply it",
-        long_about = "Run the cell QC senna and pinto apply, with the same --qc-* flags, on one backend.\n\
-                      Cells below the near-empty floor (--qc-min-cell-nnz) and cells outside the\n\
-                      robust band `median +/- --qc-mads * MAD * 1.4826` on detected features and total\n\
-                      counts (and the mito fraction, given --qc-mito-pattern) are dropped.\n\
-                      \n\
-                      Prints the outcome: cells and features kept, each metric's median, the band\n\
-                      it was held to and how many cells fell outside. With -o, writes the kept\n\
-                      cells (and features, under --qc-feature-min-cells) to a new backend;\n\
-                      --qc-report writes the per-cell metrics and verdicts.",
+        long_about = format!(
+            "Run the cell QC senna and pinto apply, with the same --qc-* flags, on one backend,\n\
+             or on several pooled into one (merged as merge-backend does; --common-rows keeps\n\
+             the genes all share; the output gets their batch labels).\n\
+             Cells below the near-empty floor (--qc-min-cell-nnz) and cells outside the\n\
+             robust band `median +/- --qc-mads * MAD * 1.4826` on detected features and total\n\
+             counts (and the mito fraction, given --qc-mito-pattern) are dropped; genes in\n\
+             fewer than --qc-feature-min-cells cells too. These floors replace squeeze's -c, -r;\n\
+             --qc-auto-cutoff puts both at their histograms' trough.\n\
+             \n\
+             On a terminal it opens a full-screen view first: each rule with its edge, how\n\
+             many cells it fails and how many it alone removes; the selected rule's\n\
+             histogram (all cells, those passing the other rules, those only it removes);\n\
+             counts against genes; and the removed cells by the rules they fail. Arrows\n\
+             move a rule (by the MAD band, or by a value of its own after m), s saves the\n\
+             figure, p shows the flags that decide the same cells, Enter writes the kept\n\
+             cells to -o (asking where, without it; never the input) and q cancels.\n\
+             In kitty, iTerm2, WezTerm or Ghostty the plots are drawn as images\n\
+             (DATA_BEANS_TUI_IMAGES=0 keeps text, =1 asks any terminal).\n\
+             --batch-process (or DATA_BEANS_BATCH=1, for a whole script), or no\n\
+             terminal, runs straight through with the flags given.\n\
+             \n\
+             Prints the outcome: cells and features kept, each metric's median, the band\n\
+             it was held to and how many cells fell outside. With -o, writes the kept\n\
+             cells (and features, under --qc-feature-min-cells) to a new backend;\n\
+             --qc-report writes the per-cell metrics and verdicts; --figure writes the\n\
+             figure the view saves (PDF and PNG).\n\
+             \n\
+             {}",
+            session_help(
+                Some("Without --batch-process, on a terminal, its view runs as a session."),
+                "A `kill` cancels the view as q does; a write under way finishes first. \
+                 The title bar shows the detach and switch keys, the footer the others."
+            )
+        ),
         mut_args(|a| a.hide(false)),
+        mut_arg("no_detach", |a| a.conflicts_with("batch_process")),
+        mut_arg("session", |a| a.conflicts_with("batch_process")),
         mut_arg("qc_mito_pattern", |a| a.default_value(crate::handlers::cell_qc::MITO))
     )]
     Qc(CellQcArgs),
 
-    #[cfg(feature = "plot")]
-    #[command(
-        about = "Figures of a backend's QC or statistics (.png, .svg, .pdf)",
-        long_about = "Draw a backend's figures:\n\
-                      - `plot qc`: each QC metric's histogram, stacked by verdict, with the edge\n\
-                        QC held it to (the same --qc-* flags as `qc`), and total counts against\n\
-                        detected genes, cells coloured kept, outlier or near-empty;\n\
-                      - `plot stat`: the histogram of one row or column statistic.\n\
-                      The output's extension picks the format."
-    )]
-    Plot(crate::handlers::plotting::PlotArgs),
-
     #[command(
         about = "ASCII log-scale histogram of a row/column statistic",
-        long_about = "Print an ASCII log10(x+1) histogram of a statistic.\n\
+        long_about = "Print an ASCII histogram of a statistic, in log-spaced bins.\n\
                       It covers the per-feature (row) and per-cell (column) axes.\n\
-                      This is the summary `squeeze --show-histogram` shows,\n\
-                      exposed as a standalone command.\n\
+                      The same summary `qc --qc-histogram` prints for its nnz cutoffs.\n\
                       \n\
                       Choose the statistic with --stat, default `nnz`, also `sum`, `mean`, `sd`;\n\
                       and the margin with --dim, default `both`.\n\
@@ -704,8 +710,8 @@ enum Commands {
         long_about = "Serve data-beans to an agent as Model Context Protocol tools over stdio\n\
                       (`claude mcp add data-beans -- data-beans mcp`). Its tools read a\n\
                       backend's size, names, statistics and values, and build new backends\n\
-                      by import, subset, subsample, split, convert and merge. No tool\n\
-                      replaces an existing file; squeeze, which rewrites its input, is left out."
+                      by import, qc, subset, subsample, split, convert and merge. No tool\n\
+                      replaces an existing file."
     )]
     Mcp(mcp::McpArgs),
 
@@ -724,10 +730,9 @@ enum Commands {
     #[command(
         about = "Stop a data-beans session",
         long_about = "Stop a `data-beans` session as its quit key does: an open view is\n\
-                      left as by q, so nothing it would write is written, while a squeeze\n\
-                      or write under way finishes first; files not reached yet are left\n\
-                      as they are. Waits up to a minute for it to end. --force kills it\n\
-                      at once, mid-write if it is writing."
+                      left as by q, so nothing it would write is written, while a write\n\
+                      under way finishes first. Waits up to a minute for it to end.\n\
+                      --force kills it at once, mid-write if it is writing."
     )]
     Kill(legume_tui::cli::KillArgs),
 
@@ -738,11 +743,17 @@ enum Commands {
     Rename(legume_tui::cli::RenameArgs),
 }
 
-/// The session paragraph of a command whose view opens with --interactive,
-/// `more` added after what a `kill` does.
-fn interactive_session_help(more: &str) -> String {
+/// When a picker's view opens: nothing selected on the command line.
+const PICKS: &str = "Given nothing to take, it opens the explorer to pick them \
+                     (mark with Space, Enter to finish); that needs a terminal, \
+                     and --batch-process or DATA_BEANS_BATCH=1 refuses it.";
+
+/// The session paragraph of a command with a view: `lead`, when its view
+/// opens, then how it runs as a session, `more` added after what a `kill`
+/// does.
+fn view_session_help(lead: &str, more: &str) -> String {
     session_help(
-        Some("With --interactive, its view runs as a session; the session flags need it."),
+        Some(lead),
         &format!(
             "A `kill` quits the view as q does; a write under way finishes first. {more}\
              The title bar shows the detach and switch keys, the footer the others."
@@ -757,8 +768,35 @@ const STDOUT_IN_A_SESSION: &str = "Written to stdout, the result goes to the ses
 
 #[cfg(test)]
 mod cli_tests {
-    use super::Cli;
+    use super::{cli_from, Cli, Commands};
     use clap::{ArgAction, CommandFactory};
+
+    /// --qc-auto-cutoff sets the gene rule only when none is given: 0, given,
+    /// keeps it off.
+    #[test]
+    fn qc_knows_whether_its_gene_rule_was_given() {
+        let given = |argv: &[&str]| {
+            let m = Cli::command().try_get_matches_from(argv).unwrap();
+            match cli_from(&m).commands {
+                Commands::Qc(a) => a.gene_rule_given,
+                _ => unreachable!(),
+            }
+        };
+        assert!(!given(&["data-beans", "qc", "x.zarr", "--qc-auto-cutoff"]));
+        assert!(given(&[
+            "data-beans",
+            "qc",
+            "x.zarr",
+            "--qc-feature-min-cells",
+            "0"
+        ]));
+        assert!(given(&[
+            "data-beans",
+            "qc",
+            "x.zarr",
+            "--qc-feature-min-cells=7"
+        ]));
+    }
 
     /// A flag that is on by default must have a way off: a bare `SetTrue`
     /// flag defaulting to true cannot be turned off from the command line

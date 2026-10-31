@@ -1,12 +1,12 @@
 //! The interactive views as detachable sessions, driven through
-//! pseudo-terminals standing in for the user's: `stat --interactive`
-//! starts hosted, a detach leaves it running and asks for a name, an
+//! pseudo-terminals standing in for the user's: `stat` on a terminal
+//! starts its explorer hosted, a detach leaves it running and asks for a name, an
 //! attach from another terminal repaints it, a lost client leaves it
 //! running, and `data-beans kill` stops it through its own quit path,
 //! leaving no process or socket behind. A kill quits `subset` as `q` does
 //! (nothing written), lets a write under way finish (also one before the
-//! first view), and stops `squeeze` before the files after it. An error
-//! that ends a detached session waits on its screen for whoever attaches.
+//! first view), and cancels `qc`'s view, writing nothing. An error that
+//! ends a detached session waits on its screen for whoever attaches.
 //! `--no-detach`, and a view started inside a session, run plain.
 
 #![cfg(all(unix, feature = "tui"))]
@@ -119,7 +119,7 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
 
     // Started in a terminal, it is hosted: this terminal is its first
     // client, and the footer lists the session keys.
-    let mut first = term(&dir, &["stat", &data, "-i"], &[]);
+    let mut first = term(&dir, &["stat", &data], &[]);
     first.wait_screen("ctrl+alt+d detach");
     first.wait_screen("ctrl+alt+s switch");
     assert!(!first.cooked(), "the client's terminal is raw");
@@ -144,7 +144,7 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
 
     // Started again on the same file: a new session, the detached one
     // named; dropped at once.
-    let mut again = term(&dir, &["stat", &data, "-i"], &[]);
+    let mut again = term(&dir, &["stat", &data], &[]);
     again.wait_for("[detached: data-beans-stat-1");
     again.wait_screen("ctrl+alt+d");
     let said = dir.run(&["kill", "stat-2"]);
@@ -219,31 +219,37 @@ fn a_kill_quits_subset_without_writing() {
 }
 
 #[test]
-fn a_kill_stops_squeeze_before_the_next_file() {
+fn a_kill_cancels_the_qc_view_and_writes_nothing() {
     let dir = private();
     let work = tempfile::tempdir().unwrap();
     let one = fixture(work.path(), "one");
-    let two = fixture(work.path(), "two");
-    let (one_before, two_before) = (info(&one), info(&two));
+    let before = info(&one);
+    let kept = work.path().join("kept");
+    let kept = kept.to_str().unwrap();
 
-    // In place, two files, one session; logged so the stop is seen.
-    let files = format!("{one},{two}");
-    let mut t = term(&dir, &["-v", "squeeze", &files, "-i", "-r", "2"], &[]);
-    t.wait_screen("rows/cols");
-    dir.wait_listed("picking nnz cutoffs for");
+    // Logged, so the cancel is seen.
+    let mut t = term(&dir, &["-v", "qc", &one, "-o", kept], &[]);
+    t.wait_screen("cell QC rules");
+    dir.wait_listed("keeps");
     let pid = dir.program_pid();
     let said = dir.run(&["kill"]);
-    assert!(said.contains("data-beans-squeeze-1 stopped"), "{said:?}");
+    assert!(said.contains("data-beans-qc-1 stopped"), "{said:?}");
     assert_eq!(t.exit_code(), 0);
     // Held while the screen was up and written once the normal screen is
     // back, where it stays, rather than lost with the alternate screen.
     assert!(!t.alternate(), "the normal screen is back");
     let shown = t.screen();
-    assert!(shown.contains("Stopped before"), "{shown}");
+    assert!(shown.contains("qc cancelled: nothing written"), "{shown}");
     dir.gone(pid);
     assert!(dir.sockets().is_empty());
-    assert_eq!(info(&one), one_before, "the cancelled file is untouched");
-    assert_eq!(info(&two), two_before, "the next file is not reached");
+    assert_eq!(info(&one), before, "the input is untouched");
+    let written: Vec<_> = std::fs::read_dir(work.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("kept"))
+        .collect();
+    assert!(written.is_empty(), "written: {written:?}");
 }
 
 #[test]
@@ -258,7 +264,7 @@ fn a_kill_lets_a_write_under_way_finish() {
     assert!(made.success());
     let out_arg = out.to_string_lossy().into_owned();
 
-    let mut t = term(&dir, &["-v", "columns", &data, "-I", "-o", &out_arg], &[]);
+    let mut t = term(&dir, &["-v", "columns", &data, "-o", &out_arg], &[]);
     t.wait_screen("ctrl+alt+d");
     dir.wait_listed("data-beans-columns-1\tattached");
     let pid = dir.program_pid();
@@ -300,7 +306,7 @@ fn a_kill_before_the_explorer_lets_its_output_file_finish() {
     assert!(made.success());
     let out_arg = out.to_string_lossy().into_owned();
 
-    let mut t = term(&dir, &["stat", &data, "-i", "-o", &out_arg], &[]);
+    let mut t = term(&dir, &["stat", &data, "-o", &out_arg], &[]);
     dir.wait_listed("data-beans-stat-1\tattached");
     let pid = dir.program_pid();
 
@@ -332,9 +338,9 @@ fn no_detach_and_a_view_inside_a_session_run_plain() {
     // hosted program starting another view): in this process, no client
     // between, no socket, no session keys; q ends it, terminal restored.
     for (args, env) in [
-        (vec!["stat", &data, "-i", "--no-detach"], vec![]),
+        (vec!["stat", &data, "--no-detach"], vec![]),
         (
-            vec!["stat", &data, "-i"],
+            vec!["stat", &data],
             vec![(legume_tui::SESSION_VAR, "data-beans-stat-9")],
         ),
     ] {
@@ -358,44 +364,39 @@ fn an_error_that_ends_a_detached_session_waits_for_whoever_attaches() {
     let dir = private();
     let work = tempfile::tempdir().unwrap();
     let one = fixture(work.path(), "one");
-    // Squeezed in place, a zipped backend is refused: an error once the
-    // first file is done.
-    let two = built(work.path(), "two", true);
-    let files = format!("{one},{two}");
+    // An output under a file: the write fails once Enter goes on.
+    let blocker = work.path().join("blocker");
+    std::fs::write(&blocker, b"").unwrap();
+    let out = blocker.join("kept");
+    let out = out.to_str().unwrap();
 
-    let mut t = term(&dir, &["squeeze", &files, "-i", "-r", "2"], &[]);
-    t.wait_screen("rows/cols");
-    dir.wait_listed("picking nnz cutoffs for");
+    let mut t = term(&dir, &["qc", &one, "-o", out], &[]);
+    t.wait_screen("cell QC rules");
+    dir.wait_listed("keeps");
     let pid = dir.program_pid();
-    // The squeeze confirmed and the session left while the program is
-    // stopped, so it reads the confirmation only once nobody is attached
-    // and the error comes then, however fast the squeeze. Enter leaves it
-    // unnamed.
-    t.type_(b"\r");
-    t.wait_screen("Squeeze in place?");
+    // Enter and the detach sent while the program is stopped, so it reads
+    // Enter only once nobody is attached and the error comes then, however
+    // fast the write. Enter at the name prompt leaves it unnamed.
     signal(pid, "STOP");
-    t.type_(b"y\x1b\x04");
+    t.type_(b"\r\x1b\x04");
     t.answer(1, b"\r");
     assert_eq!(t.exit_code(), 0);
-    dir.wait_listed("data-beans-squeeze-1\tdetached");
+    dir.wait_listed("data-beans-qc-1\tdetached");
     signal(pid, "CONT");
-    let listed = dir.wait_listed("stopped: In-place squeeze is not supported");
-    assert!(
-        listed.contains("data-beans-squeeze-1\tdetached"),
-        "{listed:?}"
-    );
+    let listed = dir.wait_listed("stopped: Not a directory");
+    assert!(listed.contains("data-beans-qc-1\tdetached"), "{listed:?}");
     assert!(alive(pid), "held until seen");
 
     // Attached: the error on the screen until a key, then said as the
     // program ends, and not again.
     let mut back = term(&dir, &["attach"], &[]);
-    back.wait_screen("In-place squeeze is not supported");
+    back.wait_screen("Not a directory");
     back.wait_screen("any key quits");
     back.type_(b"x");
     assert_eq!(back.exit_code(), 1, "the program's status");
     assert!(!back.alternate() && back.cooked(), "terminal restored");
     assert!(
-        back.screen().contains("Error: In-place squeeze"),
+        back.screen().contains("Error: Not a directory"),
         "{}",
         back.screen()
     );
@@ -403,5 +404,5 @@ fn an_error_that_ends_a_detached_session_waits_for_whoever_attaches() {
     assert!(dir.sockets().is_empty());
     let said = dir.run(&["sessions"]);
     assert!(said.contains("no live data-beans sessions"), "{said:?}");
-    assert!(!said.contains("In-place squeeze"), "said once: {said:?}");
+    assert!(!said.contains("Not a directory"), "said once: {said:?}");
 }

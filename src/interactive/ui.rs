@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType};
 use ratatui::Frame;
 
-use crate::qc::log_bin_key;
+use crate::qc::Axis;
 
 // Palette: the terminal's own foreground (so light and dark backgrounds both
 // work) for nearly everything, and one accent for what needs the eye: what a
@@ -102,6 +102,29 @@ fn send(text: &str) -> bool {
     let mut out = std::io::stdout();
     std::io::Write::write_all(&mut out, text.as_bytes()).is_ok()
         && std::io::Write::flush(&mut out).is_ok()
+}
+
+/// Ask the terminal to put `text` on the clipboard (OSC 52): kitty, iTerm2,
+/// WezTerm and others do (tmux when its `set-clipboard` lets it through);
+/// the rest ignore it. Whether it took cannot be known.
+pub fn copy(text: &str) {
+    send(&format!("\x1b]52;c;{}\x07", base64(text.as_bytes())));
+}
+
+/// `bytes` in standard base64, padded.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |n, &b| n << 8 | u32::from(b)) << (8 * (3 - chunk.len()));
+        for k in 0..4 {
+            out.push(match k <= chunk.len() {
+                true => ABC[(n >> (18 - 6 * k) & 63) as usize] as char,
+                false => '=',
+            });
+        }
+    }
+    out
 }
 
 /// Ring the terminal's bell and ask it for a desktop notification saying
@@ -399,7 +422,7 @@ fn put(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
 /// Width of the y-axis gutter left of each histogram.
 const GUTTER: u16 = 6;
 
-/// Bins on the sqrt and linear scales (the log scale uses tenth-decade bins).
+/// Bins across the range on every scale.
 const TARGET_BINS: f64 = 50.0;
 
 /// How a histogram axis is drawn.
@@ -444,29 +467,46 @@ impl Scale {
     }
 }
 
-/// Equal-width bins on a scale, keyed by integers. On the log scale these are
-/// the printed histogram's tenth-decade bins, keyed by rounding.
+/// Equal-width bins on a scale, keyed by integers from 0 at 0. The log
+/// scale is the [`Axis`] every histogram reads values on: `ln(shift + x)`,
+/// the shift 1 for counts and smaller for values mostly below 1.
 #[derive(Debug, Clone, Copy)]
 pub struct Binning {
     pub scale: Scale,
     /// Bin width on the scaled axis.
     width: f64,
+    /// What the log scale adds before its log.
+    shift: f64,
 }
 
 impl Binning {
     /// Bins spanning `0..=max`. Whole counts (`integer`) get linear bins at
-    /// least one count wide, so no bin falls between two integers.
+    /// least one count wide, so no bin falls between two integers. The log
+    /// scale shifts by 1 for whole counts or a `max` of 20 and over, else
+    /// by a thousandth of `max`; [`Binned::new`] shifts as the data says.
     pub fn new(scale: Scale, max: f64, integer: bool) -> Self {
-        let span = if integer { max + 1.0 } else { max };
-        let width = match scale {
-            Scale::Log => 0.1,
-            Scale::Linear if integer => (span / TARGET_BINS).ceil().max(1.0),
-            _ => scale.apply(span) / TARGET_BINS,
+        let shift = if integer || max >= 20.0 {
+            1.0
+        } else {
+            (max / 1e3).clamp(1e-9, 1.0)
         };
-        Self {
+        Self::shifted(scale, max, integer, shift)
+    }
+
+    /// [`Binning::new`] with the log scale shifted by `shift`.
+    fn shifted(scale: Scale, max: f64, integer: bool, shift: f64) -> Self {
+        let span = if integer { max + 1.0 } else { max };
+        let mut bins = Self {
             scale,
-            width: width.max(f64::MIN_POSITIVE),
-        }
+            width: 1.0,
+            shift,
+        };
+        let width = match scale {
+            Scale::Linear if integer => (span / TARGET_BINS).ceil().max(1.0),
+            _ => bins.t(span) / TARGET_BINS,
+        };
+        bins.width = width.max(f64::MIN_POSITIVE);
+        bins
     }
 
     /// Bins of an explicit `width` on the scaled axis. On the linear scale
@@ -476,23 +516,33 @@ impl Binning {
         Self {
             scale,
             width: width.max(f64::MIN_POSITIVE),
+            shift: 1.0,
+        }
+    }
+
+    /// `x` on the scaled axis, 0 at 0.
+    fn t(&self, x: f64) -> f64 {
+        match self.scale {
+            Scale::Log => (x.max(0.0) + self.shift).ln() - self.shift.ln(),
+            _ => self.scale.apply(x),
+        }
+    }
+
+    /// The value at `t` on the scaled axis.
+    fn value(&self, t: f64) -> f64 {
+        match self.scale {
+            Scale::Log => ((t + self.shift.ln()).exp() - self.shift).max(0.0),
+            _ => self.scale.invert(t),
         }
     }
 
     pub fn key(&self, x: f64) -> i32 {
-        match self.scale {
-            Scale::Log => log_bin_key(x),
-            _ => (self.scale.apply(x) / self.width).floor() as i32,
-        }
+        (self.t(x) / self.width).floor() as i32
     }
 
-    /// Scaled position where bin `k` starts: log keys round, so their bins
-    /// start half a bin early.
+    /// Scaled position where bin `k` starts.
     fn start(&self, k: i32) -> f64 {
-        match self.scale {
-            Scale::Log => (k as f64 - 0.5) * self.width,
-            _ => k as f64 * self.width,
-        }
+        k as f64 * self.width
     }
 
     /// Smallest whole count in bin `k` or above: the cutoff that drops every
@@ -502,7 +552,7 @@ impl Binning {
             return 0;
         }
         // Start from the exact inverse, then settle rounding either way.
-        let mut x = self.scale.invert(self.start(k)).ceil().max(0.0) as usize;
+        let mut x = self.value(self.start(k)).ceil().max(0.0) as usize;
         while self.key(x as f64) < k {
             x += 1;
         }
@@ -512,17 +562,37 @@ impl Binning {
         x
     }
 
-    /// Label for the tick at bin `k` (the bin centre on the log scale, as the
-    /// printed histogram labels it; the bin start otherwise).
+    /// The value where bin `k` starts, its tick's label.
     fn tick_value(&self, k: i32) -> f64 {
-        self.scale.invert(k as f64 * self.width)
+        self.value(self.start(k))
     }
 
-    /// Ticks every half decade on the log scale, about six otherwise.
+    /// About six ticks across.
     fn tick_every(&self, nbins: usize) -> i32 {
+        (nbins as i32 / 6).max(1)
+    }
+
+    /// The ticks over bins `kmin..=kmax`, as bin and value: on the log
+    /// scale at the axis' 1-2-5 values, so labels read round; else every
+    /// [`Binning::tick_every`] bins.
+    fn ticks(&self, kmin: i32, kmax: i32) -> Vec<(i32, f64)> {
         match self.scale {
-            Scale::Log => 5,
-            _ => (nbins as i32 / 6).max(1),
+            Scale::Log => {
+                let axis = Axis {
+                    lo: self.tick_value(kmin),
+                    hi: self.value(self.start(kmax + 1)),
+                    log: true,
+                    shift: self.shift,
+                };
+                axis.ticks().into_iter().map(|v| (self.key(v), v)).collect()
+            }
+            _ => {
+                let every = self.tick_every((kmax - kmin + 1).max(1) as usize);
+                (kmin..=kmax)
+                    .filter(|k| k % every == 0)
+                    .map(|k| (k, self.tick_value(k)))
+                    .collect()
+            }
         }
     }
 }
@@ -542,7 +612,12 @@ impl Binned {
             _ => (0.0, 0.0),
         };
         let integer = sorted.iter().all(|v| v.fract() == 0.0);
-        let bins = Binning::new(scale, max, integer);
+        // The log scale shifts as the axis does for these values.
+        let shift = match integer {
+            true => 1.0,
+            false => Axis::fit(sorted, true).shift,
+        };
+        let bins = Binning::shifted(scale, max, integer, shift);
         let kmin = bins.key(min);
         let nbins = (bins.key(max) - kmin + 1).max(1) as usize;
         let counts = count(&bins, kmin, nbins, sorted.iter().copied());
@@ -751,20 +826,37 @@ impl<T: BarValue> HistPlot<'_, T> {
             };
             put(buf, x, axis.y, sym, DIM);
         }
-        let every = self
-            .tick_every
-            .unwrap_or_else(|| self.bins.tick_every(nbins))
-            .max(1);
         let mut next_free = labels.x;
         let kmax = self.kmin + nbins as i32 - 1;
-        for k in (self.kmin..=kmax).filter(|k| k % every == 0) {
+        // Labels given, or a spacing, tick every so many bins; else the
+        // bins' own ticks (round values on the log scale).
+        let ticks: Vec<(i32, Option<f64>)> = match (self.x_label, self.tick_every) {
+            (None, None) => self
+                .bins
+                .ticks(self.kmin, kmax)
+                .into_iter()
+                .map(|(k, v)| (k, Some(v)))
+                .collect(),
+            _ => {
+                let every = self
+                    .tick_every
+                    .unwrap_or_else(|| self.bins.tick_every(nbins))
+                    .max(1);
+                (self.kmin..=kmax)
+                    .filter(|k| k % every == 0)
+                    .map(|k| (k, None))
+                    .collect()
+            }
+        };
+        for (k, value) in ticks {
             let Some(x) = x_of(k) else { continue };
-            let s = match self.x_label {
-                Some(label) => match label(k) {
+            let s = match (self.x_label, value) {
+                (Some(label), _) => match label(k) {
                     Some(s) => s,
                     None => continue,
                 },
-                None => compact(self.bins.tick_value(k)),
+                (None, Some(v)) => compact(v),
+                (None, None) => compact(self.bins.tick_value(k)),
             };
             put(buf, x, axis.y, "┴", DIM);
             if x >= next_free && x + (s.len() as u16) <= labels.right() {
