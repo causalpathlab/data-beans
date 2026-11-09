@@ -148,8 +148,8 @@ pub struct OutputTarget {
     /// The output as the handler takes it: `.zarr.zip` added under zip.
     pub effective: Box<str>,
     pub backend: SparseIoBackend,
-    /// The file the backend is written to (the un-zipped `.zarr` directory
-    /// for a `.zarr.zip` target).
+    /// The file the backend is written to (for a `.zarr.zip` target, the
+    /// un-zipped `.zarr` directory [`staging_zarr_dir`] names).
     pub working: Box<str>,
     /// What the user finds once [`finalize_output`] has run: the archive for
     /// a `.zarr.zip` target, else the working file.
@@ -231,15 +231,72 @@ pub fn materialize_writable_backend(src: &str, dst: &str) -> anyhow::Result<()> 
     }
 }
 
+/// The hidden folder, in the output's own folder, that `.zarr.zip` targets
+/// are built in.
+const STAGE: &str = ".data-beans-stage";
+
+/// The working `.zarr` directory for a `.zarr.zip` target `x.zarr.zip`:
+/// `.data-beans-stage/x.zarr` in the same folder, on the same disk. Built as a
+/// plain `x.zarr` beside the archive, every write made a directory there (and
+/// subset a `.subset_tmp` one) and removed it seconds later, and a sync client
+/// watching the folder, such as Dropbox, put the emptied directories back.
+/// [`make_stage`] marks the stage for Dropbox to leave alone, and
+/// [`finalize_zarr_output`] removes it once the archive is in place.
+pub fn staging_zarr_dir(target: &str) -> String {
+    let path = std::path::Path::new(target);
+    let name = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .and_then(|f| f.strip_suffix(".zip"))
+        .unwrap_or("data.zarr");
+    path.with_file_name(STAGE)
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The stage `working` is built in, when it is one ([`staging_zarr_dir`]).
+fn stage_of(working: &str) -> Option<&std::path::Path> {
+    std::path::Path::new(working)
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|n| n == STAGE))
+}
+
+/// Make the stage `working` is built in, if it is in one, and mark it for
+/// Dropbox to ignore before anything is written in it.
+pub fn make_stage(working: &str) -> anyhow::Result<()> {
+    if let Some(stage) = stage_of(working) {
+        std::fs::create_dir_all(stage)?;
+        mark_sync_ignored(stage);
+    }
+    Ok(())
+}
+
+/// Remove the stage `working` was built in once nothing else is being built
+/// there (another run's build keeps it).
+pub fn leave_stage(working: &str) {
+    if let Some(stage) = stage_of(working) {
+        let _ = std::fs::remove_dir(stage);
+    }
+}
+
+/// Dropbox's "ignored" mark: it neither uploads the directory nor puts it
+/// back. Best effort; elsewhere the mark is a harmless attribute.
+fn mark_sync_ignored(dir: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let _ = xattr::set(dir, "com.dropbox.ignored", b"1");
+    #[cfg(target_os = "linux")]
+    let _ = xattr::set(dir, "user.com.dropbox.ignored", b"1");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = dir;
+}
+
 /// If `target_path` ends with `.zarr.zip`, zip the `zarr_dir` into it and
-/// remove the directory. Otherwise this is a no-op (the directory IS the target).
+/// remove the directory and its [`staging_zarr_dir`] stage. Otherwise this is
+/// a no-op (the directory IS the target).
 ///
-/// To keep in-zip entry names compact, the directory is staged into a temp
-/// directory under its short stem (e.g. `atac.zarr` → `<tmp>/atac`) before
-/// zipping, so entries are prefixed `foo/...` rather than `foo.zarr/...`.
-/// Staging in a tempdir avoids collisions when a sibling file or directory
-/// already uses the short stem (e.g. an input dir named `atac/` next to
-/// `atac.zarr`).
+/// To keep in-zip entry names compact, entries are prefixed with the short
+/// stem (`foo/...` rather than `foo.zarr/...`).
 pub fn finalize_zarr_output(zarr_dir: &str, target_path: &str) -> anyhow::Result<()> {
     if !target_path.ends_with(".zarr.zip") {
         return Ok(());
@@ -253,11 +310,12 @@ pub fn finalize_zarr_output(zarr_dir: &str, target_path: &str) -> anyhow::Result
         .ok_or_else(|| anyhow::anyhow!("invalid zarr_dir: {}", zarr_dir))?
         .to_string();
 
-    // Zip to a sibling `.tmp` first so the source .zarr survives any failure
-    // (disk full, etc.). Only after the zip succeeds do we atomically rename
-    // into place and remove the source — so a crash leaves either the source
-    // directory or the final archive, never neither.
-    let tmp_target = format!("{}.tmp", target_path);
+    // Zip beside the source first (in the stage, so nothing comes and goes in
+    // the output folder) so the source .zarr survives any failure (disk full,
+    // etc.). Only after the zip succeeds do we atomically rename into place
+    // and remove the source — so a crash leaves either the source directory
+    // or the final archive, never neither.
+    let tmp_target = format!("{zarr_dir}.zip.tmp");
     info!("Zipping zarr output: {} → {}", zarr_dir, target_path);
     if let Err(e) =
         legume_numeric::matrix::common_io::zip_dir_as(zarr_dir, &tmp_target, Some(&stem))
@@ -270,6 +328,7 @@ pub fn finalize_zarr_output(zarr_dir: &str, target_path: &str) -> anyhow::Result
         return Err(e.into());
     }
     std::fs::remove_dir_all(zarr_dir)?;
+    leave_stage(zarr_dir);
     Ok(())
 }
 

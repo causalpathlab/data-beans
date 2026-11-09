@@ -85,6 +85,7 @@ pub(super) fn keep_import(
     else {
         info!("{command}: discarded; deleting {backend_file}");
         open_backend(backend_file)?.remove_backend_file()?;
+        crate::zarr_io::leave_stage(backend_file);
         return Ok(false);
     };
     off_screen(Some(&mut tui), || s.apply(backend_file))?;

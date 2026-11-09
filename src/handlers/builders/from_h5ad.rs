@@ -276,10 +276,7 @@ pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
     );
 
     // Output stem for metadata files (strip .zarr/.h5)
-    let output_stem = backend_file
-        .strip_suffix(".zarr")
-        .or_else(|| backend_file.strip_suffix(".h5"))
-        .unwrap_or(&backend_file);
+    let output_stem = crate::hdf5_io::strip_backend_suffix(&effective_output);
 
     // Handle donor_id: barcode@donor_id column names + donor mapping files
     let donor_idx = obs_df

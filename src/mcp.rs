@@ -855,7 +855,7 @@ fn written_with(
 ) -> Result<(Map<String, Value>, String)> {
     let target = backend_target(out)?;
     let is_input = |p: &str| inputs.iter().any(|i| same_file(i, p));
-    for p in [&target.effective, &target.working, &target.found] {
+    for p in [&target.effective, &target.found] {
         anyhow::ensure!(!is_input(p), "{p} is an input: choose another `out`");
     }
     let stem = strip_backend_suffix(&target.effective).to_string();

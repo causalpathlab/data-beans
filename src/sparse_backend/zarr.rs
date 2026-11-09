@@ -245,6 +245,7 @@ impl SparseMtxData {
     /// Helper function to create a new zarr backend file
     fn register_backend_file(zarr_file: &str) -> anyhow::Result<Self> {
         use zarrs::group::GroupBuilder;
+        crate::zarr_io::make_stage(zarr_file)?;
         let store = Arc::new(FilesystemStore::new(zarr_file)?);
         let root = GroupBuilder::new().build(store.clone(), "/")?;
         root.store_metadata()?;

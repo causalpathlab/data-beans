@@ -344,7 +344,7 @@ fn finish(
 /// Refuse an output that is, or writes over, one of the inputs.
 fn refuse_an_input(args: &CellQcArgs, output: &str) -> anyhow::Result<()> {
     let target = output_target(output, args.backend.clone(), args.zip)?;
-    for p in [&target.effective, &target.working, &target.found] {
+    for p in [&target.effective, &target.found] {
         if let Some(input) = args.data_files.iter().find(|i| same_file(i, p)) {
             anyhow::bail!("the output {p} is the input {input}: give -o another name");
         }

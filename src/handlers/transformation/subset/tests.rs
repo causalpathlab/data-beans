@@ -70,3 +70,56 @@ fn interactive_output_keeps_the_input_container() {
         "an explicit .zarr output wins"
     );
 }
+
+/// A subset written as `.zarr.zip` leaves the archive alone in its folder: the
+/// working `.zarr` (and subset's `.subset_tmp`) are built in a hidden stage,
+/// marked for Dropbox to ignore, so a sync client watching the output folder
+/// does not see them come and go and put them back empty.
+#[test]
+fn a_zipped_subset_leaves_only_the_archive_in_its_folder() {
+    use crate::sparse_io::{create_sparse_from_triplets, open_sparse_matrix_by_path};
+    let input_dir = tempfile::tempdir().unwrap();
+    let input = input_dir.path().join("in.zarr");
+    let triplets = [(0, 0, 1.0), (1, 1, 2.0), (2, 2, 3.0), (0, 3, 4.0)];
+    let mut data = create_sparse_from_triplets(
+        &triplets,
+        (3, 4, triplets.len()),
+        Some(input.to_str().unwrap()),
+        Some(&crate::sparse_io::SparseIoBackend::Zarr),
+    )
+    .unwrap();
+    data.register_row_names_vec(&["g0".into(), "g1".into(), "g2".into()]);
+    data.register_column_names_vec(&["c0".into(), "c1".into(), "c2".into(), "c3".into()]);
+    drop(data);
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let out = out_dir.path().join("results/out.zarr.zip");
+    let out = out.to_str().unwrap();
+    let cols = Cols::parse_from([
+        "x",
+        input.to_str().unwrap(),
+        "-i",
+        "1-3",
+        "-o",
+        out,
+        "--batch-process",
+    ]);
+    super::subset_columns(&cols.args).unwrap();
+
+    let left: Vec<String> = std::fs::read_dir(out_dir.path().join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["out.zarr.zip"]);
+    // Never as a plain sibling, even for a moment: built in the stage.
+    let (_, working) =
+        crate::hdf5_io::resolve_backend_file(out, Some(crate::sparse_io::SparseIoBackend::Zarr))
+            .unwrap();
+    let stage = std::path::Path::new(working.as_ref()).parent().unwrap();
+    assert_eq!(stage, out_dir.path().join("results/.data-beans-stage"));
+    assert!(!stage.exists(), "{} left behind", stage.display());
+    assert_eq!(
+        open_sparse_matrix_by_path(out).unwrap().num_columns(),
+        Some(3)
+    );
+}
