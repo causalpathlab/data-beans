@@ -10,7 +10,9 @@ use crate::utilities::io_helpers::{
     parse_index_spec_within, read_col_names, read_row_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
 };
 use crate::utilities::name_matching::names_matching;
-use crate::zarr_io::{apply_zip_flag, finalize_zarr_output, materialize_writable_backend};
+use crate::zarr_io::{
+    apply_zip_flag, finalize_zarr_output, make_stage, materialize_writable_backend,
+};
 
 use legume_numeric::matrix::common_io::*;
 use legume_numeric::matrix::membership::Membership;
@@ -27,7 +29,8 @@ type EditStage = (
 );
 
 /// Resolve `(backend, effective_output, working_path, opened_data)` for an
-/// in-place edit handler: stage the input at the output location (extracting
+/// in-place edit handler: stage the input at the working path (for a `.zarr.zip`
+/// output, in the hidden stage beside it) (extracting
 /// `.zarr.zip` if needed), mkdir the output parent, and open the backend for
 /// read/write.
 ///
@@ -40,6 +43,7 @@ fn stage_for_edit(input: &str, output: &str, zip: bool) -> anyhow::Result<EditSt
     let (backend, data_file) = resolve_backend_file(input, None)?;
     let effective_output = apply_zip_flag(output, zip, &backend);
     let (_, output_file) = resolve_backend_file(&effective_output, Some(backend.clone()))?;
+    make_stage(&output_file)?;
 
     if let Some(out_dir) = dirname(&output_file) {
         mkdir(&out_dir)?;

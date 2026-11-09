@@ -264,8 +264,14 @@ fn write_modality_zarr(
     cell_names: &[Box<str>],
 ) -> anyhow::Result<()> {
     let backend = args.backend.clone();
-    let backend_dir = format!("{}.{}.{}", args.out, stem, backend_suffix);
-    let final_path = apply_zip_flag(&backend_dir, args.zip_output(), &backend);
+    let final_path = apply_zip_flag(
+        &format!("{}.{}.{}", args.out, stem, backend_suffix),
+        args.zip_output(),
+        &backend,
+    );
+    // For a `.zarr.zip`, built in the hidden stage beside it.
+    let (_, backend_dir) =
+        crate::hdf5_io::resolve_backend_file(&final_path, Some(backend.clone()))?;
     let (nrows, ncols) = shape;
     let mut data = create_sparse_from_triplets(
         triplets,

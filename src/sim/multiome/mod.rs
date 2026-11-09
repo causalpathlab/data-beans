@@ -718,8 +718,13 @@ pub fn run_multiome(args: &MultiomeArgs) -> anyhow::Result<()> {
         SparseIoBackend::HDF5 => "h5",
     };
 
-    let atac_dir = format!("{}.atac.{}", args.out, backend_suffix);
-    let atac_final = apply_zip_flag(&atac_dir, args.zip, &backend);
+    let atac_final = apply_zip_flag(
+        &format!("{}.atac.{}", args.out, backend_suffix),
+        args.zip,
+        &backend,
+    );
+    // For a `.zarr.zip`, built in the hidden stage beside it.
+    let (_, atac_dir) = crate::hdf5_io::resolve_backend_file(&atac_final, Some(backend.clone()))?;
     let mut atac_data = create_sparse_from_triplets(
         &atac_triplets,
         (p, nn, atac_triplets.len()),
@@ -731,8 +736,12 @@ pub fn run_multiome(args: &MultiomeArgs) -> anyhow::Result<()> {
     finalize_zarr_output(&atac_dir, &atac_final)?;
     info!("wrote ATAC sparse backend: {}", atac_final);
 
-    let rna_dir = format!("{}.rna.{}", args.out, backend_suffix);
-    let rna_final = apply_zip_flag(&rna_dir, args.zip, &backend);
+    let rna_final = apply_zip_flag(
+        &format!("{}.rna.{}", args.out, backend_suffix),
+        args.zip,
+        &backend,
+    );
+    let (_, rna_dir) = crate::hdf5_io::resolve_backend_file(&rna_final, Some(backend.clone()))?;
     let mut rna_data = create_sparse_from_triplets(
         &rna_triplets,
         (g, nn, rna_triplets.len()),

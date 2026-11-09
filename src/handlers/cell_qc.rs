@@ -105,22 +105,39 @@ fn opens_view(args: &CellQcArgs) -> bool {
 }
 
 /// Several data files merged into one backend, in a folder of its own
-/// that goes with it.
+/// that goes with it, and with its stage once that is empty.
 struct Pool {
-    _dir: tempfile::TempDir,
+    dir: Option<tempfile::TempDir>,
     file: String,
 }
 
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            let path = dir.path().to_string_lossy().into_owned();
+            drop(dir);
+            data_beans::zarr_io::leave_stage(&path);
+        }
+    }
+}
+
 /// The data files pooled, when there are several: merged as `merge-backend`
-/// merges them (all rows, or `--common-rows`), into a hidden folder here,
-/// which a big pool needs room for.
+/// merges them (all rows, or `--common-rows`), into the hidden stage beside
+/// the output (here, before one is named), which a big pool needs room for:
+/// out of a sync client's sight, and deleted once QC is done with it.
 fn pool(args: &CellQcArgs) -> anyhow::Result<Option<Pool>> {
     if args.data_files.len() < 2 {
         return Ok(None);
     }
+    let beside = args.output.as_deref().unwrap_or("pool");
+    let staged = data_beans::zarr_io::in_stage(beside, "pool");
+    data_beans::zarr_io::make_stage(&staged)?;
+    let stage = std::path::Path::new(&staged)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
     let dir = tempfile::Builder::new()
-        .prefix(".data-beans-qc-")
-        .tempdir_in(".")?;
+        .prefix("data-beans-qc-")
+        .tempdir_in(stage)?;
     let file = dir.path().join("pool.zarr").to_string_lossy().into_owned();
     info!("pooling {} files ...", args.data_files.len());
     run_merge_backend(&MergeBackendArgs {
@@ -135,7 +152,10 @@ fn pool(args: &CellQcArgs) -> anyhow::Result<Option<Pool>> {
         block_size: args.block_size,
         view: crate::handlers::explore::PlanArgs::batch(),
     })?;
-    Ok(Some(Pool { _dir: dir, file }))
+    Ok(Some(Pool {
+        dir: Some(dir),
+        file,
+    }))
 }
 
 pub fn run_cell_qc(args: &CellQcArgs) -> anyhow::Result<()> {
@@ -344,7 +364,7 @@ fn finish(
 /// Refuse an output that is, or writes over, one of the inputs.
 fn refuse_an_input(args: &CellQcArgs, output: &str) -> anyhow::Result<()> {
     let target = output_target(output, args.backend.clone(), args.zip)?;
-    for p in [&target.effective, &target.working, &target.found] {
+    for p in [&target.effective, &target.found] {
         if let Some(input) = args.data_files.iter().find(|i| same_file(i, p)) {
             anyhow::bail!("the output {p} is the input {input}: give -o another name");
         }

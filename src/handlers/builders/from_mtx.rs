@@ -221,10 +221,7 @@ pub fn run_build_from_mtx(args: &FromMtxArgs) -> anyhow::Result<()> {
 
                 let mut col_names = data.column_names()?;
 
-                let output_stem = backend_file
-                    .strip_suffix(".zarr")
-                    .or_else(|| backend_file.strip_suffix(".h5"))
-                    .unwrap_or(&backend_file);
+                let output_stem = crate::hdf5_io::strip_backend_suffix(&effective_output);
                 let hto_file = format!("{}.barcode_to_hto.tsv.gz", output_stem);
                 {
                     use std::io::Write;

@@ -57,11 +57,9 @@ pub fn resolve_backend_file(
             }
             "zip" if file_path.ends_with(".zarr.zip") => {
                 resolved_backend = SparseIoBackend::Zarr;
-                // strip .zip — write to .zarr dir, caller finalizes via finalize_zarr_output
-                backend_file = file_path
-                    .strip_suffix(".zip")
-                    .unwrap_or(file_path)
-                    .to_string();
+                // Written to a `.zarr` dir in the temp folder, which the
+                // caller zips onto the target via finalize_zarr_output.
+                backend_file = crate::zarr_io::staging_zarr_dir(file_path);
             }
             _ => {
                 // there is no recognized extension — append based on backend

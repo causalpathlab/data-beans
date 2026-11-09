@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.10.10"
+version = "0.10.11"
 rust-version = "1.91"
 # Ship only the sources, README and license: nothing else in the working tree
 # (data stores, saved name lists, scratch files) can end up on crates.io.
@@ -116,3 +116,6 @@ legume-tui = { version = "0.3.15", default-features = false, features = ["testin
 # tests/mcp_server.rs follows a server through the watch pane.
 legume-mcp = { version = "0.4", features = ["tui"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+xattr = "1.7.0"
