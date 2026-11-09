@@ -255,6 +255,17 @@ pub fn staging_zarr_dir(target: &str) -> String {
         .into_owned()
 }
 
+/// `name` in the stage of the folder `beside` is in (or of the stage `beside`
+/// is itself in): where scratch kept with an output goes, such as a subset's
+/// `.subset_tmp` or `qc`'s pool. Pair with [`make_stage`] and [`leave_stage`].
+pub fn in_stage(beside: &str, name: &str) -> String {
+    let stage = match stage_of(beside) {
+        Some(stage) => stage.to_path_buf(),
+        None => std::path::Path::new(beside).with_file_name(STAGE),
+    };
+    stage.join(name).to_string_lossy().into_owned()
+}
+
 /// The stage `working` is built in, when it is one ([`staging_zarr_dir`]).
 fn stage_of(working: &str) -> Option<&std::path::Path> {
     std::path::Path::new(working)

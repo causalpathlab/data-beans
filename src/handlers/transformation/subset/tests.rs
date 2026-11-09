@@ -77,39 +77,10 @@ fn interactive_output_keeps_the_input_container() {
 /// does not see them come and go and put them back empty.
 #[test]
 fn a_zipped_subset_leaves_only_the_archive_in_its_folder() {
-    use crate::sparse_io::{create_sparse_from_triplets, open_sparse_matrix_by_path};
-    let input_dir = tempfile::tempdir().unwrap();
-    let input = input_dir.path().join("in.zarr");
-    let triplets = [(0, 0, 1.0), (1, 1, 2.0), (2, 2, 3.0), (0, 3, 4.0)];
-    let mut data = create_sparse_from_triplets(
-        &triplets,
-        (3, 4, triplets.len()),
-        Some(input.to_str().unwrap()),
-        Some(&crate::sparse_io::SparseIoBackend::Zarr),
-    )
-    .unwrap();
-    data.register_row_names_vec(&["g0".into(), "g1".into(), "g2".into()]);
-    data.register_column_names_vec(&["c0".into(), "c1".into(), "c2".into(), "c3".into()]);
-    drop(data);
-
-    let out_dir = tempfile::tempdir().unwrap();
+    use crate::sparse_io::open_sparse_matrix_by_path;
+    let (out_dir, left) = subset_into("out.zarr.zip");
     let out = out_dir.path().join("results/out.zarr.zip");
     let out = out.to_str().unwrap();
-    let cols = Cols::parse_from([
-        "x",
-        input.to_str().unwrap(),
-        "-i",
-        "1-3",
-        "-o",
-        out,
-        "--batch-process",
-    ]);
-    super::subset_columns(&cols.args).unwrap();
-
-    let left: Vec<String> = std::fs::read_dir(out_dir.path().join("results"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
     assert_eq!(left, ["out.zarr.zip"]);
     // Never as a plain sibling, even for a moment: built in the stage.
     let (_, working) =
@@ -122,4 +93,53 @@ fn a_zipped_subset_leaves_only_the_archive_in_its_folder() {
         open_sparse_matrix_by_path(out).unwrap().num_columns(),
         Some(3)
     );
+}
+
+/// A subset into a `.zarr` directory leaves the directory alone too: its
+/// `.subset_tmp` is built in the hidden stage, which goes once it is empty.
+#[test]
+fn a_directory_subset_leaves_only_the_directory_in_its_folder() {
+    let (_dir, left) = subset_into("out.zarr");
+    assert_eq!(left, ["out.zarr"]);
+}
+
+/// Columns 1-3 of a small backend subset into `results/{out}` of a new
+/// folder: that folder, and the names left in `results/` after.
+fn subset_into(out: &str) -> (tempfile::TempDir, Vec<String>) {
+    use crate::sparse_io::create_sparse_from_triplets;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.zarr");
+    let triplets = [(0, 0, 1.0), (1, 1, 2.0), (2, 2, 3.0), (0, 3, 4.0)];
+    let mut data = create_sparse_from_triplets(
+        &triplets,
+        (3, 4, triplets.len()),
+        Some(input.to_str().unwrap()),
+        Some(&crate::sparse_io::SparseIoBackend::Zarr),
+    )
+    .unwrap();
+    data.register_row_names_vec(&["g0".into(), "g1".into(), "g2".into()]);
+    data.register_column_names_vec(&["c0".into(), "c1".into(), "c2".into(), "c3".into()]);
+    drop(data);
+
+    let out = dir.path().join("results").join(out);
+    let mut argv = vec![
+        "x",
+        input.to_str().unwrap(),
+        "-i",
+        "1-3",
+        "-o",
+        out.to_str().unwrap(),
+        "--batch-process",
+    ];
+    if !out.to_str().unwrap().ends_with(".zip") {
+        argv.push("--no-zip");
+    }
+    let cols = Cols::parse_from(argv);
+    super::subset_columns(&cols.args).unwrap();
+
+    let left = std::fs::read_dir(dir.path().join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    (dir, left)
 }

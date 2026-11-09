@@ -589,7 +589,7 @@ pub trait SparseIo: Sync + Send {
         // surviving triplet, which is the memory wall this replaces.
         // CONTRACT of the swap: the original is untouched until the temporary
         // sibling is complete and finalized; a failure mid-stream leaves the
-        // original intact plus a `{path}.subset_tmp` leftover (cleaned on the
+        // original intact plus a `.data-beans-stage/{name}.subset_tmp` leftover (cleaned on the
         // next attempt); the unrecoverable window is only remove→rename below.
         // A zip-archived backend is refused up front — streaming to a sibling
         // DIRECTORY and renaming it over the `.zip` name would silently change
@@ -601,7 +601,14 @@ pub trait SparseIo: Sync + Send {
             "subset: {final_path} is a zip archive; convert it to a directory \
              backend first (data-beans convert)"
         );
-        let temp_path = format!("{final_path}.subset_tmp");
+        // In the hidden stage beside the output (same disk, so the rename
+        // stays atomic), where a sync client does not see it come and go.
+        let name = std::path::Path::new(&final_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let temp_path = crate::zarr_io::in_stage(&final_path, &format!("{name}.subset_tmp"));
+        crate::zarr_io::make_stage(&temp_path)?;
         if std::path::Path::new(&temp_path).exists() {
             crate::sparse_io::remove_backend_path(&temp_path)?;
         }
@@ -673,6 +680,7 @@ pub trait SparseIo: Sync + Send {
 
         self.remove_backend_file()?;
         std::fs::rename(&temp_path, &final_path)?;
+        crate::zarr_io::leave_stage(&temp_path);
         self.reopen_backend()?;
         self.clean_preloaded_columns();
         self.clean_preloaded_rows();
