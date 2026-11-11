@@ -38,6 +38,9 @@ pub struct Ontology {
     names: FxHashMap<Box<str>, Box<str>>,
     /// `def:` text per term, unescaped, without the xref list.
     defs: FxHashMap<Box<str>, Box<str>>,
+    /// `namespace:` per term (`biological_process`, …), the header's
+    /// `default-namespace:` where a term names none; obsolete terms too.
+    namespaces: FxHashMap<Box<str>, Box<str>>,
 }
 
 /// One parsed, non-obsolete OBO term gathered in the first pass.
@@ -58,8 +61,15 @@ impl Ontology {
         let doc = fastobo::from_file(path)
             .with_context(|| format!("failed to parse OBO file: {path}"))?;
 
-        // Pass 1: collect non-obsolete terms.
+        // The header's `default-namespace:`, for terms that name none.
+        let default_namespace: Option<Box<str>> = doc.header().iter().find_map(|c| match c {
+            fastobo::ast::HeaderClause::DefaultNamespace(ns) => Some(ns.to_string().trim().into()),
+            _ => None,
+        });
+        // Pass 1: collect non-obsolete terms; every term's namespace,
+        // obsolete ones' too (an old annotation may still name them).
         let mut terms: Vec<ParsedTerm> = Vec::new();
+        let mut namespaces: FxHashMap<Box<str>, Box<str>> = FxHashMap::default();
         for frame in doc.entities() {
             let EntityFrame::Term(term) = frame else {
                 continue;
@@ -69,6 +79,7 @@ impl Ontology {
             let id: Box<str> = term.id().to_string().trim().into();
             let mut name: Option<Box<str>> = None;
             let mut def: Option<Box<str>> = None;
+            let mut namespace: Option<Box<str>> = None;
             let mut is_a: Vec<Box<str>> = Vec::new();
             let mut part_of: Vec<Box<str>> = Vec::new();
             let mut obsolete = false;
@@ -81,6 +92,9 @@ impl Ontology {
                             def = Some(text.into());
                         }
                     }
+                    TermClause::Namespace(ns) => {
+                        namespace = Some(ns.to_string().trim().into());
+                    }
                     TermClause::IsObsolete(b) => obsolete = obsolete || *b,
                     TermClause::IsA(parent) => is_a.push(parent.to_string().trim().into()),
                     TermClause::Relationship(rel, target)
@@ -90,6 +104,9 @@ impl Ontology {
                     }
                     _ => {}
                 }
+            }
+            if let Some(ns) = namespace.or_else(|| default_namespace.clone()) {
+                namespaces.insert(id.clone(), ns);
             }
             if !obsolete {
                 terms.push(ParsedTerm {
@@ -133,6 +150,7 @@ impl Ontology {
             idx,
             names,
             defs,
+            namespaces,
         })
     }
 
@@ -180,6 +198,14 @@ impl Ontology {
     #[must_use]
     pub fn name(&self, id: &str) -> Option<&str> {
         self.names.get(id).map(|n| &**n)
+    }
+
+    /// The `namespace:` of `id` (GO's `biological_process`,
+    /// `molecular_function` or `cellular_component`), else the header's
+    /// `default-namespace:`; obsolete terms keep theirs.
+    #[must_use]
+    pub fn namespace(&self, id: &str) -> Option<&str> {
+        self.namespaces.get(id).map(|n| &**n)
     }
 
     /// All `is_a` ancestors of `id` plus `id` itself (empty if `id` is unknown).
@@ -231,8 +257,8 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             f,
-            "format-version: 1.2\n\n\
-             [Term]\nid: CL:0000000\nname: cell\n\n\
+            "format-version: 1.2\ndefault-namespace: cell_type\n\n\
+             [Term]\nid: CL:0000000\nname: cell\nnamespace: cell\n\n\
              [Term]\nid: CL:0000542\nname: lymphocyte\nis_a: CL:0000000 ! cell\n\n\
              [Term]\nid: CL:0000084\nname: T cell\ndef: \"A lymphocyte with a \\\"TCR\\\", made in the thymus.\" [GOC:add]\nis_a: CL:0000542 {{is_inferred=\"true\"}} ! lymphocyte\n\n\
              [Term]\nid: CL:0000624\nname: CD4 T\nis_a: CL:0000084 ! T cell\n\n\
@@ -255,6 +281,9 @@ mod tests {
         assert_eq!(onto.len(), 7);
         assert!(!onto.contains("CL:9999999"));
         assert_eq!(onto.name("CL:0000084"), Some("T cell"));
+        assert_eq!(onto.namespace("CL:0000000"), Some("cell"));
+        assert_eq!(onto.namespace("CL:0000084"), Some("cell_type"));
+        assert_eq!(onto.namespace("CL:9999999"), Some("cell_type"), "obsolete");
 
         // The {is_inferred} qualifier must NOT break the edge: CD4/CD8 under T,
         // T under lymphocyte under cell.
