@@ -164,13 +164,16 @@ impl CellRules {
     }
 
     fn index(&self, rule: Rule) -> usize {
-        self.rules
-            .iter()
-            .position(|&r| r == rule)
-            .expect("a rule of the data")
+        self.position(rule).expect("a rule of the data")
     }
 
-    /// What `rule` does now.
+    /// Where `rule` is in table order; `None` for a rule the data lacks
+    /// (no mito metric when the pattern matched no feature).
+    fn position(&self, rule: Rule) -> Option<usize> {
+        self.rules.iter().position(|&r| r == rule)
+    }
+
+    /// What `rule`, one of [`CellRules::rules`], does now.
     pub fn count(&self, rule: Rule) -> &RuleCount {
         &self.counts[self.index(rule)]
     }
@@ -187,7 +190,7 @@ impl CellRules {
     /// it (over the cells above the near-empty floor), whether or not the
     /// rule holds to it; `None` for a rule with no band, or no spread.
     pub fn band(&self, rule: Rule) -> Option<RobustBand> {
-        self.bands[self.index(rule)]
+        self.bands[self.position(rule)?]
     }
 
     /// The cells QC keeps (in the output), and how many there are.
@@ -217,8 +220,11 @@ impl CellRules {
     }
 
     /// Whether `rule` decides anything now.
+    /// A rule the data lacks (no mito metric when the pattern matched no
+    /// feature) decides nothing, whatever its settings say; they are kept,
+    /// so the flags carry them to data that has it.
     pub fn is_on(&self, rule: Rule) -> bool {
-        is_on(&self.cfg, rule)
+        self.position(rule).is_some() && is_on(&self.cfg, rule)
     }
 
     /// How `rule`'s edge is set now.
@@ -244,9 +250,9 @@ impl CellRules {
 
     /// The edge `rule` holds its metric to now, on the metric's own scale:
     /// the tightest of its band edge and its own value; `None` when it is
-    /// off or its band has no spread.
+    /// off, its band has no spread, or the data lacks it.
     pub fn edge(&self, rule: Rule) -> Option<f32> {
-        self.edges[self.index(rule)]
+        self.edges[self.position(rule)?]
     }
 
     /// The band of `rule`'s metric fitted now, for [`CellRules::recount`].

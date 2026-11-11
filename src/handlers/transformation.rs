@@ -5,6 +5,7 @@ use clap::Args;
 use log::info;
 
 mod convert;
+mod group_table;
 mod split;
 mod subsample;
 mod subset;

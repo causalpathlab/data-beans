@@ -85,8 +85,11 @@ pub struct CellQcArgs {
 }
 
 /// The mito pattern `qc` starts from, where senna's and pinto's QC has
-/// none; an empty `--qc-mito-pattern=` turns it off.
-pub const MITO: &str = "(?i)^MT-";
+/// none; an empty `--qc-mito-pattern=` turns it off. `MT-` at the start or
+/// after an underscore: `MT-ND1`, mouse `mt-Nd1`, and the `ENSG…_MT-ND1` and
+/// `GRCh38_MT-ND1` names of pooled and multi-genome references, but not
+/// `ENSG00000254959_INMT-MINDY4`.
+pub const MITO: &str = "(?i)(^|_)MT-";
 
 /// The QC config the flags ask for: `--no-qc` leaves nothing to do, and an
 /// empty `--qc-mito-pattern=` turns the mito metric off.
@@ -435,4 +438,28 @@ fn summary(rules: &CellRules, kept_cells: usize, kept_features: usize) -> Vec<Bo
         }
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_default_mito_pattern_finds_mt_after_an_underscore() {
+        let re = regex::Regex::new(super::MITO).unwrap();
+        for hit in [
+            "MT-ND1",
+            "mt-Nd1",
+            "ENSG00000198888_MT-ND1",
+            "GRCh38_MT-CO1",
+        ] {
+            assert!(re.is_match(hit), "{hit}");
+        }
+        for miss in [
+            "ENSG00000254959_INMT-MINDY4",
+            "INMT",
+            "MTOR",
+            "ENSG00000198793_MTOR",
+        ] {
+            assert!(!re.is_match(miss), "{miss}");
+        }
+    }
 }

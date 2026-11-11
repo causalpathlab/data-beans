@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.10.12"
+version = "0.10.13"
 rust-version = "1.91"
 # Ship only the sources, README and license: nothing else in the working tree
 # (data stores, saved name lists, scratch files) can end up on crates.io.
@@ -18,7 +18,9 @@ include = ["src/**/*.rs", "tests/**/*.rs", "README.md", "LICENSE"]
 [[bin]]
 name = "data-beans"
 path = "src/main.rs"
-# The CLI's interactive views need the terminal UI.
+# The CLI's interactive views need the terminal UI. `subsample --sketch`
+# bins cells with alg's random projection, as senna does; without `alg` it
+# refuses.
 required-features = ["tui"]
 
 [[bin]]
@@ -27,7 +29,7 @@ path = "src/sim_main.rs"
 required-features = ["sim"]
 
 [features]
-default = ["aux", "tui", "tensor", "ndarray", "mcp", "figure"]
+default = ["aux", "alg", "tui", "tensor", "ndarray", "mcp", "figure"]
 # Read sparse data into dense candle `Tensor`s (`read_*_tensor`). Off, no
 # candle is linked: for crates that only need matrices.
 tensor = ["legume-numeric/tensor"]

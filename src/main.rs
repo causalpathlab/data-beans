@@ -522,7 +522,13 @@ enum Commands {
                       An unset dimension keeps all of its entries.\n\
                       \n\
                       Sampling is reproducible via --seed. It reads only the selected columns.\n\
-                      Cost therefore scales with the output size, not the input.",
+                      Cost therefore scales with the output size, not the input.\n\
+                      \n\
+                      --groups TABLE --per-group N draws N cells within each group (a donor,\n\
+                      a sample) instead of over the pool; a smaller group is kept whole, and\n\
+                      the kept cells' labels go to {output}.batch.gz. --sketch (opt-in) draws\n\
+                      evenly across bins of a random-projection sketch to keep rare states;\n\
+                      it reads every cell once, and it changes the composition on purpose.",
         visible_alias = "downsample"
     )]
     Subsample(SubsampleArgs),
