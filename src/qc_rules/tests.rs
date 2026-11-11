@@ -50,10 +50,10 @@ struct Cli {
 }
 
 /// The config `flags` stand for, read as `data-beans qc` reads them: from
-/// its own mito pattern, (?i)^MT-, unless one is given.
+/// its own mito pattern, (?i)(^|_)MT- (`cell_qc::MITO`), unless one is given.
 fn read_back(flags: &[String]) -> QcConfig {
     let argv = std::iter::once("qc".to_string()).chain(flags.iter().cloned());
-    let cmd = Cli::command().mut_arg("qc_mito_pattern", |a| a.default_value("(?i)^MT-"));
+    let cmd = Cli::command().mut_arg("qc_mito_pattern", |a| a.default_value("(?i)(^|_)MT-"));
     let matches = cmd.try_get_matches_from(argv).unwrap();
     Cli::from_arg_matches(&matches)
         .unwrap()
@@ -154,7 +154,7 @@ fn a_rule_turned_off_and_on_comes_back() {
 
 #[test]
 fn mito_turned_off_stays_off_in_the_flags() {
-    // Without a pattern; read back, `qc`'s own (?i)^MT- must not return.
+    // Without a pattern; read back, `qc`'s own (?i)(^|_)MT- must not return.
     let mut m = metrics();
     m.mito_frac = None;
     let cfg = QcConfig {
@@ -205,4 +205,22 @@ fn a_rule_with_no_spread_switched_to_a_value_removes_nothing() {
     assert_eq!(rules.mode(Rule::Mito), Mode::Value);
     assert_eq!(rules.count(Rule::Mito).removes, 0);
     assert_eq!(rules.kept_cells().len(), before);
+}
+
+/// A mito pattern that matched no feature leaves no mito metric, while the
+/// config still asks for the mito band (as `qc`'s default pattern does on
+/// ENSG…_SYMBOL names): the rule is absent, not a panic, and the figure,
+/// which shades by the mito edge, still draws.
+#[test]
+fn a_mito_pattern_that_matched_nothing_leaves_no_mito_rule() {
+    let mut m = metrics();
+    m.mito_frac = None;
+    let rules = CellRules::new(m, config());
+    assert!(!rules.rules().contains(&Rule::Mito));
+    assert!(!rules.is_on(Rule::Mito), "off, as the data has it");
+    assert_eq!(rules.edge(Rule::Mito), None);
+    assert!(rules.band(Rule::Mito).is_none());
+    #[cfg(feature = "figure")]
+    assert!(crate::figure::qc::figure(&rules, "no mito").contains("<svg"));
+    assert_flags_decide_the_same(&rules);
 }

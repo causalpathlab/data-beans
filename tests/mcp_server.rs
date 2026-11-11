@@ -467,6 +467,65 @@ fn a_write_in_the_background_returns_a_job_that_writes_it() {
     // A job has nothing to wait for: a dry run, or an import of nothing.
     let dry = c.call("qc", json!({ "data": "base.zarr.zip", "background": true }));
     assert!(dry.unwrap_err().contains("dry run"));
+    // A dry run that writes its report runs as a job; what it printed (the
+    // summary a call would return) is the job's output.
+    let dry = c
+        .call(
+            "qc",
+            json!({ "data": "base.zarr.zip", "report": "dry.tsv", "background": true }),
+        )
+        .unwrap();
+    assert!(
+        dry["written"][0].as_str().unwrap().ends_with("dry.tsv"),
+        "{dry}"
+    );
+    assert!(
+        dry["report"].as_str().unwrap().ends_with("dry.tsv"),
+        "{dry}"
+    );
+    wait(&mut c, &dry["job"]);
+    assert!(dir.path().join("dry.tsv").exists());
+
+    // A quota per group, and the kept cells' labels beside the output.
+    std::fs::write(dir.path().join("groups.batch"), "A\nA\nB\nB\n").unwrap();
+    let drawn = c
+        .call(
+            "subsample",
+            json!({ "data": "base.zarr.zip", "groups": "groups.batch", "per_group": 1, "out": "quota" }),
+        )
+        .unwrap();
+    assert_eq!(drawn["info"]["columns"], 2, "{drawn}");
+    assert!(
+        drawn["batches"]
+            .as_str()
+            .unwrap()
+            .ends_with("quota.batch.gz"),
+        "{drawn}"
+    );
+    // Its own table is never replaced: here, named as the labels would be.
+    let table = dir.path().join("again.batch.gz");
+    {
+        use std::io::Write;
+        let mut gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&table).unwrap(),
+            flate2::Compression::default(),
+        );
+        gz.write_all(b"A\nA\nB\nB\n").unwrap();
+        gz.finish().unwrap();
+    }
+    let before = std::fs::read(&table).unwrap();
+    let r = c.call(
+        "subsample",
+        json!({ "data": "base.zarr.zip", "groups": "again.batch.gz", "per_group": 1, "out": "again" }),
+    );
+    let e = r.unwrap_err();
+    assert!(e.contains("exists"), "{e}");
+    assert_eq!(std::fs::read(&table).unwrap(), before);
+    let r = c.call(
+        "subsample",
+        json!({ "data": "base.zarr.zip", "groups": "groups.batch", "cells": 2, "out": "both" }),
+    );
+    assert!(r.is_err(), "a pool-wide count and a quota: {r:?}");
     let missing = c.call(
         "import",
         json!({ "command": "from-mtx", "input": "missing.mtx", "source": "nowhere", "background": true }),
@@ -702,7 +761,23 @@ fn every_tool_answers_or_refuses_as_it_should() {
         "qc",
         json!({ "data": "base.zarr.zip", "out": "k", "background": true, "figure": true }),
     );
-    assert!(r.unwrap_err().contains("comes back with the call"));
+    // Kept in the results folder, the job writes it: its path comes back.
+    let started = r.unwrap();
+    assert!(started["job"].is_string(), "{started}");
+    assert!(
+        started["figure"].as_str().unwrap().ends_with(".png"),
+        "{started}"
+    );
+    // Done before the server and its folder go.
+    for _ in 0..10 {
+        let v = c
+            .call("job_wait", json!({ "id": started["job"], "seconds": 30 }))
+            .unwrap();
+        if v["state"] != "running" {
+            assert_eq!(v["state"], "done", "{v}");
+            break;
+        }
+    }
     // The plot tool is gone: its figures come from qc and statistics.
     let r = c.request(
         "tools/call",

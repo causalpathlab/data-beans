@@ -82,8 +82,9 @@ pub struct SplitArgs {
     #[arg(long, default_value_t = 8, requires = "coord")]
     pub grid: usize,
 
-    /// two-column table (cell name, group label) -- keep cells sharing a label
-    /// on the same side: donor, sample, slide. Use --coord for geometry instead.
+    /// two-column table (cell name, group label), or one label per line in
+    /// column order (qc's {out}.batch.gz) -- keep cells sharing a label on
+    /// the same side: donor, sample, slide. Use --coord for geometry instead.
     #[arg(long, value_name = "TABLE")]
     pub groups: Option<Box<str>>,
 
@@ -381,97 +382,20 @@ fn read_coords(path: &str, cols: &[usize]) -> anyhow::Result<HashMap<Box<str>, (
     Ok(out)
 }
 
-/// Cells grouped by their group label, from a two-column (cell, label) table.
-///
-/// A cell missing from the table is an error rather than a silent singleton:
-/// a partial grouping would split part of the data by group and the rest by
-/// cell, and the resulting fold is neither.
+/// Cells grouped by their group label, from a group table (see
+/// [`super::group_table`]).
 fn column_groups_from_table(
     path: &str,
     column_names: &[Box<str>],
 ) -> anyhow::Result<Vec<Vec<usize>>> {
-    let (table_names, table_labels) = read_group_table(path)?;
-    anyhow::ensure!(
-        table_names.len() == table_labels.len(),
-        "{path}: {} names but {} group labels",
-        table_names.len(),
-        table_labels.len()
-    );
-    let label_of_column: HashMap<&str, &str> = table_names
-        .iter()
-        .map(std::convert::AsRef::as_ref)
-        .zip(table_labels.iter().map(std::convert::AsRef::as_ref))
-        .collect();
-
-    let mut group_of_label: HashMap<&str, usize> = HashMap::default();
-    let mut column_groups: Vec<Vec<usize>> = Vec::new();
-    let mut n_missing = 0usize;
-    for (column, name) in column_names.iter().enumerate() {
-        let Some(&label) = label_of_column.get(name.as_ref()) else {
-            n_missing += 1;
-            continue;
-        };
-        let next = column_groups.len();
-        let group = *group_of_label.entry(label).or_insert(next);
-        if group == next {
-            column_groups.push(Vec::new());
-        }
-        column_groups[group].push(column);
-    }
-    anyhow::ensure!(
-        n_missing == 0,
-        "{path}: {n_missing} of {} cells have no group label",
-        column_names.len()
-    );
+    let labels = super::group_table::column_labels(path, column_names)?;
+    let (_, column_groups, _) = super::group_table::groups_of(&labels);
     info!(
         "grouped split: {} cells in {} groups from {path}",
         column_names.len(),
         column_groups.len()
     );
     Ok(column_groups)
-}
-
-/// The `(name, label)` columns of a group table.
-type GroupTable = (Vec<Box<str>>, Vec<Box<str>>);
-
-/// The `(name, label)` columns of a group table, from parquet or delimited text.
-///
-/// Both, because the flag says `TABLE` and the help says "two-column table" —
-/// reading only parquet meant the TSV a user would naturally write failed with a
-/// parquet decode error. The text path goes through the workspace reader, so it
-/// sniffs the delimiter and handles `.gz` like every other list this tool takes.
-///
-/// Matching stays EXACT (see the caller). `Membership` offers base-key and prefix
-/// fallbacks, which are right for joining annotations and wrong here: a split
-/// that fuzzy-matches puts a cell in the wrong half, and nothing downstream can
-/// detect it.
-fn read_group_table(path: &str) -> anyhow::Result<GroupTable> {
-    let is_parquet = std::path::Path::new(path)
-        .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|e| e.eq_ignore_ascii_case("parquet"));
-    if is_parquet {
-        return Ok((
-            legume_numeric::matrix::parquet::read_parquet_string_column(path, 0)?,
-            legume_numeric::matrix::parquet::read_parquet_string_column(path, 1)?,
-        ));
-    }
-
-    let delim = legume_numeric::matrix::membership::detect_delimiter(path);
-    let out = legume_numeric::matrix::common_io::read_lines_of_words_delim(path, delim, -1)?;
-    let mut names = Vec::with_capacity(out.lines.len());
-    let mut labels = Vec::with_capacity(out.lines.len());
-    for (row, fields) in out.lines.iter().enumerate() {
-        anyhow::ensure!(
-            fields.len() >= 2,
-            "{path}:{}: {} column(s), need a cell name and a group label",
-            row + 1,
-            fields.len()
-        );
-        names.push(fields[0].clone());
-        labels.push(fields[1].clone());
-    }
-    Ok((names, labels))
 }
 
 /// Write one half as a new backend, streamed.

@@ -88,8 +88,9 @@ replaces a file. Leave `out` out and the output goes in today's results \
 folder, named after its input and the tool. Outputs are .zarr.zip archives \
 unless `out` ends in .zarr (a directory) or .h5. Paths are resolved against \
 the server's working directory; results give the paths written. On a big \
-store, pass `background` to these (and to qc with `out`): the call returns \
-a job at once, with the paths it will write.
+store, pass `background` to these (and to qc, which then writes `out`, or on \
+a dry run only its `report` and a named `figure`): the call returns a job \
+at once, with the paths it will write.
 
 A person may be watching (`data-beans mcp watch`): a \"Note from the user\" \
 in a result is theirs to you; take it into account. A call they stopped \
@@ -116,7 +117,7 @@ fn import_commands() -> Vec<&'static str> {
 fn qc_properties(data: &Value) -> Value {
     json!({
         "data": data,
-        "mito_pattern": { "type": "string", "description": "Regex over feature names for mitochondrial genes (default (?i)^MT-; empty turns the mito metric off)" },
+        "mito_pattern": { "type": "string", "description": "Regex over feature names for mitochondrial genes (default (?i)(^|_)MT-, which also finds ENSG…_MT-ND1; empty turns the mito metric off)" },
         "n_mads": { "type": "number", "exclusiveMinimum": 0, "description": "Band half-width in MADs (default 5; smaller drops more)" },
         "min_cell_nnz": { "type": "integer", "minimum": 0, "description": "Near-empty floor on detected features (default 2)" },
         "mad_on_genes": { "type": "boolean", "description": "Band on detected genes (default true)" },
@@ -253,7 +254,7 @@ fn tools() -> Vec<ToolSpec> {
         ),
         ToolSpec::new(
             "subsample",
-            "A new backend of randomly drawn cells (columns) and/or genes (rows), by count or fraction; an unset axis is kept whole.",
+            "A new backend of randomly drawn cells (columns) and/or genes (rows), by count or fraction; an unset axis is kept whole. With `groups`, a quota of cells within each group (`per_group` or `per_group_frac`; a smaller group is kept whole and named in the log), and the kept cells' labels go to {out}.batch.gz, for senna's -b. With `sketch` (never the default), cells are drawn evenly across bins of a random-projection sketch (senna's --proj-dim / --sort-dim binning) instead of uniformly, which keeps rare states but changes the cell-type composition on purpose: abundances, integration and mixing scores computed on it describe a population no donor has. `sketch` reads every cell once to bin it; with `groups` each group's quota is shared over the bins it has.",
             schema(
                 json!({
                     "data": data,
@@ -261,6 +262,12 @@ fn tools() -> Vec<ToolSpec> {
                     "cell_frac": { "type": "number" },
                     "genes": { "type": "integer", "minimum": 1 },
                     "gene_frac": { "type": "number" },
+                    "groups": { "type": "string", "description": "Group table: two columns (cell name, group label), .parquet or delimited text, optionally .gz; or one label per line in column order, as qc and merge write in {out}.batch.gz. Every cell needs a label. Not with `cells` / `cell_frac`" },
+                    "per_group": { "type": "integer", "minimum": 1, "description": "Cells to keep in each group (with `groups`)" },
+                    "per_group_frac": { "type": "number", "description": "Fraction of each group's cells to keep, in (0, 1] (with `groups`)" },
+                    "sketch": { "type": "boolean", "description": "Draw evenly across sketch bins, to keep rare states; changes the composition on purpose" },
+                    "sketch_dim": { "type": "integer", "minimum": 1, "description": "Dimensions of the sketch's random projection (default 50)" },
+                    "sketch_bits": { "type": "integer", "minimum": 1, "maximum": 63, "description": "Top components whose signs bin the sketch (default 10)" },
                     "seed": { "type": "integer", "minimum": 0 },
                     "out": out, "background": background,
                 }),
@@ -400,14 +407,7 @@ impl Handler for DataBeans {
             "qc" => return qc(&a, cx),
             "import" => import(&a, cx)?,
             "subset" => subset(&a, cx)?,
-            "subsample" => {
-                let data = a.path("data")?;
-                let out = a.backend_out(cx, &named(&data, "subsample"))?;
-                let mut argv = argv(["subsample", &data]);
-                argv.extend(a.numbers(&["cells", "cell_frac", "genes", "gene_frac", "seed"])?);
-                let what = format!("cells and genes drawn at random from {data}");
-                written(cx, a.flag("background")?, argv, &out, &what, &[data])?
-            }
+            "subsample" => subsample(&a, cx)?,
             "split" => split(&a, cx)?,
             "convert" => {
                 let data = a.path("data")?;
@@ -1183,7 +1183,7 @@ fn values(a: &Arguments, cx: &Call) -> Result<Value> {
 /// The `--qc-*` flags for the cell-QC settings among `a`.
 fn qc_flags(a: &Arguments) -> Result<Vec<String>> {
     let mut v = vec![];
-    // The command starts from (?i)^MT-; an empty pattern turns it off.
+    // The command starts from (?i)(^|_)MT-; an empty pattern turns it off.
     if let Some(mito) = a.str("mito_pattern") {
         v.push(format!("--qc-mito-pattern={mito}"));
     }
@@ -1239,14 +1239,11 @@ fn qc(a: &Arguments, cx: &Call) -> Result<Vec<Content>> {
         argv.push(format!("--qc-report={report}"));
     }
     let background = a.flag("background")?;
-    anyhow::ensure!(
-        a.given("out").is_some() || !background,
-        "`background` runs a qc that writes `out`; a dry run answers in the call"
-    );
     let figure = a.figure(cx, &named(&inputs[0], "qc"))?;
+    // In the background the figure is only written, so it must be kept.
     anyhow::ensure!(
-        figure.is_none() || !background,
-        "`figure` comes back with the call: leave out `background`, or ask for the figure on a dry run first"
+        figure.as_ref().is_none_or(|f| f.kept) || !background,
+        "in the background the figure is written, not returned, and this server keeps no results folder for it: name a file for `figure`, or leave out `background`"
     );
     if let Some(f) = &figure {
         argv.push(format!("--figure={}", f.path));
@@ -1257,6 +1254,7 @@ fn qc(a: &Arguments, cx: &Call) -> Result<Vec<Content>> {
         also.push(&f.path);
     }
     let what = format!("the cells of {data} that cell QC keeps");
+    let dry_what = format!("cell QC of {data}: its report or figure");
     // Without `out` a dry run: only the summary, and the report and figure
     // if asked.
     let (mut v, printed) = match a.given("out") {
@@ -1269,11 +1267,19 @@ fn qc(a: &Arguments, cx: &Call) -> Result<Vec<Content>> {
             }
             written_with(cx, background, argv, &out, &what, &inputs, &also)?
         }
-        None if also.is_empty() => (Map::new(), data_beans(cx, &argv)?),
-        None => {
-            let what = format!("cell QC of {data}: its report or figure");
-            (Map::new(), data_beans_making(cx, &argv, &also, &what)?)
+        None if background => {
+            // A dry run on a big pool outlasts a call: the job writes only
+            // the report and the figure; what it printed is its output.
+            anyhow::ensure!(
+                !also.is_empty(),
+                "a background dry run writes only its `report` and `figure`: give one, or leave out `background`"
+            );
+            let written: Vec<String> = also.iter().map(|p| absolute(p)).collect();
+            let job = data_beans_job(cx, &argv, &also, &dry_what, json!(written))?;
+            (job, String::new())
         }
+        None if also.is_empty() => (Map::new(), data_beans(cx, &argv)?),
+        None => (Map::new(), data_beans_making(cx, &argv, &also, &dry_what)?),
     };
     v.extend(key_values(&printed));
     // What it looked at, absolute: for the watcher's `o`, wherever it runs.
@@ -1288,11 +1294,15 @@ fn qc(a: &Arguments, cx: &Call) -> Result<Vec<Content>> {
     if let Some(report) = report {
         v.insert("report".into(), json!(absolute(report)));
     }
-    let images = figure
-        .as_ref()
-        .map(|f| f.contents(&mut v))
-        .transpose()?
-        .unwrap_or_default();
+    // A job writes the figure later: say where, as for its other outputs.
+    let images = match &figure {
+        Some(f) if background => {
+            v.insert("figure".into(), json!(absolute(&f.path)));
+            vec![]
+        }
+        Some(f) => f.contents(&mut v)?,
+        None => vec![],
+    };
     Ok(std::iter::once(Content::Json(Value::Object(v)))
         .chain(images)
         .collect())
@@ -1471,6 +1481,49 @@ fn outputs_beside(stem: &str) -> Result<Vec<String>> {
         .collect();
     v.sort();
     Ok(v)
+}
+
+fn subsample(a: &Arguments, cx: &Call) -> Result<Value> {
+    let data = a.path("data")?;
+    let out = a.backend_out(cx, &named(&data, "subsample"))?;
+    let mut argv = argv(["subsample", &data]);
+    argv.extend(a.numbers(&[
+        "cells",
+        "cell_frac",
+        "genes",
+        "gene_frac",
+        "per_group",
+        "per_group_frac",
+        "sketch_dim",
+        "sketch_bits",
+        "seed",
+    ])?);
+    let mut inputs = vec![data.clone()];
+    // The kept cells' group labels, beside the output.
+    let mut labels = None;
+    if a.given("groups").is_some() {
+        let groups = a.path("groups")?;
+        argv.push(format!("--groups={groups}"));
+        inputs.push(groups);
+        labels = Some(batch_file(&backend_target(&out)?.effective));
+    }
+    let sketch = a.flag("sketch")?;
+    if sketch {
+        argv.push("--sketch".into());
+    }
+    let how = if sketch {
+        "evenly over sketch bins"
+    } else {
+        "at random"
+    };
+    let what = format!("cells and genes drawn {how} from {data}");
+    let also: Vec<&str> = labels.as_deref().into_iter().collect();
+    let (mut v, _) = written_with(cx, a.flag("background")?, argv, &out, &what, &inputs, &also)?;
+    // Where the labels are (or, from a job, will be), as merge says.
+    if let Some(labels) = &labels {
+        v.insert("batches".into(), json!(absolute(labels)));
+    }
+    Ok(Value::Object(v))
 }
 
 fn split(a: &Arguments, cx: &Call) -> Result<Value> {

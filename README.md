@@ -54,7 +54,7 @@ Results go to stdout and nothing else does: logs, the QC histograms, the skipped
 
 **Names and trees.** `row-names` and `column-names` list a matrix's names, `list-h5` and `list-zarr` a file's hierarchy (Enter or the arrows open and close a group). `/` filters (a regular expression when the text is one), Space marks, `a` marks every entry shown, `w` writes the marked entries (or, with none marked, those shown; a tree's as paths) and `y` copies them.
 
-**Plans.** Before a command writes, its plan says what it will make: `merge-backend` and `merge-mtx` each input's rows and columns, how many rows every input has and how many only some, and the output's size (`c` keeps the common rows, `s` squeezes after); `align-data` each file's data type and column group, and the rows and columns each keeps (`r` sets the data types); `subsample` the size it draws (`n` cells, `g` genes, `s` seed); `split` each fold's train and test cells (`t` test fraction, `k` folds, `s` seed, `g` grid under `--coord`). After a `from-*` build, the import preview shows its rows' and columns' non-zeros on log bins with where the squeeze cutoffs fall (`s` squeeze, `r` and `c` the cutoffs); `q` there deletes the build. A plan that cannot be written says why, and Enter waits; elsewhere `q` writes nothing.
+**Plans.** Before a command writes, its plan says what it will make: `merge-backend` and `merge-mtx` each input's rows and columns, how many rows every input has and how many only some, and the output's size (`c` keeps the common rows, `s` squeezes after); `align-data` each file's data type and column group, and the rows and columns each keeps (`r` sets the data types); `subsample` the size it draws (`n` cells, or cells per group under `--groups`, `g` genes, `s` seed, `k` sketch); `split` each fold's train and test cells (`t` test fraction, `k` folds, `s` seed, `g` grid under `--coord`). After a `from-*` build, the import preview shows its rows' and columns' non-zeros on log bins with where the squeeze cutoffs fall (`s` squeeze, `r` and `c` the cutoffs); `q` there deletes the build. A plan that cannot be written says why, and Enter waits; elsewhere `q` writes nothing.
 
 In kitty, iTerm2, WezTerm and Ghostty the plots are the figure itself, drawn as images; other terminals get text plots. `DATA_BEANS_TUI_IMAGES=0` keeps text, `=1` asks any terminal. `--figure` writes the same figure without the view, and the MCP `qc` and `statistics` tools return it to an agent.
 
@@ -128,7 +128,7 @@ Look before you derive:
 
 Quality control: qc runs the cell QC senna and pinto apply (a near-empty floor, then robust MAD bands on detected genes, total counts and the mito fraction). Call it without `out` first: it reports each metric's median, the band and how many cells fall outside, and writes nothing. Adjust n_mads or the caps until the drops are what the data warrant, then call it with `out` to write the kept cells as a new backend. Pass `figure` to see the same settings as a figure, returned as an image: each rule's histogram with its edge, the cells it alone removes, counts against genes, and the removed cells by the rules they fail; look at it before and after tuning. statistics takes `figure` too: the histograms of nnz, sum, mean and sd, and mean against sd.
 
-Derive new backends with import (mtx, zarr triplets, fragments, h5ad, 10x; say in `source` where the input came from), subset, subsample, split, convert and merge. Each writes to `out`, which must not exist yet: no tool replaces a file. Leave `out` out and the output goes in today's results folder, named after its input and the tool. Outputs are .zarr.zip archives unless `out` ends in .zarr (a directory) or .h5. Paths are resolved against the server's working directory; results give the paths written. On a big store, pass `background` to these (and to qc with `out`): the call returns a job at once, with the paths it will write.
+Derive new backends with import (mtx, zarr triplets, fragments, h5ad, 10x; say in `source` where the input came from), subset, subsample, split, convert and merge. Each writes to `out`, which must not exist yet: no tool replaces a file. Leave `out` out and the output goes in today's results folder, named after its input and the tool. Outputs are .zarr.zip archives unless `out` ends in .zarr (a directory) or .h5. Paths are resolved against the server's working directory; results give the paths written. On a big store, pass `background` to these (and to qc, which then writes `out`, or on a dry run only its `report` and a named `figure`): the call returns a job at once, with the paths it will write.
 
 A person may be watching (`data-beans mcp watch`): a "Note from the user" in a result is theirs to you; take it into account. A call they stopped fails with "stopped by the user": do not run it again unasked.
 ```
@@ -147,14 +147,14 @@ After these, [legume-mcp](https://crates.io/crates/legume-mcp) adds its own note
 | `qc` | senna's and pinto's cell QC: the near-empty floor, MAD bands on genes, counts and mito fraction, caps, the gene floor; several backends pooled first; with `figure`, the QC figure as an image | the kept cells when `out` is given (and a pool's batch labels); a dry run otherwise; the figure |
 | `import` | a backend from `.mtx`, zarr triplets, fragments, `.h5ad` or 10x `.h5`, its `source` noted | a backend |
 | `subset` | some rows or columns: by `names`, a `pattern` (regex) or `indices` (ranges such as `0-19612`) | a backend |
-| `subsample` | cells and/or genes drawn at random | a backend |
+| `subsample` | cells and/or genes drawn at random; a quota per group (`groups`, `per_group`); evenly over sketch bins (`sketch`) | a backend, and the kept cells' group labels |
 | `split` | cells split train/test, or into K folds; by region or group with `options` | the halves |
 | `convert` | zarr ↔ h5, `.zarr` ↔ `.zarr.zip` | a backend |
 | `merge` | backends side by side, batch-labelled; `common_rows` keeps the rows all share | a backend and its `.batch.gz` |
 | `notebook` | the agent's plan, observations and conclusions (from legume-mcp) | the day's `notebook.md` |
 | `job_status`, `job_wait`, `job_cancel` | follow or stop a step started with `background` (from legume-mcp) | |
 
-Every tool that writes a backend (`qc` with `out`, `import`, `subset`, `subsample`, `split`, `convert`, `merge`) takes `background`: it returns at once with the `job` and the paths it will write (`written`, and merge's `batches`, qc's `report`). Wait for `job_wait` to say `done` before using them: a `.zarr` or `.h5` is there, half written, while the job runs. What the command printed (qc's medians and bands, say) is the job's `output`. Until the job ends, its outputs are no other call's to write.
+Every tool that writes a backend (`qc` with `out`, or a `qc` dry run with a `report` or a named `figure`, `import`, `subset`, `subsample`, `split`, `convert`, `merge`) takes `background`: it returns at once with the `job` and the paths it will write (`written`, and merge's `batches`, qc's `report`). Wait for `job_wait` to say `done` before using them: a `.zarr` or `.h5` is there, half written, while the job runs. What the command printed (qc's medians and bands, say) is the job's `output`. Until the job ends, its outputs are no other call's to write.
 
 No tool replaces a file: an output that is an input, or anything named after the output beside it, is refused.
 
@@ -199,4 +199,4 @@ data-beans qc data.zarr.zip --batch-process -o out \
   --qc-mad-on-genes=false --qc-mad-on-counts=false --qc-mito-pattern=
 ```
 
-`qc` starts from `--qc-mito-pattern '(?i)^MT-'`; an empty `--qc-mito-pattern=` turns the mito metric off.
+`qc` starts from `--qc-mito-pattern '(?i)(^|_)MT-'` (`MT-` at the start or after `_`, so `ENSG…_MT-ND1` names count too); an empty `--qc-mito-pattern=` turns the mito metric off.
