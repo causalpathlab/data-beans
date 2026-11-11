@@ -147,23 +147,79 @@ pub struct GafRaw {
 
 /// Parse a GAF (`.gaf` or `.gaf.gz`). Columns (1-based) used: 2 = object id /
 /// accession, 3 = symbol (the gene key), 4 = qualifier (rows with `NOT` are
-/// dropped), 5 = GO id, 7 = evidence code (for `no_iea`), 11 = synonyms,
+/// dropped), 5 = GO id, 7 = evidence code (`no_iea`), 11 = synonyms,
 /// 12 = object type (only proteins and genes are kept). The symbol,
 /// accession, and pipe-split synonyms are kept as match aliases.
 pub fn read_gaf(path: &str, opts: &GafOpts) -> Result<GafRaw> {
-    let reader = open_buf_reader(path).with_context(|| format!("failed to open GAF: {path}"))?;
+    read_gaf_without_evidence(path, opts, &[])
+}
+
+/// GAF evidence codes that carry no support of their own: `NAS` (an
+/// author's statement nobody traced) and `ND` (no biological data). A
+/// caller that wants only supported annotations passes these to
+/// [`read_gaf_without_evidence`].
+pub const UNSUPPORTED_EVIDENCE: [&str; 2] = ["NAS", "ND"];
+
+/// `s` upper-cased, borrowed when it is upper case already.
+fn upper(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.bytes().any(|b| !b.is_ascii() || b.is_ascii_lowercase()) {
+        s.to_uppercase().into()
+    } else {
+        s.into()
+    }
+}
+
+/// `x` into `set` unless it is there, allocated only when it is not.
+fn insert_new(set: &mut FxHashSet<Box<str>>, x: &str) {
+    if !set.contains(x) {
+        set.insert(x.into());
+    }
+}
+
+/// A GAF row's first 15 columns (GAF 2.x has at least 15); none for a
+/// shorter row.
+fn gaf_columns(line: &str) -> Option<[&str; 15]> {
+    let mut cols = line.trim_end_matches(['\n', '\r']).split('\t');
+    let mut f = [""; 15];
+    for c in &mut f {
+        *c = cols.next()?;
+    }
+    Some(f)
+}
+
+/// The set of `key` in `map`, made empty when it has none, its key
+/// allocated only then.
+fn entry<'m>(
+    map: &'m mut FxHashMap<Box<str>, FxHashSet<Box<str>>>,
+    key: &str,
+) -> &'m mut FxHashSet<Box<str>> {
+    if !map.contains_key(key) {
+        map.insert(key.into(), FxHashSet::default());
+    }
+    map.get_mut(key)
+        .unwrap_or_else(|| unreachable!("inserted above"))
+}
+
+/// [`read_gaf`] with the rows of the evidence codes `evidence` (column 7)
+/// left out as well, such as [`UNSUPPORTED_EVIDENCE`].
+pub fn read_gaf_without_evidence(path: &str, opts: &GafOpts, evidence: &[&str]) -> Result<GafRaw> {
+    let mut reader =
+        open_buf_reader(path).with_context(|| format!("failed to open GAF: {path}"))?;
     let mut gene2direct: FxHashMap<Box<str>, FxHashSet<Box<str>>> = FxHashMap::default();
     let mut n_other_objects = 0usize;
     let mut gene_aliases: FxHashMap<Box<str>, FxHashSet<Box<str>>> = FxHashMap::default();
-    for line in reader.lines() {
-        let line = line?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
         if line.starts_with('!') {
             continue;
         }
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.len() < 15 {
-            continue; // GAF 2.x has ≥15 columns
-        }
+        let Some(f) = gaf_columns(&line) else {
+            continue;
+        };
         let symbol = f[2].trim();
         let go = f[4].trim();
         if symbol.is_empty() || !go.starts_with("GO:") {
@@ -172,7 +228,8 @@ pub fn read_gaf(path: &str, opts: &GafOpts) -> Result<GafRaw> {
         if f[3].split('|').any(|q| q.trim() == "NOT") {
             continue;
         }
-        if opts.no_iea && f[6].trim() == "IEA" {
+        let code = f[6].trim();
+        if (opts.no_iea && code == "IEA") || evidence.contains(&code) {
             continue;
         }
         // Column 12 is the object type; a gene graph places proteins and
@@ -182,17 +239,17 @@ pub fn read_gaf(path: &str, opts: &GafOpts) -> Result<GafRaw> {
             n_other_objects += 1;
             continue;
         }
-        let key: Box<str> = symbol.to_uppercase().into();
-        let aliases = gene_aliases.entry(key.clone()).or_default();
-        aliases.insert(key.clone());
+        let key = upper(symbol);
+        let aliases = entry(&mut gene_aliases, &key);
+        insert_new(aliases, &key);
         let acc = f[1].trim();
         if !acc.is_empty() {
-            aliases.insert(acc.to_uppercase().into());
+            insert_new(aliases, &upper(acc));
         }
         for syn in f[10].split('|').map(str::trim).filter(|s| !s.is_empty()) {
-            aliases.insert(syn.to_uppercase().into());
+            insert_new(aliases, &upper(syn));
         }
-        gene2direct.entry(key).or_default().insert(go.into());
+        insert_new(entry(&mut gene2direct, &key), go);
     }
     if n_other_objects > 0 {
         log::info!(
@@ -206,6 +263,21 @@ pub fn read_gaf(path: &str, opts: &GafOpts) -> Result<GafRaw> {
 }
 
 impl GafRaw {
+    /// Each gene key with its identifier aliases (the key among them).
+    #[must_use]
+    pub fn gene_aliases(&self) -> &FxHashMap<Box<str>, FxHashSet<Box<str>>> {
+        &self.gene_aliases
+    }
+
+    /// Keep the genes (by key) `keep` says yes to, the rest dropped before
+    /// propagation: the terms then carry only the genes a caller can match,
+    /// and propagating them costs only theirs.
+    pub fn retain_genes(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.gene_aliases.retain(|gene, _| keep(gene));
+        let kept = &self.gene_aliases;
+        self.gene2direct.retain(|gene, _| kept.contains_key(gene));
+    }
+
     /// Reduce to the common [`GeneSets`] form. With an ontology, propagate each
     /// gene up the `is_a` + `part_of` closure (true-path rule) and pull display
     /// names; without one, keep the direct annotations only.
@@ -215,17 +287,18 @@ impl GafRaw {
             gene_aliases: self.gene_aliases,
             ..Default::default()
         };
+        // Each direct term's closure, walked once however many genes it has.
+        let mut closures: FxHashMap<&str, Vec<Box<str>>> = FxHashMap::default();
         for (gene, direct) in &self.gene2direct {
             let mut full: FxHashSet<Box<str>> = FxHashSet::default();
             for go in direct {
-                match onto {
+                let closure = closures.entry(go).or_insert_with(|| match onto {
                     Some(o) if o.contains(go) => {
-                        full.extend(o.ancestors_or_self_with_part_of(go));
+                        o.ancestors_or_self_with_part_of(go).into_iter().collect()
                     }
-                    _ => {
-                        full.insert(go.clone());
-                    }
-                }
+                    _ => vec![go.clone()],
+                });
+                full.extend(closure.iter().cloned());
             }
             for t in full {
                 gs.term_genes.entry(t).or_default().insert(gene.clone());
@@ -609,6 +682,26 @@ UniProtKB\tP33333\tBAZ\t\tGO:0000001\tPMID:3\tIEA\t\tP\tBaz protein\t\tprotein\t
         // max_members cap also drops the (2-member) term.
         let rec3 = gs.reconcile(&idx, 1, Some(1));
         assert!(rec3.term_rows.is_empty());
+    }
+
+    #[test]
+    fn gaf_evidence_and_genes_left_out() {
+        let rows = "\
+UniProtKB\tP11111\tFOO\t\tGO:0000001\tPMID:1\tIDA\t\tP\tFoo\t\tprotein\ttaxon:9606\t20200101\tUniProt\t\t\n\
+UniProtKB\tP22222\tBAR\t\tGO:0000001\tPMID:2\tNAS\t\tP\tBar\t\tprotein\ttaxon:9606\t20200101\tUniProt\t\t\n\
+UniProtKB\tP33333\tBAZ\t\tGO:0000001\tPMID:3\tIDA\t\tP\tBaz\tBAZ_ALT\tprotein\ttaxon:9606\t20200101\tUniProt\t\t\n";
+        let gaf = tmp(rows, ".gaf");
+        let mut raw =
+            read_gaf_without_evidence(gaf.path().to_str().unwrap(), &GafOpts::default(), &["NAS"])
+                .unwrap();
+        assert_eq!(raw.gene_aliases().len(), 2); // BAR's only row was NAS
+        assert!(raw.gene_aliases()["BAZ"].contains("BAZ_ALT"));
+        raw.retain_genes(|gene| gene == "BAZ");
+        let onto = Ontology::load_obo(write_go_obo().path().to_str().unwrap()).unwrap();
+        let gs = raw.into_gene_sets(Some(&onto));
+        assert_eq!(gs.n_genes(), 1);
+        assert!(gs.term_genes["GO:0000002"].contains("BAZ"));
+        assert!(!gs.term_genes["GO:0000001"].contains("FOO"));
     }
 
     #[test]
