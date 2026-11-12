@@ -1,7 +1,5 @@
 use crate::hdf5_io::*;
-use crate::sim::copula::marginals::{
-    nb_cdf_table, nb_inverse_cdf_from_table, nb_table_cap, phi, NbFit,
-};
+use crate::sim::copula::marginals::{nb_inverse_cdf, nb_table_cap, phi, NbFit};
 use crate::sim::copula::reference::open_reference;
 use crate::sim::copula::{fit_global_copula, GlobalCopulaArgs};
 use crate::sim::core as simulate;
@@ -20,7 +18,7 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
 
-use crate::sim::core::{inject_housekeeping, sample_lognormal_dictionary};
+use crate::sim::core::{inject_housekeeping, sample_lognormal_dictionary, standardized_log_topic};
 
 use crate::sim::copula::gaussian::CopulaCovariance;
 
@@ -692,7 +690,10 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
         CopulaCovariance::random_low_rank(dd, 0, &mut rng)
     } else {
         match cmd_args.batch_program {
-            BatchProgram::Empirical => fit.copula.truncate_rank(cmd_args.batch_rank),
+            BatchProgram::Empirical => fit
+                .copula
+                .truncate_rank(cmd_args.batch_rank)
+                .embed(&fit.hvg_indices, dd)?,
             BatchProgram::Random => {
                 CopulaCovariance::random_low_rank(dd, cmd_args.batch_rank, &mut rng)
             }
@@ -763,20 +764,7 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
             let normal = Normal::new(0.0_f32, 1.0_f32).unwrap();
 
             // Stage 1: t = z-scored log(β·θ); ε iid per gene.
-            let bt = &beta_dk * theta_kn.column(j);
-            let mut t_z: DVector<f32> = bt.map(|x| x.max(1e-30).ln());
-            let m_t = t_z.mean();
-            let s_t = {
-                let mut s2 = 0.0_f32;
-                for v in t_z.iter() {
-                    let d = *v - m_t;
-                    s2 += d * d;
-                }
-                (s2 / dd as f32).sqrt().max(1e-12)
-            };
-            for v in t_z.iter_mut() {
-                *v = (*v - m_t) / s_t;
-            }
+            let t_z = standardized_log_topic(&(&beta_dk * theta_kn.column(j)));
 
             let b = batch_membership[j];
             let mut log_lambda = log_mu_hat.clone();
@@ -810,12 +798,7 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
                     None => normal.sample(&mut local_rng),
                 };
                 let u = phi(z_g as f64).clamp(1e-7, 1.0 - 1e-7);
-                let table = nb_cdf_table(nb, nb_table_cap(nb));
-                let x = if table.is_empty() {
-                    0
-                } else {
-                    nb_inverse_cdf_from_table(u, &table)
-                };
+                let x = nb_inverse_cdf(u, nb, nb_table_cap(nb));
                 if x > 0 {
                     counts.push((g as u64, j as u64, x as f32));
                 }

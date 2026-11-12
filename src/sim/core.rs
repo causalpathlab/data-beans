@@ -1,6 +1,5 @@
 use indicatif::ParallelProgressIterator;
 use legume_numeric::matrix::dmatrix_io::*;
-use legume_numeric::matrix::dmatrix_util::row_membership_matrix;
 use legume_numeric::matrix::traits::*;
 use log::info;
 use rand::SeedableRng;
@@ -24,7 +23,11 @@ pub(crate) fn sample_theta_kn(
 ) -> anyhow::Result<DMatrix<f32>> {
     let runif = Uniform::new(0, kk)?;
     let k_membership: Vec<usize> = (0..nn).map(|_| runif.sample(rng)).collect();
-    let mut theta_kn: DMatrix<f32> = row_membership_matrix(k_membership)?.transpose();
+    // One-hot over all `kk` topics, including any that no cell drew.
+    let mut theta_kn = DMatrix::<f32>::zeros(kk, nn);
+    for (j, &k) in k_membership.iter().enumerate() {
+        theta_kn[(k, j)] = 1.0;
+    }
 
     let pve_topic = pve_topic.clamp(0., 1.);
     if kk > 1 && pve_topic < 1. {
@@ -148,10 +151,9 @@ pub(crate) fn inject_housekeeping(
 /// Sample Poisson count triplets from
 /// `Y(g,j) ~ Poisson( λ_scale · δ(g,B(j)) · Σ_k β(g,k) θ(k,j) )`.
 ///
-/// `lambda_scale` should be `depth / G` so that `E[Σ_g λ_{g,j}] ≈ depth`
-/// when `E[β] = E[δ] = 1` (the log-normal+PVE samplers in this module
-/// guarantee this). Library size is **emergent**, not enforced — there is
-/// no per-cell rescaling.
+/// `lambda_scale` should make `E[Σ_g λ_{g,j}] ≈ depth` for the dictionary's
+/// normalization (see [`library_scale`]). Library size is **emergent**, not
+/// enforced — there is no per-cell rescaling.
 pub(crate) fn sample_poisson_triplets(
     beta_dk: &DMatrix<f32>,
     theta_kn: &DMatrix<f32>,
@@ -171,7 +173,9 @@ pub(crate) fn sample_poisson_triplets(
         .par_bridge()
         .progress_count(nn as u64)
         .map(|(j, theta_j)| {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(rseed + seed_offset + j as u64);
+            let mut rng = rand::rngs::StdRng::seed_from_u64(
+                rseed.wrapping_add(seed_offset).wrapping_add(j as u64),
+            );
 
             let lambda_j = if has_batch {
                 let b = batch_membership[j];
@@ -200,6 +204,56 @@ pub(crate) fn sample_poisson_triplets(
         })
         .flatten()
         .collect()
+}
+
+/// `λ_scale` that makes `depth` the expected library size of a cell.
+///
+/// The flat log-normal dictionary has `E[β_{g,k}] = 1`, so a topic's column
+/// sums to about `G` and the scale is `depth / G`. The hierarchical dictionary
+/// is a partition of one probability simplex — all `G × K` leaf entries sum to
+/// 1, a leaf column to about `1/K` — so the scale is `depth · K`.
+pub(crate) fn library_scale(depth: usize, dd: usize, kk: usize, hierarchical: bool) -> f32 {
+    if hierarchical {
+        depth as f32 * kk as f32
+    } else {
+        depth as f32 / dd as f32
+    }
+}
+
+/// Stage-1 topic term of the reference-mode samplers: `log(β·θ)_g` z-scored
+/// across features, for one cell. Features with no topic loading
+/// (`(β·θ)_g = 0`, e.g. an all-zero dictionary row) carry no topic term: they
+/// get 0 and are left out of the mean and SD, so they do not set the scale of
+/// the features that do vary.
+pub(crate) fn standardized_log_topic(bt: &DVector<f32>) -> DVector<f32> {
+    let mut t_z = DVector::<f32>::zeros(bt.len());
+    let mut n_pos = 0usize;
+    let mut sum = 0.0_f32;
+    for (t, &x) in t_z.iter_mut().zip(bt.iter()) {
+        if x > 0.0 {
+            *t = x.max(1e-30).ln();
+            sum += *t;
+            n_pos += 1;
+        }
+    }
+    if n_pos == 0 {
+        return t_z;
+    }
+    let m_t = sum / n_pos as f32;
+    let mut s2 = 0.0_f32;
+    for (&t, &x) in t_z.iter().zip(bt.iter()) {
+        if x > 0.0 {
+            let d = t - m_t;
+            s2 += d * d;
+        }
+    }
+    let s_t = (s2 / n_pos as f32).sqrt().max(1e-12);
+    for (t, &x) in t_z.iter_mut().zip(bt.iter()) {
+        if x > 0.0 {
+            *t = (*t - m_t) / s_t;
+        }
+    }
+    t_z
 }
 
 pub struct SimArgs {
@@ -243,12 +297,12 @@ pub struct SimOut {
 /// ```text
 /// log β_{g,k} = σ_β · [√π_topic · u_{g,k} + √(1−π_topic) · v_g] − σ_β² / 2
 /// log δ_{g,b} = √π_batch · z_{g,b} + √(1−π_batch) · w_g
-/// λ_{g,j}    = (depth / G) · δ_{g, B(j)} · Σ_k β_{g,k} θ_{k,j}
+/// λ_{g,j}    = λ_scale · δ_{g, B(j)} · Σ_k β_{g,k} θ_{k,j}
 /// y_{g,j}    ~ Poisson(λ_{g,j})
 /// ```
 ///
-/// `depth` is the **expected** library size (emergent — no per-cell
-/// rescaling). `pve_topic` and `pve_batch` are independent variance shares
+/// `λ_scale` comes from [`library_scale`], so `depth` is the **expected**
+/// library size (emergent — no per-cell rescaling). `pve_topic` and `pve_batch` are independent variance shares
 /// in log space — both can be 1 simultaneously.
 pub fn generate_factored_poisson_gamma_data(args: &SimArgs) -> anyhow::Result<SimOut> {
     let nn = args.cols;
@@ -303,7 +357,7 @@ pub fn generate_factored_poisson_gamma_data(args: &SimArgs) -> anyhow::Result<Si
     let theta_kn = sample_theta_kn(kk, nn, pve_topic, &mut rng)?;
 
     // 5. emergent-library Poisson sampling
-    let lambda_scale = (args.depth as f32) / (dd as f32);
+    let lambda_scale = library_scale(args.depth, dd, kk, args.hierarchical_depth.is_some());
     let delta_ref = if bb > 1 { Some(&delta_db) } else { None };
     let triplets = sample_poisson_triplets(
         &beta_dk,
@@ -316,7 +370,7 @@ pub fn generate_factored_poisson_gamma_data(args: &SimArgs) -> anyhow::Result<Si
     );
 
     info!(
-        "sampled Poisson data with {} non-zero elements (λ_scale = depth/G = {:.4})",
+        "sampled Poisson data with {} non-zero elements (λ_scale = {:.4})",
         triplets.len(),
         lambda_scale,
     );
@@ -420,4 +474,114 @@ pub(crate) fn generate_hierarchical_dictionary(
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sim_args() -> SimArgs {
+        SimArgs {
+            rows: 400,
+            cols: 300,
+            depth: 1000,
+            factors: 4,
+            batches: 1,
+            beta_scale: 1.0,
+            pve_topic: 1.0,
+            pve_batch: 1.0,
+            rseed: 11,
+            hierarchical_depth: None,
+            n_housekeeping: 0,
+            housekeeping_fold: 10.0,
+        }
+    }
+
+    fn mean_library(triplets: &[(u64, u64, f32)], n_cells: usize) -> f32 {
+        triplets.iter().map(|&(_, _, v)| v).sum::<f32>() / n_cells as f32
+    }
+
+    /// θ keeps one row per topic even when far fewer cells than topics are
+    /// drawn, so some topics are never anyone's dominant topic.
+    #[test]
+    fn theta_has_a_row_for_every_topic() -> anyhow::Result<()> {
+        for seed in 0..20u64 {
+            for &pve in &[1.0_f32, 0.5] {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                let theta = sample_theta_kn(8, 3, pve, &mut rng)?;
+                assert_eq!(theta.shape(), (8, 3), "seed {seed}, pve {pve}");
+                for j in 0..3 {
+                    let s: f32 = theta.column(j).sum();
+                    assert!((s - 1.0).abs() < 1e-5, "column {j} sums to {s}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Few cells, many topics: the last topic is routinely undrawn and the
+    /// run still completes with a full-width θ.
+    #[test]
+    fn few_cells_many_topics_simulates() -> anyhow::Result<()> {
+        for seed in 0..10u64 {
+            let args = SimArgs {
+                rows: 50,
+                cols: 4,
+                factors: 6,
+                pve_topic: 0.7,
+                rseed: seed,
+                ..sim_args()
+            };
+            let out = generate_factored_poisson_gamma_data(&args)?;
+            assert_eq!(out.theta_kn.shape(), (6, 4));
+        }
+        Ok(())
+    }
+
+    /// `depth` is the expected library size in both dictionary modes.
+    #[test]
+    fn depth_is_the_expected_library_size() -> anyhow::Result<()> {
+        for hierarchical_depth in [None, Some(3)] {
+            let args = SimArgs {
+                hierarchical_depth,
+                ..sim_args()
+            };
+            let out = generate_factored_poisson_gamma_data(&args)?;
+            let lib = mean_library(&out.triplets, args.cols);
+            assert!(
+                (lib - 1000.0).abs() < 200.0,
+                "hierarchical_depth {hierarchical_depth:?}: mean library {lib}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A seed at the top of the u64 range wraps instead of overflowing.
+    #[test]
+    fn per_cell_seed_wraps() {
+        let beta = DMatrix::<f32>::from_element(5, 2, 1.0);
+        let theta = DMatrix::<f32>::from_element(2, 3, 0.5);
+        let trips = sample_poisson_triplets(&beta, &theta, None, &[0, 0, 0], 3.0, u64::MAX, 7);
+        assert!(!trips.is_empty());
+    }
+
+    /// Features with a zero rate get no topic term and do not enter the
+    /// z-score of the features that have one.
+    #[test]
+    fn log_topic_standardizes_over_loaded_features_only() {
+        let loaded = [0.2_f32, 0.5, 1.0, 4.0];
+        let mut padded = loaded.to_vec();
+        padded.extend([0.0; 12]);
+        let dense = standardized_log_topic(&DVector::from_row_slice(&loaded));
+        let sparse = standardized_log_topic(&DVector::from_row_slice(&padded));
+        for g in 0..loaded.len() {
+            assert!((dense[g] - sparse[g]).abs() < 1e-6, "feature {g}");
+        }
+        assert!(sparse.iter().skip(loaded.len()).all(|&t| t == 0.0));
+        let var: f32 = dense.iter().map(|t| t * t).sum::<f32>() / loaded.len() as f32;
+        assert!((var - 1.0).abs() < 1e-4, "unit variance, got {var}");
+        assert!(standardized_log_topic(&DVector::zeros(3))
+            .iter()
+            .all(|&t| t == 0.0));
+    }
 }

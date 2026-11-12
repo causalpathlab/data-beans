@@ -160,7 +160,9 @@ enum Commands {
                       Ground truth is M[G,P].\n\
                       \n\
                       Reference mode uses `--reference-rna` or `--reference-atac`.\n\
-                      Each modality gets a two-stage GLM, with NB+copula PIT sampling.\n\
+                      Each modality with a reference gets a two-stage GLM,\n\
+                      with NB+copula PIT sampling.\n\
+                      A modality without one keeps its synthetic step.\n\
                       A normalized {topic, noise, batch} budget weights the log-rate;\n\
                       there is no cis term.\n\
                       Reference row counts override --n-genes and --n-peaks.\n\

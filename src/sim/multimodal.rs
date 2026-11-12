@@ -138,18 +138,25 @@ pub fn generate_multimodal_data(args: &MultimodalSimArgs) -> anyhow::Result<Mult
         DMatrix::from_fn(kk, dd, |_, _| normal.sample(&mut rng))
     };
 
-    // 4. Housekeeping: set first n_housekeeping columns of W_base to uniform high values
+    // 4. Housekeeping: the first n_housekeeping genes sit `housekeeping_fold`
+    //    times above a topic's mean gene, in every topic. The dictionary is a
+    //    softmax of these logits, so a fold is `ln(fold)` over the topic's
+    //    log-mean-exp logit.
     let mut w_base_kd = w_base_kd;
     if args.n_housekeeping > 0 && args.n_housekeeping < dd {
-        let hk_val = args.housekeeping_fold * args.base_scale;
-        for d in 0..args.n_housekeeping {
-            for k in 0..kk {
+        let ln_fold = args.housekeeping_fold.max(eps).ln();
+        for k in 0..kk {
+            let row = w_base_kd.row(k);
+            let maxv = row.max();
+            let mean_exp = row.iter().map(|&w| (w - maxv).exp()).sum::<f32>() / dd as f32;
+            let hk_val = maxv + mean_exp.ln() + ln_fold;
+            for d in 0..args.n_housekeeping {
                 w_base_kd[(k, d)] = hk_val;
             }
         }
         info!(
-            "injected {} housekeeping genes with logit value {:.2}",
-            args.n_housekeeping, hk_val
+            "injected {} housekeeping genes at {:.1}× the mean gene of each topic",
+            args.n_housekeeping, args.housekeeping_fold
         );
     }
 
@@ -244,4 +251,55 @@ pub fn generate_multimodal_data(args: &MultimodalSimArgs) -> anyhow::Result<Mult
         batch_membership,
         triplets,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(hierarchical_depth: Option<usize>) -> MultimodalSimArgs {
+        MultimodalSimArgs {
+            rows: 500,
+            cols: 20,
+            depth_per_modality: vec![1000, 500],
+            factors: 4,
+            batches: 1,
+            base_scale: 1.0,
+            delta_scale: 1.0,
+            n_delta_features: 5,
+            pve_topic: 1.0,
+            pve_batch: 1.0,
+            rseed: 3,
+            shared_batch_effects: false,
+            hierarchical_depth,
+            beta_scale: 1.0,
+            n_housekeeping: 10,
+            housekeeping_fold: 10.0,
+        }
+    }
+
+    /// `housekeeping_fold` is a fold change over the mean gene of a topic,
+    /// the same in every topic, and the housekeeping genes stay a minority
+    /// of the library.
+    #[test]
+    fn housekeeping_fold_is_a_fold_change() -> anyhow::Result<()> {
+        for hierarchical_depth in [None, Some(3)] {
+            let a = args(hierarchical_depth);
+            let out = generate_multimodal_data(&a)?;
+            let beta = &out.beta_dk[0];
+            for k in 0..beta.ncols() {
+                let hk_mass: f32 = (0..a.n_housekeeping).map(|d| beta[(d, k)]).sum();
+                let other_mean = (1.0 - hk_mass) / (a.rows - a.n_housekeeping) as f32;
+                assert!(hk_mass < 0.5, "topic {k}: housekeeping mass {hk_mass}");
+                for d in 0..a.n_housekeeping {
+                    let fold = beta[(d, k)] / other_mean;
+                    assert!(
+                        (5.0..20.0).contains(&fold),
+                        "{hierarchical_depth:?} topic {k} gene {d}: fold {fold}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
