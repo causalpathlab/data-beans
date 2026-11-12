@@ -37,6 +37,10 @@ impl SparseIoVec {
         data_name: Option<Box<str>>,
         barcode_suffix: Option<&str>,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.column_scales.is_none(),
+            "push after set_column_scales: the new columns would have no scale"
+        );
         let Some(ncol_data) = data.num_columns() else {
             return Err(anyhow::anyhow!("data file has no columns"));
         };

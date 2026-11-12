@@ -30,6 +30,14 @@ fn remap_row(
 }
 
 impl SparseIoVec {
+    /// The factor reads divide global column `glob` by: 1 when no scales
+    /// are set, and IEEE division by 1 is exact, so such reads are the
+    /// counts as stored.
+    #[inline]
+    fn scale_of(&self, glob: usize) -> f32 {
+        self.column_scales.as_ref().map_or(1.0, |s| s[glob])
+    }
+
     ////////////////////
     // access columns //
     ////////////////////
@@ -49,6 +57,7 @@ impl SparseIoVec {
     ) -> anyhow::Result<()> {
         let off = *col_offset as u64;
         let g2c = self.global_to_compact_row.as_slice();
+        let scale = self.scale_of(glob);
         for source in self.col_to_data[glob].iter() {
             let didx = source.backend as usize;
             let loc = source.local_col as usize;
@@ -56,7 +65,7 @@ impl SparseIoVec {
             let l2g = self.data_local_to_global_row[didx].as_slice();
             for (i, _j, v) in loc_triplets {
                 if let Some(c) = g2c[l2g[i as usize]] {
-                    triplets.push((c as u64, off, v));
+                    triplets.push((c as u64, off, v / scale));
                 }
             }
         }
@@ -91,6 +100,7 @@ impl SparseIoVec {
         let ncol = cells.len();
         let chunk = chunk_cols.max(1);
         let g2c = self.global_to_compact_row.as_slice();
+        let scale: Vec<f32> = cells.iter().map(|&g| self.scale_of(g)).collect();
 
         for slab_start in (0..ncol).step_by(chunk) {
             let slab_end = (slab_start + chunk).min(ncol);
@@ -132,13 +142,13 @@ impl SparseIoVec {
                         }
                     }
                     for ((r, c), v) in acc {
-                        f(r, c, v);
+                        f(r, c, v / scale[c as usize]);
                     }
                 } else {
                     for (i, j, v) in group_triplets {
                         if let Some(c) = g2c[l2g[i as usize]] {
-                            let out_col = group[j as usize].1 as u64;
-                            f(c as u64, out_col, v);
+                            let out_col = group[j as usize].1;
+                            f(c as u64, out_col as u64, v / scale[out_col]);
                         }
                     }
                 }
@@ -284,7 +294,7 @@ impl SparseIoVec {
         let mut values: Vec<f32> = Vec::with_capacity(total_nnz);
         col_offsets.push(0);
 
-        for bucket in &mut buckets {
+        for (out_col, bucket) in buckets.iter_mut().enumerate() {
             // Canonical CSC requires within-column row indices sorted
             // ascending AND unique. On-disk indices are sorted by local
             // row, but two sources can land on the same compact row:
@@ -314,9 +324,11 @@ impl SparseIoVec {
                 }
                 bucket.truncate(write);
             }
+            // Divided after the duplicates are summed: one factor per column.
+            let scale = self.scale_of(cells[out_col]);
             for &(r, v) in bucket.iter() {
                 row_indices.push(r as usize);
-                values.push(v);
+                values.push(v / scale);
             }
             col_offsets.push(row_indices.len());
         }
@@ -395,8 +407,7 @@ impl SparseIoVec {
                     continue;
                 }
                 let out_row = local_to_out[i as usize] as u64;
-                let out_col = mapped as u64;
-                triplets.push((out_row, out_col, v));
+                triplets.push((out_row, mapped as u64, v / self.scale_of(mapped)));
             }
         }
 

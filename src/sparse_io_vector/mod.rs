@@ -23,6 +23,7 @@ mod groups;
 mod matched;
 mod push;
 mod read;
+pub mod scales;
 
 /// Where a single global cell's nonzeros come from in one of the
 /// underlying [`SparseIo`] backends. Under
@@ -165,6 +166,9 @@ pub struct SparseIoVec {
     /// thus stay separate, while the same name + same suffix (same
     /// modality across donors) still merges. `None` = no suffixing.
     per_backend_row_suffix: Option<Vec<Box<str>>>,
+    /// Per global column, the factor every read divides it by
+    /// ([`Self::set_column_scales`]). `None` reads the counts as stored.
+    column_scales: Option<Vec<f32>>,
 }
 
 /// Strategy for aligning row names across multiple pushed backends.
@@ -209,6 +213,8 @@ pub struct TripletsMatched {
     pub distances: Vec<f32>,
 }
 
+/// The backend pushed `idx`-th, as stored: reads through it bypass the row
+/// alignment and the column scales ([`SparseIoVec::set_column_scales`]).
 impl Index<usize> for SparseIoVec {
     type Output = Arc<SparseData>;
     fn index(&self, idx: usize) -> &Self::Output {
@@ -249,6 +255,7 @@ impl SparseIoVec {
             column_alignment: ColumnAlignment::default(),
             column_canonicalizer: None,
             per_backend_row_suffix: None,
+            column_scales: None,
         }
     }
 
@@ -543,6 +550,14 @@ impl SparseIoVec {
         }
         self.col_to_data = new_col_to_data;
         self.column_names_with_data_tag = new_names;
+        if let Some(scales) = self.column_scales.as_mut() {
+            *scales = scales
+                .iter()
+                .zip(keep)
+                .filter(|(_, &k)| k)
+                .map(|(&v, _)| v)
+                .collect();
+        }
 
         // Remap data_to_cols in place. It is a positional
         // local-col → global-col map per backend (consumed by
