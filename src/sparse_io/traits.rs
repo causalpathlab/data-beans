@@ -17,7 +17,7 @@ use super::index_audit;
 use super::meta::Metadata;
 use anyhow::Context;
 
-use crate::column_subset::{stream_csc_selection, RowRemap};
+use crate::column_subset::{stream_csc_selection, RowMap};
 use crate::sparse_data_visitors::styled_progress_bar;
 use clap::ValueEnum;
 use indicatif::ParallelProgressIterator;
@@ -592,13 +592,10 @@ pub trait SparseIo: Sync + Send {
             Some(cols) => cols.clone(),
             None => (0..ncol_data).collect(),
         };
-        let row_remap = rows
-            .map(|rs| RowRemap::from_selection(rs, nrow_data))
-            .transpose()?;
-        let new_nrow = rows.map_or(nrow_data, Vec::len);
+        let row_map = rows.map(|rs| RowMap::keeping(rs, nrow_data)).transpose()?;
 
         replace_backend_content(self, "subset_tmp", |data, out| {
-            stream_csc_selection(data, &old_cols, row_remap.as_ref(), new_nrow, out)?;
+            stream_csc_selection(data, &old_cols, row_map.as_ref(), out)?;
             out.register_row_names_vec(&new_row_names);
             out.register_column_names_vec(&new_col_names);
             Ok(())
@@ -658,17 +655,14 @@ pub trait SparseIo: Sync + Send {
 
         let new_col_names = self.column_names()?;
         let old_cols: Vec<usize> = (0..ncol).collect();
-        let row_remap = RowRemap::new(map);
+        let row_map = RowMap {
+            to: map,
+            nrow: row_names_order.len(),
+        };
 
         info!("remapping triplets ...");
         replace_backend_content(self, "reorder_tmp", |data, out| {
-            stream_csc_selection(
-                data,
-                &old_cols,
-                Some(&row_remap),
-                row_names_order.len(),
-                out,
-            )?;
+            stream_csc_selection(data, &old_cols, Some(&row_map), out)?;
             out.register_row_names_vec(row_names_order);
             out.register_column_names_vec(&new_col_names);
             Ok(())
