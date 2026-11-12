@@ -362,6 +362,40 @@ fn unnamed_outputs_go_to_the_results_folder_and_the_records() {
     assert!(readme.contains("the test's fixture"));
 }
 
+/// A server keeping no results folder shows the figure `true` asks for
+/// without keeping it.
+#[test]
+fn a_figure_is_shown_where_no_results_folder_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    backend(dir.path());
+    let off = Path::new("off");
+    let mut c = Client::start_with(
+        dir.path(),
+        &[("LEGUME_MCP_WATCH", off), ("LEGUME_MCP_RECORDS", off)],
+    );
+    c.request("initialize", json!({ "protocolVersion": "2025-06-18" }));
+    for (tool, args) in [
+        ("qc", json!({ "data": "base.zarr.zip", "figure": true })),
+        (
+            "statistics",
+            json!({ "data": ["base.zarr.zip"], "axis": "rows", "figure": true }),
+        ),
+    ] {
+        let r = c.request("tools/call", json!({ "name": tool, "arguments": args }));
+        let r = &r["result"];
+        assert_eq!(r["isError"], false, "{r}");
+        assert!(r["structuredContent"].get("figure").is_none(), "{r}");
+        let images = r["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["type"] == "image")
+            .count();
+        assert_eq!(images, 1, "{r}");
+    }
+    assert!(!dir.path().join("results").exists());
+}
+
 #[test]
 fn a_write_in_the_background_returns_a_job_that_writes_it() {
     let (dir, mut c) = setup();
@@ -434,6 +468,29 @@ fn a_write_in_the_background_returns_a_job_that_writes_it() {
     );
     wait(&mut c, &first["job"]);
     assert!(again.is_err(), "{again:?}");
+
+    // Once a job has ended its name is no longer spoken for: what it wrote
+    // names the next step, and an `out` named after it is free.
+    let next = c
+        .call(
+            "subsample",
+            json!({ "data": jobs[0]["written"], "cells": 2 }),
+        )
+        .unwrap();
+    assert!(
+        next["written"]
+            .as_str()
+            .unwrap()
+            .ends_with("base.subset.subsample.zarr.zip"),
+        "{next}"
+    );
+    let after = c
+        .call(
+            "subsample",
+            json!({ "data": "base.zarr.zip", "cells": 2, "out": "genes.drawn" }),
+        )
+        .unwrap();
+    assert_eq!(after["info"]["columns"], 2, "{after}");
 
     // Split's halves are named up front.
     let started = c
