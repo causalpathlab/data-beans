@@ -169,3 +169,24 @@ fn dimension_and_count_mismatches_are_refused() -> anyhow::Result<()> {
     assert!(retrieval_impute(&query, &short_ref, &ref_data, &cfg).is_err());
     Ok(())
 }
+
+#[test]
+fn zero_neighbours_are_refused() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ref_latent = Mat::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]);
+    let triplets: Vec<(u64, u64, f32)> = vec![(0, 0, 5.0), (1, 1, 7.0)];
+    let ref_data = make_ref_data(&dir, &triplets, 2, 2)?;
+    let query_latent = Mat::from_row_slice(1, 2, &[1.0, 0.0]);
+    let result = retrieval_impute(
+        &query_latent,
+        &ref_latent,
+        &ref_data,
+        &RetrievalImputeConfig {
+            knn: 0,
+            temperature: 1.0,
+            chunk: 64,
+        },
+    );
+    assert!(result.is_err());
+    Ok(())
+}

@@ -64,6 +64,7 @@ pub fn retrieval_impute(
         k_query == k_ref,
         "latent dimension mismatch: query K={k_query} vs reference K={k_ref}"
     );
+    anyhow::ensure!(cfg.knn >= 1, "knn must be at least 1");
     anyhow::ensure!(n_ref > 0, "reference latent has no rows");
     anyhow::ensure!(
         ref_data.num_columns() == n_ref,
@@ -128,6 +129,19 @@ pub fn retrieval_impute(
         warn!(
             "{n_skipped} of {n_query} query rows have a zero latent and were skipped; \
              their imputed rows stay zero"
+        );
+    }
+    // The index may return fewer neighbours than asked for (an approximate
+    // search has a fixed candidate budget); the weights are then spread over
+    // the ones it did return.
+    let n_short = neighbours
+        .iter()
+        .filter(|n| !n.ids.is_empty() && n.ids.len() < knn)
+        .count();
+    if n_short > 0 {
+        warn!(
+            "{n_short} of {n_query} query rows got fewer than the {knn} neighbours \
+             asked for; they pool the neighbours the index returned"
         );
     }
 

@@ -105,8 +105,9 @@ pub struct HvgCliArgs {
         // differs by command and "keep top N genes" reads as a hard subset
         // everywhere — which is wrong for senna, where every gene is still trained.
         help = "Top N variable genes; 0 = all",
-        long_help = "Select the top N genes by binned residual variance.\n\
-                     The method is scanpy/Seurat-style.\n\
+        long_help = "Select the top N genes by excess dispersion.\n\
+                     A negative-binomial dispersion trend is fit against the mean,\n\
+                     and genes are ranked by their dispersion above that trend.\n\
                      Collapsing and batch-effect estimation still see all genes.\n\
                      0 disables HVG selection.\n\
                      \n\
