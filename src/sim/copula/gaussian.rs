@@ -98,10 +98,12 @@ impl CopulaCovariance {
         Ok(Self { factor, ridge_sd })
     }
 
-    /// Per-batch log shifts of the reference means, `scale · z_b` with one
-    /// draw `z_b` per batch. A shift is a batch effect only as a contrast
-    /// between batches: with fewer than two batches every shift is zero, so
-    /// the simulated means stay the reference's.
+    /// Per-batch log shifts of the reference means: one draw `z_b` per
+    /// batch, centred across batches per gene, so the shifts of a gene sum to
+    /// zero and only the contrast between batches remains. Each shift is
+    /// rescaled by `√(B/(B−1))` to keep the variance `scale²` that centring
+    /// would otherwise shrink. With fewer than two batches there is nothing
+    /// to contrast and every shift is zero.
     pub fn sample_batch_shifts<R: Rng + ?Sized>(
         &self,
         n_batches: usize,
@@ -111,8 +113,16 @@ impl CopulaCovariance {
         if n_batches < 2 {
             return vec![DVector::zeros(self.dim()); n_batches];
         }
-        (0..n_batches)
-            .map(|_| self.sample(rng).scale(scale))
+        let draws: Vec<DVector<f32>> = (0..n_batches).map(|_| self.sample(rng)).collect();
+        let b = n_batches as f32;
+        let mean = draws
+            .iter()
+            .fold(DVector::zeros(self.dim()), |acc, z| acc + z)
+            / b;
+        let contrast_scale = scale * (b / (b - 1.0)).sqrt();
+        draws
+            .into_iter()
+            .map(|z| (z - &mean).scale(contrast_scale))
             .collect()
     }
 
@@ -241,7 +251,8 @@ mod tests {
     }
 
     /// One batch has no other batch to differ from, so its shift is zero;
-    /// with several, each batch gets its own draw at the requested scale.
+    /// with several, each batch gets its own shift at the requested scale,
+    /// and a gene's shifts sum to zero.
     #[test]
     fn batch_shifts_are_contrasts_between_batches() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(3);
@@ -260,6 +271,9 @@ mod tests {
             let var = shift.iter().map(|v| v * v).sum::<f32>() / shift.len() as f32;
             assert!((var - 0.25).abs() < 0.05, "shift variance {var}");
         }
+        // The shifts of each gene cancel across batches.
+        let total = &three[0] + &three[1] + &three[2];
+        assert!(total.iter().all(|v| v.abs() < 1e-5));
         assert!(cov.sample_batch_shifts(0, 1.0, &mut rng).is_empty());
     }
 

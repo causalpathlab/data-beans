@@ -85,7 +85,8 @@ enum Commands {
                       where t is z-scored log(β·θ) per cell. β is drawn as in synthetic mode,\n\
                       and ε is iid N(0, 1). z_{g,b} comes from the gene-gene copula factor,\n\
                       at rank `--batch-rank`, on axes chosen by `--batch-program`.\n\
-                      With one batch there is no shift: the means are the reference's.\n\
+                      z is centred across batches per gene. With one batch there is no shift:\n\
+                      the means are the reference's.\n\
                       \n\
                       `--depth` is reinterpreted as a multiplicative scale.\n\
                       Library size then matches the reference's mean. This follows the scDesign,\n\

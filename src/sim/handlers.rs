@@ -107,7 +107,8 @@ pub struct RunSimulateArgs {
         help = "Expected library size E[Σ_g Y(g,j)] per cell",
         long_help = "Expected library size E[Σ_g Y(g,j)] per cell. It is emergent;\n\
                      nothing is rescaled per cell.\n\
-                     In synthetic mode it enters as λ_scale = depth/G.\n\
+                     In synthetic mode it enters as λ_scale = depth/G, or depth·K with\n\
+                     `--hierarchical-depth`, whose dictionary sums to 1 over all genes and topics.\n\
                      In reference mode it scales the per-gene mean μ̂_g."
     )]
     pub depth: usize,
@@ -156,7 +157,8 @@ pub struct RunSimulateArgs {
                      \n\
                      In reference mode the reference's per-gene mean is the baseline:\n\
                      \x20 log δ(g,b) = √π_batch·z(g,b)\n\
-                     with two or more batches, and no shift with one."
+                     with two or more batches, z centred across batches per gene,\n\
+                     and no shift with one."
     )]
     pub pve_batch: f32,
 
@@ -419,7 +421,8 @@ fn build_and_write_backend(
 /// Simulate log-normal factored count data.
 ///
 /// Without `--reference`: pure log-normal · Poisson model
-/// `y(g,j) ~ Poisson( (depth/G) · δ(g,B(j)) · Σ_k β(g,k) θ(k,j) )` with
+/// `y(g,j) ~ Poisson( λ_scale · δ(g,B(j)) · Σ_k β(g,k) θ(k,j) )`, λ_scale
+/// from [`crate::sim::core::library_scale`], with
 /// log β decomposed into topic-specific + topic-invariant components by
 /// `pve_topic`, and log δ decomposed into batch-specific + batch-invariant
 /// by `pve_batch`. Library size is emergent.

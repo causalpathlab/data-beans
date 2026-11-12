@@ -1076,10 +1076,11 @@ fn sample_with_reference(
     }
 
     // Normalize the {topic, noise, batch} budget to a simplex (reference mode has
-    // no cis path); √π_x are the standardized-component coefficients.
+    // no cis path); √π_x are the standardized-component coefficients. One
+    // batch has no batch effect, so it takes no share of the budget.
     let bt = pve_topic.max(0.0);
     let bn = pve_noise.max(0.0);
-    let bbt = pve_batch.max(0.0);
+    let bbt = if bb > 1 { pve_batch.max(0.0) } else { 0.0 };
     let bsum = (bt + bn + bbt).max(1e-12);
     let (pi_topic, pi_noise, pi_batch) = (bt / bsum, bn / bsum, bbt / bsum);
     let alpha_topic = pi_topic.sqrt();
