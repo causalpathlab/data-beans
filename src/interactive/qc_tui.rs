@@ -64,6 +64,8 @@ pub struct QcView {
     images: bool,
     detecting: bool,
     plots: [PlotImage; 2],
+    /// How many cells, and genes, the rules keep now.
+    kept: (usize, usize),
 }
 
 /// Colours of the text histogram's layers, back to front.
@@ -75,6 +77,7 @@ impl QcView {
     /// `suggest`, say `pbmc.qc`).
     pub fn new(rules: CellRules, name: &str, output: Option<String>, suggest: &str) -> Self {
         Self {
+            kept: kept(&rules),
             rules,
             name: name.into(),
             output,
@@ -118,10 +121,13 @@ impl QcView {
         self.rules.rules()[self.focus]
     }
 
+    /// After a key that may have moved a rule or the selection: the
+    /// figures are drawn again and the kept cells and genes counted again.
     fn changed(&mut self) {
         for p in &mut self.plots {
             p.invalidate();
         }
+        self.kept = kept(&self.rules);
     }
 
     /// Ask the terminal attached now for images, once per attach.
@@ -214,13 +220,14 @@ impl QcView {
                 buf.pop();
             }
             KeyCode::Enter => match self.typing.take() {
+                // `inf` and `1e39` parse too, and are no edge on an axis.
                 Some(Typing::Edge(text)) => match text.trim().parse::<f32>() {
-                    Ok(v) => {
+                    Ok(v) if v.is_finite() => {
                         let rule = self.rule();
                         self.rules.set_value(rule, v);
                         self.changed();
                     }
-                    Err(_) => {
+                    _ => {
                         self.note = Some(Line::from(Span::styled(
                             format!(" not a number: {text}"),
                             HIGHLIGHT,
@@ -305,8 +312,8 @@ impl QcView {
             ]));
         }
         let v = self.rules.verdicts();
-        let (cells, kept) = (v.train_keep.len(), self.rules.kept_cells().len());
-        let (genes, kept_genes) = (v.feature_keep.len(), self.rules.kept_genes().len());
+        let (cells, genes) = (v.train_keep.len(), v.feature_keep.len());
+        let (kept, kept_genes) = self.kept;
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::raw("  kept "),
@@ -569,15 +576,17 @@ fn braille_scatter(buf: &mut Buffer, area: Rect, rules: &CellRules) {
     }
     let accent = Style::reset().fg(ACCENT);
     let dim = Style::reset().add_modifier(ratatui::style::Modifier::DIM);
-    // Edges first; dots drawn over them.
+    // Edges first; dots drawn over them. An edge off the axis (a floor
+    // given as `inf`) is drawn at its end.
+    let within = |f: f64| f.clamp(0.0, 1.0);
     if let Some(e) = ce {
-        let x = sx + (xa.frac(e as f64) * (sw - 1) as f64).round() as u16;
+        let x = sx + (within(xa.frac(e as f64)) * (sw - 1) as f64).round() as u16;
         for y in area.y..area.y + sh {
             buf[(x, y)].set_symbol("┊").set_style(accent);
         }
     }
     if let Some(e) = ge {
-        let y = area.y + sh - 1 - (ya.frac(e as f64) * (sh - 1) as f64).round() as u16;
+        let y = area.y + sh - 1 - (within(ya.frac(e as f64)) * (sh - 1) as f64).round() as u16;
         for x in sx..sx + sw {
             buf[(x, y)].set_symbol("┄").set_style(accent);
         }
@@ -836,10 +845,21 @@ impl Screen for QcView {
         Some(format!(
             "qc {}: keeps {} of {} cells",
             self.name,
-            self.rules.kept_cells().len(),
+            self.kept.0,
             self.rules.verdicts().train_keep.len()
         ))
     }
+}
+
+/// How many cells, and genes, `rules` keep: the lengths of
+/// [`CellRules::kept_cells`] and [`CellRules::kept_genes`], counted without
+/// listing them.
+fn kept(rules: &CellRules) -> (usize, usize) {
+    let kept = |removed: &[bool]| removed.iter().filter(|&&r| !r).count();
+    (
+        kept(rules.removed(Rule::Genes)),
+        kept(rules.removed(Rule::GeneCells)),
+    )
 }
 
 /// A backend's name without its extension: `pbmc` of `pbmc.zarr.zip`.
