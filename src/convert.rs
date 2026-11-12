@@ -90,6 +90,15 @@ pub fn write_10x_matrix(
     if let Some(keep_rows) = &keep_rows {
         keep.retain(|&i| keep_rows[i]);
     }
+    if keep.is_empty() && nrows > 0 {
+        let types: std::collections::BTreeSet<&str> =
+            row_types.iter().flatten().map(|t| t.as_ref()).collect();
+        anyhow::bail!(
+            "none of the {nrows} rows is kept (select `{select_row_type}`, remove \
+             `{remove_row_type}`); the file's feature types are {types:?}. Name the \
+             types to keep with --select-row-type"
+        );
+    }
     // The other rows leave the triplets before anything is written.
     if keep.len() < nrows {
         info!("Keeping {} of {nrows} rows", keep.len());
@@ -369,11 +378,61 @@ pub fn convert_zarr_to_backend(zarr_file: &str, output: &str) -> anyhow::Result<
     })
 }
 
+/// The backend cached at `converted`, when it is there and whole: it opens
+/// and knows its shape. `None` for a missing or unusable one.
+fn cached_conversion(converted: &str) -> Option<Box<dyn SparseIo<IndexIter = Vec<usize>>>> {
+    if !std::path::Path::new(converted).exists() {
+        return None;
+    }
+    let data = open_sparse_matrix(converted, &SparseIoBackend::Zarr).ok()?;
+    let whole =
+        data.num_rows().is_some() && data.num_columns().is_some() && data.num_non_zeros().is_some();
+    whole.then_some(data)
+}
+
+/// Where a conversion cached as `{base}.db.zarr` is built: a sibling no
+/// other conversion writes to, in this process or another, so the cache
+/// path only ever holds a finished backend.
+fn staged_conversion(base: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NTH: AtomicUsize = AtomicUsize::new(0);
+    format!(
+        "{base}.db.partial-{}-{}.zarr",
+        std::process::id(),
+        NTH.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Move the backend built at `staged` to the cache path `converted`, in one
+/// rename. A usable cache already there is another conversion of the same
+/// input that finished first; it stays and `staged` is dropped. An unusable
+/// one is replaced.
+fn install_conversion(staged: &str, converted: &str) -> anyhow::Result<()> {
+    if cached_conversion(converted).is_none() {
+        remove_file(converted)?;
+        match std::fs::rename(staged, converted) {
+            Ok(()) => return Ok(()),
+            // Lost the race to a conversion that renamed in between.
+            Err(_) if std::path::Path::new(converted).exists() => {}
+            Err(e) => {
+                let _ = remove_file(staged);
+                return Err(e.into());
+            }
+        }
+    }
+    remove_file(staged)
+}
+
 /// Try to open a data file directly; if that fails, attempt automatic
-/// conversion from raw 10x formats (h5/h5ad, zarr/zarr.zip).
+/// conversion from raw 10x formats (Cell Ranger h5, Xenium zarr/zarr.zip).
+/// An AnnData `.h5ad` is not converted here: `data-beans from-h5ad` reads
+/// it, with its own layout and metadata files.
 ///
 /// Converted backends are cached as `{data_file}.db.zarr` next to
-/// the original file so subsequent calls skip conversion.
+/// the original file so subsequent calls skip conversion. The conversion is
+/// built beside the cache path and renamed onto it when done, so an
+/// interrupted or concurrent conversion never leaves a partial cache; a
+/// cache that does not open is converted again.
 pub fn try_open_or_convert(
     data_file: &str,
 ) -> anyhow::Result<Box<dyn SparseIo<IndexIter = Vec<usize>>>> {
@@ -383,47 +442,53 @@ pub fn try_open_or_convert(
         _ => SparseIoBackend::Zarr,
     };
 
-    match open_sparse_matrix(data_file, &backend) {
-        Ok(data) => Ok(data),
-        Err(original_err) => {
-            let base = strip_backend_suffix(data_file);
-            let converted = format!("{}.db.zarr", base);
+    let original_err = match open_sparse_matrix(data_file, &backend) {
+        Ok(data) => return Ok(data),
+        Err(e) => e,
+    };
+    let base = strip_backend_suffix(data_file);
+    let converted = format!("{}.db.zarr", base);
 
-            if std::path::Path::new(&converted).exists() {
-                info!("Using cached conversion: {}", converted);
-                return open_sparse_matrix(&converted, &SparseIoBackend::Zarr);
-            }
-
-            match ext.as_ref() {
-                "h5" | "h5ad" => {
-                    #[cfg(feature = "hdf5")]
-                    {
-                        info!(
-                            "Converting h5/h5ad to backend: {} -> {}",
-                            data_file, converted
-                        );
-                        convert_h5_to_backend(data_file, &converted)?;
-                    }
-                    #[cfg(not(feature = "hdf5"))]
-                    {
-                        anyhow::bail!(
-                            "{} is an HDF5 file but data-beans was built without the `hdf5` \
-                             feature. Reinstall with `--features hdf5` (and a working libhdf5) \
-                             to read .h5/.h5ad inputs.",
-                            data_file
-                        );
-                    }
-                }
-                "zarr" | "zip" => {
-                    info!("Converting zarr to backend: {} -> {}", data_file, converted);
-                    convert_zarr_to_backend(data_file, &converted)?;
-                }
-                _ => return Err(original_err),
-            }
-
-            open_sparse_matrix(&converted, &SparseIoBackend::Zarr)
-        }
+    if let Some(data) = cached_conversion(&converted) {
+        info!("Using cached conversion: {}", converted);
+        return Ok(data);
     }
+    if std::path::Path::new(&converted).exists() {
+        log::warn!(
+            "the cached conversion {} is incomplete; converting {} again",
+            converted,
+            data_file
+        );
+    }
+
+    let convert: fn(&str, &str) -> anyhow::Result<()> = match ext.as_ref() {
+        #[cfg(feature = "hdf5")]
+        "h5" => convert_h5_to_backend,
+        #[cfg(feature = "hdf5")]
+        "h5ad" => anyhow::bail!(
+            "{data_file} does not open as a data-beans backend ({original_err}), and an \
+             AnnData .h5ad is not converted automatically; run `data-beans from-h5ad \
+             {data_file} -o <output>` and use its output"
+        ),
+        #[cfg(not(feature = "hdf5"))]
+        "h5" | "h5ad" => anyhow::bail!(
+            "{} is an HDF5 file but data-beans was built without the `hdf5` \
+             feature. Reinstall with `--features hdf5` (and a working libhdf5) \
+             to read .h5/.h5ad inputs.",
+            data_file
+        ),
+        "zarr" | "zip" => convert_zarr_to_backend,
+        _ => return Err(original_err),
+    };
+
+    let staged = staged_conversion(base);
+    info!("Converting {} to backend: {}", data_file, converted);
+    if let Err(e) = convert(data_file, &staged) {
+        let _ = remove_file(&staged);
+        return Err(e);
+    }
+    install_conversion(&staged, &converted)?;
+    open_sparse_matrix(&converted, &SparseIoBackend::Zarr)
 }
 
 #[cfg(test)]
@@ -500,6 +565,78 @@ mod tests {
         );
     }
 
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_partial_cached_conversion_is_converted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("matrix.zarr");
+        xenium_like_store(&store);
+        // What an interrupted conversion left at the cache path.
+        let cache = dir.path().join("matrix.db.zarr");
+        std::fs::create_dir_all(cache.join("by_column")).unwrap();
+        std::fs::write(cache.join(".zgroup"), r#"{"zarr_format": 2}"#).unwrap();
+
+        let data = try_open_or_convert(store.to_str().unwrap()).unwrap();
+        assert_eq!(
+            data.row_names().unwrap(),
+            ["FID1_GENE1", "FID2_GENE2"].map(Box::from)
+        );
+        assert_eq!(data.num_columns(), Some(4));
+        drop(data);
+        // Nothing is left of the build but the cache, which the next call
+        // opens as it is.
+        assert_eq!(file_names(dir.path()), ["matrix.db.zarr", "matrix.zarr"]);
+        let stamp = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        let built = stamp(&cache);
+        let again = try_open_or_convert(store.to_str().unwrap()).unwrap();
+        assert_eq!(again.num_non_zeros(), Some(4));
+        assert_eq!(stamp(&cache), built);
+    }
+
+    #[test]
+    fn a_failed_conversion_leaves_no_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("matrix.zarr");
+        xenium_like_store(&store);
+        // No feature is of a kept type, so the conversion fails.
+        let attrs = serde_json::json!({
+            "feature_ids": ["FID1", "FID2", "FID3"],
+            "feature_keys": ["A", "B", "C"],
+            "feature_types": vec!["negative_control_probe"; 3],
+        });
+        std::fs::write(store.join("cell_features/.zattrs"), attrs.to_string()).unwrap();
+
+        assert!(try_open_or_convert(store.to_str().unwrap()).is_err());
+        assert_eq!(file_names(dir.path()), ["matrix.zarr"]);
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn an_h5ad_file_is_sent_to_from_h5ad() {
+        let dir = tempfile::tempdir().unwrap();
+        let h5ad = dir.path().join("cells.h5ad");
+        let file = hdf5::File::create(&h5ad).unwrap();
+        file.create_group("X").unwrap();
+        file.create_group("obs").unwrap();
+        file.create_group("var").unwrap();
+        drop(file);
+
+        let e = try_open_or_convert(h5ad.to_str().unwrap())
+            .err()
+            .expect("an AnnData file is not a backend")
+            .to_string();
+        assert!(e.contains("from-h5ad"), "{e}");
+        assert_eq!(file_names(dir.path()), ["cells.h5ad"]);
+    }
+
     fn names(xs: &[&str]) -> Option<Vec<Box<str>>> {
         Some(xs.iter().map(|&x| Box::from(x)).collect())
     }
@@ -555,5 +692,34 @@ mod tests {
         };
         let e = write_10x_matrix(m, "gene", "", out.to_str().unwrap(), &SparseIoBackend::Zarr);
         assert!(e.unwrap_err().to_string().contains("names 2 rows"));
+    }
+
+    #[test]
+    fn keeping_no_row_is_an_error_naming_the_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.zarr");
+        let m = TenxMatrix {
+            triplets: vec![(0, 0, 1.0), (1, 1, 2.0)],
+            reach: (2, 2),
+            row_ids: names(&["HTO1", "CD3"]),
+            row_names: None,
+            row_types: names(&["Multiplexing Capture", "Antibody Capture"]),
+            column_names: None,
+            keep_rows: None,
+        };
+        let e = write_10x_matrix(
+            m,
+            MatrixLayout::SELECT_ROW_TYPES,
+            MatrixLayout::REMOVE_ROW_TYPES,
+            out.to_str().unwrap(),
+            &SparseIoBackend::Zarr,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("Antibody Capture") && e.contains("gene,peak"),
+            "{e}"
+        );
+        assert!(!out.exists());
     }
 }
