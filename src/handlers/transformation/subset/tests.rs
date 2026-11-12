@@ -261,6 +261,76 @@ fn an_output_that_is_the_input_is_refused_and_the_input_kept() {
     }
 }
 
+/// A zipped input is no more its own output than a directory is: `-o in`
+/// resolves to `in.zarr.zip`, and is refused with the archive untouched.
+#[test]
+fn an_output_that_is_the_zipped_input_is_refused_and_the_input_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = input_in(dir.path());
+    let input = format!("{plain}.zip");
+    let input = input.as_str();
+    crate::zarr_io::finalize_zarr_output(&plain, input).unwrap();
+    assert_eq!(rows_of(input), input_rows());
+    let bytes = std::fs::read(input).unwrap();
+    let bare = input.strip_suffix(".zarr.zip").unwrap();
+    let order = dir.path().join("rows.tsv");
+    std::fs::write(&order, "g2\ng0\n").unwrap();
+
+    for out in [input, bare] {
+        let argv = ["x", input, "-i", "0-1", "-o", out, "--batch-process"];
+        let err = super::subset_columns(&Cols::parse_from(argv).args).unwrap_err();
+        assert!(format!("{err:#}").contains("is the input"), "{err:#}");
+        let err = super::subset_rows(&Rows::parse_from(argv).args).unwrap_err();
+        assert!(format!("{err:#}").contains("is the input"), "{err:#}");
+        let argv = ["x", input, "-r", order.to_str().unwrap(), "-o", out];
+        let err = super::reorder_rows(&Reorder::parse_from(argv).args).unwrap_err();
+        assert!(format!("{err:#}").contains("is the input"), "{err:#}");
+        assert_eq!(std::fs::read(input).unwrap(), bytes, "the archive changed");
+    }
+    let left: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "rows.tsv")
+        .collect();
+    assert_eq!(left, ["in.zarr.zip"]);
+}
+
+/// A name the order lists twice would leave its second row empty; a name
+/// two rows of the data carry would fold them into one. Both are refused
+/// and nothing is written.
+#[test]
+fn an_order_that_places_a_row_twice_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = input_in(dir.path());
+    let order = dir.path().join("rows.tsv");
+    let out = dir.path().join("out.zarr");
+    let argv = [
+        "x",
+        input.as_str(),
+        "-r",
+        order.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--no-zip",
+    ];
+
+    std::fs::write(&order, "g2\ng0\ng2\n").unwrap();
+    let err = super::reorder_rows(&Reorder::parse_from(argv).args).unwrap_err();
+    assert!(format!("{err:#}").contains("lists `g2` twice"), "{err:#}");
+    assert!(!out.exists());
+
+    let mut data = crate::sparse_io::open_sparse_matrix_by_path(&input).unwrap();
+    data.register_row_names_vec(&["g0".into(), "g1".into(), "g0".into()]);
+    drop(data);
+    std::fs::write(&order, "g1\ng0\n").unwrap();
+    let err = super::reorder_rows(&Reorder::parse_from(argv).args).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("rows 0 and 2 are both named `g0`"),
+        "{err:#}"
+    );
+    assert!(!out.exists());
+}
+
 /// An output named for the other format is written in that format.
 #[cfg(feature = "hdf5")]
 #[test]

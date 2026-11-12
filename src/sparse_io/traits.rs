@@ -17,7 +17,7 @@ use super::index_audit;
 use super::meta::Metadata;
 use anyhow::Context;
 
-use crate::column_subset::{stream_csc_selection, RowMap};
+use crate::column_subset::{distinct_within, stream_csc_selection, RowMap};
 use crate::sparse_data_visitors::styled_progress_bar;
 use clap::ValueEnum;
 use indicatif::ParallelProgressIterator;
@@ -525,9 +525,18 @@ pub trait SparseIo: Sync + Send {
     // major structural change //
     /////////////////////////////
 
-    /// Select the columns of the data and create a new backend file
-    /// * `columns`: columns to be subsetted
-    /// * `rows`: if something, subset the rows
+    /// Keep the columns `columns` and the rows `rows` of the data, each in
+    /// the order listed (`None` keeps that side whole), replacing the
+    /// backend's content. The result is streamed into a sibling and swapped
+    /// in once complete, so a refused selection leaves the data as it was.
+    ///
+    /// # Errors
+    /// - a selection is empty: this method replaces the original, and an
+    ///   empty matrix over real data is not what a caller means;
+    /// - an index is past the data's rows or columns;
+    /// - a selection lists an index twice;
+    /// - the backend is a zip archive, which cannot be rewritten in place
+    ///   (convert it to a directory backend first).
     fn subset_columns_rows(
         &mut self,
         columns: Option<&Vec<usize>>,
@@ -540,34 +549,17 @@ pub trait SparseIo: Sync + Send {
             .num_rows()
             .ok_or_else(|| anyhow::anyhow!("missing shape information"))?;
 
-        // Empty, duplicated and out-of-range selections are refused, not
-        // honoured: this method REPLACES the original, and writing a
-        // zero-column husk or a matrix short of the requested columns over
-        // real data is almost certainly a caller mistake rather than an
-        // intention. A duplicate would also collapse in the old→new map while
-        // still counting toward the new shape.
-        let distinct = |sel: &[usize], what: &str, ntot: usize| -> anyhow::Result<()> {
-            anyhow::ensure!(!sel.is_empty(), "subset: empty {what} selection");
-            if let Some(&bad) = sel.iter().find(|&&i| i >= ntot) {
-                anyhow::bail!("subset: {what} index {bad} is outside the {ntot} {what}s");
-            }
-            let mut seen = sel.to_vec();
-            seen.sort_unstable();
-            seen.dedup();
-            anyhow::ensure!(
-                seen.len() == sel.len(),
-                "subset: the {what} selection repeats an index ({} of {} are distinct)",
-                seen.len(),
-                sel.len()
-            );
-            Ok(())
-        };
         if let Some(cols) = columns {
-            distinct(cols, "column", ncol_data)?;
+            anyhow::ensure!(!cols.is_empty(), "subset: empty column selection");
+            distinct_within(cols, ncol_data, "column")?;
         }
-        if let Some(rs) = rows {
-            distinct(rs, "row", nrow_data)?;
-        }
+        let row_map = match rows {
+            Some(rs) => {
+                anyhow::ensure!(!rs.is_empty(), "subset: empty row selection");
+                Some(RowMap::keeping(rs, nrow_data)?)
+            }
+            None => None,
+        };
 
         // The selection's order is the output order, for names and data alike.
         let take_names = |sel: Option<&Vec<usize>>,
@@ -592,8 +584,6 @@ pub trait SparseIo: Sync + Send {
             Some(cols) => cols.clone(),
             None => (0..ncol_data).collect(),
         };
-        let row_map = rows.map(|rs| RowMap::keeping(rs, nrow_data)).transpose()?;
-
         replace_backend_content(self, "subset_tmp", |data, out| {
             stream_csc_selection(data, &old_cols, row_map.as_ref(), out)?;
             out.register_row_names_vec(&new_row_names);
@@ -610,7 +600,7 @@ pub trait SparseIo: Sync + Send {
     ///
     /// # Errors
     /// If `row_names_order` lists a name twice, or two rows of the data carry
-    /// one listed name — either would fold rows together or leave one empty.
+    /// one listed name (see [`RowMap::by_names`]).
     fn reorder_rows(&mut self, row_names_order: &[Box<str>]) -> anyhow::Result<()> {
         let Some(ncol) = self.num_columns() else {
             self.clean_preloaded_columns();
@@ -621,44 +611,14 @@ pub trait SparseIo: Sync + Send {
             .num_rows()
             .ok_or_else(|| anyhow::anyhow!("missing shape information"))?;
 
-        let name2new = build_name2index_map(row_names_order);
-        if name2new.len() != row_names_order.len() {
-            // The map keeps the last position of a repeated name.
-            let (first, name) = row_names_order
-                .iter()
-                .enumerate()
-                .find(|&(i, name)| name2new[name] != i)
-                .expect("a shorter map means a repeated name");
-            anyhow::bail!(
-                "reorder rows: `{name}` is listed twice (positions {first} and {})",
-                name2new[name]
-            );
-        }
-
-        // Dense old-row → new-row map; `claimed[new]` is the old row that
-        // already took the new position.
+        // A row past the names has none, so no listed name places it.
         let old_names = self.row_names()?;
-        let mut map: Vec<Option<u64>> = vec![None; nrow_data];
-        let mut claimed: Vec<Option<usize>> = vec![None; row_names_order.len()];
-        for (old, name) in old_names.iter().enumerate().take(nrow_data) {
-            let Some(&new) = name2new.get(name) else {
-                continue;
-            };
-            if let Some(first) = claimed[new].replace(old) {
-                anyhow::bail!(
-                    "reorder rows: rows {first} and {old} are both named `{name}`; \
-                     they cannot share one position"
-                );
-            }
-            map[old] = Some(new as u64);
-        }
+        let named = old_names.len().min(nrow_data);
+        let mut row_map = RowMap::by_names(&old_names[..named], row_names_order)?;
+        row_map.to.resize(nrow_data, None);
 
         let new_col_names = self.column_names()?;
         let old_cols: Vec<usize> = (0..ncol).collect();
-        let row_map = RowMap {
-            to: map,
-            nrow: row_names_order.len(),
-        };
 
         info!("remapping triplets ...");
         replace_backend_content(self, "reorder_tmp", |data, out| {
@@ -1087,9 +1047,9 @@ pub trait SparseIo: Sync + Send {
     /// Build `/by_row/{data, indices, indptr}` by transposing the already-
     /// written CSC data on disk: one pass over the CSC to count each row,
     /// then one scatter pass per row band. The band is as large as the
-    /// process-wide preload budget still allows (never under
-    /// [`SLAB_BUDGET_BYTES`]), so a matrix that fits is transposed in a
-    /// single scatter pass.
+    /// process-wide preload budget and the memory available now allow
+    /// (never under [`SLAB_BUDGET_BYTES`]), so a matrix that fits is
+    /// transposed in a single scatter pass.
     fn build_csr_from_csc_streaming(&mut self) -> anyhow::Result<()> {
         let wanted = self
             .num_non_zeros()

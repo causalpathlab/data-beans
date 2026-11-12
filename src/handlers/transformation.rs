@@ -26,7 +26,7 @@ pub struct ReorderRowsArgs {
     #[arg(short, long, required = true)]
     pub row_file: Box<str>,
 
-    /// output header
+    /// output header; it must not be the input: write to a new name
     #[arg(short, long, required = true)]
     pub output: Box<str>,
 
@@ -41,7 +41,7 @@ pub struct SubsetArgs {
     pub data_file: Box<str>,
 
     /// output file, in the input's format unless the name gives `.zarr` or
-    /// `.zarr.zip`
+    /// `.zarr.zip`; it must not be the input: write to a new name
     #[arg(short, long, required = true)]
     pub output: Box<str>,
 
@@ -116,7 +116,7 @@ pub struct SubsetColumnsArgs {
     #[arg(long, default_value_t = 1)]
     pub column_nnz_cutoff: usize,
 
-    /// output file
+    /// output file; it must not be the input: write to a new name
     #[arg(short, long, required = true)]
     pub output: Box<str>,
 
@@ -187,7 +187,7 @@ pub struct SubsetRowsArgs {
     #[arg(long, default_value_t = 1)]
     pub column_nnz_cutoff: usize,
 
-    /// output file
+    /// output file; it must not be the input: write to a new name
     #[arg(short, long, required = true)]
     pub output: Box<str>,
 
@@ -196,23 +196,40 @@ pub struct SubsetRowsArgs {
     pub zip: bool,
 }
 
-/// [`prepare_output`] for a handler that derives its output from `input`:
-/// the output is cleared before the input is read and, zipped, renamed over
-/// its own name after, so it is refused when it is, or is built at, the
+/// Refuse an output that is one of `inputs`: the path `output` resolves to
+/// under `backend` and `zip`, the path it is built at, or the path found
+/// there already. The output is cleared before the inputs are read and,
+/// zipped, renamed over its own name after, so none of the three may be an
 /// input.
+pub(crate) fn ensure_output_is_no_input<S: AsRef<str>>(
+    inputs: &[S],
+    output: &str,
+    backend: SparseIoBackend,
+    zip: bool,
+) -> anyhow::Result<()> {
+    let target = output_target(output, backend, zip)?;
+    for input in inputs {
+        let input = input.as_ref();
+        for p in [&target.effective, &target.working, &target.found] {
+            anyhow::ensure!(
+                !same_file(input, p),
+                "the output {p} is the input {input}: give -o another name"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// [`prepare_output`] for a handler that derives its output from `input`:
+/// refused, before anything is cleared, when the output is the input (see
+/// [`ensure_output_is_no_input`]).
 pub(crate) fn prepare_output_beside(
     input: &str,
     output: &str,
     backend: SparseIoBackend,
     zip: bool,
 ) -> anyhow::Result<(Box<str>, SparseIoBackend, Box<str>)> {
-    let target = output_target(output, backend.clone(), zip)?;
-    for p in [&target.effective, &target.working, &target.found] {
-        anyhow::ensure!(
-            !same_file(input, p),
-            "the output {p} is the input {input}: give -o another name"
-        );
-    }
+    ensure_output_is_no_input(&[input], output, backend.clone(), zip)?;
     prepare_output(output, backend, zip)
 }
 

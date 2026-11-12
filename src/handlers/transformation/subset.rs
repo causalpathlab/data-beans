@@ -1,6 +1,6 @@
 use super::{prepare_output_beside, squeeze_in_place, ReorderRowsArgs};
 use super::{SubsetArgs, SubsetColumnsArgs, SubsetRowsArgs};
-use crate::column_subset::{stream_mapped_selection, RowMap};
+use crate::column_subset::{distinct_within, stream_mapped_selection, RowMap};
 use crate::handlers::explore::{off_screen, open_session, pick_entries, pick_rows_and_columns};
 use crate::hdf5_io::*;
 use crate::interactive::picks;
@@ -13,6 +13,7 @@ use crate::utilities::io_helpers::{
 use crate::utilities::name_matching::names_matching;
 use crate::zarr_io::{finalize_zarr_output, make_stage};
 
+use anyhow::Context;
 use legume_numeric::matrix::common_io::*;
 use legume_numeric::matrix::membership::Membership;
 use log::info;
@@ -20,30 +21,15 @@ use log::info;
 /// The backend [`write_subset`] reads.
 type Source = dyn SparseIo<IndexIter = Vec<usize>>;
 
-/// A selection of one side must name something, each entry once and within
-/// the `n` there are.
-fn distinct_within(selection: &[usize], n: usize, what: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(!selection.is_empty(), "subset: empty {what} selection");
-    let mut seen = vec![false; n];
-    for &i in selection {
-        let slot = seen
-            .get_mut(i)
-            .ok_or_else(|| anyhow::anyhow!("subset: {what} {i} is past the {n} {what}s"))?;
-        anyhow::ensure!(
-            !std::mem::replace(slot, true),
-            "subset: the {what} selection repeats {what} {i}"
-        );
-    }
-    Ok(())
-}
-
 /// The rows `selection` of `data`, in that order: where each row goes, and
-/// the names of those kept.
+/// the names of those kept. The selection must name something, each row
+/// once and within those there are.
 fn rows_kept(data: &Source, selection: &[usize]) -> anyhow::Result<(RowMap, Vec<Box<str>>)> {
+    anyhow::ensure!(!selection.is_empty(), "subset: empty row selection");
     let names = data.row_names()?;
-    distinct_within(selection, names.len(), "row")?;
+    let map = RowMap::keeping(selection, names.len())?;
     let kept = selection.iter().map(|&r| names[r].clone()).collect();
-    Ok((RowMap::keeping(selection, names.len())?, kept))
+    Ok((map, kept))
 }
 
 /// Stream the `columns` of `data` (the backend at `input`; all of them when
@@ -70,6 +56,7 @@ fn write_subset(
     let every_column: Vec<usize>;
     let columns = match columns {
         Some(columns) => {
+            anyhow::ensure!(!columns.is_empty(), "subset: empty column selection");
             distinct_within(columns, all_names.len(), "column")?;
             columns
         }
@@ -430,28 +417,12 @@ pub fn reorder_rows(args: &ReorderRowsArgs) -> anyhow::Result<()> {
 
     // Each row of the data goes where the file names it; a row it does not
     // name is dropped, and a name the data lacks is an empty row.
-    let place = build_name2index_map(&row_names_order);
-    let mut taken = vec![false; row_names_order.len()];
-    let to = data
-        .row_names()?
-        .iter()
-        .map(|name| {
-            let Some(&new) = place.get(name) else {
-                return Ok(None);
-            };
-            anyhow::ensure!(
-                !std::mem::replace(&mut taken[new], true),
-                "{}: the row name {name} is on more than one row, so which of \
-                 them goes to its place is not determined",
-                args.data_file
-            );
-            Ok(Some(new as u64))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let rows = RowMap {
-        to,
-        nrow: row_names_order.len(),
-    };
+    let rows = RowMap::by_names(&data.row_names()?, &row_names_order).with_context(|| {
+        format!(
+            "{} cannot take the order of {}",
+            args.data_file, args.row_file
+        )
+    })?;
 
     let (effective_output, output_file) = write_subset(
         &args.data_file,

@@ -1,13 +1,10 @@
 #![cfg(feature = "ndarray")]
 
-//! `subset_columns_rows` round-trips, written against the CURRENT
-//! implementation so they pin behaviour before the streaming rewrite.
-//!
-//! This trait default method is the highest-leverage write path in the crate —
-//! ten call sites across the builders, subset, convert, merging and qc — and it
-//! materialises every surviving triplet in RAM before deleting the original
-//! backend and rewriting it. The tests fix what the rewrite must preserve:
-//! shapes, names, values, and the row/column renumbering.
+//! `subset_columns_rows` and `reorder_rows` round-trips: the in-place
+//! rewrites keep shapes, names, values and the row/column renumbering, and
+//! leave the data as it was when they refuse a selection. The streamed
+//! selection underneath is tested against a dense matrix in
+//! `column_selection_tests.rs`.
 
 use data_beans::sparse_io::*;
 
@@ -181,29 +178,27 @@ fn a_cold_read_after_the_swap_serves_the_new_contents() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A duplicated index collapses in the old-to-new map while still counting
-/// toward the new shape, so slabs land at wrong offsets and the build fails
-/// with an nnz-tiling message that names nothing the caller did. Refuse it up
-/// front with the actual cause — this method destroys the original.
+/// A selection lists each index once: one listed twice is refused by name,
+/// before the original is touched.
 #[test]
 fn a_duplicated_selection_is_refused_by_name() -> anyhow::Result<()> {
     let mut data = named_fixture();
+    let before = dense(&*data);
     let err = data
         .subset_columns_rows(Some(&vec![0usize, 3, 0]), None)
         .expect_err("duplicates must be refused");
-    assert!(
-        err.to_string().contains("repeats an index"),
-        "the error must name the cause, got: {err}"
-    );
-    let mut data = named_fixture();
-    assert!(data
+    assert_eq!(err.to_string(), "the column selection repeats column 0");
+    let err = data
         .subset_columns_rows(None, Some(&vec![1usize, 1]))
-        .is_err());
+        .expect_err("duplicates must be refused");
+    assert_eq!(err.to_string(), "the row selection repeats row 1");
+    assert_eq!(dense(&*data), before);
     Ok(())
 }
 
-/// An index past the matrix was dropped in silence, shifting every later
-/// column of the result against the caller's selection.
+/// Every index of a selection is within the matrix: one past it is refused,
+/// not dropped, since dropping it would shift every later row or column of
+/// the result against the caller's selection.
 #[test]
 fn an_out_of_range_selection_is_refused_and_the_data_kept() -> anyhow::Result<()> {
     let mut data = named_fixture();
@@ -212,11 +207,11 @@ fn an_out_of_range_selection_is_refused_and_the_data_kept() -> anyhow::Result<()
     let err = data
         .subset_columns_rows(Some(&vec![1usize, 2, 5]), None)
         .expect_err("column 5 of 5 must be refused");
-    assert!(err.to_string().contains("column index 5"), "got: {err}");
+    assert_eq!(err.to_string(), "column 5 is past the 5 columns");
     let err = data
         .subset_columns_rows(None, Some(&vec![0usize, 4]))
         .expect_err("row 4 of 4 must be refused");
-    assert!(err.to_string().contains("row index 4"), "got: {err}");
+    assert_eq!(err.to_string(), "row 4 is past the 4 rows");
 
     assert_eq!(data.num_columns(), Some(5));
     assert_eq!(data.num_rows(), Some(4));
@@ -267,10 +262,7 @@ fn reordering_refuses_a_name_listed_twice() -> anyhow::Result<()> {
     let err = data
         .reorder_rows(&names(&["r0", "r1", "r0"]))
         .expect_err("r0 twice");
-    assert!(
-        err.to_string().contains("`r0` is listed twice"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("lists `r0` twice"), "got: {err}");
     assert_eq!(data.row_names()?, names(&["r0", "r1", "r2", "r3"]));
     assert_eq!(dense(&*data), before);
     Ok(())
@@ -307,58 +299,5 @@ fn reordering_onto_names_the_data_lacks_leaves_an_empty_matrix() -> anyhow::Resu
     assert_eq!(data.num_columns(), Some(5));
     assert_eq!(data.num_non_zeros(), Some(0));
     assert_eq!(dense(&*data).sum(), 0.0);
-    Ok(())
-}
-
-/// The column-selection writer, with and without a row filter, against the
-/// dense matrix it selects from.
-#[test]
-fn a_streamed_selection_equals_the_dense_selection() -> anyhow::Result<()> {
-    use data_beans::column_subset::stream_column_selection;
-    let data = named_fixture();
-    let full = dense(&*data);
-    let dir = tempfile::tempdir()?;
-
-    let cases: [(&[usize], Option<&[usize]>); 4] = [
-        (&[4, 0, 3], None),
-        // Every column kept: the total comes from the row index.
-        (&[0, 1, 2, 3, 4], Some(&[0, 2, 3])),
-        (&[2, 4, 0, 1, 3], Some(&[1, 3])),
-        // Both filtered: the total comes from a counting pass.
-        (&[3, 1], Some(&[0, 3])),
-    ];
-    for (k, (cols, rows)) in cases.into_iter().enumerate() {
-        let kept_rows: Vec<usize> = rows.map_or((0..4).collect(), <[usize]>::to_vec);
-        let row_names: Vec<Box<str>> = kept_rows.iter().map(|r| format!("r{r}").into()).collect();
-        let col_names: Vec<Box<str>> = cols.iter().map(|c| format!("c{c}").into()).collect();
-        let path = dir.path().join(format!("sel{k}.zarr"));
-        let path = path.to_str().expect("utf8");
-        let (nrow, ncol, nnz) = stream_column_selection(
-            &*data,
-            cols,
-            rows,
-            &row_names,
-            &col_names,
-            path,
-            &SparseIoBackend::Zarr,
-        )?;
-
-        let expected = nalgebra::DMatrix::<f32>::from_fn(kept_rows.len(), cols.len(), |i, j| {
-            full[(kept_rows[i], cols[j])]
-        });
-        assert_eq!((nrow, ncol), expected.shape());
-        assert_eq!(nnz, expected.iter().filter(|&&x| x != 0.0).count());
-
-        let out = open_sparse_matrix(path, &SparseIoBackend::Zarr)?;
-        assert_eq!(out.num_non_zeros(), Some(nnz));
-        assert_eq!(dense(&*out), expected, "case {k}, by columns");
-        assert_eq!(
-            out.read_rows_dmatrix((0..nrow).collect())?,
-            expected,
-            "case {k}, by rows"
-        );
-        assert_eq!(out.row_names()?, row_names);
-        assert_eq!(out.column_names()?, col_names);
-    }
     Ok(())
 }
