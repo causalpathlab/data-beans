@@ -525,3 +525,59 @@ fn more_blocks_than_slots_is_refused() {
     };
     assert!(partition_features(&counts, &sizes, 8, 3, &opts).is_err());
 }
+
+/// A blocked partition of features none of which is informative is one
+/// background group, as it is without blocks.
+#[test]
+fn a_blocked_partition_with_no_informative_feature_is_all_background() {
+    let counts = DMatrix::<f32>::zeros(12, 6);
+    let sizes = vec![4.0f32; 6];
+    let opts = PartitionOptions {
+        min_group_size: 0,
+        block: Some((0..12).map(|i| u32::from(i >= 6)).collect()),
+    };
+    let part = partition_features(&counts, &sizes, 10, 3, &opts).unwrap();
+    assert_eq!(part.num_groups, 1);
+    assert_eq!(part.background, Some(0));
+    assert!(part.labels.iter().all(|&g| g == 0));
+}
+
+/// A coarser level of target 1 above a finer one is the single background
+/// group, and the finer level keeps its informative groups.
+#[test]
+fn a_target_one_level_above_a_finer_one_is_all_background() {
+    let (counts, sizes) = planted(2, 8, 20, 20, 24, 11);
+    let levels = coarsen_features(&counts, &sizes, &[1, 4], 5).unwrap();
+    assert_eq!(levels.len(), 2);
+    assert_eq!(levels[0].num_coarse, 1);
+    assert!(levels[0].fine_to_coarse.iter().all(|&g| g == 0));
+    assert!(levels[1].num_coarse > 1);
+}
+
+/// The residual profiles are, entry for entry, the clipped Pearson residuals
+/// against each row's flat rate, scaled to unit rows.
+#[test]
+fn residual_profiles_match_the_entrywise_definition() {
+    let (counts, sizes) = planted(3, 10, 5, 10, 24, 17);
+    let rows: Vec<usize> = (0..counts.nrows()).filter(|g| g % 3 != 1).collect();
+    let n_pb = sizes.len();
+    let total_size: f32 = sizes.iter().sum();
+    let clip = (n_pb as f32).sqrt();
+    let mut want = DMatrix::<f32>::zeros(rows.len(), n_pb);
+    for (i, &g) in rows.iter().enumerate() {
+        let t: f32 = counts.row(g).sum();
+        for s in 0..n_pb {
+            let e = t * sizes[s] / total_size.max(f32::MIN_POSITIVE);
+            if e > 0.0 {
+                want[(i, s)] = ((counts[(g, s)] - e) / e.sqrt()).clamp(-clip, clip);
+            }
+        }
+    }
+    unit_rows(&mut want);
+    let got = residual_profiles(&counts, &sizes, &rows, 7);
+    assert_eq!(got.shape(), want.shape());
+    for (g, w) in got.iter().zip(want.iter()) {
+        assert_eq!(g.to_bits(), w.to_bits());
+    }
+    assert_eq!(residual_profiles(&counts, &sizes, &[], 7).nrows(), 0);
+}
