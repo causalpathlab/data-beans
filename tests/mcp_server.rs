@@ -82,6 +82,23 @@ impl Drop for Client {
     }
 }
 
+/// The backend `<out>.zarr.zip` in `dir`, of the MatrixMarket text `mtx`
+/// with the row and column names given one a line.
+fn from_mtx(dir: &Path, mtx: &str, rows: &str, cols: &str, out: &str) {
+    std::fs::write(dir.join("m.mtx"), mtx).unwrap();
+    std::fs::write(dir.join("rows.tsv"), rows).unwrap();
+    std::fs::write(dir.join("cols.tsv"), cols).unwrap();
+    let status = Command::new(EXE)
+        .args([
+            "from-mtx", "m.mtx", "-r", "rows.tsv", "-c", "cols.tsv", "-o", out,
+        ])
+        .current_dir(dir)
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 /// A 6 x 4 backend `base.zarr.zip` in `dir`: rows MT-CO1, MT-ND1, G2..G5;
 /// row i is non-zero in column (i mod 4), with count i + 1.
 fn backend(dir: &Path) {
@@ -89,18 +106,38 @@ fn backend(dir: &Path) {
     for i in 0..6 {
         mtx += &format!("{} {} {}\n", i + 1, i % 4 + 1, i + 1);
     }
-    std::fs::write(dir.join("m.mtx"), mtx).unwrap();
-    std::fs::write(dir.join("rows.tsv"), "MT-CO1\nMT-ND1\nG2\nG3\nG4\nG5\n").unwrap();
-    std::fs::write(dir.join("cols.tsv"), "C0\nC1\nC2\nC3\n").unwrap();
-    let status = Command::new(EXE)
-        .args([
-            "from-mtx", "m.mtx", "-r", "rows.tsv", "-c", "cols.tsv", "-o", "base",
-        ])
-        .current_dir(dir)
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success());
+    from_mtx(
+        dir,
+        &mtx,
+        "MT-CO1\nMT-ND1\nG2\nG3\nG4\nG5\n",
+        "C0\nC1\nC2\nC3\n",
+        "base",
+    );
+}
+
+/// A 60 x 120 backend `peaks.zarr.zip` in `dir` whose cells per gene have
+/// two peaks: genes 0..30 are in every cell, gene 30 + g in the three cells
+/// from 4g on. Each cell holds 30 or 31 genes, one peak.
+fn two_peaked_genes(dir: &Path) {
+    let (common, rare, cells) = (30, 30, 120);
+    let mut entries = String::new();
+    for c in 0..cells {
+        for g in 0..common {
+            entries += &format!("{} {} 1\n", g + 1, c + 1);
+        }
+    }
+    for g in 0..rare {
+        for c in 4 * g..4 * g + 3 {
+            entries += &format!("{} {} 1\n", common + g + 1, c + 1);
+        }
+    }
+    let genes = common + rare;
+    let nnz = common * cells + rare * 3;
+    let mtx = format!(
+        "%%MatrixMarket matrix coordinate integer general\n{genes} {cells} {nnz}\n{entries}"
+    );
+    let names = |n: usize, p: &str| (0..n).map(|i| format!("{p}{i}\n")).collect::<String>();
+    from_mtx(dir, &mtx, &names(genes, "G"), &names(cells, "C"), "peaks");
 }
 
 /// A server in a fresh directory holding the `backend` fixture, past its
@@ -318,6 +355,34 @@ fn qc_figures_and_merge_on_common_rows() {
     assert_eq!(pooled["features"], 2, "{pooled}");
     let labels = dir.path().join("pooled.batch.gz");
     assert!(labels.exists(), "{pooled}");
+}
+
+/// `auto_cutoff` puts the gene rule at the trough of cells per gene; a
+/// `feature_min_cells` of 0 given with it keeps every gene.
+#[test]
+fn auto_cutoff_sets_the_gene_rule_unless_one_is_given() {
+    let (dir, mut c) = setup();
+    two_peaked_genes(dir.path());
+    // The cell rules are off, so the genes alone tell the two runs apart.
+    let mut qc = |extra: Value| {
+        let mut args = json!({
+            "data": "peaks.zarr.zip", "auto_cutoff": true, "min_cell_nnz": 0,
+            "mad_on_genes": false, "mad_on_counts": false, "mito_pattern": "",
+        });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        c.call("qc", args).unwrap()
+    };
+
+    let at_trough = qc(json!({}));
+    assert_eq!(at_trough["cells_kept"], 120, "{at_trough}");
+    assert_eq!(at_trough["features"], 60, "{at_trough}");
+    assert_eq!(at_trough["features_kept"], 30, "{at_trough}");
+
+    let given = qc(json!({ "feature_min_cells": 0 }));
+    assert_eq!(given["cells_kept"], 120, "{given}");
+    assert_eq!(given["features_kept"], 60, "{given}");
 }
 
 #[test]

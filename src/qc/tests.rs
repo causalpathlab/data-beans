@@ -272,3 +272,19 @@ fn one_pass_statistics_match_the_separate_passes() {
     assert_eq!(col.mean(), col_alone.mean());
     assert_eq!(row.count_positives(), row_alone.count_positives());
 }
+
+/// A backend nothing was written to has no shape, so no counts to squeeze
+/// by: it is refused.
+#[test]
+fn squeeze_refuses_a_backend_without_a_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.zarr");
+    let data = create_sparse_streaming_empty(path.to_str(), Some(&SparseIoBackend::Zarr)).unwrap();
+    assert!(data.num_rows().is_none() || data.num_columns().is_none());
+    let cutoffs = SqueezeCutoffs { row: 1, column: 1 };
+    let err = squeeze_by_nnz(data.as_ref(), cutoffs, None, false).unwrap_err();
+    assert!(
+        err.to_string().contains("missing shape information"),
+        "{err}"
+    );
+}

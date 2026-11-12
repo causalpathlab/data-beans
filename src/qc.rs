@@ -44,6 +44,11 @@ pub fn squeeze_by_nnz(
     block_size: Option<usize>,
     preload: bool,
 ) -> anyhow::Result<()> {
+    // Without a shape there are no counts to compare with the cutoffs.
+    anyhow::ensure!(
+        data.num_rows().is_some() && data.num_columns().is_some(),
+        "missing shape information"
+    );
     let (col_stat, row_stat) = collect_column_row_stat(data, block_size)?;
 
     fn nnz_index(nnz: &[f32], cutoff: usize) -> Option<Vec<usize>> {
@@ -170,10 +175,33 @@ pub fn collect_row_stat(
     block_size: Option<usize>,
 ) -> anyhow::Result<SparseRunningStatistics<f32>> {
     let nrows = data.num_rows().unwrap_or(0);
-    let mut row_stat = SparseRunningStatistics::new(nrows);
-    let arc_stat = Arc::new(Mutex::new(&mut row_stat));
+    Ok(fold_column_blocks(
+        data,
+        block_size,
+        SparseRunningStatistics::new(nrows),
+        |stat, csc, _| stat.add_csc(csc),
+    ))
+}
 
-    let jobs = create_jobs(data.num_columns().unwrap_or(0), nrows, block_size);
+/// Read the columns of `data` block by block in parallel and fold each
+/// block into `stat` under one lock: `add(stat, csc, lb)` takes the block
+/// and the index of its first column. A backend without a shape has no
+/// blocks.
+fn fold_column_blocks<S, F>(
+    data: &dyn SparseIo<IndexIter = Vec<usize>>,
+    block_size: Option<usize>,
+    stat: S,
+    add: F,
+) -> S
+where
+    S: Send,
+    F: Fn(&mut S, &CscMatrix<f32>, usize) + Sync,
+{
+    let ncols = data.num_columns().unwrap_or(0);
+    let nrows = data.num_rows().unwrap_or(0);
+    let stat = Mutex::new(stat);
+
+    let jobs = create_jobs(ncols, nrows, block_size);
 
     jobs.par_iter()
         .progress_with(styled_progress_bar(jobs.len() as u64, "blocks"))
@@ -181,11 +209,11 @@ pub fn collect_row_stat(
             let csc = data
                 .read_columns_csc((lb..ub).collect())
                 .expect("failed to read data");
-            let mut stat = arc_stat.lock().expect("failed to lock row_stat");
-            stat.add_csc(&csc);
+            let mut stat = stat.lock().expect("failed to lock the statistics");
+            add(&mut stat, &csc, lb);
         });
 
-    Ok(row_stat)
+    stat.into_inner().expect("failed to unlock the statistics")
 }
 
 /// The rows of `select_rows` (those within `nrows`) as a mask over all
@@ -242,25 +270,18 @@ pub fn collect_column_row_stat(
 )> {
     let ncols = data.num_columns().unwrap_or(0);
     let nrows = data.num_rows().unwrap_or(0);
-    let stat = Mutex::new((
-        SparseColumnRunningStatistics::<f32>::new(ncols, nrows),
-        SparseRunningStatistics::<f32>::new(nrows),
-    ));
-
-    let jobs = create_jobs(ncols, nrows, block_size);
-
-    jobs.par_iter()
-        .progress_with(styled_progress_bar(jobs.len() as u64, "blocks"))
-        .for_each(|&(lb, ub)| {
-            let csc = data
-                .read_columns_csc((lb..ub).collect())
-                .expect("failed to read data");
-            let mut stat = stat.lock().expect("failed to lock col/row stat");
-            stat.0.add_csc(&csc, lb);
-            stat.1.add_csc(&csc);
-        });
-
-    Ok(stat.into_inner().expect("failed to unlock col/row stat"))
+    Ok(fold_column_blocks(
+        data,
+        block_size,
+        (
+            SparseColumnRunningStatistics::<f32>::new(ncols, nrows),
+            SparseRunningStatistics::<f32>::new(nrows),
+        ),
+        |(col_stat, row_stat), csc, lb| {
+            col_stat.add_csc(csc, lb);
+            row_stat.add_csc(csc);
+        },
+    ))
 }
 
 /// collect column-wise sufficient statistics for Q/C
@@ -272,22 +293,12 @@ pub fn collect_column_stat(
 ) -> anyhow::Result<SparseColumnRunningStatistics<f32>> {
     let ncols = data.num_columns().unwrap_or(0);
     let nrows = data.num_rows().unwrap_or(0);
-    let mut col_stat = SparseColumnRunningStatistics::<f32>::new(ncols, nrows);
-    let arc_stat = Arc::new(Mutex::new(&mut col_stat));
-
-    let jobs = create_jobs(ncols, nrows, block_size);
-
-    jobs.par_iter()
-        .progress_with(styled_progress_bar(jobs.len() as u64, "blocks"))
-        .for_each(|&(lb, ub)| {
-            let csc = data
-                .read_columns_csc((lb..ub).collect())
-                .expect("failed to read data");
-            let mut stat = arc_stat.lock().expect("failed to lock col_stat");
-            stat.add_csc(&csc, lb);
-        });
-
-    Ok(col_stat)
+    Ok(fold_column_blocks(
+        data,
+        block_size,
+        SparseColumnRunningStatistics::<f32>::new(ncols, nrows),
+        |stat, csc, lb| stat.add_csc(csc, lb),
+    ))
 }
 
 struct EmptyArgs {}

@@ -605,16 +605,14 @@ pub struct Binned {
 }
 
 impl Binned {
-    /// Bin `sorted` (ascending). All-whole data gets whole-count bins.
-    /// Values that are not finite (they sort to the ends) span no bin and
-    /// are not counted.
+    /// Bin `sorted`: finite, ascending. Its ends are the range the bins
+    /// span. All-whole data gets whole-count bins.
     pub fn new(sorted: &[f32], scale: Scale) -> Self {
-        let finite = |v: &&f32| v.is_finite();
-        let (min, max) = match (sorted.iter().find(finite), sorted.iter().rfind(finite)) {
+        let (min, max) = match (sorted.first(), sorted.last()) {
             (Some(&lo), Some(&hi)) => (lo as f64, hi as f64),
             _ => (0.0, 0.0),
         };
-        let integer = sorted.iter().filter(finite).all(|v| v.fract() == 0.0);
+        let integer = sorted.iter().all(|v| v.fract() == 0.0);
         // The log scale shifts as the axis does for these values.
         let shift = match integer {
             true => 1.0,

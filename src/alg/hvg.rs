@@ -6,8 +6,9 @@
 //!   ranking genes by excess dispersion above the trend.
 //! - [`select_hvg_streaming`] — sparse streaming wrapper that computes
 //!   per-gene `(mean, variance)` of raw counts directly from CSC chunks
-//!   (lock-free, per-thread accumulators merged at the end), then
-//!   delegates to [`select_hvg_by_stats`].
+//!   (one accumulator per block of columns, merged in block order, so the
+//!   sums do not depend on the thread schedule), then delegates to
+//!   [`select_hvg_by_stats`].
 //!
 //! Used by senna and chickpea to reweight the random-projection basis so
 //! the sketch geometry reflects variable biology rather than housekeeping

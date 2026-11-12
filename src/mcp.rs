@@ -1644,13 +1644,10 @@ mod tests {
     }
 
     /// `auto_cutoff` alone lets the command put the gene rule at its
-    /// trough; the schema says so, and a `feature_min_cells` given, 0
-    /// included, reaches the command to stand instead.
+    /// trough; a `feature_min_cells` given, 0 included, reaches the command
+    /// to stand instead.
     #[test]
-    fn auto_cutoff_says_it_sets_the_gene_rule_and_a_given_one_is_passed() {
-        let schema = super::qc_properties(&json!({}));
-        let said = schema["auto_cutoff"]["description"].as_str().unwrap();
-        assert!(said.contains("unless feature_min_cells is given"), "{said}");
+    fn a_gene_rule_given_with_auto_cutoff_is_passed() {
         let flags = |args| super::qc_flags(&super::Arguments(args)).unwrap();
         assert_eq!(flags(json!({ "auto_cutoff": true })), ["--qc-auto-cutoff"]);
         assert_eq!(

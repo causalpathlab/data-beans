@@ -500,21 +500,25 @@ impl RandProjOps for SparseIoVec {
     }
 }
 
-/// The batch membership to correct a stack of `ncols` columns with: `None`,
-/// with a warning, when its length is not `ncols`, the rule
-/// [`adjust_batch_biases`] applies to a single modality.
+/// The batch membership to correct a stack of `ncols` columns with. One
+/// longer than `ncols` is cut to its first `ncols` entries, the columns it
+/// has in common with the stack; one shorter leaves some columns without a
+/// batch, so there is no adjustment (`None`). Either comes with a warning.
 fn membership_of_columns<T>(batch_membership: Option<&[T]>, ncols: usize) -> Option<&[T]> {
     let col_to_batch = batch_membership?;
-    if col_to_batch.len() != ncols {
+    let size = col_to_batch.len();
+    if size > ncols {
         warn!(
-            "The batch membership size {} mismatches with the number of columns {}; \
-             no batch adjustment ...",
-            col_to_batch.len(),
-            ncols
+            "The batch membership size {size} exceeds the number of columns {ncols}; \
+             using its first {ncols} entries ..."
         );
-        return None;
+    } else if size < ncols {
+        warn!(
+            "The batch membership size {size} falls short of the number of columns {ncols}; \
+             no batch adjustment ..."
+        );
     }
-    Some(col_to_batch)
+    col_to_batch.get(..ncols)
 }
 
 /// The modalities' projections stacked on the feature axis: bases and
@@ -798,38 +802,54 @@ mod repro_tests {
         Ok(())
     }
 
-    /// A stack treats a batch membership of the wrong length as a single
-    /// modality does: no batch adjustment, whether it is too short or too
-    /// long.
+    /// The stack's projections under `batch`, plain and row-weighted.
+    fn stack_projections_with(
+        stack: &SparseIoStack,
+        batch: Option<&[usize]>,
+    ) -> anyhow::Result<[nalgebra::DMatrix<f32>; 2]> {
+        let weights = vec![1.0f32; 16];
+        Ok([
+            stack
+                .project_columns_with_batch_correction_seeded(4, None, batch, 9)?
+                .proj,
+            stack
+                .project_columns_weighted_seeded(4, None, batch, &weights, 9)?
+                .proj,
+        ])
+    }
+
+    /// A batch membership that does not cover every column of a stack
+    /// leaves the projection without a batch adjustment.
     #[test]
-    fn stack_ignores_a_batch_membership_of_the_wrong_length() -> anyhow::Result<()> {
+    fn stack_ignores_a_batch_membership_that_is_too_short() -> anyhow::Result<()> {
         let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
         let stack = tiny_stack(&dir_a, &dir_b)?;
-        let weights = vec![1.0f32; 16];
-        let none = stack.project_columns_with_batch_correction_seeded::<usize>(4, None, None, 9)?;
-        let none_weighted =
-            stack.project_columns_weighted_seeded::<usize>(4, None, None, &weights, 9)?;
+        let none = stack_projections_with(&stack, None)?;
 
         let fitting: Vec<usize> = (0..12).map(|j| j % 2).collect();
-        let corrected =
-            stack.project_columns_with_batch_correction_seeded(4, None, Some(&fitting[..]), 9)?;
-        assert_ne!(
-            corrected.proj, none.proj,
-            "the adjustment changes the fixture"
-        );
+        let corrected = stack_projections_with(&stack, Some(&fitting))?;
+        assert_ne!(corrected, none, "the adjustment changes the fixture");
 
-        for len in [11usize, 13] {
-            let batch: Vec<usize> = (0..len).map(|j| j % 2).collect();
-            let out =
-                stack.project_columns_with_batch_correction_seeded(4, None, Some(&batch[..]), 9)?;
-            assert_eq!(out.proj, none.proj, "membership of {len}");
-            let out =
-                stack.project_columns_weighted_seeded(4, None, Some(&batch[..]), &weights, 9)?;
-            assert_eq!(
-                out.proj, none_weighted.proj,
-                "weighted, membership of {len}"
-            );
-        }
+        assert_eq!(stack_projections_with(&stack, Some(&fitting[..11]))?, none);
+        Ok(())
+    }
+
+    /// A batch membership longer than a stack has columns adjusts with its
+    /// first entries, one per column; the rest are not read.
+    #[test]
+    fn stack_truncates_a_batch_membership_that_is_too_long() -> anyhow::Result<()> {
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let stack = tiny_stack(&dir_a, &dir_b)?;
+        let none = stack_projections_with(&stack, None)?;
+
+        let fitting: Vec<usize> = (0..12).map(|j| j % 2).collect();
+        let corrected = stack_projections_with(&stack, Some(&fitting))?;
+        assert_ne!(corrected, none, "the adjustment changes the fixture");
+
+        // The surplus entry names a batch of its own.
+        let mut too_long = fitting.clone();
+        too_long.push(7);
+        assert_eq!(stack_projections_with(&stack, Some(&too_long))?, corrected);
         Ok(())
     }
 

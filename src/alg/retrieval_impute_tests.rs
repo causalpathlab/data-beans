@@ -190,3 +190,19 @@ fn zero_neighbours_are_refused() -> anyhow::Result<()> {
     assert!(result.is_err());
     Ok(())
 }
+
+/// A searched row the index returned nothing for is a short list, not a
+/// zero-latent row: only rows that were not searched count as those.
+#[test]
+fn empty_search_results_count_as_short_not_zero_latent() {
+    let found = |n: usize| {
+        Some(QueryNeighbours {
+            ids: (0..n as u32).collect(),
+            weights: vec![1.0 / n.max(1) as f32; n],
+        })
+    };
+    let neighbours = vec![found(3), None, found(0), found(2), None, found(0)];
+    assert_eq!(count_zero_latent_and_short(&neighbours, 3), (2, 3));
+    assert_eq!(count_zero_latent_and_short(&neighbours, 2), (2, 2));
+    assert_eq!(count_zero_latent_and_short(&[], 3), (0, 0));
+}

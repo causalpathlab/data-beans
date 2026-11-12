@@ -39,11 +39,26 @@ pub struct RetrievalImputeConfig {
     pub chunk: usize,
 }
 
-/// A query row's matched reference rows and their pooling weights.
-/// Empty for a zero-latent query row.
+/// A searched query row's matched reference rows and their pooling weights.
 struct QueryNeighbours {
     ids: Vec<u32>,
     weights: Vec<f32>,
+}
+
+/// How many query rows were not searched for having a zero latent (`None`),
+/// and how many searched ones got fewer than `knn` neighbours, none at all
+/// included.
+fn count_zero_latent_and_short(
+    neighbours: &[Option<QueryNeighbours>],
+    knn: usize,
+) -> (usize, usize) {
+    let n_zero_latent = neighbours.iter().filter(|n| n.is_none()).count();
+    let n_short = neighbours
+        .iter()
+        .flatten()
+        .filter(|n| n.ids.len() < knn)
+        .count();
+    (n_zero_latent, n_short)
 }
 
 /// Weighted-kNN imputation of `ref_data`'s features onto the query rows.
@@ -102,7 +117,8 @@ pub fn retrieval_impute(
     );
 
     let knn = cfg.knn.min(live.len());
-    let neighbours: Vec<QueryNeighbours> = (0..n_query)
+    // `None` marks a zero-latent query row, which is not searched.
+    let neighbours: Vec<Option<QueryNeighbours>> = (0..n_query)
         .into_par_iter()
         // One search scratch per rayon worker: re-growing the backend's
         // visited set is O(n_ref) per query otherwise.
@@ -111,37 +127,31 @@ pub fn retrieval_impute(
             |scratch, i| {
                 let query: Vec<f32> = query_latent.row(i).iter().copied().collect();
                 if query.iter().all(|&x| x == 0.0) {
-                    return Ok(QueryNeighbours {
-                        ids: Vec::new(),
-                        weights: Vec::new(),
-                    });
+                    return Ok(None);
                 }
                 let (ids, distances) = ref_dict
                     .search_by_query_data_reuse(&query, knn, scratch)
                     .map_err(|e| anyhow::anyhow!("kNN search for query row {i}: {e}"))?;
                 let weights = dist_to_softmax_weights(&distances, cfg.temperature);
-                Ok(QueryNeighbours { ids, weights })
+                Ok(Some(QueryNeighbours { ids, weights }))
             },
         )
         .collect::<anyhow::Result<_>>()?;
-    let n_skipped = neighbours.iter().filter(|n| n.ids.is_empty()).count();
-    if n_skipped > 0 {
+    let (n_zero_latent, n_short) = count_zero_latent_and_short(&neighbours, knn);
+    if n_zero_latent > 0 {
         warn!(
-            "{n_skipped} of {n_query} query rows have a zero latent and were skipped; \
+            "{n_zero_latent} of {n_query} query rows have a zero latent and were skipped; \
              their imputed rows stay zero"
         );
     }
     // The index may return fewer neighbours than asked for (an approximate
     // search has a fixed candidate budget); the weights are then spread over
-    // the ones it did return.
-    let n_short = neighbours
-        .iter()
-        .filter(|n| !n.ids.is_empty() && n.ids.len() < knn)
-        .count();
+    // the ones it did return, and a row it returned none for stays zero.
     if n_short > 0 {
         warn!(
             "{n_short} of {n_query} query rows got fewer than the {knn} neighbours \
-             asked for; they pool the neighbours the index returned"
+             asked for; they pool the neighbours the index returned, and stay zero \
+             where it returned none"
         );
     }
 
@@ -163,6 +173,7 @@ pub fn retrieval_impute(
     // chunks where no consumer touches any of the chunk's cells.
     let mut cell_to_consumers: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n_ref];
     for (query_id, nbr) in neighbours.iter().enumerate() {
+        let Some(nbr) = nbr else { continue };
         for (&c, &w) in nbr.ids.iter().zip(nbr.weights.iter()) {
             cell_to_consumers[c as usize].push((query_id as u32, w));
         }
