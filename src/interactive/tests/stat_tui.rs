@@ -486,3 +486,35 @@ fn on_stat_opens_sorted_by_that_statistic_at_the_top() {
     let e = explorer().on_stat(0);
     assert!(e.descending);
 }
+
+/// A statistic that is not a number for one entry (the mean of nothing)
+/// leaves the histogram and its summary to the others; the entry stays in
+/// the table, unranked.
+#[test]
+fn an_entry_that_is_not_a_number_stays_out_of_the_histogram() {
+    let clean = {
+        let mut e = explorer();
+        press(&mut e, KeyCode::Char('3'));
+        e.hist.counts.clone()
+    };
+    let mut data = rows();
+    data.names.push("EMPTY".into());
+    for (k, v) in data.values.iter_mut().enumerate() {
+        v.push(if k == 2 { f32::NAN } else { 1.0 });
+    }
+    let mut e = StatExplorer::new("input", Side::Rows, data, None, None, Purpose::Explore);
+    press(&mut e, KeyCode::Char('3'));
+    assert_eq!(e.sorted.len(), 12);
+    assert_eq!(e.hist.counts, clean);
+    assert!(e.hist.counts.len() > 1);
+
+    let empty = e.names.iter().position(|n| &**n == "EMPTY").unwrap();
+    e.cursor = e.view.iter().position(|&i| i == empty).unwrap();
+    let text = screen_text(&mut e, 120, 30);
+    assert!(text.contains("▲ EMPTY"), "{text}");
+    assert!(!text.contains("rank 13 of"), "{text}");
+    assert!(!text.contains("max NaN"), "{text}");
+    // Another entry is ranked among the twelve numbers.
+    e.cursor = e.view.iter().position(|&i| i != empty).unwrap();
+    assert!(screen_text(&mut e, 120, 30).contains("of 12"));
+}

@@ -25,6 +25,33 @@ fn continuous_bins_cover_the_range() {
     }
 }
 
+/// A value that is not a number sorts last; the bins still span the
+/// finite values, which alone are counted.
+#[test]
+fn values_that_are_not_finite_take_no_bin() {
+    for scale in [Scale::Log, Scale::Sqrt, Scale::Linear] {
+        let vals = [0.0f32, 0.5, 3.2, 18.0];
+        let clean = Binned::new(&vals, scale);
+        let odd = [
+            f32::NEG_INFINITY,
+            0.0,
+            0.5,
+            3.2,
+            18.0,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        let binned = Binned::new(&odd, scale);
+        assert_eq!(binned.kmin, clean.kmin, "{scale:?}");
+        assert_eq!(binned.counts, clean.counts, "{scale:?}");
+        let subset = binned.count([0.5f32, f32::NAN, 18.0].into_iter());
+        assert_eq!(subset.iter().sum::<usize>(), 2, "{scale:?}");
+    }
+    // Whole counts keep their whole-count bins beside one.
+    let whole = Binned::new(&[0.0, 3.0, 7.0, 400.0, f32::NAN], Scale::Linear);
+    assert!(whole.bins.width >= 1.0 && whole.bins.width.fract() == 0.0);
+}
+
 #[test]
 fn compact_labels() {
     assert_eq!(compact(0.0), "0");

@@ -606,12 +606,15 @@ pub struct Binned {
 
 impl Binned {
     /// Bin `sorted` (ascending). All-whole data gets whole-count bins.
+    /// Values that are not finite (they sort to the ends) span no bin and
+    /// are not counted.
     pub fn new(sorted: &[f32], scale: Scale) -> Self {
-        let (min, max) = match (sorted.first(), sorted.last()) {
+        let finite = |v: &&f32| v.is_finite();
+        let (min, max) = match (sorted.iter().find(finite), sorted.iter().rfind(finite)) {
             (Some(&lo), Some(&hi)) => (lo as f64, hi as f64),
             _ => (0.0, 0.0),
         };
-        let integer = sorted.iter().all(|v| v.fract() == 0.0);
+        let integer = sorted.iter().filter(finite).all(|v| v.fract() == 0.0);
         // The log scale shifts as the axis does for these values.
         let shift = match integer {
             true => 1.0,
@@ -624,7 +627,7 @@ impl Binned {
         Self { bins, kmin, counts }
     }
 
-    /// Counts of `values` in these bins.
+    /// Counts of the finite `values` in these bins.
     pub fn count(&self, values: impl Iterator<Item = f32>) -> Vec<usize> {
         count(&self.bins, self.kmin, self.counts.len(), values)
     }
@@ -634,11 +637,11 @@ impl Binned {
     }
 }
 
-/// Counts of `values` per bin, from `kmin` to `kmin + nbins - 1` (values
-/// outside land in the end bins).
+/// Counts of the finite `values` per bin, from `kmin` to `kmin + nbins - 1`
+/// (values outside land in the end bins).
 fn count(bins: &Binning, kmin: i32, nbins: usize, values: impl Iterator<Item = f32>) -> Vec<usize> {
     let mut counts = vec![0; nbins];
-    for v in values {
+    for v in values.filter(|v| v.is_finite()) {
         let i = (bins.key(v as f64) - kmin).clamp(0, nbins as i32 - 1);
         counts[i as usize] += 1;
     }
