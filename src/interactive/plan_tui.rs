@@ -208,6 +208,7 @@ impl<'a> PlanView<'a> {
     }
 
     fn edit_key(&mut self, key: KeyEvent) {
+        self.status = None;
         let Mode::Edit(i, text) = &mut self.mode else {
             return;
         };
@@ -269,11 +270,16 @@ impl<'a> PlanView<'a> {
     fn footer(&self) -> Line<'static> {
         if let Mode::Edit(i, text) = &self.mode {
             let label = self.controls[*i].label;
-            return input_line(
+            let mut line = input_line(
                 &format!("{label}: "),
                 text,
                 &[("enter", "set"), ("esc", "back")],
             );
+            // A value refused stays to be mended, with why beside it.
+            if let Some(s) = &self.status {
+                line.push_span(Span::styled(format!("  {s}"), HIGHLIGHT));
+            }
+            return line;
         }
         if let Some(s) = &self.status {
             return Line::from(Span::styled(format!(" {s}"), HIGHLIGHT));

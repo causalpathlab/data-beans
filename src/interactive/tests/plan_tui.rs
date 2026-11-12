@@ -124,3 +124,26 @@ fn a_settings_key_is_never_taken_for_moving() {
     assert!(!v.done());
     assert_eq!(v.plan.notes, ["Some(5.0)"]);
 }
+
+/// A value that is no number is refused where it is typed, and said so
+/// there; the next key clears the line, and leaving leaves none behind.
+#[test]
+fn a_refused_number_is_said_while_editing() {
+    let mut v = view();
+    press(&mut v, KeyCode::Char('n'));
+    press(&mut v, KeyCode::Char('e'));
+    press(&mut v, KeyCode::Enter);
+    assert!(matches!(v.mode, Mode::Edit(..)));
+    let s = render(&mut v);
+    assert!(s.contains("cells: 10e"), "{s}");
+    assert!(s.contains("10e: not a number"), "{s}");
+    assert_eq!(v.plan.notes, ["10 cells"]);
+    press(&mut v, KeyCode::Backspace);
+    assert!(!render(&mut v).contains("not a number"));
+    press(&mut v, KeyCode::Char('e'));
+    press(&mut v, KeyCode::Enter);
+    press(&mut v, KeyCode::Esc);
+    let s = render(&mut v);
+    assert!(!s.contains("not a number"), "{s}");
+    assert!(s.contains("common rows"), "{s}");
+}
