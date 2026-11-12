@@ -669,14 +669,13 @@ fn resolve_batch_union(
             "Union mode: per-cell @batch tag taken from unified barcodes ({} cells)",
             n_cells
         );
-        return Ok(per_cell_tags);
+    } else {
+        info!(
+            "No --batch-files and no embedded @batch tags — falling back to single \
+             batch 'all' (Union mode: per-file batch fallback is ambiguous)."
+        );
     }
-
-    info!(
-        "No --batch-files and no embedded @batch tags — falling back to single \
-         batch 'all' (Union mode: per-file batch fallback is ambiguous)."
-    );
-    Ok(vec!["all".to_string().into_boxed_str(); n_cells])
+    Ok(per_cell_tags)
 }
 
 /// Infer per-cell batch labels for one file's column names.
@@ -794,16 +793,18 @@ mod tests {
     fn each_name_is_read_for_its_own_tag() {
         // Tagged and untagged barcodes in one list, in either order: a
         // name without a tag takes the fallback, never its own barcode.
-        for names in [
-            cols(&["AAAA@donorA", "CCCC", "GGGG@donorB"]),
-            cols(&["CCCC", "AAAA@donorA", "GGGG@donorB"]),
+        for (names, want) in [
+            (
+                cols(&["AAAA@donorA", "CCCC", "GGGG@donorB"]),
+                ["donorA", "all", "donorB"],
+            ),
+            (
+                cols(&["CCCC", "AAAA@donorA", "GGGG@donorB"]),
+                ["all", "donorA", "donorB"],
+            ),
         ] {
             let (tags, used_embedded) = infer_batch_from_columns(&names, "all", None);
             assert!(used_embedded);
-            let want: Vec<&str> = names
-                .iter()
-                .map(|n| n.rsplit_once('@').map_or("all", |(_, tag)| tag))
-                .collect();
             assert_eq!(tags.iter().map(|b| b.as_ref()).collect::<Vec<_>>(), want);
         }
     }

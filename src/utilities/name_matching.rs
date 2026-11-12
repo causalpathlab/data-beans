@@ -1,5 +1,7 @@
 use crate::sparse_io::ROW_SEP;
-use genomic_data::coordinates::{import_interval, is_locus, locus_key};
+use genomic_data::coordinates::{
+    chr_stripped, import_interval, is_locus, locus_key, split_interval,
+};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
@@ -119,23 +121,37 @@ pub fn colon_peak_names(
 /// equalled id) both parts are the whole string, so a 10x `features.tsv` still
 /// gets a non-empty gene name.
 ///
-/// A locus id is never cut at a `ROW_SEP` of its contig name: an id-only
+/// A locus id is not cut at a `ROW_SEP` of its contig name: an id-only
 /// peak row (`chrUn_KI270742v1:100-200`, `chr1_KI270706v1_random:5-9`) comes
 /// back whole, and a locus id with a name splits after the locus
-/// (`chrUn_KI270742v1:100-200_GENE1`). Other ids are cut at their first
-/// `ROW_SEP`, so an id-only row whose id holds one (`Y_RNA`) is not told
-/// apart from an `id{ROW_SEP}name` pair.
+/// (`chrUn_KI270742v1:100-200_GENE1`). A composite that is one locus as a
+/// whole may also be an id joined to a locus name (`peak1_chr1:100-200`);
+/// it is read as that pair when the part after its first `ROW_SEP` is a
+/// locus on a `chr`-prefixed contig, which no piece of a contig name is.
+///
+/// Other ids are cut at their first `ROW_SEP`, so an id-only row whose id
+/// holds one (`Y_RNA`) is not told apart from an `id{ROW_SEP}name` pair.
+/// Nor is an id joined to a locus without the `chr` prefix
+/// (`peak1_1:100-200`, `ENSG1_KI270742v1:5-9`) told apart from one locus on
+/// a contig with a `ROW_SEP` in its name: it comes back whole.
 pub fn split_id_name(composite: &str) -> (&str, &str) {
-    if let Some((locus, rest)) = locus_part(composite) {
-        return match rest.strip_prefix(ROW_SEP) {
-            Some(name) if !name.is_empty() => (locus, name),
-            _ => (composite, composite),
-        };
-    }
-    match composite.split_once(ROW_SEP) {
-        Some((id, name)) if !name.is_empty() => (id, name),
-        _ => (composite, composite),
-    }
+    let at_first_sep = composite
+        .split_once(ROW_SEP)
+        .filter(|(_, name)| !name.is_empty());
+    let pair = match locus_part(composite) {
+        Some((_, "")) => at_first_sep.filter(|(_, name)| is_chr_locus(name)),
+        Some((locus, rest)) => rest
+            .strip_prefix(ROW_SEP)
+            .filter(|name| !name.is_empty())
+            .map(|name| (locus, name)),
+        None => at_first_sep,
+    };
+    pair.unwrap_or((composite, composite))
+}
+
+/// True when `name` is a locus whose contig carries the `chr` prefix.
+fn is_chr_locus(name: &str) -> bool {
+    split_interval(name).is_some_and(|(chr, _, _)| chr_stripped(chr).len() < chr.len())
 }
 
 /// Comma-separated case-insensitive substring filter, parsed once and matched

@@ -181,6 +181,18 @@ fn a_locus_id_is_not_split_inside_its_contig_name() {
         split_id_name(&id_name("chrUn_KI270742v1:100-200", "GENE1")),
         ("chrUn_KI270742v1:100-200", "GENE1")
     );
+    // An id joined to a locus name is a pair, though the whole reads as a
+    // locus on the contig `peak1_chr1`.
+    assert_eq!(
+        split_id_name("peak1_chr1:100-200"),
+        ("peak1", "chr1:100-200")
+    );
+    assert_eq!(split_id_name("ENSG1_chr1:5-9"), ("ENSG1", "chr1:5-9"));
+    // Without the `chr` prefix the same shape is a contig name.
+    assert_eq!(
+        split_id_name("peak1_1:100-200"),
+        ("peak1_1:100-200", "peak1_1:100-200")
+    );
     // Gene rows split on the first separator, as composed.
     assert_eq!(
         split_id_name("ENSG00000153563_CD8A"),

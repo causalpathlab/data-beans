@@ -48,19 +48,21 @@ pub struct CellTypeMembership {
 /// The data rows of an annotation table (TSV, CSV, or whitespace-separated,
 /// plain or gzipped), each split into its fields.
 ///
-/// One delimiter serves the whole file: tab when any line holds a tab, else
-/// comma when any line holds a comma, else runs of whitespace. A tab- or
-/// comma-separated field therefore keeps its spaces (`CD4 T cell`), and is
-/// trimmed and unquoted. Comment lines (`#`, `%`) and blank lines are
-/// skipped; the first remaining line is the header and is dropped.
+/// The header line names the delimiter for the whole file: tab when it holds
+/// a tab, else comma when it holds a comma, else runs of whitespace. A tab-
+/// or comma-separated field therefore keeps its spaces (`CD4 T cell`), and is
+/// trimmed and unquoted, while a comma inside a label of a
+/// whitespace-separated table (`B,naive`) is part of the label. Comment lines
+/// (`#`, `%`) and blank lines are skipped; the first remaining line is the
+/// header and is dropped.
 fn read_annotation_rows(path: &str) -> Result<Vec<Vec<Box<str>>>> {
     let lines: Vec<Box<str>> = read_lines(path)?
         .into_iter()
         .filter(|line| !line.trim().is_empty() && !line.starts_with(['#', '%']))
         .collect();
-    let delim = ['\t', ',']
-        .into_iter()
-        .find(|&d| lines.iter().any(|line| line.contains(d)));
+    let delim = lines
+        .first()
+        .and_then(|header| ['\t', ','].into_iter().find(|&d| header.contains(d)));
     Ok(lines
         .iter()
         .skip(1)
@@ -73,12 +75,16 @@ fn read_annotation_rows(path: &str) -> Result<Vec<Vec<Box<str>>>> {
 
 /// Each row's cell id and its label in field `label_idx`, in file order.
 /// A row too short to hold the label is skipped; so is a row whose cell id or
-/// label is empty, and those are counted in a warning.
+/// label is empty. Both are counted in a warning, and a file that yields no
+/// row at all is an error: its rows do not follow the header's delimiter, or
+/// it has no such column.
 fn read_cell_labels(path: &str, label_idx: usize) -> Result<Vec<(Box<str>, Box<str>)>> {
+    let mut n_short = 0usize;
     let mut n_empty = 0usize;
     let mut out = Vec::new();
     for mut words in read_annotation_rows(path)? {
         if words.len() <= label_idx {
+            n_short += 1;
             continue;
         }
         if words[0].is_empty() || words[label_idx].is_empty() {
@@ -88,8 +94,19 @@ fn read_cell_labels(path: &str, label_idx: usize) -> Result<Vec<(Box<str>, Box<s
         let label = words.swap_remove(label_idx);
         out.push((words.swap_remove(0), label));
     }
-    if n_empty > 0 {
-        warn!("{path}: {n_empty} rows with an empty cell id or label skipped");
+    let n_fields = label_idx + 1;
+    if out.is_empty() {
+        bail!(
+            "{path}: no row holds a cell id and a label in field {n_fields} \
+             ({n_short} rows with fewer than {n_fields} fields, {n_empty} rows \
+             with an empty cell id or label); the header line sets the delimiter"
+        );
+    }
+    if n_short > 0 || n_empty > 0 {
+        warn!(
+            "{path}: skipped {n_short} rows with fewer than {n_fields} fields \
+             and {n_empty} rows with an empty cell id or label"
+        );
     }
     Ok(out)
 }
@@ -394,6 +411,76 @@ mod tests {
         assert_eq!(anno.individual_ids, vec![Box::<str>::from("IND_A")]);
         assert_eq!(anno.cell_to_individual.len(), 2);
         Ok(())
+    }
+
+    #[test]
+    fn the_header_line_sets_the_delimiter() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let columns: Vec<Box<str>> = vec!["cell_0".into(), "cell_1".into(), "cell_2".into()];
+
+        // Whitespace-separated: a comma is part of the label it sits in.
+        let spaced = write_table(
+            &dir,
+            "cells.txt",
+            &[
+                "cell indiv type",
+                "cell_0 IND_A T",
+                "cell_1 IND_B B,naive",
+                "cell_2 IND_B T",
+            ],
+        );
+        let anno = read_cell_annotations(&spaced)?;
+        assert_eq!(anno.cell_to_individual.len(), 3);
+        assert_eq!(individual_of(&anno, "cell_1"), "IND_B");
+        let membership = build_onehot_membership(&spaced, &columns)?;
+        assert_eq!(
+            membership.cell_type_names,
+            vec![Box::<str>::from("T"), "B,naive".into()]
+        );
+        assert_eq!(membership.matrix[(1, 1)], 1.0);
+        assert_eq!(membership.matrix[(2, 0)], 1.0);
+
+        let tsv = write_table(
+            &dir,
+            "cells.tsv",
+            &[
+                "cell\tindiv\ttype",
+                "cell_0\tIND_A\tT",
+                "cell_1\tIND_B\tB",
+                "cell_2\tIND_B\tT",
+            ],
+        );
+        let anno = read_cell_annotations(&tsv)?;
+        assert_eq!(anno.cell_to_individual.len(), 3);
+        assert_eq!(individual_of(&anno, "cell_0"), "IND_A");
+        assert_eq!(individual_of(&anno, "cell_2"), "IND_B");
+        assert_eq!(
+            build_onehot_membership(&tsv, &columns)?.cell_type_names,
+            vec![Box::<str>::from("T"), "B".into()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_table_where_no_row_parses_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // The rows do not use the header's delimiter: each is one field.
+        let mixed = write_table(
+            &dir,
+            "mixed.tsv",
+            &["cell\tindiv", "cell_0 IND_A", "cell_1 IND_B"],
+        );
+        let err = read_cell_annotations(&mixed).unwrap_err().to_string();
+        assert!(err.contains("2 rows with fewer than 2 fields"), "{err}");
+
+        // Two columns hold no cell type.
+        let two = write_table(&dir, "two.tsv", &["cell\tindiv", "cell_0\tIND_A"]);
+        assert!(read_cell_annotations(&two).is_ok());
+        let columns: Vec<Box<str>> = vec!["cell_0".into()];
+        assert!(build_onehot_membership(&two, &columns).is_err());
+
+        let header_only = write_table(&dir, "empty.tsv", &["cell\tindiv"]);
+        assert!(read_cell_annotations(&header_only).is_err());
     }
 
     #[test]
