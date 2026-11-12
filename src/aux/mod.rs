@@ -5,5 +5,5 @@ pub mod feature_rows;
 pub mod feature_types;
 pub mod frozen_features;
 pub mod gene_sets;
-pub mod logging;
+pub use crate::logging; // the logger and progress bars, under their first path
 pub mod ontology;

@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
     // Errors only by default, as env_logger has it; records raised while a
     // view's screen is up are held back until the normal screen is back,
     // rather than written over the view.
-    data_beans::aux::logging::init_logger_with("error");
+    data_beans::logging::init_logger_with("error");
 
     if let Some(n) = cli.n_threads {
         if n == 0 {
