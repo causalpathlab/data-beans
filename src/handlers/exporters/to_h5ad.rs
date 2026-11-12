@@ -11,6 +11,9 @@ use std::collections::HashMap;
 /// backend's Blosc because h5py / anndata read it without any filter plugin.
 const GZIP_LEVEL: u8 = 4;
 
+/// The obs column `from-h5ad` names multi-donor cells by: `barcode@donor`.
+const DONOR_COLUMN: &str = "donor_id";
+
 /// Upper bound on the chunk length (elements) for the `X` datasets.
 const MAX_CHUNK_ELEMS: usize = 1 << 20;
 
@@ -34,7 +37,8 @@ pub struct ToH5adArgs {
         help = "Cell-metadata TSV to attach as `obs` columns",
         long_help = "Optional TSV whose first column is the cell key; gzip is fine.\n\
                      Keys match against the backend column names.\n\
-                     A `barcode@donor` -> `barcode` fallback applies.\n\
+                     A cell named `barcode@donor` also matches the row keyed `barcode`\n\
+                     whose `donor_id` column is `donor`, or, the key listed once, `barcode`.\n\
                      \n\
                      Remaining columns become `obs` columns. Unmatched cells get `NA`.\n\
                      \n\
@@ -190,8 +194,9 @@ fn write_index_arrays<T: H5Type>(
 ///
 /// * `index` — the observation / variable names (`_index` dataset).
 /// * `meta_tsv` — optional metadata to align onto `index` and add as columns.
-/// * `barcode_fallback` — when matching `meta_tsv` keys, also try the barcode
-///   prefix before `@` (data-beans names multi-donor cells `barcode@donor`).
+/// * `barcode_fallback` — when matching `meta_tsv` keys, also match a cell
+///   named `barcode@donor` (as data-beans names multi-donor cells) by its
+///   barcode and donor, or by its barcode alone.
 fn write_dataframe(
     file: &hdf5::File,
     name: &str,
@@ -234,6 +239,12 @@ fn write_dataframe(
 /// `_index` column, if present, is dropped to avoid clashing with the index
 /// dataset). Returns `(column_names, columns)` where every column has the same
 /// length as `names`; unmatched entries are filled with `"NA"`.
+///
+/// With `barcode_fallback`, a name `barcode@donor` that is no key itself
+/// matches the row keyed `barcode` whose `donor_id` column says `donor`
+/// (the name `from-h5ad` gives that row's cell), else the row keyed
+/// `barcode`. A key the file lists more than once names no single row: it
+/// matches nothing and the entry is left `"NA"`, with a warning.
 #[allow(clippy::type_complexity)]
 fn load_aligned_metadata(
     path: &str,
@@ -256,30 +267,51 @@ fn load_aligned_metadata(
         .map(|(i, &c)| (i, Box::<str>::from(c)))
         .unzip();
 
-    let mut key2row: HashMap<Box<str>, Vec<Box<str>>> = HashMap::new();
-    for line in &lines[1..] {
-        let fields: Vec<Box<str>> = line.split('\t').map(|s| s.into()).collect();
-        if let Some(key) = fields.first() {
-            key2row.insert(key.clone(), fields);
+    let rows: Vec<Vec<&str>> = lines[1..]
+        .iter()
+        .map(|line| line.split('\t').collect())
+        .collect();
+    // Key -> its row, or `None` for a key listed more than once.
+    let mut key2row: HashMap<Box<str>, Option<usize>> = HashMap::new();
+    let mut add_key = |key: Box<str>, row: usize| {
+        key2row
+            .entry(key)
+            .and_modify(|listed| *listed = None)
+            .or_insert(Some(row));
+    };
+    let donor_col = header.iter().position(|&c| c == DONOR_COLUMN);
+    for (i, fields) in rows.iter().enumerate() {
+        let Some(&key) = fields.first() else {
+            continue;
+        };
+        add_key(key.into(), i);
+        // The name of this row's cell in a multi-donor backend.
+        let donor = donor_col.and_then(|d| fields.get(d));
+        if let (true, Some(donor)) = (barcode_fallback, donor) {
+            if !key.contains(COLUMN_SEP) {
+                add_key(format!("{key}{COLUMN_SEP}{donor}").into(), i);
+            }
         }
     }
 
     let mut columns: Vec<Vec<Box<str>>> = vec![Vec::with_capacity(names.len()); col_names.len()];
     let mut n_matched = 0usize;
+    let mut n_ambiguous = 0usize;
     for nm in names {
-        let row = key2row.get(nm).or_else(|| {
+        let listed = key2row.get(nm).or_else(|| {
             if barcode_fallback {
                 nm.split(COLUMN_SEP).next().and_then(|bc| key2row.get(bc))
             } else {
                 None
             }
         });
-        match row {
-            Some(fields) => {
+        n_ambiguous += usize::from(listed == Some(&None));
+        match listed.copied().flatten() {
+            Some(row) => {
                 n_matched += 1;
+                let fields = &rows[row];
                 for (ci, &hidx) in keep_idx.iter().enumerate() {
-                    let val = fields.get(hidx).cloned().unwrap_or_else(|| "NA".into());
-                    columns[ci].push(val);
+                    columns[ci].push(fields.get(hidx).copied().unwrap_or("NA").into());
                 }
             }
             None => {
@@ -288,6 +320,15 @@ fn load_aligned_metadata(
                 }
             }
         }
+    }
+    if n_ambiguous > 0 {
+        log::warn!(
+            "{} of {} entries match a key that {} lists more than once; \
+             their metadata is left NA",
+            n_ambiguous,
+            names.len(),
+            path
+        );
     }
 
     info!(
@@ -356,4 +397,45 @@ fn write_string_array(group: &hdf5::Group, name: &str, values: &[Box<str>]) -> a
     write_str_attr(&ds, "encoding-type", "string-array")?;
     write_str_attr(&ds, "encoding-version", "0.2.0")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(xs: &[&str]) -> Vec<Box<str>> {
+        xs.iter().map(|&x| Box::from(x)).collect()
+    }
+
+    /// Two donors share a barcode: each cell gets its own donor's row, and
+    /// where the file cannot tell them apart, neither gets the other's.
+    #[test]
+    fn a_barcode_shared_by_two_donors_keeps_each_donors_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let cells = names(&["AAAC-1@donorA", "AAAC-1@donorB", "GGGT-1@donorA"]);
+
+        let with_donor = dir.path().join("with_donor.tsv");
+        std::fs::write(
+            &with_donor,
+            "barcode\tdonor_id\tcell_type\n\
+             AAAC-1\tdonorA\tT\n\
+             AAAC-1\tdonorB\tB\n\
+             GGGT-1\tdonorA\tNK\n",
+        )
+        .unwrap();
+        let (cols, data) =
+            load_aligned_metadata(with_donor.to_str().unwrap(), &cells, true).unwrap();
+        assert_eq!(cols, names(&["donor_id", "cell_type"]));
+        assert_eq!(data[0], names(&["donorA", "donorB", "donorA"]));
+        assert_eq!(data[1], names(&["T", "B", "NK"]));
+
+        let bare = dir.path().join("bare.tsv");
+        std::fs::write(
+            &bare,
+            "barcode\tcell_type\nAAAC-1\tT\nAAAC-1\tB\nGGGT-1\tNK\n",
+        )
+        .unwrap();
+        let (_, data) = load_aligned_metadata(bare.to_str().unwrap(), &cells, true).unwrap();
+        assert_eq!(data[0], names(&["NA", "NA", "NK"]));
+    }
 }
