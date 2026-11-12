@@ -9,14 +9,58 @@
 //! bar with consistent styling.
 
 use crate::sparse_io_vector::SparseIoVec;
-use indicatif::ParallelProgressIterator;
 use legume_numeric::matrix::sparse_stat::SparseRunningStatistics;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
-use rayon::prelude::*;
+
+/// Column blocks folded into one accumulator at a leaf of
+/// [`fold_in_fixed_order`] by the streaming passes: one, so every block is
+/// read on a task of its own.
+pub(crate) const BLOCKS_PER_LEAF: usize = 1;
+
+/// Fold `items` into one accumulator over a fixed binary tree: a run of at
+/// most `leaf` items is folded in order into a fresh accumulator; a longer
+/// run is halved, the halves folded on separate rayon tasks and merged left
+/// into right.
+///
+/// The grouping of the floating-point sums then depends on `items.len()` and
+/// `leaf` alone, not on the thread count or on how rayon schedules the work,
+/// so the result is the same bits run to run. (A plain rayon `fold`/`reduce`
+/// splits where work stealing happens to split.)
+pub(crate) fn fold_in_fixed_order<T, A, I, F, M>(
+    items: &[T],
+    leaf: usize,
+    init: &I,
+    fold: &F,
+    merge: &M,
+) -> anyhow::Result<A>
+where
+    T: Sync,
+    A: Send,
+    I: Fn() -> A + Sync,
+    F: Fn(&mut A, &T) -> anyhow::Result<()> + Sync,
+    M: Fn(&mut A, A) + Sync,
+{
+    if items.len() <= leaf.max(1) {
+        let mut acc = init();
+        for item in items {
+            fold(&mut acc, item)?;
+        }
+        return Ok(acc);
+    }
+    let (left, right) = items.split_at(items.len() / 2);
+    let (left, right) = rayon::join(
+        || fold_in_fixed_order(left, leaf, init, fold, merge),
+        || fold_in_fixed_order(right, leaf, init, fold, merge),
+    );
+    let mut acc = left?;
+    merge(&mut acc, right?);
+    Ok(acc)
+}
 
 /// Stream cells through `data_vec` in `block_size` chunks, accumulating
-/// per-feature NB sufficient statistics into one `SparseRunningStatistics`
-/// per rayon worker, then merge to one result.
+/// per-feature NB sufficient statistics in parallel and merging them in a
+/// fixed order ([`fold_in_fixed_order`]), so the result does not depend on
+/// the thread count.
 ///
 /// `progress_label` is shown in the indicatif progress bar (e.g.
 /// `"HVG"`, `"NB-Fisher"`).
@@ -32,24 +76,18 @@ pub fn streaming_sparse_running_stats(
     let prog_bar = legume_numeric::matrix::progress::new_progress_bar(jobs.len() as u64)
         .with_message(format!("{progress_label} blocks"));
 
-    let stats: SparseRunningStatistics<f32> = jobs
-        .par_iter()
-        .progress_with(prog_bar.clone())
-        .try_fold(
-            || SparseRunningStatistics::<f32>::new(n_features),
-            |mut acc, &(lb, ub)| -> anyhow::Result<SparseRunningStatistics<f32>> {
-                let chunk = data_vec.read_columns_csc(lb..ub)?;
-                acc.add_csc(&chunk);
-                Ok(acc)
-            },
-        )
-        .try_reduce(
-            || SparseRunningStatistics::<f32>::new(n_features),
-            |mut a, b| {
-                a.merge(&b);
-                Ok(a)
-            },
-        )?;
+    let stats = fold_in_fixed_order(
+        &jobs,
+        BLOCKS_PER_LEAF,
+        &|| SparseRunningStatistics::<f32>::new(n_features),
+        &|acc, &(lb, ub)| {
+            let chunk = data_vec.read_columns_csc(lb..ub)?;
+            acc.add_csc(&chunk);
+            prog_bar.inc(1);
+            Ok(())
+        },
+        &|a, b| a.merge(&b),
+    )?;
     prog_bar.finish_and_clear();
 
     Ok(stats)
@@ -103,7 +141,7 @@ pub fn streaming_sparse_running_stats_folded(
         .with_message(format!("{progress_label} blocks"));
 
     // The dense scratch lives in the fold accumulator, so it is allocated once
-    // per rayon worker rather than once per block, and it is cleared in
+    // per leaf of the fold rather than once per column, and it is cleared in
     // O(touched) rather than O(n_folded).
     // The accumulator carries a `seen` stamp alongside the value buffer. Using
     // `buf[g] == 0.0` as the "not yet touched" marker would be wrong: a stored
@@ -122,63 +160,55 @@ pub fn streaming_sparse_running_stats_folded(
         Vec<f32>,
     );
 
-    let (row_stats, folded_stats) = jobs
-        .par_iter()
-        .progress_with(prog_bar.clone())
-        .try_fold(
-            || {
-                (
-                    SparseRunningStatistics::<f32>::new(n_features),
-                    SparseRunningStatistics::<f32>::new(n_folded),
-                    vec![0.0f32; n_folded],
-                    vec![false; n_folded],
-                    Vec::<usize>::new(),
-                    Vec::<f32>::new(),
-                )
-            },
-            |(mut rows, mut folded, mut buf, mut seen, mut touched, mut vals),
-             &(lb, ub)|
-             -> anyhow::Result<Acc> {
-                let chunk = data_vec.read_columns_csc(lb..ub)?;
-                rows.add_csc(&chunk);
-                for col in chunk.col_iter() {
-                    touched.clear();
-                    for (&r, &v) in col.row_indices().iter().zip(col.values().iter()) {
-                        let g = row_to_gene[r] as usize;
-                        if !seen[g] {
-                            seen[g] = true;
-                            touched.push(g);
-                        }
-                        buf[g] += v;
+    let (row_stats, folded_stats, ..) = fold_in_fixed_order(
+        &jobs,
+        BLOCKS_PER_LEAF,
+        &|| -> Acc {
+            (
+                SparseRunningStatistics::<f32>::new(n_features),
+                SparseRunningStatistics::<f32>::new(n_folded),
+                vec![0.0f32; n_folded],
+                vec![false; n_folded],
+                Vec::<usize>::new(),
+                Vec::<f32>::new(),
+            )
+        },
+        &|(rows, folded, buf, seen, touched, vals), &(lb, ub)| {
+            let chunk = data_vec.read_columns_csc(lb..ub)?;
+            rows.add_csc(&chunk);
+            for col in chunk.col_iter() {
+                touched.clear();
+                for (&r, &v) in col.row_indices().iter().zip(col.values().iter()) {
+                    let g = row_to_gene[r] as usize;
+                    if !seen[g] {
+                        seen[g] = true;
+                        touched.push(g);
                     }
-                    // `add_sparse_column` accumulates per row and never reads
-                    // the order, so the touched list is left unsorted.
-                    vals.clear();
-                    vals.extend(touched.iter().map(|&g| buf[g]));
-                    folded.add_sparse_column(&touched, &vals);
-                    for &g in touched.iter() {
-                        buf[g] = 0.0;
-                        seen[g] = false;
-                    }
+                    buf[g] += v;
                 }
-                Ok((rows, folded, buf, seen, touched, vals))
-            },
-        )
-        .map(|acc| acc.map(|(rows, folded, ..)| (rows, folded)))
-        .try_reduce(
-            || {
-                (
-                    SparseRunningStatistics::<f32>::new(n_features),
-                    SparseRunningStatistics::<f32>::new(n_folded),
-                )
-            },
-            |(mut ra, mut fa), (rb, fb)| {
-                ra.merge(&rb);
-                fa.merge(&fb);
-                Ok((ra, fa))
-            },
-        )?;
+                // `add_sparse_column` accumulates per row and never reads
+                // the order, so the touched list is left unsorted.
+                vals.clear();
+                vals.extend(touched.iter().map(|&g| buf[g]));
+                folded.add_sparse_column(touched, vals);
+                for &g in touched.iter() {
+                    buf[g] = 0.0;
+                    seen[g] = false;
+                }
+            }
+            prog_bar.inc(1);
+            Ok(())
+        },
+        &|(ra, fa, ..), (rb, fb, ..)| {
+            ra.merge(&rb);
+            fa.merge(&fb);
+        },
+    )?;
     prog_bar.finish_and_clear();
 
     Ok((row_stats, folded_stats))
 }
+
+#[cfg(test)]
+#[path = "sparse_streaming_tests.rs"]
+mod tests;

@@ -256,40 +256,35 @@ impl Profiles {
         use legume_numeric::matrix::sparse_stat::SparseRunningStatistics;
         use legume_numeric::matrix::traits::RunningStatOps;
 
-        // Parallel fold over rows: each worker accumulates into its own
-        // `SparseRunningStatistics`, then we reduce via `merge`. Avoids the
-        // single-threaded `for row in &self.rows` over ~10⁴–10⁵ pb-samples.
+        // Rows are folded in parallel and merged in a fixed order, so the
+        // (non-integer) sums come out the same on any number of threads.
+        // Avoids the single-threaded `for row in &self.rows` over ~10⁴–10⁵
+        // pb-samples.
+        const ROWS_PER_LEAF: usize = 256;
         let num_features = self.num_features;
-        let stats = self
-            .rows
-            .par_iter()
-            .fold(
-                || {
-                    (
-                        SparseRunningStatistics::<f32>::new(num_features),
-                        Vec::<usize>::new(),
-                        Vec::<f32>::new(),
-                    )
-                },
-                |(mut acc, mut col_rows, mut col_vals), row| {
-                    col_rows.clear();
-                    col_vals.clear();
-                    for &(g, v) in row {
-                        col_rows.push(g as usize);
-                        col_vals.push(v);
-                    }
-                    acc.add_sparse_column(&col_rows, &col_vals);
-                    (acc, col_rows, col_vals)
-                },
-            )
-            .map(|(acc, _, _)| acc)
-            .reduce(
-                || SparseRunningStatistics::<f32>::new(num_features),
-                |mut a, b| {
-                    a.merge(&b);
-                    a
-                },
-            );
+        let (stats, ..) = crate::alg::sparse_streaming::fold_in_fixed_order(
+            &self.rows,
+            ROWS_PER_LEAF,
+            &|| {
+                (
+                    SparseRunningStatistics::<f32>::new(num_features),
+                    Vec::<usize>::new(),
+                    Vec::<f32>::new(),
+                )
+            },
+            &|(acc, col_rows, col_vals), row| {
+                col_rows.clear();
+                col_vals.clear();
+                for &(g, v) in row {
+                    col_rows.push(g as usize);
+                    col_vals.push(v);
+                }
+                acc.add_sparse_column(col_rows, col_vals);
+                Ok(())
+            },
+            &|(a, ..), (b, ..)| a.merge(&b),
+        )
+        .expect("the row fold cannot fail");
 
         // `π_g = sum[g] / Σ sum` is derived directly from the stats without
         // a second sparse traversal. `mean_g` uses the entity-count denominator
@@ -620,6 +615,26 @@ pub fn argmax_log_restricted(log_probs: &[f64], allowed: &[usize]) -> usize {
     let mut best = allowed[0];
     let mut best_val = log_probs[best];
     for &k in &allowed[1..] {
+        if log_probs[k] > best_val {
+            best = k;
+            best_val = log_probs[k];
+        }
+    }
+    best
+}
+
+/// Argmax over `allowed` indices that leaves `current` only for a strictly
+/// better block: a tie with the current label (an entity with no evidence
+/// scores every block alike) is not a move. With `current` outside
+/// `allowed`, ties go to the first allowed index.
+pub fn argmax_log_restricted_from(log_probs: &[f64], allowed: &[usize], current: usize) -> usize {
+    let mut best = if allowed.contains(&current) {
+        current
+    } else {
+        allowed[0]
+    };
+    let mut best_val = log_probs[best];
+    for &k in allowed {
         if log_probs[k] > best_val {
             best = k;
             best_val = log_probs[k];
@@ -1028,7 +1043,7 @@ pub fn refine_with_candidates_guarded<G: MoveGuard>(
                 guard,
                 k,
                 &mut proposals,
-                |log_probs, cand, _e, _current| argmax_log_restricted(log_probs, cand),
+                |log_probs, cand, _e, current| argmax_log_restricted_from(log_probs, cand, current),
             )
         } else {
             sweep_sequential(
@@ -1038,7 +1053,7 @@ pub fn refine_with_candidates_guarded<G: MoveGuard>(
                 guard,
                 &mut log_probs,
                 0..num_entities,
-                |log_probs, cand, _current| argmax_log_restricted(log_probs, cand),
+                argmax_log_restricted_from,
             )
         };
         total_moves += sc.moves;

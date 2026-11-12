@@ -13,13 +13,13 @@
 
 use crate::alg::feature_coarsening::FeatureCoarsening;
 use crate::alg::nb_dispersion::DispersionTrend;
-use crate::alg::sparse_streaming::streaming_sparse_running_stats;
+use crate::alg::sparse_streaming::{
+    fold_in_fixed_order, streaming_sparse_running_stats, BLOCKS_PER_LEAF,
+};
 use crate::sparse_io_vector::SparseIoVec;
-use indicatif::ParallelProgressIterator;
 use legume_numeric::matrix::sparse_stat::SparseRunningStatistics;
 use legume_numeric::matrix::traits::{IoOps, RunningStatOps};
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
-use rayon::prelude::*;
 
 /// Fit a fresh NB dispersion trend on `stats` and return per-feature
 /// Fisher-info weights `w_d ∈ (0, 1]`. `n_entities` is the count divisor
@@ -136,25 +136,19 @@ pub fn compute_nb_fisher_weights_coarsened(
     let prog_bar = legume_numeric::matrix::progress::new_progress_bar(jobs.len() as u64)
         .with_message("NB-Fisher (coarse) blocks");
 
-    let stats: SparseRunningStatistics<f32> = jobs
-        .par_iter()
-        .progress_with(prog_bar.clone())
-        .try_fold(
-            || SparseRunningStatistics::<f32>::new(n_features_coarse),
-            |mut acc, &(lb, ub)| -> anyhow::Result<SparseRunningStatistics<f32>> {
-                let chunk = data_vec.read_columns_csc(lb..ub)?;
-                let coarse = coarsening.aggregate_sparse_csc(&chunk);
-                acc.add_dense_columns(&coarse);
-                Ok(acc)
-            },
-        )
-        .try_reduce(
-            || SparseRunningStatistics::<f32>::new(n_features_coarse),
-            |mut a, b| {
-                a.merge(&b);
-                Ok(a)
-            },
-        )?;
+    let stats = fold_in_fixed_order(
+        &jobs,
+        BLOCKS_PER_LEAF,
+        &|| SparseRunningStatistics::<f32>::new(n_features_coarse),
+        &|acc, &(lb, ub)| {
+            let chunk = data_vec.read_columns_csc(lb..ub)?;
+            let coarse = coarsening.aggregate_sparse_csc(&chunk);
+            acc.add_dense_columns(&coarse);
+            prog_bar.inc(1);
+            Ok(())
+        },
+        &|a, b| a.merge(&b),
+    )?;
     prog_bar.finish_and_clear();
 
     Ok(fisher_weights_from_stats(&stats, n_total))
