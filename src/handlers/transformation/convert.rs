@@ -1,6 +1,7 @@
+use super::prepare_output_beside;
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
-use crate::zarr_io::{finalize_output, materialize_writable_backend, prepare_output};
+use crate::zarr_io::{finalize_output, materialize_writable_backend};
 
 use clap::Args;
 use log::info;
@@ -27,12 +28,16 @@ pub struct ConvertArgs {
 /// `.zarr` <-> `.zarr.zip`), preserving the matrix and row/column names.
 ///
 /// When the source and target share the same backend the data is copied
-/// (or unzipped / re-zipped) directly; a cross-backend conversion re-encodes
-/// through the triplet representation.
+/// (or unzipped / re-zipped) directly; a cross-backend conversion streams the
+/// columns into the other format, a slab at a time.
 pub fn run_convert(args: &ConvertArgs) -> anyhow::Result<()> {
     let (backend_in, file_in) = resolve_backend_file(&args.data_file, None)?;
-    let (effective_output, backend_out, file_out) =
-        prepare_output(&args.output, args.backend.clone(), args.zip)?;
+    let (effective_output, backend_out, file_out) = prepare_output_beside(
+        &args.data_file,
+        &args.output,
+        args.backend.clone(),
+        args.zip,
+    )?;
 
     if backend_in == backend_out {
         // Same on-disk format: copy the file / extract the archive directly.
@@ -48,26 +53,19 @@ pub fn run_convert(args: &ConvertArgs) -> anyhow::Result<()> {
             file_in, backend_in, file_out, backend_out
         );
         let data = open_sparse_matrix(&file_in, &backend_in)?;
-        let nrow = data
-            .num_rows()
-            .ok_or_else(|| anyhow::anyhow!("backend has no `nrow`"))?;
         let ncol = data
             .num_columns()
             .ok_or_else(|| anyhow::anyhow!("backend has no `ncol`"))?;
-
-        let (_, _, triplets) = data.read_triplets_by_columns((0..ncol).collect())?;
-        let nnz = triplets.len();
-
-        let mut out = create_sparse_from_triplets_owned(
-            triplets,
-            (nrow, ncol, nnz),
-            Some(file_out.as_ref()),
-            Some(&backend_out),
+        let every_column: Vec<usize> = (0..ncol).collect();
+        let (nrow, ncol, nnz) = crate::column_subset::stream_column_selection(
+            data.as_ref(),
+            &every_column,
+            None,
+            &data.row_names()?,
+            &data.column_names()?,
+            file_out.as_ref(),
+            &backend_out,
         )?;
-        out.register_row_names_vec(&data.row_names()?);
-        out.register_column_names_vec(&data.column_names()?);
-        out.set_metadata(&data.metadata())?;
-        drop(out);
         info!("re-encoded {} non-zeros in {} x {}", nnz, nrow, ncol);
     }
 
@@ -75,3 +73,7 @@ pub fn run_convert(args: &ConvertArgs) -> anyhow::Result<()> {
     info!("done: {}", final_path);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "convert/tests.rs"]
+mod tests;

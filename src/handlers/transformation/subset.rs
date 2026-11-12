@@ -1,5 +1,6 @@
-use super::{squeeze_in_place, ReorderRowsArgs};
+use super::{prepare_output_beside, squeeze_in_place, ReorderRowsArgs};
 use super::{SubsetArgs, SubsetColumnsArgs, SubsetRowsArgs};
+use crate::column_subset::{stream_mapped_selection, RowMap};
 use crate::handlers::explore::{off_screen, open_session, pick_entries, pick_rows_and_columns};
 use crate::hdf5_io::*;
 use crate::interactive::picks;
@@ -10,55 +11,103 @@ use crate::utilities::io_helpers::{
     parse_index_spec_within, read_col_names, read_row_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
 };
 use crate::utilities::name_matching::names_matching;
-use crate::zarr_io::{
-    apply_zip_flag, finalize_zarr_output, make_stage, materialize_writable_backend,
-};
+use crate::zarr_io::{finalize_zarr_output, make_stage};
 
 use legume_numeric::matrix::common_io::*;
 use legume_numeric::matrix::membership::Membership;
 use log::info;
 
-/// `(backend, effective_output, working_path, opened_data)`. The effective
-/// output is what the user will find; the working path is the `.zarr` directory
-/// actually written, which [`finalize_zarr_output`] re-zips onto it.
-type EditStage = (
-    SparseIoBackend,
-    Box<str>,
-    Box<str>,
-    Box<dyn SparseIo<IndexIter = Vec<usize>>>,
-);
+/// The backend [`write_subset`] reads.
+type Source = dyn SparseIo<IndexIter = Vec<usize>>;
 
-/// Resolve `(backend, effective_output, working_path, opened_data)` for an
-/// in-place edit handler: stage the input at the working path (for a `.zarr.zip`
-/// output, in the hidden stage beside it) (extracting
-/// `.zarr.zip` if needed), mkdir the output parent, and open the backend for
-/// read/write.
+/// A selection of one side must name something, each entry once and within
+/// the `n` there are.
+fn distinct_within(selection: &[usize], n: usize, what: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!selection.is_empty(), "subset: empty {what} selection");
+    let mut seen = vec![false; n];
+    for &i in selection {
+        let slot = seen
+            .get_mut(i)
+            .ok_or_else(|| anyhow::anyhow!("subset: {what} {i} is past the {n} {what}s"))?;
+        anyhow::ensure!(
+            !std::mem::replace(slot, true),
+            "subset: the {what} selection repeats {what} {i}"
+        );
+    }
+    Ok(())
+}
+
+/// The rows `selection` of `data`, in that order: where each row goes, and
+/// the names of those kept.
+fn rows_kept(data: &Source, selection: &[usize]) -> anyhow::Result<(RowMap, Vec<Box<str>>)> {
+    let names = data.row_names()?;
+    distinct_within(selection, names.len(), "row")?;
+    let kept = selection.iter().map(|&r| names[r].clone()).collect();
+    Ok((RowMap::keeping(selection, names.len())?, kept))
+}
+
+/// Stream the `columns` of `data` (the backend at `input`; all of them when
+/// `None`), in that order, into the backend `output` names, with the rows
+/// `rows` maps and names when given. The input is only read; the output is
+/// a fresh backend of the input's format, unless its name gives another.
 ///
 /// `zip` is applied here, the same way every `from-*` builder applies it, so a
 /// bare `-o out` lands on `out.zarr.zip` whichever subcommand produced it.
 ///
-/// Pair with [`finalize_zarr_output`] at the end of the handler so `.zarr.zip`
-/// output paths get re-zipped.
-fn stage_for_edit(input: &str, output: &str, zip: bool) -> anyhow::Result<EditStage> {
-    let (backend, data_file) = resolve_backend_file(input, None)?;
-    let effective_output = apply_zip_flag(output, zip, &backend);
-    let (_, output_file) = resolve_backend_file(&effective_output, Some(backend.clone()))?;
-    make_stage(&output_file)?;
+/// Returns `(effective_output, working_path)`: what the user will find, and
+/// the file actually written (for a `.zarr.zip` output, a `.zarr` directory
+/// in the hidden stage beside it). Pair with [`finalize_zarr_output`] at the
+/// end of the handler so `.zarr.zip` output paths get zipped.
+fn write_subset(
+    input: &str,
+    data: &Source,
+    columns: Option<&[usize]>,
+    rows: Option<(RowMap, Vec<Box<str>>)>,
+    output: &str,
+    zip: bool,
+) -> anyhow::Result<(Box<str>, Box<str>)> {
+    let all_names = data.column_names()?;
+    let every_column: Vec<usize>;
+    let columns = match columns {
+        Some(columns) => {
+            distinct_within(columns, all_names.len(), "column")?;
+            columns
+        }
+        None => {
+            every_column = (0..all_names.len()).collect();
+            &every_column
+        }
+    };
+    let column_names: Vec<Box<str>> = columns.iter().map(|&c| all_names[c].clone()).collect();
+    let (rows, row_names) = match rows {
+        Some((map, names)) => (Some(map), names),
+        None => (None, data.row_names()?),
+    };
 
+    let (backend_in, _) = resolve_backend_file(input, None)?;
+    let (effective_output, backend, output_file) =
+        prepare_output_beside(input, output, backend_in, zip)?;
+    make_stage(&output_file)?;
     if let Some(out_dir) = dirname(&output_file) {
         mkdir(&out_dir)?;
     }
 
-    materialize_writable_backend(&data_file, &output_file)?;
-    info!("staged working copy at {}", output_file);
-
-    let data = open_sparse_matrix(&output_file, &backend)?;
-    Ok((backend, effective_output, output_file, data))
+    let (nrow, ncol, nnz) = stream_mapped_selection(
+        data,
+        columns,
+        rows.as_ref(),
+        &row_names,
+        &column_names,
+        &output_file,
+        &backend,
+    )?;
+    info!("wrote {nrow} rows x {ncol} columns, {nnz} non-zeros to {output_file}");
+    Ok((effective_output, output_file))
 }
 
 /// Interactive runs write the same container as the input: a `.zarr`
 /// directory stays a directory, a `.zarr.zip` stays zipped, and HDF5 stays
-/// HDF5 (which [`stage_for_edit`] already keeps). An explicit `.zarr` or
+/// HDF5 (which [`write_subset`] already keeps). An explicit `.zarr` or
 /// `.zarr.zip` output name still wins.
 fn zip_like_input(input: &str, output: &str) -> bool {
     input.ends_with(".zarr.zip") && !output.ends_with(".zarr")
@@ -81,14 +130,13 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
         .then(|| open_session("subset-columns", &args.session))
         .transpose()?;
     let mut tui = session.as_ref().map(Tui::new);
-    // Pick before staging, so cancelling copies nothing.
+    // Pick before writing, so cancelling writes nothing.
     let columns_indices = match tui.as_mut() {
         Some(tui) => match pick_entries(tui, &args.data_file, Side::Columns, "subset")? {
             Some(picked) => Some(picked),
             None => return Ok(()),
         },
-        // By index or pattern: resolved on the input before staging, so a
-        // selection that fails copies nothing.
+        // By index or pattern: resolved before anything is written.
         None => early_columns(
             args.column_indices.as_deref(),
             args.pattern.as_deref(),
@@ -105,8 +153,7 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
         } else {
             args.zip
         };
-        let (_backend, effective_output, output_file, mut data) =
-            stage_for_edit(&args.data_file, &args.output, zip)?;
+        let data = open_sparse_matrix_by_path(&args.data_file)?;
 
         let original_ncol = data.num_columns().unwrap_or(0);
         info!("original data: {} columns", original_ncol);
@@ -169,7 +216,14 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
             ));
         };
 
-        data.subset_columns_rows(Some(&selected_columns), None)?;
+        let (effective_output, output_file) = write_subset(
+            &args.data_file,
+            data.as_ref(),
+            Some(&selected_columns),
+            None,
+            &args.output,
+            zip,
+        )?;
         info!("after subset: {} columns", selected_columns.len());
         drop(data);
 
@@ -204,14 +258,13 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
         .then(|| open_session("subset-rows", &args.session))
         .transpose()?;
     let mut tui = session.as_ref().map(Tui::new);
-    // Pick before staging, so cancelling copies nothing.
+    // Pick before writing, so cancelling writes nothing.
     let row_indices = match tui.as_mut() {
         Some(tui) => match pick_entries(tui, &args.data_file, Side::Rows, "subset")? {
             Some(picked) => Some(picked),
             None => return Ok(()),
         },
-        // By index or pattern: resolved on the input before staging, so a
-        // selection that fails copies nothing.
+        // By index or pattern: resolved before anything is written.
         None => early_rows(
             args.row_indices.as_deref(),
             args.pattern.as_deref(),
@@ -228,8 +281,7 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
         } else {
             args.zip
         };
-        let (_backend, effective_output, output_file, mut data) =
-            stage_for_edit(&args.data_file, &args.output, zip)?;
+        let data = open_sparse_matrix_by_path(&args.data_file)?;
 
         let original_nrow = data.num_rows().unwrap_or(0);
         info!("original data: {} rows", original_nrow);
@@ -288,7 +340,15 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
             ));
         };
 
-        data.subset_columns_rows(None, Some(&selected_rows))?;
+        let rows = rows_kept(data.as_ref(), &selected_rows)?;
+        let (effective_output, output_file) = write_subset(
+            &args.data_file,
+            data.as_ref(),
+            None,
+            Some(rows),
+            &args.output,
+            zip,
+        )?;
         info!("after subset: {} rows", selected_rows.len());
         drop(data);
 
@@ -321,15 +381,14 @@ pub fn subset(args: &SubsetArgs) -> anyhow::Result<()> {
     // The picker's session first: hosted, the rest runs in the session.
     let session = open_session("subset", &args.session)?;
     let mut tui = Tui::new(&session);
-    // Pick before staging, so cancelling copies nothing.
+    // Pick before writing, so cancelling writes nothing.
     let Some(picked) = pick_rows_and_columns(&mut tui, &args.data_file, "subset")? else {
         return Ok(());
     };
     // Written off the screen: a `kill` meanwhile lets it finish.
     off_screen(Some(&mut tui), || {
         let zip = zip_like_input(&args.data_file, &args.output);
-        let (_backend, effective_output, output_file, mut data) =
-            stage_for_edit(&args.data_file, &args.output, zip)?;
+        let data = open_sparse_matrix_by_path(&args.data_file)?;
 
         let rows = (!picked.rows.is_empty()).then_some(picked.rows);
         let columns = (!picked.columns.is_empty()).then_some(picked.columns);
@@ -341,7 +400,17 @@ pub fn subset(args: &SubsetArgs) -> anyhow::Result<()> {
                 .as_ref()
                 .map_or(data.num_columns().unwrap_or(0), |c| c.len())
         );
-        data.subset_columns_rows(columns.as_ref(), rows.as_ref())?;
+        let rows = rows
+            .map(|rows| rows_kept(data.as_ref(), &rows))
+            .transpose()?;
+        let (effective_output, output_file) = write_subset(
+            &args.data_file,
+            data.as_ref(),
+            columns.as_deref(),
+            rows,
+            &args.output,
+            zip,
+        )?;
         drop(data);
 
         finalize_zarr_output(&output_file, &effective_output)?;
@@ -357,10 +426,41 @@ pub fn subset(args: &SubsetArgs) -> anyhow::Result<()> {
 pub fn reorder_rows(args: &ReorderRowsArgs) -> anyhow::Result<()> {
     let row_names_order: Vec<Box<str>> = read_row_names(args.row_file.clone(), MAX_ROW_NAME_IDX)?;
 
-    let (_backend, effective_output, output_file, mut data) =
-        stage_for_edit(&args.data_file, &args.output, args.zip)?;
+    let data = open_sparse_matrix_by_path(&args.data_file)?;
 
-    data.reorder_rows(&row_names_order)?;
+    // Each row of the data goes where the file names it; a row it does not
+    // name is dropped, and a name the data lacks is an empty row.
+    let place = build_name2index_map(&row_names_order);
+    let mut taken = vec![false; row_names_order.len()];
+    let to = data
+        .row_names()?
+        .iter()
+        .map(|name| {
+            let Some(&new) = place.get(name) else {
+                return Ok(None);
+            };
+            anyhow::ensure!(
+                !std::mem::replace(&mut taken[new], true),
+                "{}: the row name {name} is on more than one row, so which of \
+                 them goes to its place is not determined",
+                args.data_file
+            );
+            Ok(Some(new as u64))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let rows = RowMap {
+        to,
+        nrow: row_names_order.len(),
+    };
+
+    let (effective_output, output_file) = write_subset(
+        &args.data_file,
+        data.as_ref(),
+        None,
+        Some((rows, row_names_order)),
+        &args.output,
+        args.zip,
+    )?;
     drop(data);
 
     finalize_zarr_output(&output_file, &effective_output)?;

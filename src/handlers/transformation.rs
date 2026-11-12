@@ -1,6 +1,8 @@
+use crate::handlers::merging::same_file;
 use crate::hdf5_io::resolve_backend_file;
 use crate::qc::{squeeze_by_nnz, SqueezeCutoffs};
-use crate::sparse_io::open_sparse_matrix;
+use crate::sparse_io::{open_sparse_matrix, SparseIoBackend};
+use crate::zarr_io::{output_target, prepare_output};
 use clap::Args;
 use log::info;
 
@@ -192,6 +194,26 @@ pub struct SubsetRowsArgs {
     /// keep a `.zarr` directory instead of producing a `.zarr.zip` archive
     #[arg(long = "no-zip", default_value_t = true, action = clap::ArgAction::SetFalse)]
     pub zip: bool,
+}
+
+/// [`prepare_output`] for a handler that derives its output from `input`:
+/// the output is cleared before the input is read and, zipped, renamed over
+/// its own name after, so it is refused when it is, or is built at, the
+/// input.
+pub(crate) fn prepare_output_beside(
+    input: &str,
+    output: &str,
+    backend: SparseIoBackend,
+    zip: bool,
+) -> anyhow::Result<(Box<str>, SparseIoBackend, Box<str>)> {
+    let target = output_target(output, backend.clone(), zip)?;
+    for p in [&target.effective, &target.working, &target.found] {
+        anyhow::ensure!(
+            !same_file(input, p),
+            "the output {p} is the input {input}: give -o another name"
+        );
+    }
+    prepare_output(output, backend, zip)
 }
 
 /// Cut, in place, the rows and columns of the backend at `backend_file`
