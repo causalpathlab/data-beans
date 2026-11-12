@@ -152,7 +152,11 @@ pub struct RunSimulateArgs {
                      \n\
                      π_batch = 0 makes batches share one per-gene shift exp(w).\n\
                      π_batch = 1 is fully batch-specific.\n\
-                     It is independent of pve_topic."
+                     It is independent of pve_topic.\n\
+                     \n\
+                     In reference mode the reference's per-gene mean is the baseline:\n\
+                     \x20 log δ(g,b) = √π_batch·z(g,b)\n\
+                     with two or more batches, and no shift with one."
     )]
     pub pve_batch: f32,
 
@@ -705,18 +709,10 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
         cmd_args.batch_program,
         bb
     );
-    // Pre-sample δ_{:, b} per batch with explicit log-space variance
-    // decomposition mirroring the synthetic-mode batch effects:
-    //   log δ_{g,b} = √π_batch · z_{g,b} + √(1−π_batch) · w_g
-    // z_{g,b} from the (gene-gene-correlated) copula, w_g iid N(0,1) shared
-    // across batches (the batch-invariant per-gene shift).
-    let alpha_invariant_batch = (1.0 - pve_batch).sqrt();
-    let normal01 = Normal::new(0.0_f32, 1.0_f32).expect("standard normal");
-    let w_invariant: DVector<f32> =
-        DVector::from_fn(dd, |_, _| normal01.sample(&mut rng) * alpha_invariant_batch);
-    let batch_delta: Vec<DVector<f32>> = (0..bb)
-        .map(|_| batch_cov.sample(&mut rng).scale(alpha_batch) + &w_invariant)
-        .collect();
+    // Pre-sample the per-batch log shift `log δ_{g,b} = √π_batch · z_{g,b}`,
+    // z_{g,b} from the (gene-gene-correlated) batch copula. The reference's
+    // `μ̂_g` is the gene baseline, so nothing batch-invariant is added.
+    let batch_delta = batch_cov.sample_batch_shifts(bb, alpha_batch, &mut rng);
 
     // Topic dictionary β: log-normal with explicit topic-PVE decomposition,
     // matching synthetic mode. Hierarchical mode uses the stick-breaking

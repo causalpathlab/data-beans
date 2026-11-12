@@ -1085,7 +1085,6 @@ fn sample_with_reference(
     let alpha_topic = pi_topic.sqrt();
     let alpha_noise = pi_noise.sqrt();
     let alpha_batch = pi_batch.sqrt();
-    let alpha_invariant_batch = (1.0 - pi_batch).sqrt();
 
     // Effective dictionary (γ ⊙ β).
     let eff_dk: std::borrow::Cow<Mat> = match gamma_dk {
@@ -1137,16 +1136,10 @@ fn sample_with_reference(
         batch_program,
         bb
     );
-    // Explicit log-space variance decomposition mirroring synthetic mode:
-    //   log δ_{g,b} = √π_batch · z_{g,b} + √(1−π_batch) · w_g
-    // z from the (gene-gene-correlated) batch copula; w iid N(0,1) shared
-    // across batches (the batch-invariant per-gene shift).
-    let normal01 = Normal::new(0.0_f32, 1.0_f32).unwrap();
-    let w_invariant: DVector<f32> =
-        DVector::from_fn(dd, |_, _| normal01.sample(&mut rng) * alpha_invariant_batch);
-    let batch_delta: Vec<DVector<f32>> = (0..bb)
-        .map(|_| batch_cov.sample(&mut rng).scale(alpha_batch) + &w_invariant)
-        .collect();
+    // Per-batch log shift `log δ_{g,b} = √π_batch · z_{g,b}`, z from the
+    // (gene-gene-correlated) batch copula. The reference's `μ̂_g` is the
+    // feature baseline, so nothing batch-invariant is added.
+    let batch_delta = batch_cov.sample_batch_shifts(bb, alpha_batch, &mut rng);
 
     let triplets: Vec<(u64, u64, f32)> = (0..nn)
         .into_par_iter()

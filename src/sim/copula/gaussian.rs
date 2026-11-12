@@ -98,6 +98,24 @@ impl CopulaCovariance {
         Ok(Self { factor, ridge_sd })
     }
 
+    /// Per-batch log shifts of the reference means, `scale · z_b` with one
+    /// draw `z_b` per batch. A shift is a batch effect only as a contrast
+    /// between batches: with fewer than two batches every shift is zero, so
+    /// the simulated means stay the reference's.
+    pub fn sample_batch_shifts<R: Rng + ?Sized>(
+        &self,
+        n_batches: usize,
+        scale: f32,
+        rng: &mut R,
+    ) -> Vec<DVector<f32>> {
+        if n_batches < 2 {
+            return vec![DVector::zeros(self.dim()); n_batches];
+        }
+        (0..n_batches)
+            .map(|_| self.sample(rng).scale(scale))
+            .collect()
+    }
+
     /// Sample `z*[h] = F[h,:]·η + ridge_sd[h]·ε_h`, `η ~ N(0, I_rank)`,
     /// `ε ~ N(0, I_g)`. After the per-row rescale in `fit`, `Var(z*[h]) = 1`.
     pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> DVector<f32> {
@@ -220,6 +238,29 @@ mod tests {
         }
         assert!(sub.embed(&indices[..3], dim).is_err());
         assert!(sub.embed(&indices, 10).is_err());
+    }
+
+    /// One batch has no other batch to differ from, so its shift is zero;
+    /// with several, each batch gets its own draw at the requested scale.
+    #[test]
+    fn batch_shifts_are_contrasts_between_batches() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        // Rank 0: every gene's draw is its own N(0, 1), so the variance
+        // over genes of one batch's shift is the squared scale.
+        let cov = CopulaCovariance::random_low_rank(2000, 0, &mut rng);
+
+        let one = cov.sample_batch_shifts(1, 1.0, &mut rng);
+        assert_eq!(one.len(), 1);
+        assert!(one[0].iter().all(|&v| v == 0.0));
+
+        let three = cov.sample_batch_shifts(3, 0.5, &mut rng);
+        assert_eq!(three.len(), 3);
+        assert_ne!(three[0], three[1]);
+        for shift in &three {
+            let var = shift.iter().map(|v| v * v).sum::<f32>() / shift.len() as f32;
+            assert!((var - 0.25).abs() < 0.05, "shift variance {var}");
+        }
+        assert!(cov.sample_batch_shifts(0, 1.0, &mut rng).is_empty());
     }
 
     #[test]

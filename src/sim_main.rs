@@ -80,12 +80,12 @@ enum Commands {
                       Reference mode (`--reference <h5/zarr>`): two-stage GLM,\n\
                       NB+copula sampling —\n\
                       stage 1:  log λ⁰ = log μ̂_g + √pve_topic·t + √pve_noise·ε\n\
-                      stage 2:  log λ  = log λ⁰ + √pve_batch·z_{g,b} + √(1−pve_batch)·w_g\n\
+                      stage 2:  log λ  = log λ⁰ + √pve_batch·z_{g,b}   (two or more batches)\n\
                       sample :  y ~ NB(λ, r̂_g)  via  u=Φ(z*),  F⁻¹_NB(u; λ, r̂)\n\
                       where t is z-scored log(β·θ) per cell. β is drawn as in synthetic mode,\n\
                       and ε is iid N(0, 1). z_{g,b} comes from the gene-gene copula factor,\n\
                       at rank `--batch-rank`, on axes chosen by `--batch-program`.\n\
-                      w_g iid N(0, 1) gives the batch-invariant per-gene shift.\n\
+                      With one batch there is no shift: the means are the reference's.\n\
                       \n\
                       `--depth` is reinterpreted as a multiplicative scale.\n\
                       Library size then matches the reference's mean. This follows the scDesign,\n\
