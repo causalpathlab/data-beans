@@ -131,6 +131,28 @@ impl CopulaCovariance {
         Self { factor, ridge_sd }
     }
 
+    /// Lift a covariance over a feature subset to all `dim` features: row `h`
+    /// of `self` becomes row `indices[h]`, and every feature outside
+    /// `indices` gets a zero factor row with `ridge_sd = 1` (an independent
+    /// unit-variance draw). The copula is fit on HVGs only, so this is what
+    /// turns its truncated factor into a per-gene batch program.
+    pub fn embed(&self, indices: &[usize], dim: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            indices.len() == self.dim(),
+            "embed: {} indices for a {}-row covariance",
+            indices.len(),
+            self.dim()
+        );
+        let mut factor = DMatrix::<f32>::zeros(dim, self.rank());
+        let mut ridge_sd = DVector::<f32>::from_element(dim, 1.0);
+        for (h, &g) in indices.iter().enumerate() {
+            anyhow::ensure!(g < dim, "embed: index {} out of range for dim {}", g, dim);
+            factor.set_row(g, &self.factor.row(h));
+            ridge_sd[g] = self.ridge_sd[h];
+        }
+        Ok(Self { factor, ridge_sd })
+    }
+
     /// Construct a fresh low-rank factor from iid N(0, 1) entries, then
     /// per-row-rescale so each gene has unit marginal variance under
     /// `Var(z*[h]) = ‖F[h,:]‖² + ridge_sd[h]² = 1`. Used by the two-stage
@@ -172,6 +194,33 @@ impl CopulaCovariance {
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    /// Embedding keeps the subset's rows where the index map puts them and
+    /// gives every other feature an independent unit-variance draw.
+    #[test]
+    fn embed_scatters_rows_and_fills_unit_ridge() {
+        let (h, n, dim) = (6usize, 400usize, 15usize);
+        let normal = Normal::new(0.0_f32, 1.0_f32).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        let z = DMatrix::from_fn(h, n, |_, _| normal.sample(&mut rng));
+        let sub = CopulaCovariance::fit(&z, 4, 1e-3).unwrap().truncate_rank(2);
+        let indices = [12usize, 0, 7, 3, 14, 9];
+
+        let full = sub.embed(&indices, dim).unwrap();
+        assert_eq!(full.dim(), dim);
+        assert_eq!(full.rank(), 2);
+        assert_eq!(full.sample(&mut rng).len(), dim);
+        for (row, &g) in indices.iter().enumerate() {
+            assert_eq!(full.factor.row(g), sub.factor.row(row));
+            assert_eq!(full.ridge_sd[g], sub.ridge_sd[row]);
+        }
+        for g in (0..dim).filter(|g| !indices.contains(g)) {
+            assert!(full.factor.row(g).iter().all(|&v| v == 0.0));
+            assert_eq!(full.ridge_sd[g], 1.0);
+        }
+        assert!(sub.embed(&indices[..3], dim).is_err());
+        assert!(sub.embed(&indices, 10).is_err());
+    }
 
     #[test]
     fn identity_recovery_full_rank() {

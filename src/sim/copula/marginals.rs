@@ -93,8 +93,9 @@ pub fn nb_table_cap(fit: NbFit) -> usize {
     ((mu + 20.0 * var.sqrt()).ceil() as usize).saturating_add(100)
 }
 
-/// `min { k : F(k) ≥ u }` from a pre-built CDF table. Hot-path lookup used by
-/// the per-cell sample loop; pair with `nb_cdf_table` once per (HVG, batch).
+/// `min { k : F(k) ≥ u }` from a pre-built CDF table. Pair with one
+/// `nb_cdf_table` per fit when many quantiles share that fit; for a fit that
+/// changes on every draw use [`nb_inverse_cdf`].
 pub fn nb_inverse_cdf_from_table(u: f64, table: &[f64]) -> u32 {
     if u <= 0.0 {
         return 0;
@@ -105,6 +106,46 @@ pub fn nb_inverse_cdf_from_table(u: f64, table: &[f64]) -> u32 {
         }
     }
     table.len() as u32
+}
+
+/// `min { k : F(k) ≥ u }` for one `(fit, u)` pair, capped at `k_max + 1`.
+///
+/// Walks the same log-PMF recurrence as [`nb_cdf_table`] and stops at the
+/// first `k` whose cumulative mass reaches `u`, so it returns exactly what
+/// `nb_inverse_cdf_from_table(u, &nb_cdf_table(fit, k_max))` does without
+/// building the table. Use it when the fit changes on every draw (a per-cell
+/// mean); keep the table when many `u` share one fit.
+pub fn nb_inverse_cdf(u: f64, fit: NbFit, k_max: usize) -> u32 {
+    let mu = fit.mu as f64;
+    let r = fit.r as f64;
+    if u <= 0.0 || mu <= 0.0 {
+        return 0;
+    }
+    // Per-step log-PMF increment: ln P(k+1) − ln P(k).
+    let poisson = !r.is_finite();
+    let (mut ln_pk, ln_step) = if poisson {
+        (-mu, mu.ln())
+    } else {
+        let p = r / (r + mu);
+        (r * p.ln(), (1.0 - p).ln())
+    };
+    let mut acc = ln_pk.exp();
+    if acc.min(1.0) >= u {
+        return 0;
+    }
+    for k in 0..k_max {
+        let kf = k as f64;
+        ln_pk += if poisson {
+            ln_step - (kf + 1.0).ln()
+        } else {
+            ((kf + r) / (kf + 1.0)).ln() + ln_step
+        };
+        acc += ln_pk.exp();
+        if acc.min(1.0) >= u {
+            return (k + 1) as u32;
+        }
+    }
+    (k_max + 1) as u32
 }
 
 /// Standard normal CDF Φ; thin wrapper over `statrs::distribution::Normal`.
@@ -132,6 +173,52 @@ mod tests {
             assert!(w[1] >= w[0] - 1e-12);
         }
         assert!((table.last().unwrap() - 1.0).abs() < 1e-3);
+    }
+
+    /// The table-free inverse CDF agrees with table + scan for NB and
+    /// Poisson fits, across the quantile range and when the cap truncates.
+    #[test]
+    fn inverse_cdf_matches_table_lookup() {
+        let fits = [
+            NbFit { mu: 0.0, r: 2.0 },
+            NbFit { mu: 1e-4, r: 0.01 },
+            NbFit { mu: 0.3, r: 0.5 },
+            NbFit { mu: 5.0, r: 2.0 },
+            NbFit { mu: 40.0, r: 0.01 },
+            NbFit { mu: 250.0, r: 8.0 },
+            NbFit {
+                mu: 0.7,
+                r: f32::INFINITY,
+            },
+            NbFit {
+                mu: 60.0,
+                r: f32::INFINITY,
+            },
+        ];
+        let us = [
+            0.0,
+            1e-7,
+            0.01,
+            0.2,
+            0.5,
+            0.731,
+            0.9,
+            0.99,
+            0.9999,
+            1.0 - 1e-7,
+        ];
+        for fit in fits {
+            for k_max in [0usize, 3, nb_table_cap(fit)] {
+                let table = nb_cdf_table(fit, k_max);
+                for u in us {
+                    assert_eq!(
+                        nb_inverse_cdf(u, fit, k_max),
+                        nb_inverse_cdf_from_table(u, &table),
+                        "fit {fit:?}, k_max {k_max}, u {u}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
