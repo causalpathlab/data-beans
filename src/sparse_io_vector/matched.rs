@@ -44,9 +44,6 @@ impl SparseIoVec {
 
         debug_assert!(target_batch < self.num_batches());
 
-        let nrow = self.num_rows();
-        let mut ncol = 0;
-        let mut triplets = Vec::new();
         let mut distances = Vec::new();
         let mut source_columns = Vec::new();
         let mut matched_columns = Vec::new();
@@ -67,7 +64,6 @@ impl SparseIoVec {
                     if glob == glob_matched {
                         continue; // avoid identical cell pairs
                     }
-                    self.read_column_offset(glob_matched, &mut ncol, &mut triplets)?;
                     source_columns.push(glob);
                     matched_columns.push(glob_matched);
                     distances.push(dist);
@@ -75,8 +71,24 @@ impl SparseIoVec {
             }
         }
 
+        self.read_matched(source_columns, matched_columns, distances)
+    }
+
+    /// Read the `matched_columns` in one batched pass: output column `k`
+    /// holds global column `matched_columns[k]`, repeats included. One read
+    /// per backend lets it coalesce ranges and reuse decoded chunks, where a
+    /// read per matched column would decode the same chunks again and again.
+    ///
+    /// `pub(super)` so the tests of sibling modules can read through it.
+    pub(super) fn read_matched(
+        &self,
+        source_columns: Vec<usize>,
+        matched_columns: Vec<usize>,
+        distances: Vec<f32>,
+    ) -> anyhow::Result<TripletsMatched> {
+        let (shape, triplets) = self.columns_triplets(matched_columns.iter().copied())?;
         Ok(TripletsMatched {
-            shape: (nrow, ncol),
+            shape,
             triplets,
             source_columns,
             matched_columns,
@@ -195,10 +207,6 @@ impl SparseIoVec {
 
         let approx_ncol = knn_columns * knn_batches;
 
-        let nrow = self.num_rows();
-        let mut ncol = 0_usize;
-        let mut triplets = Vec::with_capacity(approx_ncol * nrow);
-
         let mut distances = Vec::with_capacity(approx_ncol);
         let mut source_columns = Vec::with_capacity(approx_ncol);
         let mut matched_columns = Vec::with_capacity(approx_ncol);
@@ -239,7 +247,6 @@ impl SparseIoVec {
                         if glob_index == glob_matched_index {
                             continue;
                         }
-                        self.read_column_offset(glob_matched_index, &mut ncol, &mut triplets)?;
                         source_columns.push(glob_index);
                         matched_columns.push(glob_matched_index);
                         distances.push(dist);
@@ -248,13 +255,7 @@ impl SparseIoVec {
             }
         }
 
-        Ok(TripletsMatched {
-            shape: (nrow, ncol),
-            triplets,
-            source_columns,
-            matched_columns,
-            distances,
-        })
+        self.read_matched(source_columns, matched_columns, distances)
     }
 
     fn query_columns_by_data_triplets<T>(
@@ -271,12 +272,7 @@ impl SparseIoVec {
             .as_ref()
             .ok_or(anyhow::anyhow!("no knn lookup"))?;
 
-        let nrow = self.num_rows();
-        let mut ncol = 0_usize;
-
         let approx_knn = self.num_batches() * knn_per_batch;
-        let mut triplets = Vec::with_capacity(approx_knn);
-        let mut source_columns = Vec::with_capacity(approx_knn);
         let mut matched_columns = Vec::with_capacity(approx_knn);
         let mut distances = Vec::with_capacity(approx_knn);
 
@@ -286,20 +282,13 @@ impl SparseIoVec {
                 lookup.search_by_query_data(q.as_slice(), knn_per_batch)?;
 
             for (&glob_idx, &dist) in matched.iter().zip(matched_distances.iter()) {
-                self.read_column_offset(glob_idx, &mut ncol, &mut triplets)?;
-                source_columns.push(glob_idx);
                 matched_columns.push(glob_idx);
                 distances.push(dist);
             }
         }
 
-        Ok(TripletsMatched {
-            shape: (nrow, ncol),
-            triplets,
-            source_columns,
-            matched_columns,
-            distances,
-        })
+        let sources = matched_columns.clone();
+        self.read_matched(sources, matched_columns, distances)
     }
 
     /// Take columns within the neighbourhood of given `cells`

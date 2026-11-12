@@ -22,9 +22,12 @@ impl SparseIoVec {
     where
         T: Sync + Send + std::hash::Hash + Eq + Clone + ToString,
     {
-        {
-            debug_assert_eq!(batch_membership.len(), feature_matrix.ncols());
-        }
+        anyhow::ensure!(
+            feature_matrix.ncols() == batch_membership.len(),
+            "the feature matrix has {} columns but there are {} batch labels",
+            feature_matrix.ncols(),
+            batch_membership.len(),
+        );
         self._register_batches(
             feature_matrix,
             batch_membership,
@@ -52,9 +55,12 @@ impl SparseIoVec {
     where
         T: Sync + Send + std::hash::Hash + Eq + Clone + ToString,
     {
-        {
-            debug_assert_eq!(batch_membership.len(), feature_matrix.ncols());
-        }
+        anyhow::ensure!(
+            feature_matrix.ncols() == batch_membership.len(),
+            "the feature matrix has {} columns but there are {} batch labels",
+            feature_matrix.ncols(),
+            batch_membership.len(),
+        );
 
         self._register_batches(
             feature_matrix,
@@ -80,9 +86,13 @@ impl SparseIoVec {
         F: Fn(&M, &Vec<usize>) -> ColumnDict<usize> + Sync,
         T: Sync + Send + std::hash::Hash + Eq + Clone + ToString,
     {
-        let batches = partition_by_membership(batch_membership, None);
-
         let ntot = self.num_columns();
+        anyhow::ensure!(
+            batch_membership.len() == ntot,
+            "batch membership has {} entries but there are {ntot} columns",
+            batch_membership.len(),
+        );
+        let batches = partition_by_membership(batch_membership, None);
         let mut col_to_batch = vec![0; ntot];
 
         // A ColumnDict build is internally parallel (instant-distance's rayon
@@ -264,12 +274,23 @@ impl SparseIoVec {
     /// Register batch membership information without building HNSW
     /// indices. This is a lightweight alternative to `register_batches_dmatrix`
     /// for use with pb-sample based batch correction.
+    ///
+    /// # Panics
+    /// If `batch_membership` is not one entry per column: a shorter slice
+    /// would leave the unlisted columns in the first batch, absent from that
+    /// batch's column list.
     pub fn register_batch_membership<T>(&mut self, batch_membership: &[T])
     where
         T: Sync + Send + std::hash::Hash + Eq + Clone + ToString,
     {
-        let batches = partition_by_membership(batch_membership, None);
         let ntot = self.num_columns();
+        assert_eq!(
+            batch_membership.len(),
+            ntot,
+            "batch membership has {} entries but there are {ntot} columns",
+            batch_membership.len(),
+        );
+        let batches = partition_by_membership(batch_membership, None);
         let mut col_to_batch = vec![0; ntot];
 
         let mut sorted_batches: Vec<_> = batches.into_iter().collect();
@@ -323,23 +344,20 @@ impl SparseIoVec {
         {
             anyhow::bail!("column {i} has multiplicity {w}; weights must be finite and positive");
         }
-        self.derived.col_multiplicity = Some(multiplicity.to_vec());
+        self.col_multiplicity = Some(multiplicity.to_vec());
         Ok(())
     }
 
     /// Weight of a single column — `1.0` when no multiplicities are registered.
     #[must_use]
     pub fn column_multiplicity(&self, col: usize) -> f32 {
-        self.derived
-            .col_multiplicity
-            .as_ref()
-            .map_or(1.0, |m| m[col])
+        self.col_multiplicity.as_ref().map_or(1.0, |m| m[col])
     }
 
     /// True when any column stands for more than one observation.
     #[must_use]
     pub fn has_column_multiplicity(&self) -> bool {
-        self.derived.col_multiplicity.is_some()
+        self.col_multiplicity.is_some()
     }
 
     /// The whole multiplicity vector, one weight per column — `None` when no
@@ -350,7 +368,7 @@ impl SparseIoVec {
     /// "absent means 1.0" default at every site.
     #[must_use]
     pub fn column_multiplicities(&self) -> Option<&[f32]> {
-        self.derived.col_multiplicity.as_deref()
+        self.col_multiplicity.as_deref()
     }
 
     pub fn batch_names(&self) -> Option<Vec<Box<str>>> {

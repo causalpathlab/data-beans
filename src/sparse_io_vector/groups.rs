@@ -24,11 +24,14 @@ impl SparseIoVec {
         let (group_keys, group_to_cols): (Vec<Box<str>>, Vec<Vec<usize>>) =
             sorted_partitions.into_iter().unzip();
 
-        let col_to_group: HashMap<_, _> = group_to_cols
-            .iter()
-            .enumerate()
-            .flat_map(|(g, cols)| cols.iter().map(move |&j| (j, g)))
-            .collect();
+        // Columns are dense ids, so the reverse map is a plain vector;
+        // `ncolumns_per_group` can leave a column out of every group.
+        let mut col_to_group = vec![usize::MAX; column_to_group.len()];
+        for (g, cols) in group_to_cols.iter().enumerate() {
+            for &j in cols {
+                col_to_group[j] = g;
+            }
+        }
 
         self.derived.group_keys = Some(group_keys);
         self.derived.group_to_cols = Some(group_to_cols);
@@ -93,8 +96,9 @@ impl SparseIoVec {
         cells
             .map(|j| {
                 cell_to_group
-                    .get(&j)
+                    .get(j)
                     .copied()
+                    .filter(|&g| g != usize::MAX)
                     .ok_or_else(|| anyhow::anyhow!("missing group membership"))
             })
             .collect()

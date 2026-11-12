@@ -49,8 +49,86 @@ impl SparseIoVec {
         let didx_u32: u32 = didx
             .try_into()
             .map_err(|_| anyhow::anyhow!("backend count overflows u32"))?;
+
+        // Everything that can fail runs before the first change to `self`, so
+        // a refused backend leaves the vector exactly as it was and the next
+        // push starts from a consistent state.
         let raw_col_names = data.column_names()?;
         debug_assert_eq!(raw_col_names.len(), ncol_data);
+        anyhow::ensure!(u32::try_from(ncol_data).is_ok(), "local col overflows u32");
+        // `Union` keys its global columns by `u32`.
+        anyhow::ensure!(
+            self.column_alignment == ColumnAlignment::Disjoint
+                || u32::try_from(self.offset + ncol_data).is_ok(),
+            "global col overflows u32"
+        );
+
+        // Per-backend modality namespacing: `/{suffix}` goes after
+        // canonicalization so the gene/locus rule still applies to the
+        // bare name and only the modality tag distinguishes the row.
+        let row_suffix = match self.per_backend_row_suffix.as_ref() {
+            Some(suffixes) => Some(suffixes.get(didx).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "per_backend_row_suffix has {} entries but backend index is {}",
+                    suffixes.len(),
+                    didx,
+                )
+            })?),
+            None => None,
+        };
+        let row_keys: Vec<Box<str>> = data
+            .row_names()?
+            .iter()
+            .map(|row| {
+                let key: Box<str> = match self.row_canonicalizer.as_ref() {
+                    Some(canon) => canon(row),
+                    None => row.clone(),
+                };
+                match row_suffix {
+                    Some(suffix) => format!("{key}/{suffix}").into_boxed_str(),
+                    None => key,
+                }
+            })
+            .collect();
+
+        // `Union` only: each column's (merge key, displayed name), refused
+        // when two columns of this backend share a key — that would put two
+        // entries from the same backend on one global col.
+        let union_keys: Vec<(Box<str>, Box<str>)> = match self.column_alignment {
+            ColumnAlignment::Disjoint => Vec::new(),
+            ColumnAlignment::Union => {
+                let mut seen_in_this_push: HashMap<Box<str>, usize> =
+                    HashMap::with_capacity_and_hasher(ncol_data, Default::default());
+                let mut keys = Vec::with_capacity(ncol_data);
+                for (loc, raw) in raw_col_names.iter().enumerate() {
+                    // Tag the barcode with the per-file suffix (sample id)
+                    // before canonicalization so the merge key — and the
+                    // displayed name — carry sample identity. Same suffix
+                    // across backends ⇒ merge; different ⇒ distinct cells.
+                    let tagged: Box<str> = match barcode_suffix {
+                        Some(s) => format!("{raw}{COLUMN_SEP}{s}").into_boxed_str(),
+                        None => raw.clone(),
+                    };
+                    let canon: Box<str> = match self.column_canonicalizer.as_ref() {
+                        Some(c) => c(&tagged),
+                        None => tagged.clone(),
+                    };
+                    if let Some(prev_loc) = seen_in_this_push.insert(canon.clone(), loc) {
+                        return Err(anyhow::anyhow!(
+                            "ColumnAlignment::Union: backend {} has duplicate canonical \
+                             barcode `{}` (local cols {} and {}) — Union cannot fold a \
+                             cell with itself within one backend",
+                            didx,
+                            canon,
+                            prev_loc,
+                            loc,
+                        ));
+                    }
+                    keys.push((canon, tagged));
+                }
+                keys
+            }
+        };
 
         // `Disjoint`: every push appends fresh global columns + the
         // `@<basename>` disambiguator. `Union`: match each pushed
@@ -59,18 +137,14 @@ impl SparseIoVec {
         // backends (reads merge their nonzeros into one output col).
         let data_to_cells_loc_to_glob: Vec<usize> = match self.column_alignment {
             ColumnAlignment::Disjoint => {
-                let mut local_to_glob = Vec::with_capacity(ncol_data);
-                for loc in 0..ncol_data {
-                    let glob = self.offset + loc;
-                    let loc_u32: u32 = loc
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("local col overflows u32"))?;
-                    self.col_to_data.push(vec![BackendLocation {
-                        backend: didx_u32,
-                        local_col: loc_u32,
-                    }]);
-                    local_to_glob.push(glob);
-                }
+                let local_to_glob: Vec<usize> = (self.offset..self.offset + ncol_data).collect();
+                self.col_to_data
+                    .extend((0..ncol_data as u32).map(|local_col| {
+                        vec![BackendLocation {
+                            backend: didx_u32,
+                            local_col,
+                        }]
+                    }));
                 let data_tag = match data_name.as_deref() {
                     Some(x) => COLUMN_SEP.to_string() + x,
                     None => String::new(),
@@ -84,65 +158,25 @@ impl SparseIoVec {
                 local_to_glob
             }
             ColumnAlignment::Union => {
-                // First pass: detect within-backend duplicate barcodes
-                // (would create a malformed global col with two entries
-                // from the same backend).
-                let mut seen_in_this_push: HashMap<Box<str>, usize> =
-                    HashMap::with_capacity_and_hasher(ncol_data, Default::default());
                 let mut local_to_glob = Vec::with_capacity(ncol_data);
-                for (loc, raw) in raw_col_names.iter().enumerate() {
-                    // Tag the barcode with the per-file suffix (sample id)
-                    // before canonicalization so the merge key — and the
-                    // displayed name — carry sample identity. Same suffix
-                    // across backends ⇒ merge; different ⇒ distinct cells.
-                    // Borrow `raw` in the common no-suffix path so the merge
-                    // pass doesn't allocate a `Box<str>` per column.
-                    let tagged: Cow<str> = match barcode_suffix {
-                        Some(s) => Cow::Owned(format!("{raw}{COLUMN_SEP}{s}")),
-                        None => Cow::Borrowed(raw.as_ref()),
+                for (loc, (canon, tagged)) in union_keys.into_iter().enumerate() {
+                    let here = BackendLocation {
+                        backend: didx_u32,
+                        local_col: loc as u32,
                     };
-                    let canon: Box<str> = match self.column_canonicalizer.as_ref() {
-                        Some(c) => c(&tagged),
-                        None => Box::from(&*tagged),
-                    };
-                    if let Some(&prev_loc) = seen_in_this_push.get(&canon) {
-                        return Err(anyhow::anyhow!(
-                            "ColumnAlignment::Union: backend {} has duplicate canonical \
-                             barcode `{}` (local cols {} and {}) — Union cannot fold a \
-                             cell with itself within one backend",
-                            didx,
-                            canon,
-                            prev_loc,
-                            loc,
-                        ));
-                    }
-                    seen_in_this_push.insert(canon.clone(), loc);
-
-                    let loc_u32: u32 = loc
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("local col overflows u32"))?;
                     let glob = match self.col_name_position.get(&canon).copied() {
                         Some(g) => {
-                            self.col_to_data[g as usize].push(BackendLocation {
-                                backend: didx_u32,
-                                local_col: loc_u32,
-                            });
+                            self.col_to_data[g as usize].push(here);
                             g as usize
                         }
                         None => {
                             let new_g = self.offset;
-                            let new_g_u32: u32 = new_g
-                                .try_into()
-                                .map_err(|_| anyhow::anyhow!("global col overflows u32"))?;
-                            self.col_name_position.insert(canon, new_g_u32);
-                            self.col_to_data.push(vec![BackendLocation {
-                                backend: didx_u32,
-                                local_col: loc_u32,
-                            }]);
+                            self.col_name_position.insert(canon, new_g as u32);
+                            self.col_to_data.push(vec![here]);
                             // Tagged barcode (`raw` when no suffix) becomes
                             // the displayed name; subsequent backends
                             // contributing to this cell don't relabel it.
-                            self.column_names_with_data_tag.push(Box::from(&*tagged));
+                            self.column_names_with_data_tag.push(tagged);
                             self.offset += 1;
                             new_g
                         }
@@ -156,29 +190,10 @@ impl SparseIoVec {
         // `data_to_cols[didx][loc] = glob`. Stored separately from
         // `col_to_data` because callers (e.g. `rows_triplets`) need the
         // forward map per backend.
-        let entry = self.data_to_cols.entry(didx).or_default();
-        entry.extend(data_to_cells_loc_to_glob.iter().copied());
+        self.data_to_cols.insert(didx, data_to_cells_loc_to_glob);
 
-        let row_names = data.row_names()?;
-        let mut local_to_global = Vec::with_capacity(row_names.len());
-        for row in row_names.iter() {
-            let mut key: Box<str> = match self.row_canonicalizer.as_ref() {
-                Some(canon) => canon(row),
-                None => row.clone(),
-            };
-            // Per-backend modality namespacing: append `/{suffix}` after
-            // canonicalization so the gene/locus rule still applies to the
-            // bare name and only the modality tag distinguishes the row.
-            if let Some(suffixes) = self.per_backend_row_suffix.as_ref() {
-                let suffix = suffixes.get(didx).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "per_backend_row_suffix has {} entries but backend index is {}",
-                        suffixes.len(),
-                        didx,
-                    )
-                })?;
-                key = format!("{key}/{suffix}").into_boxed_str();
-            }
+        let mut local_to_global = Vec::with_capacity(row_keys.len());
+        for key in row_keys {
             let glob_row = match self.row_name_position.get(&key) {
                 Some(&g) => g,
                 None => {
@@ -208,11 +223,12 @@ impl SparseIoVec {
         // them twice (which breaks `from_nonzero_triplets` strictness).
         let has_intra_merges = counted.len() != local_to_global.len();
         self.data_has_intra_row_merges.push(has_intra_merges);
-        let mut g2l: HashMap<usize, usize> =
-            HashMap::with_capacity_and_hasher(local_to_global.len(), Default::default());
-        for (l, &g) in local_to_global.iter().enumerate() {
-            g2l.insert(g, l);
-        }
+        let mut g2l: Vec<(usize, usize)> = local_to_global
+            .iter()
+            .enumerate()
+            .map(|(l, &g)| (g, l))
+            .collect();
+        g2l.sort_unstable();
         self.data_global_to_local_row.push(g2l);
         self.data_local_to_global_row.push(local_to_global);
 

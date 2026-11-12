@@ -10,7 +10,6 @@ use legume_numeric::matrix::utils::*;
 use log::info;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::borrow::Cow;
 use std::ops::Index;
 use std::sync::Arc;
 
@@ -71,7 +70,8 @@ pub type ColumnNameCanonicalizer = Arc<dyn Fn(&str) -> Box<str> + Send + Sync>;
 #[derive(Default)]
 struct DerivedCaches {
     // group caches (built by `assign_groups`)
-    col_to_group: Option<HashMap<usize, usize>>,
+    // per column, `usize::MAX` for a column left out of every group
+    col_to_group: Option<Vec<usize>>,
     group_to_cols: Option<Vec<Vec<usize>>>,
     group_keys: Option<Vec<Box<str>>>,
     // batch caches (built by `register_batches` / `register_batch_membership`)
@@ -80,9 +80,6 @@ struct DerivedCaches {
     batch_to_cols: Option<Vec<Vec<usize>>>,
     batch_idx_to_name: Option<Vec<Box<str>>>,
     between_batch_proximity: Option<Vec<Vec<usize>>>,
-    // how many observations each column stands for (built by
-    // `register_column_multiplicity`); `None` means one apiece
-    col_multiplicity: Option<Vec<f32>>,
 }
 
 impl Clone for DerivedCaches {
@@ -112,10 +109,13 @@ pub struct SparseIoVec {
     row_name_position: HashMap<Box<str>, usize>,
     row_names_by_global: Vec<Box<str>>,
     data_local_to_global_row: Vec<Vec<usize>>,
-    /// Per-backend inverse of `data_local_to_global_row[didx]`.
-    /// Built once at `push` time, never mutated thereafter, so row reads
-    /// don't have to rebuild it per call.
-    data_global_to_local_row: Vec<HashMap<usize, usize>>,
+    /// Per-backend inverse of `data_local_to_global_row[didx]`: every
+    /// `(global, local)` row pair, sorted, so the local rows of one global
+    /// row are a contiguous run found by binary search -- more than one where
+    /// the canonicalizer folded rows together. Built once at `push` time,
+    /// never mutated thereafter, so row reads don't have to rebuild it per
+    /// call.
+    data_global_to_local_row: Vec<Vec<(usize, usize)>>,
     /// `true` for datasets where `local_to_global` is non-injective —
     /// i.e. the canonicalizer collapsed two or more local rows to the
     /// same global row. Read paths use this to switch from a fast
@@ -169,6 +169,13 @@ pub struct SparseIoVec {
     /// Per global column, the factor every read divides it by
     /// ([`Self::set_column_scales`]). `None` reads the counts as stored.
     column_scales: Option<Vec<f32>>,
+    /// Per global column, how many observations it stands for
+    /// ([`Self::register_column_multiplicity`]); `None` means one apiece.
+    /// Declared by the caller and derivable from nothing else, so unlike
+    /// [`DerivedCaches`] it survives cloning and
+    /// [`Self::clear_column_membership`], and [`Self::mask_columns`] keeps the
+    /// surviving columns' weights.
+    col_multiplicity: Option<Vec<f32>>,
 }
 
 /// Strategy for aligning row names across multiple pushed backends.
@@ -256,6 +263,7 @@ impl SparseIoVec {
             column_canonicalizer: None,
             per_backend_row_suffix: None,
             column_scales: None,
+            col_multiplicity: None,
         }
     }
 
@@ -438,7 +446,8 @@ impl SparseIoVec {
     /// Named entry point for the collapse copy; it is exactly `self.clone()`,
     /// kept as a method so call sites read as intent. Cloning copies the data
     /// handles (matrices are `Arc`-shared, so only the index `Vec`s/`HashMap`s
-    /// are duplicated — cheap) and the row/column alignment state, while
+    /// are duplicated — cheap), the row/column alignment state and the
+    /// per-column scales and multiplicities, while
     /// **dropping** every derived batch / group / HNSW cache — see
     /// [`DerivedCaches`], whose drop-on-clone behavior is what isolates the
     /// non-`Clone` `batch_knn_lookup` HNSW indices and lets `SparseIoVec`
@@ -550,13 +559,15 @@ impl SparseIoVec {
         }
         self.col_to_data = new_col_to_data;
         self.column_names_with_data_tag = new_names;
-        if let Some(scales) = self.column_scales.as_mut() {
-            *scales = scales
-                .iter()
-                .zip(keep)
-                .filter(|(_, &k)| k)
-                .map(|(&v, _)| v)
-                .collect();
+        for per_column in [&mut self.column_scales, &mut self.col_multiplicity] {
+            if let Some(values) = per_column.as_mut() {
+                *values = values
+                    .iter()
+                    .zip(keep)
+                    .filter(|(_, &k)| k)
+                    .map(|(&v, _)| v)
+                    .collect();
+            }
         }
 
         // Remap data_to_cols in place. It is a positional
@@ -614,7 +625,8 @@ impl SparseIoVec {
     /// before [`Self::mask_columns`] when a collapse already registered groups
     /// on this backend (it asserts the caches are unset); the next
     /// `assign_groups` / `register_batch_membership` / collapse rebuilds them.
-    /// This is the fourth reset site alluded to in [`DerivedCaches`].
+    /// This is the fourth reset site alluded to in [`DerivedCaches`]. Column
+    /// multiplicities and scales are not membership and stay registered.
     pub fn clear_column_membership(&mut self) {
         self.derived = DerivedCaches::default();
     }
