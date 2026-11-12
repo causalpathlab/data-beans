@@ -411,7 +411,21 @@ pub fn subset(args: &SubsetArgs) -> anyhow::Result<()> {
 /// This function reorders the rows of the input data file according to the
 /// order specified in a row name file, and writes the result to a new output file.
 pub fn reorder_rows(args: &ReorderRowsArgs) -> anyhow::Result<()> {
-    let row_names_order: Vec<Box<str>> = read_row_names(args.row_file.clone(), MAX_ROW_NAME_IDX)?;
+    let mut row_names_order: Vec<Box<str>> =
+        read_row_names(args.row_file.clone(), MAX_ROW_NAME_IDX)?;
+    // Blank lines at the end of the file name no row.
+    let named = row_names_order
+        .iter()
+        .rposition(|name| !name.is_empty())
+        .map_or(0, |last| last + 1);
+    if named < row_names_order.len() {
+        info!(
+            "{}: {} blank line(s) at the end ignored",
+            args.row_file,
+            row_names_order.len() - named
+        );
+        row_names_order.truncate(named);
+    }
 
     let data = open_sparse_matrix_by_path(&args.data_file)?;
 

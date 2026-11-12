@@ -49,7 +49,8 @@ pub struct CellTypeMembership {
 /// plain or gzipped), each split into its fields.
 ///
 /// The header line names the delimiter for the whole file: tab when it holds
-/// a tab, else comma when it holds a comma, else runs of whitespace. A tab-
+/// a tab, else comma when it holds a comma; a header with neither leaves it
+/// to the rows, tab when one holds a tab, else runs of whitespace. A tab-
 /// or comma-separated field therefore keeps its spaces (`CD4 T cell`), and is
 /// trimmed and unquoted, while a comma inside a label of a
 /// whitespace-separated table (`B,naive`) is part of the label. Comment lines
@@ -60,9 +61,18 @@ fn read_annotation_rows(path: &str) -> Result<Vec<Vec<Box<str>>>> {
         .into_iter()
         .filter(|line| !line.trim().is_empty() && !line.starts_with(['#', '%']))
         .collect();
+    // A header of one column name holds no delimiter; tabs in the rows
+    // under it then tell (a comma there may be part of a label).
     let delim = lines
         .first()
-        .and_then(|header| ['\t', ','].into_iter().find(|&d| header.contains(d)));
+        .and_then(|header| ['\t', ','].into_iter().find(|&d| header.contains(d)))
+        .or_else(|| {
+            lines
+                .iter()
+                .skip(1)
+                .any(|line| line.contains('\t'))
+                .then_some('\t')
+        });
     Ok(lines
         .iter()
         .skip(1)
@@ -410,6 +420,29 @@ mod tests {
         let anno = read_cell_annotations(&gapped)?;
         assert_eq!(anno.individual_ids, vec![Box::<str>::from("IND_A")]);
         assert_eq!(anno.cell_to_individual.len(), 2);
+        Ok(())
+    }
+
+    /// A header with no tab or comma over tab-separated rows: the rows'
+    /// tabs separate, so a label keeps its spaces.
+    #[test]
+    fn rows_with_tabs_set_the_delimiter_a_header_does_not_name() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let columns: Vec<Box<str>> = vec!["cell_0".into(), "cell_1".into()];
+        let table = write_table(
+            &dir,
+            "cells.txt",
+            &[
+                "cell indiv type",
+                "cell_0\tIND_A\tCD4 T cell",
+                "cell_1\tIND_B\tB",
+            ],
+        );
+        let membership = build_onehot_membership(&table, &columns)?;
+        assert_eq!(
+            membership.cell_type_names,
+            vec![Box::<str>::from("CD4 T cell"), "B".into()]
+        );
         Ok(())
     }
 

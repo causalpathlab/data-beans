@@ -431,10 +431,9 @@ fn merge_backend_within(
 
     // Each batch goes through in slabs of columns, as many read at once as
     // there are threads and appended in order. The threads share one slab
-    // budget, so what is resident does not grow with the batch; a thread's
-    // share is never under a triplet, so a slab always holds a column.
+    // budget, so what is resident does not grow with the batch.
     let threads = rayon::current_num_threads().max(1);
-    let slab_share = (slab_budget / threads).max(TRIPLET_BYTES);
+    let slab_share = slab_budget / threads;
     let prog_bar = styled_progress_bar(num_batches as u64, "batches");
     let mut nnz_offset: u64 = 0;
     for h in &batches {

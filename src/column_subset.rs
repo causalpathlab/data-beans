@@ -271,36 +271,28 @@ where
     // index gives it for free. Otherwise one counting pass.
     let every_column_once =
         old_cols.len() == ncol_src && distinct_within(old_cols, ncol_src, "column").is_ok();
-    let (nnz, slab_nnz): (u64, Vec<u64>) = match rows {
-        None => (stored_nnz.iter().sum(), stored_nnz),
+    let nnz: u64 = match rows {
+        None => stored_nnz.iter().sum(),
         Some(remap) => match every_column_once
             .then(|| nnz_of_kept_rows(src, remap))
             .flatten()
         {
-            Some(total) => (total, stored_nnz),
+            Some(total) => total,
             None => {
                 // Blocks are read all at once, one to a thread, so each takes
-                // a thread's share of the slab budget (never under a triplet,
-                // so a block always holds a column).
-                let share = (slab_budget / rayon::current_num_threads().max(1)).max(TRIPLET_BYTES);
-                let counts: Vec<u64> = byte_budget_intervals(&stored_nnz, share, TRIPLET_BYTES)
+                // a thread's share of the slab budget.
+                let share = slab_budget / rayon::current_num_threads().max(1);
+                byte_budget_intervals(&stored_nnz, share, TRIPLET_BYTES)
                     .par_iter()
-                    .map(|&(lb, ub)| -> anyhow::Result<Vec<u64>> {
-                        let mut counts = vec![0u64; ub - lb];
+                    .map(|&(lb, ub)| -> anyhow::Result<u64> {
                         let (_, _, triplets) = src
                             .read_triplets_by_columns(old_cols[lb..ub].iter().copied().collect())?;
-                        for (r, c_local, _) in triplets {
-                            if remap.to[r as usize].is_some() {
-                                counts[c_local as usize] += 1;
-                            }
-                        }
-                        Ok(counts)
+                        Ok(triplets
+                            .iter()
+                            .filter(|(r, _, _)| remap.to[*r as usize].is_some())
+                            .count() as u64)
                     })
-                    .collect::<anyhow::Result<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                (counts.iter().sum(), counts)
+                    .sum::<anyhow::Result<u64>>()?
             }
         },
     };
@@ -308,8 +300,9 @@ where
     Ok(SelectionPlan {
         nrow: rows.map_or(nrow_src, |r| r.nrow),
         nnz,
-        // Slabs bounded by bytes of triplets read, not by a column count.
-        slabs: byte_budget_intervals(&slab_nnz, slab_budget, TRIPLET_BYTES),
+        // A slab reads every stored entry of its columns, whatever the row
+        // map then drops, so the stored counts are what bound it.
+        slabs: byte_budget_intervals(&stored_nnz, slab_budget, TRIPLET_BYTES),
     })
 }
 

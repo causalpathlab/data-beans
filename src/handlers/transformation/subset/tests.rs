@@ -331,6 +331,39 @@ fn an_order_that_places_a_row_twice_is_refused() {
     assert!(!out.exists());
 }
 
+/// Blank lines at the end of the order file name no row: the result is the
+/// one the file without them gives.
+#[test]
+fn blank_lines_ending_an_order_are_not_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = input_in(dir.path());
+    let order = dir.path().join("rows.tsv");
+    let reordered = |text: &str, name: &str| {
+        std::fs::write(&order, text).unwrap();
+        let out = dir.path().join(name);
+        let out = out.to_str().unwrap().to_string();
+        let argv = [
+            "x",
+            input.as_str(),
+            "-r",
+            order.to_str().unwrap(),
+            "-o",
+            out.as_str(),
+            "--no-zip",
+        ];
+        super::reorder_rows(&Reorder::parse_from(argv).args).unwrap();
+        let data = crate::sparse_io::open_sparse_matrix_by_path(&out).unwrap();
+        let ncol = data.num_columns().unwrap();
+        (
+            data.row_names().unwrap(),
+            data.read_triplets_by_columns((0..ncol).collect()).unwrap(),
+        )
+    };
+    let plain = reordered("g2\ng0\n", "plain.zarr");
+    assert_eq!(plain.0.len(), 2);
+    assert_eq!(reordered("g2\ng0\n\n\n", "blank.zarr"), plain);
+}
+
 /// An output named for the other format is written in that format.
 #[cfg(feature = "hdf5")]
 #[test]

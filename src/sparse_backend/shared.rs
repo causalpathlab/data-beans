@@ -193,16 +193,14 @@ where
 {
     let mut buf = open_buf_writer(mtx_file)?;
     let written = write(&mut buf).and_then(|()| Ok(buf.flush()?));
-    if written.is_err() && !is_standard_stream(mtx_file) {
+    // Only a regular file is a partial output to take away: a stream
+    // (`stdout`, a device, a pipe) holds nothing to remove.
+    if written.is_err() && std::fs::metadata(mtx_file).is_ok_and(|m| m.is_file()) {
         // close the file before unlinking it
         drop(buf);
         let _ = std::fs::remove_file(mtx_file);
     }
     written
-}
-
-fn is_standard_stream(file: &str) -> bool {
-    file.eq_ignore_ascii_case("stdout") || file.eq_ignore_ascii_case("stderr")
 }
 
 #[cfg(test)]

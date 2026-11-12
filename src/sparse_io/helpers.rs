@@ -160,7 +160,10 @@ fn transpose_grant(wanted: usize, room: usize) -> usize {
 /// (see [`transpose_grant`]). The room is what the preload budget has left,
 /// and no more than half the memory available now: the budget was sized when
 /// the process first asked, and the process has allocated since. The grant
-/// is [`PreloadReservation::bytes`], given back when the guard drops.
+/// is [`PreloadReservation::bytes`], given back when the guard drops. The
+/// memory available is read once per call, and a grant shows there only once
+/// its band is allocated, so the half is a bound per caller, not across
+/// transposes that start together.
 pub(crate) fn reserve_transpose_band(wanted: usize) -> PreloadReservation {
     use std::sync::atomic::Ordering;
     if let Some(budget) = std::env::var("LEGUME_PRELOAD_BUDGET_BYTES")
@@ -296,10 +299,8 @@ mod preload_reservation_tests {
     }
 
     #[test]
-    fn a_transpose_band_is_reserved_and_given_back() {
-        let band = reserve_transpose_band(1024);
-        assert_eq!(band.bytes(), 1024, "a band under one slab is granted whole");
-        drop(band);
+    fn a_transpose_band_under_one_slab_is_granted_whole() {
+        assert_eq!(reserve_transpose_band(1024).bytes(), 1024);
     }
 
     #[test]

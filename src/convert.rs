@@ -457,17 +457,23 @@ fn staged_conversion(base: &str) -> String {
 
 /// Move the backend built at `staged` to the cache path `converted`, in one
 /// rename. The rename fails when a backend is already there, which is looked
-/// at only then, so nothing another conversion installs in the meantime is
-/// removed unseen: a usable one is another conversion of the same input that
-/// finished first, and it stays while `staged` is dropped; an unusable one
-/// is removed and the rename tried once more.
+/// at only then: a usable one is another conversion of the same input that
+/// finished first, and it stays while `staged` is dropped. An unusable one
+/// is moved aside, in one rename too, before `staged` takes its place, and
+/// only what was moved aside is deleted; a backend another conversion
+/// installs in between is therefore never deleted, it makes the second
+/// rename fail and is then the cache.
 fn install_conversion(staged: &str, converted: &str) -> anyhow::Result<()> {
     let rename = || Ok(std::fs::rename(staged, converted)?);
     let occupied = || std::path::Path::new(converted).exists();
     let usable = || cached_conversion(converted).is_some();
     let mut renamed: anyhow::Result<()> = rename();
     if renamed.is_err() && occupied() && !usable() {
-        renamed = remove_file(converted).and_then(|()| rename());
+        let stale = format!("{staged}.stale");
+        if std::fs::rename(converted, &stale).is_ok() {
+            renamed = rename();
+            remove_file(&stale)?;
+        }
     }
     let Err(e) = renamed else {
         return Ok(());
