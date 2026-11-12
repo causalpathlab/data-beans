@@ -36,11 +36,15 @@ fn choice_of(s: &[Setting], base: Choice) -> anyhow::Result<Choice> {
     })
 }
 
-/// What `choice` writes from the cells `names`.
-fn plan_of(args: &SplitArgs, names: &[Box<str>], choice: Choice) -> anyhow::Result<Plan> {
-    let groups = column_groups(args, names, choice.grid)?.len();
-    let splits = split_columns(args, names, choice)?;
-    let n = names.len().max(1) as f64;
+/// What `choice` writes from the `n_cells` cells `grouping` groups.
+fn plan_of(
+    args: &SplitArgs,
+    grouping: &Grouping,
+    n_cells: usize,
+    choice: Choice,
+) -> anyhow::Result<Plan> {
+    let (groups, splits) = split_columns(grouping, n_cells, choice)?;
+    let n = n_cells.max(1) as f64;
     let rows = splits
         .iter()
         .enumerate()
@@ -67,10 +71,7 @@ fn plan_of(args: &SplitArgs, names: &[Box<str>], choice: Choice) -> anyhow::Resu
             .to_vec(),
         rows,
         notes: vec![
-            format!(
-                "{} cells, shuffled and assigned in units of {unit}",
-                names.len()
-            ),
+            format!("{n_cells} cells, shuffled and assigned in units of {unit}"),
             format!("seed {}", choice.seed),
         ],
         blocked: None,
@@ -82,7 +83,8 @@ fn plan_of(args: &SplitArgs, names: &[Box<str>], choice: Choice) -> anyhow::Resu
 pub(super) fn choose(
     tui: &mut Tui<'_>,
     args: &SplitArgs,
-    names: &[Box<str>],
+    grouping: &Grouping,
+    n_cells: usize,
     choice: Choice,
 ) -> anyhow::Result<Option<Choice>> {
     let mut controls = vec![
@@ -95,7 +97,7 @@ pub(super) fn choose(
     }
     let planner: Planner = Box::new(move |s: &[Setting]| {
         let c = choice_of(s, choice)?;
-        plan_of(args, names, c)
+        plan_of(args, grouping, n_cells, c)
     });
     let view = PlanView::new("split", &args.data_file, "split", controls, planner);
     match plan_in(tui, view)? {

@@ -19,6 +19,99 @@ fn covers(n: usize, train: &[usize], test: &[usize]) {
     assert_eq!(t.len() + e.len(), n, "the halves do not cover the groups");
 }
 
+/// `split` of `cells.zarr` by the positions in `coord`, its columns
+/// `coord_columns`.
+fn coord_args(coord: &std::path::Path, coord_columns: Option<Vec<usize>>) -> SplitArgs {
+    SplitArgs {
+        data_file: "cells.zarr".into(),
+        test_frac: Some(0.5),
+        folds: None,
+        coord: Some(coord.to_str().expect("utf8").into()),
+        coord_columns,
+        grid: 2,
+        groups: None,
+        seed: 1,
+        backend: SparseIoBackend::Zarr,
+        output: "cv".into(),
+        zip: false,
+        view: crate::handlers::explore::PlanArgs::batch(),
+    }
+}
+
+#[test]
+fn positions_are_read_once_and_tiled_by_the_grid() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let coord = dir.path().join("pos.csv");
+    std::fs::write(
+        &coord,
+        "cell,x,y\na,0,0\nb,0.1,0.1\nc,10,0\nd,10,10\ne,0,10\n",
+    )?;
+    let cells = names(&["a", "b", "c", "d", "e"]);
+    let grouping = Grouping::read(&coord_args(&coord, None), &cells)?;
+    // The file is not needed again, whatever grid is asked next.
+    std::fs::remove_file(&coord)?;
+    let mut tiles = grouping.column_groups(cells.len(), 2)?;
+    tiles.sort();
+    assert_eq!(tiles, [vec![0, 1], vec![2], vec![3], vec![4]]);
+    assert!(grouping.column_groups(cells.len(), 1).is_err());
+
+    let choice = Choice {
+        test_frac: Some(0.5),
+        folds: None,
+        grid: 2,
+        seed: 1,
+    };
+    let (groups, splits) = split_columns(&grouping, cells.len(), choice)?;
+    assert_eq!(groups, 4);
+    let (train, test) = &splits[0];
+    covers(5, train, test);
+    // The cells of one tile stay on one side.
+    assert_eq!(train.contains(&0), train.contains(&1));
+    Ok(())
+}
+
+#[test]
+fn a_cell_whose_position_is_not_finite_has_none() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let coord = dir.path().join("pos.tsv");
+    std::fs::write(&coord, "a\t0\t0\nb\tNaN\t1\nc\t1\tinf\nd\t1\t1\n")?;
+    let cells = names(&["a", "b", "c", "d"]);
+    let err = Grouping::read(&coord_args(&coord, None), &cells)
+        .err()
+        .expect("b and c have no position");
+    assert!(
+        format!("{err:#}").contains("2 of 4 cells have no coordinate"),
+        "{err:#}"
+    );
+    Ok(())
+}
+
+#[test]
+fn parquet_coordinate_columns_are_checked_against_the_file() -> anyhow::Result<()> {
+    use legume_numeric::matrix::traits::IoOps;
+    let dir = tempfile::tempdir()?;
+    let coord = dir.path().join("pos.parquet");
+    let cells = names(&["a", "b", "c", "d"]);
+    let positions =
+        nalgebra::DMatrix::<f32>::from_row_slice(4, 2, &[0.0, 0.0, 9.0, 0.0, 0.0, 9.0, 9.0, 9.0]);
+    positions.to_parquet_with_names(
+        coord.to_str().expect("utf8"),
+        (Some(&cells), Some("cell")),
+        Some(&names(&["x", "y"])),
+    )?;
+
+    let grouping = Grouping::read(&coord_args(&coord, Some(vec![1, 2])), &cells)?;
+    assert_eq!(grouping.column_groups(4, 2)?.len(), 4);
+    // Column 0 holds the names, and there is no column 3.
+    for columns in [vec![0, 1], vec![1, 3]] {
+        let err = Grouping::read(&coord_args(&coord, Some(columns)), &cells)
+            .err()
+            .expect("not a value column");
+        assert!(format!("{err:#}").contains("--coord-columns"), "{err:#}");
+    }
+    Ok(())
+}
+
 #[test]
 fn a_fraction_split_covers_every_group_exactly_once() {
     let folds = partition_groups(100, Some(0.2), None, 42).expect("split");

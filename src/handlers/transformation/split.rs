@@ -39,7 +39,7 @@
 
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
-use crate::zarr_io::{finalize_output, prepare_output};
+use crate::zarr_io::finalize_output;
 
 use clap::Args;
 use log::info;
@@ -136,9 +136,10 @@ pub fn run_split(args: &SplitArgs) -> anyhow::Result<()> {
         grid: args.grid,
         seed: args.seed,
     };
+    let grouping = Grouping::read(args, &column_names)?;
     let mut tui = session.as_ref().map(Tui::new);
     if let Some(tui) = tui.as_mut() {
-        match plan::choose(tui, args, &column_names, choice)? {
+        match plan::choose(tui, args, &grouping, column_names.len(), choice)? {
             Some(c) => choice = c,
             None => {
                 info!("split: cancelled; nothing written");
@@ -146,41 +147,65 @@ pub fn run_split(args: &SplitArgs) -> anyhow::Result<()> {
             }
         }
     }
-    let splits = split_columns(args, &column_names, choice)?;
+    let (_, splits) = split_columns(&grouping, n_columns, choice)?;
     off_screen(tui.as_mut(), || {
-        write_splits(args, &*data, n_columns, &splits, choice)
+        write_splits(args, &*data, &column_names, &splits, choice)
     })
 }
 
 /// The cells of each train and test half: their columns, by fold.
 type Splits = Vec<(Vec<usize>, Vec<usize>)>;
 
-/// The units shuffled and assigned whole, under `choice`: one column each
-/// by default, one grid tile under `--coord`, one label under `--groups`.
-/// Everything after is the same in all three cases, which is why grouped
-/// splitting costs nothing extra to support.
-fn column_groups(
-    args: &SplitArgs,
-    column_names: &[Box<str>],
-    grid: usize,
-) -> anyhow::Result<Vec<Vec<usize>>> {
-    Ok(match (args.coord.as_deref(), args.groups.as_deref()) {
-        (Some(path), _) => {
-            let coord_columns = args.coord_columns.clone().unwrap_or_else(|| vec![1, 2]);
-            column_groups_from_grid(path, grid, &coord_columns, column_names)?
-        }
-        (_, Some(path)) => column_groups_from_table(path, column_names)?,
-        _ => (0..column_names.len()).map(|i| vec![i]).collect(),
-    })
+/// What the cells are grouped by, read once: the units shuffled and assigned
+/// whole. One column each by default, one grid tile under `--coord`, one
+/// label under `--groups`. Everything after is the same in all three cases,
+/// which is why grouped splitting costs nothing extra to support.
+enum Grouping {
+    Cells,
+    /// `--coord`: the file, and each column's position in it.
+    Coords {
+        path: Box<str>,
+        of_column: Vec<(f64, f64)>,
+    },
+    /// `--groups`: the columns of each label.
+    Table(Vec<Vec<usize>>),
 }
 
-/// The halves `choice` makes of the columns of `column_names`.
+impl Grouping {
+    /// The grouping `args` asks for over the cells `column_names`.
+    fn read(args: &SplitArgs, column_names: &[Box<str>]) -> anyhow::Result<Self> {
+        Ok(match (args.coord.as_deref(), args.groups.as_deref()) {
+            (Some(path), _) => {
+                let coord_columns = args.coord_columns.clone().unwrap_or_else(|| vec![1, 2]);
+                Grouping::Coords {
+                    path: path.into(),
+                    of_column: coords_of_columns(path, &coord_columns, column_names)?,
+                }
+            }
+            (_, Some(path)) => Grouping::Table(column_groups_from_table(path, column_names)?),
+            _ => Grouping::Cells,
+        })
+    }
+
+    /// The columns of each group, of `n_columns`; `grid` tiles an axis under
+    /// `--coord`.
+    fn column_groups(&self, n_columns: usize, grid: usize) -> anyhow::Result<Vec<Vec<usize>>> {
+        Ok(match self {
+            Grouping::Coords { path, of_column } => column_groups_from_grid(path, grid, of_column)?,
+            Grouping::Table(groups) => groups.clone(),
+            Grouping::Cells => (0..n_columns).map(|i| vec![i]).collect(),
+        })
+    }
+}
+
+/// The halves `choice` makes of the `n_columns` columns `grouping` groups,
+/// and how many groups they were dealt from.
 fn split_columns(
-    args: &SplitArgs,
-    column_names: &[Box<str>],
+    grouping: &Grouping,
+    n_columns: usize,
     choice: Choice,
-) -> anyhow::Result<Splits> {
-    let column_groups = column_groups(args, column_names, choice.grid)?;
+) -> anyhow::Result<(usize, Splits)> {
+    let column_groups = grouping.column_groups(n_columns, choice.grid)?;
     // Two, not one: a single group cannot be divided, and `--test-frac` would
     // reach `clamp(1, 0)` and panic. One group is a real outcome of a coarse
     // `--grid` or a `--groups` table with a single label, so it gets a message
@@ -196,7 +221,7 @@ fn split_columns(
     // Group ids first, then the columns they cover: the partition never sees a
     // column, so a grouped split cannot leak one across the boundary by
     // construction rather than by a later check.
-    Ok(partition_groups(
+    let splits = partition_groups(
         column_groups.len(),
         choice.test_frac,
         choice.folds,
@@ -209,7 +234,8 @@ fn split_columns(
             columns_in_groups(&column_groups, &test_groups),
         )
     })
-    .collect())
+    .collect();
+    Ok((column_groups.len(), splits))
 }
 
 /// `{output}.train` and `{output}.test`, or `{output}.fold{k}.*` for folds.
@@ -223,10 +249,13 @@ fn half_name(args: &SplitArgs, choice: Choice, fold: usize, half: &str) -> Strin
 fn write_splits(
     args: &SplitArgs,
     data: &dyn SparseIo<IndexIter = Vec<usize>>,
-    n_columns: usize,
+    column_names: &[Box<str>],
     splits: &Splits,
     choice: Choice,
 ) -> anyhow::Result<()> {
+    let n_columns = column_names.len();
+    let row_names = data.row_names()?;
+    let names = (row_names.as_slice(), column_names);
     for (fold, (train_columns, test_columns)) in splits.iter().enumerate() {
         anyhow::ensure!(
             train_columns.len() + test_columns.len() == n_columns,
@@ -235,8 +264,8 @@ fn write_splits(
             test_columns.len()
         );
         let tag = |half: &str| half_name(args, choice, fold, half);
-        write_half(data, train_columns, &tag("train"), args)?;
-        write_half(data, test_columns, &tag("test"), args)?;
+        write_half(data, names, train_columns, &tag("train"), args)?;
+        write_half(data, names, test_columns, &tag("test"), args)?;
         info!(
             "fold {fold}: {} train cells, {} test cells",
             train_columns.len(),
@@ -257,7 +286,35 @@ fn columns_in_groups(column_groups: &[Vec<usize>], picked: &[usize]) -> Vec<usiz
     columns
 }
 
-/// Cells grouped into a regular grid over their coordinates.
+/// Each column's position, from the coordinate file `path`; every cell
+/// needs one, and a finite one.
+fn coords_of_columns(
+    path: &str,
+    coord_columns: &[usize],
+    column_names: &[Box<str>],
+) -> anyhow::Result<Vec<(f64, f64)>> {
+    anyhow::ensure!(
+        coord_columns.len() == 2,
+        "--coord-columns needs exactly two indices; got {}",
+        coord_columns.len()
+    );
+    let coords = read_coords(path, coord_columns)?;
+
+    let of_column: Vec<(f64, f64)> = column_names
+        .iter()
+        .filter_map(|name| coords.get(name.as_ref()).copied())
+        .collect();
+    let n_missing = column_names.len() - of_column.len();
+    anyhow::ensure!(
+        n_missing == 0,
+        "{path}: {n_missing} of {} cells have no coordinate",
+        column_names.len()
+    );
+    Ok(of_column)
+}
+
+/// Cells grouped into a regular grid over their coordinates (each column's,
+/// read from `path`).
 ///
 /// A grid rather than a clustering on purpose: the tiles are then a property of
 /// the tissue's geometry alone, reproducible from the coordinate file without a
@@ -266,36 +323,12 @@ fn columns_in_groups(column_groups: &[Vec<usize>], picked: &[usize]) -> Vec<usiz
 fn column_groups_from_grid(
     path: &str,
     tiles_per_axis: usize,
-    coord_columns: &[usize],
-    column_names: &[Box<str>],
+    coord_of_column: &[(f64, f64)],
 ) -> anyhow::Result<Vec<Vec<usize>>> {
     anyhow::ensure!(tiles_per_axis >= 2, "--grid must be at least 2");
-    anyhow::ensure!(
-        coord_columns.len() == 2,
-        "--coord-columns needs exactly two indices; got {}",
-        coord_columns.len()
-    );
-    let coords = read_coords(path, coord_columns)?;
-
-    let mut coord_of_column: Vec<(f64, f64)> = Vec::with_capacity(column_names.len());
-    let mut n_missing = 0usize;
-    for name in column_names {
-        match coords.get(name.as_ref()) {
-            Some(&xy) => coord_of_column.push(xy),
-            None => {
-                n_missing += 1;
-                coord_of_column.push((f64::NAN, f64::NAN));
-            }
-        }
-    }
-    anyhow::ensure!(
-        n_missing == 0,
-        "{path}: {n_missing} of {} cells have no coordinate",
-        column_names.len()
-    );
 
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    for &(x, y) in &coord_of_column {
+    for &(x, y) in coord_of_column {
         x0 = x0.min(x);
         y0 = y0.min(y);
         x1 = x1.max(x);
@@ -326,13 +359,14 @@ fn column_groups_from_grid(
     info!(
         "spatial split: {} cells in {} non-empty tiles of a \
          {tiles_per_axis}x{tiles_per_axis} grid ({path})",
-        column_names.len(),
+        coord_of_column.len(),
         column_groups.len()
     );
     Ok(column_groups)
 }
 
-/// `cell -> (x, y)` from a CSV/TSV/parquet whose first column is the cell name.
+/// `cell -> (x, y)` from a CSV/TSV/parquet whose first column is the cell
+/// name. A cell whose position is not finite (`NaN`, `inf`) has none.
 fn read_coords(path: &str, cols: &[usize]) -> anyhow::Result<HashMap<Box<str>, (f64, f64)>> {
     let (i, j) = (cols[0], cols[1]);
     let mut out: HashMap<Box<str>, (f64, f64)> = HashMap::default();
@@ -340,15 +374,25 @@ fn read_coords(path: &str, cols: &[usize]) -> anyhow::Result<HashMap<Box<str>, (
         let names = legume_numeric::matrix::parquet::read_parquet_string_column(path, 0)?;
         let mat =
             <nalgebra::DMatrix<f32> as legume_numeric::matrix::traits::IoOps>::from_parquet(path)?;
+        // The matrix holds the columns after the names': file column 1 is
+        // its column 0.
+        let n_file_columns = mat.mat.ncols() + 1;
+        anyhow::ensure!(
+            (1..n_file_columns).contains(&i) && (1..n_file_columns).contains(&j),
+            "{path}: --coord-columns {i},{j} are not among its value columns 1 to {} \
+             (column 0 is the cell name)",
+            n_file_columns - 1
+        );
         for (r, name) in names.iter().enumerate() {
-            out.insert(
-                name.clone(),
-                (
-                    f64::from(mat.mat[(r, i - 1)]),
-                    f64::from(mat.mat[(r, j - 1)]),
-                ),
+            let (x, y) = (
+                f64::from(mat.mat[(r, i - 1)]),
+                f64::from(mat.mat[(r, j - 1)]),
             );
+            if x.is_finite() && y.is_finite() {
+                out.insert(name.clone(), (x, y));
+            }
         }
+        anyhow::ensure!(!out.is_empty(), "{path}: no coordinate rows parsed");
         return Ok(out);
     }
     let text = std::fs::read_to_string(path)
@@ -376,7 +420,9 @@ fn read_coords(path: &str, cols: &[usize]) -> anyhow::Result<HashMap<Box<str>, (
         let (Ok(x), Ok(y)) = (f[i].trim().parse::<f64>(), f[j].trim().parse::<f64>()) else {
             continue;
         };
-        out.insert(f[0].trim().into(), (x, y));
+        if x.is_finite() && y.is_finite() {
+            out.insert(f[0].trim().into(), (x, y));
+        }
     }
     anyhow::ensure!(!out.is_empty(), "{path}: no coordinate rows parsed");
     Ok(out)
@@ -407,25 +453,24 @@ fn column_groups_from_table(
 /// imaging scale is gone, and so is the doc comment that described it.
 fn write_half(
     data: &dyn SparseIo<IndexIter = Vec<usize>>,
+    (row_names, all_column_names): (&[Box<str>], &[Box<str>]),
     selected_columns: &[usize],
     output: &str,
     args: &SplitArgs,
 ) -> anyhow::Result<()> {
-    let row_names = data.row_names()?;
-    let all_column_names = data.column_names()?;
     let kept_column_names: Vec<Box<str>> = selected_columns
         .iter()
         .map(|&c| all_column_names[c].clone())
         .collect();
 
     let (effective_output, backend_out, file_out) =
-        prepare_output(output, args.backend.clone(), args.zip)?;
+        super::prepare_output_beside(&args.data_file, output, args.backend.clone(), args.zip)?;
     info!("Streaming {} columns to {output}", selected_columns.len());
     let (n_rows, n_cols, nnz) = crate::column_subset::stream_column_selection(
         data,
         selected_columns,
         None,
-        &row_names,
+        row_names,
         &kept_column_names,
         file_out.as_ref(),
         &backend_out,
