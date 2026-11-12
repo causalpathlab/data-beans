@@ -256,8 +256,8 @@ pub fn show_info(cmd_args: &InfoArgs) -> anyhow::Result<()> {
     }
 
     if !output.is_empty() {
-        use {mkdir, write_lines};
-        mkdir(&output)?;
+        // `output` is a file prefix: its folder is made, not one of its name.
+        mkdir_parent(&output)?;
         let row_names = data.row_names()?;
         let col_names = data.column_names()?;
         write_lines(&row_names, &(output.to_string() + ".rows.gz"))?;
@@ -437,3 +437,7 @@ pub fn take_rows(args: &TakeRowsArgs) -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+#[cfg(test)]
+#[path = "inspection_tests.rs"]
+mod tests;
