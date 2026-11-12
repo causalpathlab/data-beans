@@ -514,6 +514,24 @@ fn matched_columns_across_batches() -> anyhow::Result<()> {
         assert!(d >= 0.0);
     }
 
+    // The same match, naming the matched column behind each matrix column:
+    // a batch-1 cell (columns 20..40) whose stored data the column carries.
+    let (csc_named, sources_named, matched, distances_named) =
+        vec.read_matched_columns_with_targets_csc(0..5, &[1], knn, true)?;
+    assert_eq!(csc_named, csc);
+    assert_eq!(sources_named, sources);
+    assert_eq!(distances_named, distances);
+    assert_eq!(matched.len(), csc.ncols());
+    for (t, &m) in matched.iter().enumerate() {
+        assert!(
+            (20..ncol).contains(&m),
+            "matched column {m} is not in batch 1"
+        );
+        let stored = vec.read_columns_csc(std::iter::once(m))?;
+        assert_eq!(csc.col(t).row_indices(), stored.col(0).row_indices());
+        assert_eq!(csc.col(t).values(), stored.col(0).values());
+    }
+
     Ok(())
 }
 

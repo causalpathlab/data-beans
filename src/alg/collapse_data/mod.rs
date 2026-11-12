@@ -36,12 +36,11 @@ pub const DEFAULT_OPT_ITER: usize = 100;
 /// `cell_to_pb_per_level[k][c] = pb_id at level k for cell c`.
 mod pb_samples;
 use pb_samples::{
-    build_pb_sample_layout, build_pb_sample_to_cells, build_pb_samples,
-    collect_pb_sample_gene_sums, per_batch_sc_neighbors,
+    build_pb_sample_layout, build_pb_sample_to_cells, build_pb_samples, collect_pb_sample_gene_sums,
 };
 pub use pb_samples::{PbSampleCollection, PbSampleLayout};
 // Shared cross-batch pb-sample matching, reused by `refine_multilevel`.
-pub(crate) use pb_samples::bbknn_match_one_pbsamp;
+pub(crate) use pb_samples::per_batch_sc_neighbors;
 mod reassign_cells;
 pub use reassign_cells::ReassignCellsParams;
 mod pb_tree;
@@ -56,7 +55,8 @@ use refine::{
 mod stats;
 use stats::{
     collect_basic_stat_visitor, collect_batch_stat_visitor, collect_matched_stat_coarse,
-    collect_matched_stat_visitor, merge_stat, optimize, KnnParams, DEFAULT_NUM_LEVELS,
+    collect_matched_stat_visitor, collect_observed_stat_from_pb_samples, merge_stat, optimize,
+    KnnParams, DEFAULT_NUM_LEVELS,
 };
 pub use stats::{resample_and_optimize, CollapsedOut, CollapsedStat};
 mod strata;
@@ -463,30 +463,42 @@ fn attach_observability(stat: &mut CollapsedStat, data_vec: &SparseIoVec) -> any
         }
     }
 
-    let mut size_ds = DMatrix::<f32>::zeros(num_genes, num_samples);
-    for (src, cov) in coverage.iter().enumerate() {
+    let mut covered_rows: Vec<Vec<usize>> = Vec::with_capacity(coverage.len());
+    for cov in coverage.iter() {
         anyhow::ensure!(
             cov.len() == num_genes,
             "row coverage has {} rows but the stat has {num_genes} genes",
             cov.len(),
         );
-        for (g, &covered) in cov.iter().enumerate() {
-            if covered {
-                for s in 0..num_samples {
-                    size_ds[(g, s)] += count_bs[(src, s)];
+        covered_rows.push((0..num_genes).filter(|&g| cov[g]).collect());
+    }
+    // One sample (a contiguous column of the column-major plane) per worker;
+    // a source without mass in the sample adds nothing and is skipped.
+    let mut size_ds = DMatrix::<f32>::zeros(num_genes, num_samples);
+    if num_genes > 0 {
+        size_ds
+            .as_mut_slice()
+            .par_chunks_mut(num_genes)
+            .enumerate()
+            .for_each(|(s, size_s)| {
+                for (src, rows) in covered_rows.iter().enumerate() {
+                    let mass = count_bs[(src, s)];
+                    if mass == 0.0 {
+                        continue;
+                    }
+                    for &g in rows {
+                        size_s[g] += mass;
+                    }
                 }
-            }
-        }
+            });
     }
 
     let mut mask_db = DMatrix::<f32>::zeros(num_genes, num_batches);
-    for (src, cov) in coverage.iter().enumerate() {
+    for (src, rows) in covered_rows.iter().enumerate() {
         for (b, &used) in source_in_batch[src].iter().enumerate() {
             if used {
-                for (g, &covered) in cov.iter().enumerate() {
-                    if covered {
-                        mask_db[(g, b)] = 1.0;
-                    }
+                for &g in rows {
+                    mask_db[(g, b)] = 1.0;
                 }
             }
         }
@@ -889,8 +901,6 @@ where
     // finest level by construction; coarser levels vote in case the source
     // hierarchy was not strictly nested.
     let num_levels = level_dims.len();
-    let mut pbsamp_to_group: Vec<Vec<usize>> = Vec::with_capacity(num_levels);
-    let mut num_groups_per_level: Vec<usize> = Vec::with_capacity(num_levels);
     for (lvl_idx, lvl) in cell_to_pb_per_level.iter().enumerate() {
         anyhow::ensure!(
             lvl.len() == ncols,
@@ -899,14 +909,9 @@ where
             lvl.len(),
             ncols
         );
-        let mut p2g: Vec<usize> = Vec::with_capacity(num_pb);
-        for cells in &pb_sample_to_cells {
-            p2g.push(modal_group(cells, lvl));
-        }
-        let (compact, k) = crate::alg::refine_multilevel::compact_labels(&p2g);
-        num_groups_per_level.push(k);
-        pbsamp_to_group.push(compact);
     }
+    let (pbsamp_to_group, num_groups_per_level) =
+        nested_levels_by_vote(&pb_sample_to_cells, cell_to_pb_per_level);
     let refined = split_anchored_finest_groups(
         crate::alg::refine_multilevel::RefinedAssignment {
             pbsamp_to_group,
@@ -937,14 +942,18 @@ where
 
     let mut fine_stat = CollapsedStat::new(num_features, k_finest, num_batches);
     fine_stat.exclude_unmatched_from_delta = params.strata.is_some();
-    info!("Collecting basic stats over {} groups ...", k_finest);
-    data_vec.collect_basic_stat(&mut fine_stat)?;
+    info!(
+        "Collecting observed stats over {} groups × {} batches from {} pb-samples ...",
+        k_finest, num_batches, num_pb
+    );
+    collect_observed_stat_from_pb_samples(
+        data_vec,
+        &pb_samples.layout,
+        &pb_samples.gene_sums,
+        &refined.pbsamp_to_group[0],
+        &mut fine_stat,
+    )?;
     if num_batches >= 2 {
-        info!(
-            "Collecting per-batch stats over {} groups × {} batches ...",
-            k_finest, num_batches
-        );
-        data_vec.collect_batch_stat(&mut fine_stat)?;
         let batch_knn = data_vec
             .batch_knn_lookup()
             .ok_or_else(|| anyhow::anyhow!("batch_knn_lookup not built"))?;
@@ -952,12 +961,17 @@ where
             "Collecting cross-batch matched stats (knn={}) over {} pb-samples ...",
             knn, num_pb
         );
+        let matches = per_batch_sc_neighbors(
+            &pb_samples.layout,
+            batch_knn.as_slice(),
+            knn,
+            anchor_batches.as_deref(),
+        )?;
         collect_matched_stat_coarse(
             &pb_samples.layout,
             &pb_samples.gene_sums,
             &refined.pbsamp_to_group[0],
-            batch_knn.as_slice(),
-            knn,
+            &matches,
             anchor_batches.as_deref(),
             &mut fine_stat,
         )?;
@@ -1036,6 +1050,53 @@ where
         cell_to_pb_per_level: cell_to_pb_per_level_out,
         pb_tree: None,
     })
+}
+
+/// Per-level pb-sample → group labels (compacted, finest first) and group
+/// counts from an inherited per-level cell → group membership.
+///
+/// The finest level takes each pb-sample's modal label. Every coarser level
+/// is voted per group of the level below it — the group takes the label most
+/// of its cells carry, ties going to the smaller label — so each level nests
+/// in the next whether or not the inherited hierarchy did, which is what
+/// `fine_to_coarse_from_refined` and `merge_stat` rely on.
+fn nested_levels_by_vote(
+    pb_sample_to_cells: &[Vec<usize>],
+    cell_to_group_per_level: &[Vec<usize>],
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    use rustc_hash::FxHashMap;
+    let mut pbsamp_to_group: Vec<Vec<usize>> = Vec::with_capacity(cell_to_group_per_level.len());
+    let mut num_groups_per_level: Vec<usize> = Vec::with_capacity(cell_to_group_per_level.len());
+    for lvl in cell_to_group_per_level {
+        let voted: Vec<usize> = match pbsamp_to_group.last() {
+            None => pb_sample_to_cells
+                .iter()
+                .map(|cells| modal_group(cells, lvl))
+                .collect(),
+            Some(finer) => {
+                let k_finer = num_groups_per_level.last().copied().unwrap_or(0);
+                let mut votes: Vec<FxHashMap<usize, usize>> = vec![FxHashMap::default(); k_finer];
+                for (cells, &g) in pb_sample_to_cells.iter().zip(finer) {
+                    for &c in cells {
+                        *votes[g].entry(lvl[c]).or_insert(0) += 1;
+                    }
+                }
+                let winner: Vec<usize> = votes
+                    .iter()
+                    .map(|v| {
+                        v.iter()
+                            .max_by_key(|&(&label, &n)| (n, std::cmp::Reverse(label)))
+                            .map_or(0, |(&label, _)| label)
+                    })
+                    .collect();
+                finer.iter().map(|&g| winner[g]).collect()
+            }
+        };
+        let (compact, k) = crate::alg::refine_multilevel::compact_labels(&voted);
+        num_groups_per_level.push(k);
+        pbsamp_to_group.push(compact);
+    }
+    (pbsamp_to_group, num_groups_per_level)
 }
 
 /// Modal `lvl[c]` over `c ∈ cells`. Returns 0 when `cells` is empty.
@@ -1278,3 +1339,7 @@ where
     };
     refine_and_collect_stack(stack, proj_kn, &ctx)
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

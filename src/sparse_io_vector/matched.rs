@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// A matrix of matched columns with, per column: the source (query) column it
+/// was matched for, its own global column index, and their distance.
+pub type MatchedColumnsCsc = (CscMatrix<f32>, Vec<usize>, Vec<usize>, Vec<f32>);
+
 impl SparseIoVec {
     /////////////////////
     // matched columns //
@@ -447,16 +451,44 @@ impl SparseIoVec {
     where
         I: Iterator<Item = usize>,
     {
+        let (matrix, source_columns, _, distances) = self.read_matched_columns_with_targets_csc(
+            cells,
+            target_batches,
+            knn,
+            skip_same_batch,
+        )?;
+        Ok((matrix, source_columns, distances))
+    }
+
+    /// [`Self::read_matched_columns_csc`], also naming the matched column
+    /// behind each column of the matrix.
+    ///
+    /// # Returns
+    /// * the knn-matched matrix
+    /// * `source_columns` - the source (query) column of each matched column
+    /// * `matched_columns` - the global index of each matched column
+    /// * a vector of distances between the matched columns
+    pub fn read_matched_columns_with_targets_csc<I>(
+        &self,
+        cells: I,
+        target_batches: &[usize],
+        knn: usize,
+        skip_same_batch: bool,
+    ) -> anyhow::Result<MatchedColumnsCsc>
+    where
+        I: Iterator<Item = usize>,
+    {
         let TripletsMatched {
             shape: (nrow, ncol),
             triplets,
             source_columns,
+            matched_columns,
             distances,
-            ..
         } = self.matched_columns_triplets(cells, target_batches, knn, skip_same_batch)?;
         Ok((
             CscMatrix::<f32>::from_nonzero_triplets(nrow, ncol, &triplets)?,
             source_columns,
+            matched_columns,
             distances,
         ))
     }

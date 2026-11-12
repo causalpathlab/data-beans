@@ -16,7 +16,7 @@
 
 #![allow(dead_code)]
 
-use crate::alg::collapse_data::PbSampleLayout;
+use crate::alg::collapse_data::{per_batch_sc_neighbors, PbSampleLayout};
 use crate::alg::dc_poisson::{
     compute_sibling_sets, intersect_with_siblings_fallback, refine_with_proposer,
     CandidateProposer, ProfileSource, Profiles, RefineContext,
@@ -62,48 +62,82 @@ fn build_bbknn_neighbors(
     batch_knn_lookup: &[legume_numeric::matrix::knn_match::ColumnDict<usize>],
     knn: usize,
 ) -> anyhow::Result<Vec<Vec<usize>>> {
-    use crate::alg::collapse_data::bbknn_match_one_pbsamp;
-    use rayon::prelude::*;
-    let num_pb = layout.cell_counts.len();
+    // Pooled (None): the DC-SBM refinement graph should connect across
+    // every batch pair regardless of anchoring — anchoring shapes the
+    // counterfactual for δ, not the clustering topology.
+    let matches = per_batch_sc_neighbors(layout, batch_knn_lookup, knn, None)?;
+    Ok(candidate_ids(&matches))
+}
 
-    // Same cross-batch matching as `per_batch_sc_neighbors`, but we keep only
-    // the candidate pb-sample ids — distances are unused for refinement.
-    (0..num_pb)
-        .into_par_iter()
-        .map(|pbsamp| -> anyhow::Result<Vec<usize>> {
-            // Pooled (None): the DC-SBM refinement graph should connect across
-            // every batch pair regardless of anchoring — anchoring shapes the
-            // counterfactual for δ, not the clustering topology.
-            let hits = bbknn_match_one_pbsamp(layout, batch_knn_lookup, knn, pbsamp, None)?;
-            Ok(hits.into_iter().map(|(p, _)| p).collect())
-        })
+/// The candidate pb-sample ids of a match table — distances are unused for
+/// refinement.
+fn candidate_ids(matches: &[Vec<(usize, f32)>]) -> Vec<Vec<usize>> {
+    matches
+        .iter()
+        .map(|hits| hits.iter().map(|&(p, _)| p).collect())
         .collect()
 }
 
 /// Candidate set per pb-sample = siblings ∩ (groups of BBKNN neighbors),
 /// via the shared [`intersect_with_siblings_fallback`] helper.
+///
+/// With `pb_sample_to_stratum`, a pb-sample's siblings are first cut down to
+/// its own group and the groups made of its stratum only, so neither the
+/// intersection nor the sibling fallback (a pb-sample without a same-stratum
+/// match in another batch has no BBKNN neighbors) can move it across strata.
 fn build_candidate_sets(
     siblings: &[Vec<usize>],
     bbknn: &[Vec<usize>],
     pbsamp_to_group_at_level: &[usize],
+    pb_sample_to_stratum: Option<&[usize]>,
 ) -> Vec<Vec<usize>> {
+    let strata = pb_sample_to_stratum
+        .map(|stratum| (stratum, group_strata(pbsamp_to_group_at_level, stratum)));
     siblings
         .iter()
         .enumerate()
         .map(|(pbsamp, sib)| {
+            let own = pbsamp_to_group_at_level[pbsamp];
             let mut neighbor_groups: Vec<usize> = bbknn[pbsamp]
                 .iter()
                 .map(|&j| pbsamp_to_group_at_level[j])
                 .collect();
             neighbor_groups.sort_unstable();
             neighbor_groups.dedup();
-            intersect_with_siblings_fallback(
-                sib,
-                &neighbor_groups,
-                pbsamp_to_group_at_level[pbsamp],
-            )
+            match strata.as_ref() {
+                Some((stratum, of_group)) => {
+                    let same_stratum: Vec<usize> = sib
+                        .iter()
+                        .copied()
+                        .filter(|&g| g == own || of_group.get(g) == Some(&Some(stratum[pbsamp])))
+                        .collect();
+                    intersect_with_siblings_fallback(&same_stratum, &neighbor_groups, own)
+                }
+                None => intersect_with_siblings_fallback(sib, &neighbor_groups, own),
+            }
         })
         .collect()
+}
+
+/// The one stratum of each group's members, for the groups up to the largest
+/// label in use; `None` for an empty group and for a group that mixes strata.
+fn group_strata(pbsamp_to_group: &[usize], stratum: &[usize]) -> Vec<Option<usize>> {
+    let k = pbsamp_to_group.iter().max().map_or(0, |&m| m + 1);
+    let mut of_group: Vec<Option<usize>> = vec![None; k];
+    let mut mixed = vec![false; k];
+    for (&g, &s) in pbsamp_to_group.iter().zip(stratum) {
+        match of_group[g] {
+            None => of_group[g] = Some(s),
+            Some(seen) if seen != s => mixed[g] = true,
+            Some(_) => {}
+        }
+    }
+    for (slot, &is_mixed) in of_group.iter_mut().zip(&mixed) {
+        if is_mixed {
+            *slot = None;
+        }
+    }
+    of_group
 }
 
 ///////////////////////////////////
@@ -116,21 +150,41 @@ fn build_candidate_sets(
 /// `siblings ∩ (groups of BBKNN neighbors)`, with sibling fallback when
 /// the intersection is empty. Siblings are the other pb-samples sharing
 /// the same parent group at the next-coarser level (passed in at
-/// construction).
+/// construction). With strata ([`Self::with_strata`]) the candidates are
+/// further limited to groups of the pb-sample's own stratum.
 pub struct BbknnProposer<'a> {
     siblings: Vec<Vec<usize>>,
     bbknn: &'a [Vec<usize>],
+    pb_sample_to_stratum: Option<&'a [usize]>,
 }
 
 impl<'a> BbknnProposer<'a> {
     pub fn new(siblings: Vec<Vec<usize>>, bbknn: &'a [Vec<usize>]) -> Self {
-        Self { siblings, bbknn }
+        Self {
+            siblings,
+            bbknn,
+            pb_sample_to_stratum: None,
+        }
+    }
+
+    /// Keep every pb-sample within groups of its own stratum
+    /// (`PbSampleLayout::pb_sample_to_stratum`); `None` leaves the proposer
+    /// unstratified.
+    #[must_use]
+    pub fn with_strata(mut self, pb_sample_to_stratum: Option<&'a [usize]>) -> Self {
+        self.pb_sample_to_stratum = pb_sample_to_stratum;
+        self
     }
 }
 
 impl<'a> CandidateProposer for BbknnProposer<'a> {
     fn propose(&self, labels: &[usize]) -> Vec<Vec<usize>> {
-        build_candidate_sets(&self.siblings, self.bbknn, labels)
+        build_candidate_sets(
+            &self.siblings,
+            self.bbknn,
+            labels,
+            self.pb_sample_to_stratum,
+        )
     }
 }
 
@@ -170,6 +224,18 @@ pub struct RefineInputs<'a> {
 pub fn refine_assignments(
     inputs: &RefineInputs<'_>,
     params: &RefineParams,
+) -> anyhow::Result<RefinedAssignment> {
+    refine_assignments_with_matches(inputs, params, None)
+}
+
+/// [`refine_assignments`] with the pooled cross-batch match table already at
+/// hand: `pooled_matches` is `per_batch_sc_neighbors(layout, batch_knn_lookup,
+/// k_per_batch, None)`, which the caller also needs for the matched
+/// statistics. `None` computes it here.
+pub(crate) fn refine_assignments_with_matches(
+    inputs: &RefineInputs<'_>,
+    params: &RefineParams,
+    pooled_matches: Option<&[Vec<(usize, f32)>]>,
 ) -> anyhow::Result<RefinedAssignment> {
     let RefineInputs {
         layout,
@@ -241,7 +307,10 @@ pub fn refine_assignments(
         "Building BBKNN candidate sets (knn={} per non-own batch) ...",
         k_per_batch
     );
-    let bbknn = build_bbknn_neighbors(layout, batch_knn_lookup, k_per_batch)?;
+    let bbknn = match pooled_matches {
+        Some(matches) => candidate_ids(matches),
+        None => build_bbknn_neighbors(layout, batch_knn_lookup, k_per_batch)?,
+    };
 
     let mut rng = SmallRng::seed_from_u64(params.seed);
 
@@ -277,7 +346,8 @@ pub fn refine_assignments(
         debug!("refining level {} (k={}, num_pb={})", level, k, num_pb);
         let siblings = compute_sibling_sets(&refined, level, k);
 
-        let proposer = BbknnProposer::new(siblings, &bbknn);
+        let proposer = BbknnProposer::new(siblings, &bbknn)
+            .with_strata(layout.pb_sample_to_stratum.as_deref());
 
         let pbsamp_to_group = &mut refined[level];
         let label = format!("Refine L{}/{}", num_levels - level, num_levels);

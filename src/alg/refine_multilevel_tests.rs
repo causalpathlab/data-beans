@@ -8,7 +8,7 @@ fn test_build_candidate_sets_fallback() {
     let pbsamp_to_group = vec![0usize, 1];
     // Neighbor of sc0 is sc1 (group 1) → intersection {1}.
     // sc0 is in group 0; intersection lacks 0 so 0 is appended.
-    let cand = build_candidate_sets(&siblings, &bbknn, &pbsamp_to_group);
+    let cand = build_candidate_sets(&siblings, &bbknn, &pbsamp_to_group, None);
     assert_eq!(cand[0], vec![0, 1]);
     assert_eq!(cand[1], vec![0, 1]);
 }
@@ -52,5 +52,198 @@ fn test_project_to_refinement_splits_straddling_groups() {
     let mut group_parent = std::collections::HashMap::new();
     for (&g, &p) in reproj.iter().zip(parent.iter()) {
         assert_eq!(*group_parent.entry(g).or_insert(p), p);
+    }
+}
+
+/// With strata, a pb-sample only gets groups of its own stratum: neither the
+/// sibling fallback (no BBKNN neighbors) nor a neighbor's group can take it
+/// across, and a group that already mixes strata is nobody's candidate.
+#[test]
+fn candidate_sets_stay_within_the_stratum() {
+    // Groups: 0 = {pb 0} (stratum 3), 1 = {pb 1} (stratum 0),
+    // 2 = {pb 2} (stratum 0), 3 = {pb 3, pb 4} (strata 0 and 3, mixed).
+    let labels = vec![0usize, 1, 2, 3, 3];
+    let strata = vec![3usize, 0, 0, 0, 3];
+    let siblings = vec![vec![0usize, 1, 2, 3]; 5];
+    // pb 0 has no cross-batch match of its stratum; pb 1's match sits in group 2.
+    let bbknn = vec![vec![], vec![2usize], vec![1], vec![1], vec![]];
+
+    let unstratified = build_candidate_sets(&siblings, &bbknn, &labels, None);
+    assert_eq!(unstratified[0], vec![0, 1, 2, 3]);
+
+    let cand = build_candidate_sets(&siblings, &bbknn, &labels, Some(&strata));
+    assert_eq!(cand[0], vec![0], "private stratum stays put");
+    assert_eq!(cand[1], vec![1, 2]);
+    assert_eq!(cand[2], vec![1, 2]);
+    // Members of the mixed group may leave for a pure group of their stratum
+    // or stay.
+    assert_eq!(cand[3], vec![1, 3]);
+    assert_eq!(cand[4], vec![0, 3]);
+}
+
+/// Two batches of pb-samples over four well-separated states, two pb-samples
+/// (three cells each) per state and batch.
+struct Toy {
+    layout: PbSampleLayout,
+    gene_sums: GeneSums,
+    pb_sample_to_cells: Vec<Vec<usize>>,
+    batch_knn: Vec<legume_numeric::matrix::knn_match::ColumnDict<usize>>,
+    state: Vec<usize>,
+}
+
+const TOY_STATES: usize = 4;
+const TOY_GENES: usize = 8;
+
+fn toy() -> Toy {
+    use legume_numeric::matrix::knn_match::ColumnDict;
+    use nalgebra::DMatrix;
+    let num_pb = 2 * TOY_STATES * 2;
+    let mut centroids = DMatrix::<f32>::zeros(TOY_STATES, num_pb);
+    let mut pb_sample_to_batch = Vec::new();
+    let mut state = Vec::new();
+    let mut cell_to_pbsamp = Vec::new();
+    let mut pb_sample_to_cells = Vec::new();
+    let mut gene_sums: GeneSums = Vec::new();
+    let mut per_batch: Vec<Vec<(usize, Vec<f32>)>> = vec![Vec::new(); 2];
+    for (batch, cells_of_batch) in per_batch.iter_mut().enumerate() {
+        for k in 0..TOY_STATES {
+            for rep in 0..2 {
+                let pb = pb_sample_to_batch.len();
+                let mut cells = Vec::new();
+                for i in 0..3 {
+                    let c = cell_to_pbsamp.len();
+                    let mut feat = vec![0f32; TOY_STATES];
+                    feat[k] = 1.0 + 0.01 * (rep * 3 + i) as f32;
+                    centroids[(k, pb)] += feat[k] / 3.0;
+                    cells_of_batch.push((c, feat));
+                    cell_to_pbsamp.push(pb);
+                    cells.push(c);
+                }
+                pb_sample_to_cells.push(cells);
+                pb_sample_to_batch.push(batch);
+                state.push(k);
+                // Two marker genes per state over a flat background.
+                gene_sums.push(
+                    (0..TOY_GENES)
+                        .map(|g| (g, if g / 2 == k { 60.0 } else { 3.0 } + rep as f32))
+                        .collect(),
+                );
+            }
+        }
+    }
+    let batch_knn = per_batch
+        .into_iter()
+        .map(|cells| {
+            let mut mat = DMatrix::<f32>::zeros(TOY_STATES, cells.len());
+            let mut names = Vec::new();
+            for (col, (c, feat)) in cells.into_iter().enumerate() {
+                mat.column_mut(col).copy_from_slice(&feat);
+                names.push(c);
+            }
+            ColumnDict::<usize>::from_dmatrix(mat, names)
+        })
+        .collect();
+    let layout = PbSampleLayout {
+        centroids,
+        cell_counts: vec![3.0; num_pb],
+        pb_sample_to_batch,
+        pb_sample_to_group: (0..num_pb).collect(),
+        bg_to_pbsamp: Default::default(),
+        cell_to_pbsamp,
+        singleton_col: vec![None; num_pb],
+        bulk_batches: Vec::new(),
+        pb_sample_to_stratum: None,
+    };
+    Toy {
+        layout,
+        gene_sums,
+        pb_sample_to_cells,
+        batch_knn,
+        state,
+    }
+}
+
+fn toy_params() -> RefineParams {
+    RefineParams {
+        num_gibbs: 5,
+        num_greedy: 3,
+        seed: 7,
+        ..Default::default()
+    }
+}
+
+/// Handing the refinement the pooled match table gives the assignment it
+/// would have computed from the lookups itself.
+#[test]
+fn refinement_with_a_given_match_table_is_the_same_refinement() {
+    let t = toy();
+    // A scrambled start: finest groups pair pb-samples across states.
+    let num_pb = t.state.len();
+    let finest: Vec<usize> = (0..num_pb).map(|p| (p * 3) % 6).collect();
+    let coarse: Vec<usize> = finest.iter().map(|&g| g / 3).collect();
+    let levels = vec![finest, coarse];
+    let inputs = RefineInputs {
+        layout: &t.layout,
+        gene_sums: &t.gene_sums,
+        num_genes: TOY_GENES,
+        pb_sample_to_cells: &t.pb_sample_to_cells,
+        batch_knn_lookup: &t.batch_knn,
+        k_per_batch: 3,
+        initial_sc_to_group_per_level: &levels,
+        reproject_offsets_per_level: &[],
+    };
+    let own = refine_assignments(&inputs, &toy_params()).unwrap();
+    let matches = per_batch_sc_neighbors(&t.layout, &t.batch_knn, 3, None).unwrap();
+    assert!(matches.iter().all(|m| !m.is_empty()));
+    let given = refine_assignments_with_matches(&inputs, &toy_params(), Some(&matches)).unwrap();
+    assert_eq!(own.pbsamp_to_group, given.pbsamp_to_group);
+    assert_eq!(own.num_groups_per_level, given.num_groups_per_level);
+    assert_ne!(own.pbsamp_to_group, levels, "the sweeps moved something");
+}
+
+/// A stratum present in one batch only has no cross-batch match, so its
+/// pb-samples fall back to their siblings. Refinement must still leave every
+/// group, at every level, within one stratum.
+#[test]
+fn refinement_never_merges_a_private_stratum() {
+    let mut t = toy();
+    let num_pb = t.state.len();
+    // Batch 0's two pb-samples of state 0 form a private stratum whose
+    // profile is that of the stratum-0 pb-samples of the same state.
+    let strata: Vec<usize> = (0..num_pb)
+        .map(|p| usize::from(t.layout.pb_sample_to_batch[p] == 0 && t.state[p] == 0))
+        .collect();
+    t.layout.pb_sample_to_stratum = Some(strata.clone());
+
+    // Start stratum-pure: one finest group per (state, stratum), all groups
+    // siblings under one coarse parent.
+    let finest: Vec<usize> = (0..num_pb).map(|p| t.state[p] * 2 + strata[p]).collect();
+    let levels = vec![finest, vec![0; num_pb]];
+    let inputs = RefineInputs {
+        layout: &t.layout,
+        gene_sums: &t.gene_sums,
+        num_genes: TOY_GENES,
+        pb_sample_to_cells: &t.pb_sample_to_cells,
+        batch_knn_lookup: &t.batch_knn,
+        k_per_batch: 3,
+        initial_sc_to_group_per_level: &levels,
+        reproject_offsets_per_level: &[],
+    };
+    for seed in 0..8 {
+        let params = RefineParams {
+            seed,
+            ..toy_params()
+        };
+        let refined = refine_assignments(&inputs, &params).unwrap();
+        let finest = &refined.pbsamp_to_group[0];
+        for p in 0..num_pb {
+            for q in 0..num_pb {
+                assert!(
+                    finest[p] != finest[q] || strata[p] == strata[q],
+                    "seed {seed}: pb-samples {p} and {q} of different strata share group {}",
+                    finest[p]
+                );
+            }
+        }
     }
 }
