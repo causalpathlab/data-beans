@@ -40,7 +40,8 @@
 //! partition of the same edges). Cross-run comparisons are not meaningful.
 //!
 //! In the bottom-up agglomeration `bhc_merge` picks the largest `log_BF` at each
-//! step, so scores are monotonically non-increasing along the merge sequence.
+//! step. The scores need not decrease along the merge sequence: a merged node
+//! can score higher against a third cluster than the pair that formed it.
 //! The crossing point `log_BF = 0` is the natural "consensus cut" threshold
 //! exposed via `bhc_cut(merges, k, 0.0)`.
 //!
@@ -59,10 +60,12 @@
 //!
 //! Runs over K clusters (not N samples). Pairwise log BFs are cached, so only
 //! a new node's K pairs are scored after each merge: K²·M lgamma calls overall,
-//! spread over threads. Picking the best pair still scans the cached scores,
-//! K² lookups per merge (K³ overall, no lgamma), and the cache holds up to
-//! 2K² values: meant for K up to a few thousand. No RNG; the merges match
-//! scoring every pair afresh.
+//! spread over threads. Every node also keeps its best partner among the
+//! nodes before it, so picking the best pair is K lookups per merge plus a
+//! rescan of the rows whose best partner was just merged away (K² lookups
+//! overall when few rows go stale, K³ at worst, no lgamma). The cache holds
+//! up to 2K² values: meant for K up to a few thousand. No RNG; the merges
+//! match scoring every pair afresh.
 
 use crate::alg::union_find::UnionFind;
 use rayon::prelude::*;
@@ -125,6 +128,40 @@ fn order_pair(a: i32, b: i32) -> (i32, i32) {
     } else {
         (b, a)
     }
+}
+
+/// A node's best partner among the active nodes before it in the arena.
+#[derive(Clone, Copy)]
+struct RowBest {
+    /// Arena index of the partner.
+    lo: usize,
+    log_bf: f64,
+    /// `(min_id, max_id)` of the pair, the tiebreak.
+    key: (i32, i32),
+}
+
+/// Whether a pair scoring `log_bf` with ids `key` beats `best`: the larger
+/// log BF, ties to the ascending `(min_id, max_id)`.
+#[inline]
+fn beats(log_bf: f64, key: (i32, i32), best: Option<&RowBest>) -> bool {
+    best.is_none_or(|b| log_bf > b.log_bf || (log_bf == b.log_bf && key < b.key))
+}
+
+/// The best partner of arena node `hi` among the `active` nodes before it,
+/// from its cached row of log BFs. `active` is in ascending arena order.
+fn best_in_row(hi: usize, row: &[f64], active: &[usize], arena: &[NodeStats]) -> Option<RowBest> {
+    let mut best: Option<RowBest> = None;
+    for &lo in active.iter().take_while(|&&lo| lo < hi) {
+        let key = order_pair(arena[lo].id, arena[hi].id);
+        if beats(row[lo], key, best.as_ref()) {
+            best = Some(RowBest {
+                lo,
+                log_bf: row[lo],
+                key,
+            });
+        }
+    }
+    best
 }
 
 /// Empirical-Bayes prior constants. Precomputed once per `bhc_merge` call.
@@ -268,30 +305,26 @@ pub fn bhc_merge(input: BhcInput<'_>, gamma: f64) -> Vec<BhcMerge> {
         })
         .collect();
 
+    // Each node's best partner among the active nodes before it. Every
+    // active pair sits in exactly one row, so the best pair overall is the
+    // best of the row bests.
+    let mut row_best: Vec<Option<RowBest>> = (0..arena.len())
+        .into_par_iter()
+        .map(|hi| best_in_row(hi, &bf_rows[hi], &active, &arena))
+        .collect();
+
     while active.len() >= 2 {
         // Maximize log BF; tiebreak on ascending (min_id, max_id).
-        let mut best: Option<(usize, usize, f64, (i32, i32))> = None;
-        for i in 0..active.len() {
-            for j in (i + 1)..active.len() {
-                let a = &arena[active[i]];
-                let b = &arena[active[j]];
-                let bf = bf_rows[active[j]][active[i]];
-                let key = order_pair(a.id, b.id);
-                let pick = match best {
-                    None => true,
-                    Some((_, _, best_bf, best_key)) => {
-                        bf > best_bf || (bf == best_bf && key < best_key)
-                    }
-                };
-                if pick {
-                    best = Some((i, j, bf, key));
+        let mut best: Option<(usize, RowBest)> = None;
+        for &hi in &active {
+            if let Some(rb) = row_best[hi] {
+                if beats(rb.log_bf, rb.key, best.as_ref().map(|(_, b)| b)) {
+                    best = Some((hi, rb));
                 }
             }
         }
 
-        let (i, j, log_bf, _) = best.expect("at least one pair exists");
-        let ai = active[i];
-        let aj = active[j];
+        let (aj, RowBest { lo: ai, log_bf, .. }) = best.expect("at least one pair exists");
         let (left_id, right_id) = order_pair(arena[ai].id, arena[aj].id);
 
         let new_t: Vec<f64> = arena[ai]
@@ -322,13 +355,18 @@ pub fn bhc_merge(input: BhcInput<'_>, gamma: f64) -> Vec<BhcMerge> {
         });
         next_id += 1;
 
-        // Remove j first (j > i) so the index for i stays valid.
-        active.remove(j);
-        active.remove(i);
+        active.retain(|&a| a != ai && a != aj);
         // The merged nodes never come back; their rows are freed, and the
         // new node's row is scored against the nodes still active.
         bf_rows[ai] = Vec::new();
         bf_rows[aj] = Vec::new();
+        // A row whose best partner was merged away is scanned again; the
+        // others keep theirs.
+        for &hi in &active {
+            if row_best[hi].is_some_and(|rb| rb.lo == ai || rb.lo == aj) {
+                row_best[hi] = best_in_row(hi, &bf_rows[hi], &active, &arena);
+            }
+        }
         let mut row = vec![f64::NAN; new_arena_idx];
         let scored: Vec<f64> = active
             .par_iter()
@@ -337,6 +375,7 @@ pub fn bhc_merge(input: BhcInput<'_>, gamma: f64) -> Vec<BhcMerge> {
         for (&lo, bf) in active.iter().zip(scored) {
             row[lo] = bf;
         }
+        row_best.push(best_in_row(new_arena_idx, &row, &active, &arena));
         bf_rows.push(row);
         active.push(new_arena_idx);
     }
@@ -347,28 +386,47 @@ pub fn bhc_merge(input: BhcInput<'_>, gamma: f64) -> Vec<BhcMerge> {
 /// Walk the merge tree and collapse children whose `log_bf >= cutoff`.
 ///
 /// Returns dense consensus labels indexed by original cluster id (length `k`).
-/// Clusters that were empty (`effective_size == 0` during `bhc_merge` and
-/// therefore never appear in any merge) get label `-1`.
+/// A cluster that appears in no merge gets label `-1`: the clusters that were
+/// empty (`effective_size == 0` during `bhc_merge`), and also the single
+/// non-empty cluster of a run with only one, which leaves no merge to find it
+/// in. [`bhc_cut_with_sizes`] tells the two apart.
 ///
 /// A cutoff of `0.0` is the natural Bayesian break point: positive log BF means
 /// the data prefers merging; negative means separating is preferred.
 pub fn bhc_cut(merges: &[BhcMerge], k: usize, cutoff: f64) -> Vec<i32> {
+    // Non-empty originals appear as a direct leaf in exactly one merge, when
+    // there is a merge at all.
+    let mut referenced = vec![false; k];
+    for m in merges {
+        for child in [m.left as usize, m.right as usize] {
+            if child < k {
+                referenced[child] = true;
+            }
+        }
+    }
+    cut_labels(merges, &referenced, cutoff)
+}
+
+/// [`bhc_cut`] with the `effective_size` given to `bhc_merge`: exactly the
+/// clusters with `effective_size == 0` get label `-1`, so the only non-empty
+/// cluster of a run without merges keeps a label of its own.
+pub fn bhc_cut_with_sizes(merges: &[BhcMerge], effective_size: &[usize], cutoff: f64) -> Vec<i32> {
+    let non_empty: Vec<bool> = effective_size.iter().map(|&n| n > 0).collect();
+    cut_labels(merges, &non_empty, cutoff)
+}
+
+/// Dense labels of the clusters flagged in `labelled` (the rest get `-1`)
+/// after joining the children of every merge with `log_bf >= cutoff`.
+fn cut_labels(merges: &[BhcMerge], labelled: &[bool], cutoff: f64) -> Vec<i32> {
+    let k = labelled.len();
     let mut uf = UnionFind::new(k);
     // Representative leaf id per node, indexed by BhcMerge.id. Ids are contiguous
     // K .. K + merges.len() − 1, so we size once up front.
     let mut rep: Vec<usize> = Vec::with_capacity(k + merges.len());
     rep.extend(0..k);
     rep.resize(k + merges.len(), 0);
-    // Non-empty originals appear as a direct leaf in exactly one merge.
-    let mut referenced = vec![false; k];
 
     for m in merges {
-        if (m.left as usize) < k {
-            referenced[m.left as usize] = true;
-        }
-        if (m.right as usize) < k {
-            referenced[m.right as usize] = true;
-        }
         let l_rep = rep[m.left as usize];
         let r_rep = rep[m.right as usize];
         if m.log_bf >= cutoff {
@@ -381,7 +439,7 @@ pub fn bhc_cut(merges: &[BhcMerge], k: usize, cutoff: f64) -> Vec<i32> {
     let mut root_to_dense: Vec<Option<i32>> = vec![None; k];
     let mut next_dense: i32 = 0;
     for c in 0..k {
-        if !referenced[c] {
+        if !labelled[c] {
             continue;
         }
         let root = uf.find(c);
