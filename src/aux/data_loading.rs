@@ -558,11 +558,22 @@ fn resolve_batch_disjoint(
         if batch_files.len() != data_files.len() {
             return Err(anyhow::anyhow!("# batch files != # of data files"));
         }
-        for batch_file in batch_files.iter() {
+        // Each file's labels are counted against its own columns: only then
+        // does a label sit on the cell it was written for.
+        let column_counts = data_vec.num_columns_by_data()?;
+        for (file_idx, batch_file) in batch_files.iter().enumerate() {
             info!("Reading batch file: {}", batch_file);
-            for s in read_lines(batch_file)? {
-                batch_membership.push(s.to_string().into_boxed_str());
+            let labels = read_lines(batch_file)?;
+            if labels.len() != column_counts[file_idx] {
+                return Err(anyhow::anyhow!(
+                    "batch file {} has {} lines but data file {} has {} columns",
+                    batch_file,
+                    labels.len(),
+                    data_files[file_idx],
+                    column_counts[file_idx]
+                ));
             }
+            batch_membership.extend(labels);
         }
     } else {
         let column_counts = data_vec.num_columns_by_data()?;
@@ -650,7 +661,9 @@ fn resolve_batch_union(
     // reconciliation is needed: two cells that disagreed on their tag would
     // have different merge keys and never folded into one cell.
     let unified_names = data_vec.column_names()?;
-    let (per_cell_tags, used_embedded) = infer_batch_from_columns(&unified_names, "", None);
+    // A cell without a tag (a file loaded without a barcode suffix) is in
+    // batch "all".
+    let (per_cell_tags, used_embedded) = infer_batch_from_columns(&unified_names, "all", None);
     if used_embedded {
         info!(
             "Union mode: per-cell @batch tag taken from unified barcodes ({} cells)",
@@ -674,8 +687,12 @@ fn resolve_batch_union(
 /// `@batch` tag, otherwise `rsplit('@')` picks up the basename and every
 /// cell in a file collapses to one wrong batch label.
 ///
-/// Returns `(tags, used_embedded)` where `used_embedded=true` means the
-/// raw column names already contained an `@batch` tag.
+/// Each name is read on its own: the text after its last `@` when it has
+/// one, `file_base` when it has none, so a column list that mixes tagged and
+/// untagged barcodes never takes a whole barcode for a batch.
+///
+/// Returns `(tags, used_embedded)` where `used_embedded=true` means some
+/// raw column name already contained an `@batch` tag.
 fn infer_batch_from_columns(
     file_columns: &[Box<str>],
     file_base: &str,
@@ -688,24 +705,21 @@ fn infer_batch_from_columns(
         }
     }
 
-    let has_embedded_batch = file_columns
-        .first()
-        .is_some_and(|name| raw_of(name.as_ref(), appended_suffix).contains('@'));
-
-    if has_embedded_batch {
-        let tags = file_columns
-            .iter()
-            .map(|col_name| {
-                let raw = raw_of(col_name.as_ref(), appended_suffix);
-                let embedded = raw.rsplit('@').next().unwrap_or(raw);
-                embedded.to_string().into_boxed_str()
-            })
-            .collect();
-        (tags, true)
-    } else {
-        let fallback: Box<str> = file_base.to_string().into_boxed_str();
-        (vec![fallback; file_columns.len()], false)
-    }
+    let mut used_embedded = false;
+    let tags = file_columns
+        .iter()
+        .map(|col_name| {
+            let raw = raw_of(col_name.as_ref(), appended_suffix);
+            match raw.rsplit_once('@') {
+                Some((_, embedded)) => {
+                    used_embedded = true;
+                    embedded.into()
+                }
+                None => file_base.into(),
+            }
+        })
+        .collect();
+    (tags, used_embedded)
 }
 
 #[cfg(test)]
@@ -774,6 +788,24 @@ mod tests {
             tags.iter().map(|b| b.as_ref()).collect::<Vec<_>>(),
             vec!["only", "only"]
         );
+    }
+
+    #[test]
+    fn each_name_is_read_for_its_own_tag() {
+        // Tagged and untagged barcodes in one list, in either order: a
+        // name without a tag takes the fallback, never its own barcode.
+        for names in [
+            cols(&["AAAA@donorA", "CCCC", "GGGG@donorB"]),
+            cols(&["CCCC", "AAAA@donorA", "GGGG@donorB"]),
+        ] {
+            let (tags, used_embedded) = infer_batch_from_columns(&names, "all", None);
+            assert!(used_embedded);
+            let want: Vec<&str> = names
+                .iter()
+                .map(|n| n.rsplit_once('@').map_or("all", |(_, tag)| tag))
+                .collect();
+            assert_eq!(tags.iter().map(|b| b.as_ref()).collect::<Vec<_>>(), want);
+        }
     }
 
     #[test]
