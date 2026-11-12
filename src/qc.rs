@@ -32,14 +32,19 @@ pub fn below_nnz_cutoff(nnz: f32, cutoff: usize) -> bool {
 }
 
 /// squeeze out rows and columns with excessive zero values
+///
+/// The two cutoffs apply independently, each to the non-zeros counted over
+/// the whole matrix before anything is removed: a row is kept by its count
+/// across every column, the removed ones included, and a column likewise.
+/// So a kept row can end below `cutoffs.row` among the kept columns (all
+/// zero, even), and squeezing the result again can remove more.
 pub fn squeeze_by_nnz(
     data: &dyn SparseIo<IndexIter = Vec<usize>>,
     cutoffs: SqueezeCutoffs,
     block_size: Option<usize>,
     preload: bool,
 ) -> anyhow::Result<()> {
-    let col_stat = collect_column_stat(data, block_size)?;
-    let row_stat = collect_row_stat(data, block_size)?;
+    let (col_stat, row_stat) = collect_column_row_stat(data, block_size)?;
 
     fn nnz_index(nnz: &[f32], cutoff: usize) -> Option<Vec<usize>> {
         let ret: Vec<usize> = nnz
@@ -183,6 +188,24 @@ pub fn collect_row_stat(
     Ok(row_stat)
 }
 
+/// The rows of `select_rows` (those within `nrows`) as a mask over all
+/// rows, and empty statistics of `ncols` columns over them: the rows
+/// selected are the denominator of the mean.
+pub fn masked_column_stat(
+    ncols: usize,
+    nrows: usize,
+    select_rows: &[usize],
+) -> (Vec<bool>, SparseColumnRunningStatistics<f32>) {
+    let mut mask = vec![false; nrows];
+    for &r in select_rows {
+        if r < nrows {
+            mask[r] = true;
+        }
+    }
+    let selected = mask.iter().filter(|x| **x).count();
+    (mask, SparseColumnRunningStatistics::new(ncols, selected))
+}
+
 /// collect column-wise sufficient statistics for Q/C
 /// * `data` - `SparseIoVec` across many data matrices
 /// * `select_rows` - selected row indices
@@ -195,23 +218,49 @@ pub fn collect_column_stat_across_vec(
     let ncols = data.num_columns();
     let nrows_total = data.num_rows();
 
-    let row_mask: Option<Vec<bool>> = select_rows.map(|sel| {
-        let mut m = vec![false; nrows_total];
-        for &r in sel {
-            if r < nrows_total {
-                m[r] = true;
-            }
+    let (row_mask, mut col_stat) = match select_rows {
+        Some(sel) => {
+            let (mask, stat) = masked_column_stat(ncols, nrows_total, sel);
+            (Some(mask), stat)
         }
-        m
-    });
-    let nrows_denom = row_mask
-        .as_ref()
-        .map(|m| m.iter().filter(|x| **x).count())
-        .unwrap_or(nrows_total);
-
-    let mut col_stat = SparseColumnRunningStatistics::<f32>::new(ncols, nrows_denom);
+        None => (None, SparseColumnRunningStatistics::new(ncols, nrows_total)),
+    };
     data.visit_columns_by_block(&col_stat_visitor, &row_mask, &mut col_stat, block_size)?;
     Ok(col_stat)
+}
+
+/// collect column-wise and row-wise sufficient statistics for Q/C, reading
+/// every block once ([`collect_column_stat`] and [`collect_row_stat`])
+/// * `data` - `SparseIo`
+/// * `block_size` - a block size for each parallelized job
+pub fn collect_column_row_stat(
+    data: &dyn SparseIo<IndexIter = Vec<usize>>,
+    block_size: Option<usize>,
+) -> anyhow::Result<(
+    SparseColumnRunningStatistics<f32>,
+    SparseRunningStatistics<f32>,
+)> {
+    let ncols = data.num_columns().unwrap_or(0);
+    let nrows = data.num_rows().unwrap_or(0);
+    let stat = Mutex::new((
+        SparseColumnRunningStatistics::<f32>::new(ncols, nrows),
+        SparseRunningStatistics::<f32>::new(nrows),
+    ));
+
+    let jobs = create_jobs(ncols, nrows, block_size);
+
+    jobs.par_iter()
+        .progress_with(styled_progress_bar(jobs.len() as u64, "blocks"))
+        .for_each(|&(lb, ub)| {
+            let csc = data
+                .read_columns_csc((lb..ub).collect())
+                .expect("failed to read data");
+            let mut stat = stat.lock().expect("failed to lock col/row stat");
+            stat.0.add_csc(&csc, lb);
+            stat.1.add_csc(&csc);
+        });
+
+    Ok(stat.into_inner().expect("failed to unlock col/row stat"))
 }
 
 /// collect column-wise sufficient statistics for Q/C
@@ -472,7 +521,14 @@ const PRINTED_BINS: usize = 40;
 /// statistic (nnz, sum, mean, sd); the ranges stay exact `f32` so
 /// count-like stats still print as integers.
 fn create_log_histogram(values: &[f32], cutoff: usize) -> Vec<HistBin> {
-    let axis = Axis::fit(values, true).including(cutoff as f64);
+    // The axis reaches a cutoff that is set; with none (cutoff == 0) it
+    // spans the values alone.
+    let axis = Axis::fit(values, true);
+    let axis = if cutoff > 0 {
+        axis.including(cutoff as f64)
+    } else {
+        axis
+    };
     let mut bins: Vec<(usize, f32, f32)> =
         vec![(0, f32::INFINITY, f32::NEG_INFINITY); PRINTED_BINS];
     for &val in values.iter().filter(|v| v.is_finite()) {
@@ -588,8 +644,9 @@ pub fn write_nnz_summary(
     // Calculate basic statistics
     let min = values.iter().copied().fold(f32::INFINITY, f32::min);
     let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = values.iter().sum();
-    let mean = if total > 0 { sum / total as f32 } else { 0.0 };
+    // Summed in f64: an f32 sum stops growing once it dwarfs its addends.
+    let sum: f64 = values.iter().map(|&v| v as f64).sum();
+    let mean = if total > 0 { sum / total as f64 } else { 0.0 };
 
     let mut sorted = values.to_vec();
     sorted.sort_unstable_by(f32::total_cmp);

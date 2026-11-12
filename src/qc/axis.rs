@@ -163,6 +163,13 @@ impl Axis {
                 .map(|m| m * mag)
                 .find(|s| span / s <= 6.0)
                 .unwrap_or(10.0 * mag);
+            // No step to count in: an empty, reversed or non-finite range,
+            // or one too narrow for its fifth to be a number. A single
+            // value is its own tick.
+            if !step.is_finite() || step <= 0.0 {
+                let one = self.lo == self.hi && self.lo.is_finite();
+                return one.then_some(self.lo).into_iter().collect();
+            }
             // Each tick k steps in, rounded to the step's decimals so 0.15
             // reads 0.15.
             let places = 10f64.powi((2 - step.log10().floor() as i32).max(0));
