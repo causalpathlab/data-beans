@@ -1,7 +1,82 @@
 //! Unit tests for the trajectory (velocity) cell-state generator.
 
-use super::{sample_trajectory_topics, traj_theta};
+use super::{sample_all, sample_dirichlet, sample_trajectory_topics, traj_theta};
+use crate::sim::faba::FabaArgs;
+use clap::Parser;
 use rand::SeedableRng;
+
+#[derive(Parser)]
+struct Cli {
+    #[command(flatten)]
+    args: FabaArgs,
+}
+
+/// `FabaArgs` at their CLI defaults on a small problem, plus `extra` flags.
+fn small_args(extra: &[&str]) -> FabaArgs {
+    let base = [
+        "faba",
+        "--out",
+        "unused",
+        "--n-genes",
+        "40",
+        "--n-cells",
+        "30",
+    ];
+    Cli::parse_from(base.iter().chain(extra.iter())).args
+}
+
+const PI_MEASURED: [f32; 4] = [1.0, 0.3, 0.2, 0.4];
+
+/// A one-component mixture is the whole mass, with no Dirichlet draw.
+#[test]
+fn single_component_dirichlet_is_one() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+    assert_eq!(sample_dirichlet(1, 0.5, &mut rng).unwrap(), vec![1.0]);
+    let w = sample_dirichlet(3, 0.5, &mut rng).unwrap();
+    assert_eq!(w.len(), 3);
+    assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+}
+
+/// `--components-per-modifier 1` is a valid model: every modifier row has
+/// the single mixture weight 1.
+#[test]
+fn one_component_per_modifier_samples() {
+    let args = small_args(&["--components-per-modifier", "1"]);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(2);
+    let lats = sample_all(&args, &PI_MEASURED, &mut rng).unwrap();
+    assert_eq!(lats.alpha_per_mod[0].nrows(), 2);
+    for alpha in &lats.alpha_per_mod[1..] {
+        assert_eq!(alpha.nrows(), 1);
+        assert!(alpha.iter().all(|&a| a == 1.0));
+    }
+}
+
+/// A non-positive Dirichlet concentration is reported as an error.
+#[test]
+fn non_positive_alpha_mix_is_an_error() {
+    for bad in ["0", "-1"] {
+        let args = small_args(&[&format!("--alpha-mix={bad}")]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let err = sample_all(&args, &PI_MEASURED, &mut rng)
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("alpha-mix"), "{err}");
+    }
+}
+
+/// Standard-mode θ is a proportion with the documented dominant weight
+/// `π_topic + (1 − π_topic)/K`.
+#[test]
+fn standard_theta_is_a_proportion() {
+    let args = small_args(&["--pve-topic", "0.5", "--k-topics", "8"]);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(4);
+    let lats = sample_all(&args, &PI_MEASURED, &mut rng).unwrap();
+    for j in 0..lats.theta_kn.ncols() {
+        let col = lats.theta_kn.column(j);
+        assert!((col.sum() - 1.0).abs() < 1e-5);
+        assert!((col.max() - (0.5 + 0.5 / 8.0)).abs() < 1e-5);
+    }
+}
 
 /// θ(t, b) is always a valid proportion (non-negative, sums to 1).
 #[test]
