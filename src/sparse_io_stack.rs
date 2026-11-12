@@ -88,13 +88,30 @@ impl SparseIoStack {
     }
 
     /// Register batch membership for all layers in the stack.
+    ///
+    /// # Panics
+    /// If `batch_membership` is not one entry per column;
+    /// [`try_register_batch_membership`](Self::try_register_batch_membership)
+    /// returns that as an error instead.
     pub fn register_batch_membership<T>(&mut self, batch_membership: &[T])
     where
         T: Sync + Send + std::hash::Hash + Eq + Clone + ToString,
     {
+        self.try_register_batch_membership(batch_membership)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// [`register_batch_membership`](Self::register_batch_membership) that
+    /// returns a membership of the wrong length as an error. The layers
+    /// share their columns, so a refused membership is registered on none.
+    pub fn try_register_batch_membership<T>(&mut self, batch_membership: &[T]) -> anyhow::Result<()>
+    where
+        T: Sync + Send + std::hash::Hash + Eq + Clone + ToString,
+    {
         for layer in self.stack.iter_mut() {
-            layer.register_batch_membership(batch_membership);
+            layer.try_register_batch_membership(batch_membership)?;
         }
+        Ok(())
     }
 
     /// Get the row names combined across all the types. We will

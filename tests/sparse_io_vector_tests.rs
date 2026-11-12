@@ -1710,6 +1710,25 @@ fn a_short_batch_membership_is_refused() {
 }
 
 #[test]
+fn a_short_batch_membership_is_an_error_to_the_fallible_form() -> anyhow::Result<()> {
+    let raw = Array2::<f32>::runif(3, 6);
+    let sp = make_named_sparse(&raw, &str_vec(3, "r"), &str_vec(6, "c"));
+    let mut vec = SparseIoVec::new();
+    vec.push(sp, None)?;
+    let err = vec
+        .try_register_batch_membership(&["a", "a", "b", "b"])
+        .expect_err("4 labels for 6 columns");
+    assert_eq!(
+        err.to_string(),
+        "batch membership has 4 entries but there are 6 columns"
+    );
+    assert_eq!(vec.num_batches(), 0, "nothing is registered");
+    vec.try_register_batch_membership(&["a", "a", "b", "b", "c", "c"])?;
+    assert_eq!(vec.num_batches(), 3);
+    Ok(())
+}
+
+#[test]
 fn batch_registration_checks_the_number_of_labels() -> anyhow::Result<()> {
     let raw = Array2::<f32>::runif(3, 6);
     let sp = make_named_sparse(&raw, &str_vec(3, "r"), &str_vec(6, "c"));
