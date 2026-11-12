@@ -63,7 +63,8 @@ pub fn picker(session: &legume_tui::Session) -> Option<Picker> {
 
 /// One plot area drawn as an image: rebuilt only when marked stale, when
 /// the area changes size, or after a terminal attached (its picker may be
-/// another, and kitty's images were deleted by the attach).
+/// another, and kitty's images were deleted by the attach). An image that
+/// could not be made is not tried again until then either.
 #[derive(Default)]
 pub struct PlotImage {
     stale: bool,
@@ -101,22 +102,24 @@ impl PlotImage {
             self.made = Some(made);
         }
         let size = (area.width, area.height);
-        if self.stale || self.size != Some(size) || self.protocol.is_none() {
+        if self.stale || self.size != Some(size) {
             let scale = font.height.max(1) as f32 / POINTS_PER_CELL;
             let (px, py) = (
                 area.width as f32 * font.width as f32,
                 area.height as f32 * font.height as f32,
             );
             let svg = draw((px / scale) as f64, (py / scale) as f64);
-            self.protocol = super::image(&svg, scale).ok().and_then(|img| {
-                picker
-                    .new_protocol(
-                        DynamicImage::ImageRgba8(img),
-                        Size::new(area.width, area.height),
-                        Resize::Fit(None),
-                    )
-                    .ok()
+            let made = super::image(&svg, scale).and_then(|img| {
+                Ok(picker.new_protocol(
+                    DynamicImage::ImageRgba8(img),
+                    Size::new(area.width, area.height),
+                    Resize::Fit(None),
+                )?)
             });
+            if let Err(e) = &made {
+                log::debug!("no image for a {}x{} plot area: {e}", size.0, size.1);
+            }
+            self.protocol = made.ok();
             self.size = Some(size);
             self.stale = false;
         }
@@ -149,5 +152,34 @@ mod tests {
         assert!(!asks(None, env(&[("TERM", "xterm-256color")])));
         assert!(asks(Some("1"), env(&[("TERM", "xterm-256color")])));
         assert!(!asks(Some("0"), env(&[("TERM", "xterm-kitty")])));
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_made_is_not_drawn_again_each_frame() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let picker = Picker::halfblocks();
+        let mut plot = PlotImage::default();
+        let mut drawn = 0;
+        let mut frame = |plot: &mut PlotImage, drawn: &mut usize| {
+            let mut shown = true;
+            terminal
+                .draw(|f| {
+                    shown = plot.render(f, f.area(), &picker, |_, _| {
+                        *drawn += 1;
+                        "not a figure".to_string()
+                    })
+                })
+                .unwrap();
+            shown
+        };
+        assert!(!frame(&mut plot, &mut drawn));
+        assert!(!frame(&mut plot, &mut drawn));
+        assert_eq!(drawn, 1);
+        // A change to the view tries again.
+        plot.invalidate();
+        assert!(!frame(&mut plot, &mut drawn));
+        assert_eq!(drawn, 2);
     }
 }
