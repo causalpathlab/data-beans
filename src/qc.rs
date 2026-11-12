@@ -41,14 +41,6 @@ pub fn squeeze_by_nnz(
     let col_stat = collect_column_stat(data, block_size)?;
     let row_stat = collect_row_stat(data, block_size)?;
 
-    let file = data.get_backend_file_name();
-    let backend = data.backend_type();
-
-    let mut data = open_sparse_matrix(file, &backend)?;
-    if preload {
-        data.preload_columns()?;
-    }
-
     fn nnz_index(nnz: &[f32], cutoff: usize) -> Option<Vec<usize>> {
         let ret: Vec<usize> = nnz
             .iter()
@@ -85,6 +77,21 @@ pub fn squeeze_by_nnz(
         );
     }
 
+    // A side on which nothing falls below its cutoff is left whole, and the
+    // backend as it is when that is both.
+    let row_idx = row_idx.filter(|kept| kept.len() < row_nnz_vec.len());
+    let col_idx = col_idx.filter(|kept| kept.len() < col_nnz_vec.len());
+    if row_idx.is_none() && col_idx.is_none() {
+        return Ok(());
+    }
+
+    let file = data.get_backend_file_name();
+    let backend = data.backend_type();
+
+    let mut data = open_sparse_matrix(file, &backend)?;
+    if preload {
+        data.preload_columns()?;
+    }
     data.subset_columns_rows(col_idx.as_ref(), row_idx.as_ref())
 }
 

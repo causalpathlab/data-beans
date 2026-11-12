@@ -243,3 +243,6 @@ pub fn squeeze_in_place(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
