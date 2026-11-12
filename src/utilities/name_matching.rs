@@ -2,10 +2,17 @@ use crate::sparse_io::ROW_SEP;
 use genomic_data::coordinates::{import_interval, is_locus, locus_key};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 
 /// Make duplicate names unique by appending `-1`, `-2`, etc. to repeated entries.
-/// Similar to scanpy's `var_names_make_unique()`.
+/// Similar to scanpy's `var_names_make_unique()`. A suffixed name is never one
+/// the list already holds (`ABC, ABC-1, ABC` gives `ABC, ABC-1, ABC-2`), so
+/// the result has no duplicates.
 pub fn make_names_unique(names: &mut [Box<str>]) -> usize {
+    let mut used: HashSet<Box<str>> = names.iter().cloned().collect();
+    if used.len() == names.len() {
+        return 0;
+    }
     let mut counts: HashMap<Box<str>, usize> = HashMap::default();
     let mut num_duped = 0usize;
     for name in names.iter_mut() {
@@ -13,8 +20,14 @@ pub fn make_names_unique(names: &mut [Box<str>]) -> usize {
             if *count == 1 {
                 num_duped += 1;
             }
-            *name = format!("{}-{}", name, count).into_boxed_str();
-            *count += 1;
+            // Skip the suffixes another name already took.
+            *name = loop {
+                let candidate = format!("{}-{}", name, count).into_boxed_str();
+                *count += 1;
+                if used.insert(candidate.clone()) {
+                    break candidate;
+                }
+            };
         } else {
             counts.insert(name.clone(), 1);
         }
@@ -105,7 +118,20 @@ pub fn colon_peak_names(
 /// separator (a bare symbol, or an id-only composite where name was empty or
 /// equalled id) both parts are the whole string, so a 10x `features.tsv` still
 /// gets a non-empty gene name.
+///
+/// A locus id is never cut at a `ROW_SEP` of its contig name: an id-only
+/// peak row (`chrUn_KI270742v1:100-200`, `chr1_KI270706v1_random:5-9`) comes
+/// back whole, and a locus id with a name splits after the locus
+/// (`chrUn_KI270742v1:100-200_GENE1`). Other ids are cut at their first
+/// `ROW_SEP`, so an id-only row whose id holds one (`Y_RNA`) is not told
+/// apart from an `id{ROW_SEP}name` pair.
 pub fn split_id_name(composite: &str) -> (&str, &str) {
+    if let Some((locus, rest)) = locus_part(composite) {
+        return match rest.strip_prefix(ROW_SEP) {
+            Some(name) if !name.is_empty() => (locus, name),
+            _ => (composite, composite),
+        };
+    }
     match composite.split_once(ROW_SEP) {
         Some((id, name)) if !name.is_empty() => (id, name),
         _ => (composite, composite),
@@ -341,8 +367,8 @@ fn alias_candidates(sym: &str) -> Vec<String> {
 ///   5. HGNC alias retry ([`alias_candidates`]: `HIST1H4C` ↔ `H4C3`, `MARCH2` ↔ `MARCHF2`),
 ///   6. fallback to the general [`flexible_name_match`] (prefix / `_x_` segment).
 ///
-/// Tiers 1–5 are O(1) hash lookups; only the rare fallback scans the
-/// vocabulary. Build once, match many — replaces the O(genes × markers)
+/// Tiers 1–5 are O(1) hash lookups, and the fallback tests only the rows that
+/// hold the query's first `_`-segment. Build once, match many — replaces the O(genes × markers)
 /// `.position(flexible_name_match)` scan. Tier 1 preferring an exact match
 /// over an earlier-indexed suffix match is the one intended refinement vs a
 /// pure positional scan. Tiers 3–4 make HGNC / ENSG / `ENSG_HGNC` reconcile
@@ -355,6 +381,9 @@ pub struct GeneIndex {
     exact: HashMap<String, usize>,
     symbol: HashMap<String, usize>,
     ensg: HashMap<String, usize>,
+    /// Every `_`-separated segment of a lowered name, with the rows that hold
+    /// it in ascending order: the candidates of the fallback tier.
+    segment: HashMap<String, Vec<usize>>,
     /// Rows with a locus part ([`locus_part`]), by their name as written,
     /// then by locus key plus the rest of the name, then (for rows with a
     /// rest) by the bare locus key. Loci match only here, case kept.
@@ -432,11 +461,18 @@ impl GeneIndex {
         let mut exact: HashMap<String, usize> = HashMap::default();
         let mut symbol: HashMap<String, usize> = HashMap::default();
         let mut ensg: HashMap<String, usize> = HashMap::default();
+        let mut segment: HashMap<String, Vec<usize>> = HashMap::default();
         for (i, low) in lowered.iter().enumerate() {
             if low.is_empty() {
                 continue;
             }
             exact.entry(low.clone()).or_insert(i);
+            for seg in low.split('_') {
+                let rows = segment.entry(seg.to_string()).or_default();
+                if rows.last() != Some(&i) {
+                    rows.push(i);
+                }
+            }
             // Strip a faba-style aux suffix first (`SYMBOL/count/spliced` →
             // symbol is the leading `/`-segment), then an Ensembl-style prefix
             // (`ENSG…_CD8A` → symbol is the trailing `_`-segment). Handles
@@ -457,6 +493,7 @@ impl GeneIndex {
             exact,
             symbol,
             ensg,
+            segment,
             locus_raw,
             locus,
         }
@@ -509,19 +546,26 @@ impl GeneIndex {
                 return Some(i);
             }
         }
-        // Allocation-free flexible fallback: `flexible_name_match` re-lowercases
-        // both sides and builds three `format!` needles *per comparison*, which
-        // is catastrophic when scanning a 30k+ vocabulary for each of thousands
-        // of unmatched gene-set genes. The vocabulary is already lowercased and
-        // `gl` is lowercase, so build the needles once and scan with plain
-        // byte-level `ends_with`/`starts_with`/`contains`.
-        // (an exact `*t == gl` match is already handled by the `exact` tier above)
+        self.match_segments(&gl)
+    }
+
+    /// The fallback tier, [`flexible_name_match`] over the lowered
+    /// vocabulary: the first row that ends with `_{gl}`, starts with `{gl}_`
+    /// or holds `_{gl}_`. In each case `gl` sits between `_` boundaries of
+    /// the row, so the row holds `gl`'s first `_`-segment as a whole segment;
+    /// only those rows are tested, in row order. The needles are built once
+    /// and compared bytewise (the vocabulary and `gl` are both lowercase); an
+    /// exact `row == gl` match belongs to the `exact` tier.
+    fn match_segments(&self, gl: &str) -> Option<usize> {
+        let first = gl.split('_').next().unwrap_or(gl);
+        let rows = self.segment.get(first)?;
         let suffix = format!("_{gl}");
         let prefix = format!("{gl}_");
         let middle = format!("_{gl}_");
-        self.lowered
-            .iter()
-            .position(|t| t.ends_with(&suffix) || t.starts_with(&prefix) || t.contains(&middle))
+        rows.iter().copied().find(|&i| {
+            let t = &self.lowered[i];
+            t.ends_with(&suffix) || t.starts_with(&prefix) || t.contains(&middle)
+        })
     }
 }
 
@@ -536,6 +580,10 @@ pub fn idf_weight(n_types: usize, df: usize) -> f32 {
 
 /// Match names by substring queries and return matched indices and names
 ///
+/// Each matched name is returned once, in the order the queries first reach
+/// it, however many queries it matches. An empty query (a blank line in a
+/// name file) is not a query and matches nothing.
+///
 /// # Arguments
 /// * `all_names` - All available names to search through
 /// * `queries` - Substring queries to match against
@@ -549,10 +597,12 @@ pub fn match_by_substring(
     entity_type: &str,
 ) -> anyhow::Result<(Vec<usize>, Vec<Box<str>>)> {
     let mut matched_indices = Vec::new();
+    let mut is_matched = vec![false; all_names.len()];
 
-    for query in queries.iter() {
+    for query in queries.iter().filter(|q| !q.is_empty()) {
         for (idx, name) in all_names.iter().enumerate() {
-            if name.contains(query.as_ref()) {
+            if !is_matched[idx] && name.contains(query.as_ref()) {
+                is_matched[idx] = true;
                 matched_indices.push(idx);
             }
         }

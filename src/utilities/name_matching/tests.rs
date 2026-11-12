@@ -144,3 +144,128 @@ fn locus_queries_prefer_the_exact_row_and_reach_composite_rows() {
     assert_eq!(idx.match_gene("chr1:100-200"), Some(1));
     assert_eq!(idx.match_gene("x:0-100/count/spliced"), None);
 }
+
+#[test]
+fn a_suffixed_name_never_collides_with_a_name_in_the_list() {
+    let mut v = names(&["ABC", "ABC-1", "ABC", "ABC", "X", "ABC-1"]);
+    assert_eq!(make_names_unique(&mut v), 2);
+    assert_eq!(
+        v,
+        names(&["ABC", "ABC-1", "ABC-2", "ABC-3", "X", "ABC-1-1"])
+    );
+    let distinct: HashSet<&str> = v.iter().map(|n| n.as_ref()).collect();
+    assert_eq!(distinct.len(), v.len());
+
+    // Plain duplicates number as before.
+    let mut v = names(&["A", "B", "A", "A", "B"]);
+    assert_eq!(make_names_unique(&mut v), 2);
+    assert_eq!(v, names(&["A", "B", "A-1", "A-2", "B-1"]));
+
+    let mut v = names(&["A", "B"]);
+    assert_eq!(make_names_unique(&mut v), 0);
+    assert_eq!(v, names(&["A", "B"]));
+}
+
+#[test]
+fn a_locus_id_is_not_split_inside_its_contig_name() {
+    for id in [
+        "chrUn_KI270742v1:100-200",
+        "chr1_KI270706v1_random:5-9",
+        "chr1:100-200",
+        "chrUn_KI270742v1:100-200/count/spliced",
+    ] {
+        assert_eq!(split_id_name(id), (id, id), "{id}");
+        assert_eq!(split_id_name(&id_name(id, id)), (id, id), "{id}");
+    }
+    assert_eq!(
+        split_id_name(&id_name("chrUn_KI270742v1:100-200", "GENE1")),
+        ("chrUn_KI270742v1:100-200", "GENE1")
+    );
+    // Gene rows split on the first separator, as composed.
+    assert_eq!(
+        split_id_name("ENSG00000153563_CD8A"),
+        ("ENSG00000153563", "CD8A")
+    );
+    assert_eq!(split_id_name("CD8A"), ("CD8A", "CD8A"));
+}
+
+#[test]
+fn substring_matches_come_back_once_and_blank_queries_match_nothing() {
+    let all = names(&["CD3E", "CD3D", "CD8A", "MS4A1"]);
+
+    // A blank line of a name file is not a query for every name.
+    let (idx, got) = match_by_substring(&all, &names(&["CD8A", ""]), "row").unwrap();
+    assert_eq!(idx, vec![2]);
+    assert_eq!(got, names(&["CD8A"]));
+    assert!(match_by_substring(&all, &names(&[""]), "row").is_err());
+
+    // Overlapping queries: each name once, in first-matched order.
+    let (idx, got) = match_by_substring(&all, &names(&["CD3E", "CD3", "MS4"]), "row").unwrap();
+    assert_eq!(idx, vec![0, 1, 3]);
+    assert_eq!(got, names(&["CD3E", "CD3D", "MS4A1"]));
+}
+
+/// The fallback tier finds the row a scan of the whole vocabulary finds.
+#[test]
+fn the_fallback_tier_agrees_with_a_full_scan() {
+    let parts = ["a", "b", "ab", "c", "", "ensg0001", "x1", "gene"];
+    // Names of one to four parts, thinned so that many queries have no row,
+    // then a few with an aux suffix or a locus.
+    let mut dict: Vec<String> = Vec::new();
+    for n in 1..=4usize {
+        for code in 0..parts.len().pow(n as u32) {
+            let mut c = code;
+            let segs: Vec<&str> = (0..n)
+                .map(|_| {
+                    let p = parts[c % parts.len()];
+                    c /= parts.len();
+                    p
+                })
+                .collect();
+            if code % 7 < 2 {
+                dict.push(segs.join("_"));
+            }
+        }
+    }
+    dict.push("A_B/count/spliced".into());
+    dict.push("chr1:1-2".into());
+    dict.push("chr1:1-2_A".into());
+    let dict: Vec<Box<str>> = dict.into_iter().map(String::into_boxed_str).collect();
+    let idx = GeneIndex::build(&dict);
+
+    let scan = |gl: &str| {
+        let suffix = format!("_{gl}");
+        let prefix = format!("{gl}_");
+        let middle = format!("_{gl}_");
+        idx.lowered
+            .iter()
+            .position(|t| t.ends_with(&suffix) || t.starts_with(&prefix) || t.contains(&middle))
+    };
+    let mut queries: Vec<String> = vec![
+        String::new(),
+        "_".into(),
+        "__".into(),
+        "zzz".into(),
+        "a_".into(),
+        "_a".into(),
+        "b/count/spliced".into(),
+        "chr1:1-2".into(),
+        "spliced".into(),
+    ];
+    for a in parts {
+        queries.push(a.to_string());
+        for b in parts {
+            queries.push(format!("{a}_{b}"));
+            for c in parts {
+                queries.push(format!("{a}_{b}_{c}"));
+            }
+        }
+    }
+    let mut n_hits = 0;
+    for q in &queries {
+        let want = scan(q);
+        assert_eq!(idx.match_segments(q), want, "query `{q}`");
+        n_hits += usize::from(want.is_some());
+    }
+    assert!(n_hits > 50 && n_hits < queries.len(), "{n_hits} hits");
+}
