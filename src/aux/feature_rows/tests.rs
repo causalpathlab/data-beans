@@ -280,3 +280,20 @@ fn each_modality_names_its_two_channels() {
     assert_eq!(channels(BAF), Some((ALT, DEPTH)));
     assert_eq!(channels("mod1"), None);
 }
+
+/// A stray row under `OwnGene` is on its own even when it is named exactly
+/// like a gene whose channel rows are in the matrix, wherever it sits.
+#[test]
+fn a_stray_row_named_like_a_gene_is_never_paired_with_it() {
+    let rows = names(&["G1/count/spliced", "G1", "G1/count/unspliced"]);
+    let map = intern_count_rows(&rows, UnparsedRowPolicy::OwnGene);
+    assert_eq!(map.row_to_gene, vec![0, 1, 0]);
+    assert_eq!(map.unparsed, vec![1]);
+    assert_eq!(map.row_is_nascent, vec![false, false, true]);
+
+    let rows = names(&["G1", "G1/count/spliced", "G1/count/unspliced", "G1"]);
+    let map = intern_count_rows(&rows, UnparsedRowPolicy::OwnGene);
+    assert_eq!(map.row_to_gene, vec![0, 1, 1, 2]);
+    assert_eq!(map.n_genes(), 3);
+    assert_eq!(map.unparsed, vec![0, 3]);
+}
