@@ -308,6 +308,10 @@ impl SparseIo for SparseMtxData {
         self.max_row_name_idx = MAX_ROW_NAME_IDX;
         self.by_column_indptr = vec![];
         self.by_row_indptr = vec![];
+        // Nothing read from the removed file describes the new one.
+        self.streamed_nnz = 0;
+        self.clean_preloaded_columns();
+        self.clean_preloaded_rows();
 
         Ok(())
     }
@@ -509,25 +513,25 @@ impl SparseIo for SparseMtxData {
         if let (Some(ncol), Some(nrow), Some(nnz)) =
             (self.num_columns(), self.num_rows(), self.num_non_zeros())
         {
-            let mut buf = open_buf_writer(mtx_file)?;
             let indptr = indptr
                 .as_slice()
                 .ok_or_else(|| anyhow!("column pointers are not contiguous in memory"))?;
 
-            shared::write_mtx(
-                &mut buf,
-                (nrow, ncol, nnz),
-                indptr,
-                shared::MTX_STREAM_BLOCK,
-                |s, e| {
-                    let range = (s as usize)..(e as usize);
-                    Ok((
-                        data.read_slice_1d::<f32, _>(range.clone())?,
-                        indices.read_slice_1d::<u64, _>(range)?,
-                    ))
-                },
-            )?;
-            buf.flush()?;
+            shared::write_mtx_file(mtx_file, |buf| {
+                shared::write_mtx(
+                    buf,
+                    (nrow, ncol, nnz),
+                    indptr,
+                    shared::MTX_STREAM_BLOCK,
+                    |s, e| {
+                        let range = (s as usize)..(e as usize);
+                        Ok((
+                            data.read_slice_1d::<f32, _>(range.clone())?,
+                            indices.read_slice_1d::<u64, _>(range)?,
+                        ))
+                    },
+                )
+            })?;
             info!(
                 "{}: {} rows, {} columns, {} non-zeros",
                 mtx_file, nrow, ncol, nnz

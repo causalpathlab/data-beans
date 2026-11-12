@@ -288,17 +288,35 @@ impl SparseMtxData {
         })
     }
 
+    /// Drop the decoded-chunk cache of the array at `key`; a no-op for an
+    /// array that has none. A cache pins the array it was opened on, shape
+    /// and chunk grid included, along with the chunks decoded from it, so it
+    /// has to go whenever that array is created again or written to.
+    fn forget_array_chunks(&mut self, key: &str) {
+        let cell = match key {
+            KEY_BY_COLUMN_DATA => &mut self.by_column_data_cache,
+            KEY_BY_COLUMN_INDICES => &mut self.by_column_indices_cache,
+            KEY_BY_ROW_DATA => &mut self.by_row_data_cache,
+            KEY_BY_ROW_INDICES => &mut self.by_row_indices_cache,
+            _ => return,
+        };
+        *cell = Arc::new(OnceLock::new());
+    }
+
     /// Forget everything held in memory about the store's contents: the
-    /// decoded-chunk caches (which pin the arrays they were opened on, shape
-    /// and chunk grid included), the shape attributes and the streaming
-    /// cursor. For when the store behind this handle has been replaced;
-    /// chunks decoded from the old arrays would otherwise be served against
-    /// the new index pointers.
+    /// decoded-chunk caches, the shape attributes and the streaming cursor.
+    /// For when the store behind this handle has been replaced; chunks
+    /// decoded from the old arrays would otherwise be served against the new
+    /// index pointers.
     fn forget_store_contents(&mut self) {
-        self.by_column_data_cache = Arc::new(OnceLock::new());
-        self.by_column_indices_cache = Arc::new(OnceLock::new());
-        self.by_row_data_cache = Arc::new(OnceLock::new());
-        self.by_row_indices_cache = Arc::new(OnceLock::new());
+        for key in [
+            KEY_BY_COLUMN_DATA,
+            KEY_BY_COLUMN_INDICES,
+            KEY_BY_ROW_DATA,
+            KEY_BY_ROW_INDICES,
+        ] {
+            self.forget_array_chunks(key);
+        }
         self.shape = MtxShape::default();
         self.streamed_nnz = 0;
     }
@@ -323,6 +341,7 @@ impl SparseMtxData {
         use zarrs::array::ArrayBuilder;
         use zarrs::array::FillValue;
 
+        self.forget_array_chunks(key);
         let ws = self.write_store()?;
 
         let nelem = vec.len();
@@ -382,6 +401,7 @@ impl SparseMtxData {
         use zarrs::array::ArrayBuilder;
         use zarrs::array::FillValue;
 
+        self.forget_array_chunks(key);
         let ws = self.write_store()?;
 
         let chunk_size = chunk_elems(nelem, elem_bytes);
@@ -421,6 +441,7 @@ impl SparseMtxData {
         if data.is_empty() {
             return Ok(());
         }
+        self.forget_array_chunks(key);
         let array = self._open_writable_vector(key)?;
         let subset = Self::create_subset(offset..offset + data.len() as u64);
         array.store_array_subset(&subset, data)?;
@@ -432,6 +453,7 @@ impl SparseMtxData {
         if data.is_empty() {
             return Ok(());
         }
+        self.forget_array_chunks(key);
         let array = self._open_writable_vector(key)?;
         let subset = Self::create_subset(offset..offset + data.len() as u64);
         array.store_array_subset(&subset, data)?;
@@ -646,11 +668,7 @@ impl SparseIo for SparseMtxData {
     }
 
     fn reopen_backend(&mut self) -> anyhow::Result<()> {
-        // Path-addressed store: rebuild it, refresh the resident indptrs — and
-        // DROP the decoded-chunk LRU caches, which pin arrays of the store they
-        // were built on. Keeping them served pre-swap chunk contents against
-        // post-swap indptrs: a matrix that read back with row indices past its
-        // own nrow, from a file that was byte-for-byte correct on disk.
+        // Open the store at the path again; reread its shape and index pointers.
         let store = Arc::new(FilesystemStore::new(&self.file_name)?);
         self.read_store = store.clone();
         self.write_store = Some(store);
@@ -856,26 +874,24 @@ impl SparseIo for SparseMtxData {
         if let (Some(ncol), Some(nrow), Some(nnz)) =
             (self.num_columns(), self.num_rows(), self.num_non_zeros())
         {
-            let mut buf = open_buf_writer(mtx_file)?;
+            shared::write_mtx_file(mtx_file, |buf| {
+                let (indptr, data, indices) = self.open_csc_triplets()?;
+                let indptr = indptr.retrieve_array_subset::<Vec<u64>>(&indptr.subset_all())?;
 
-            let (indptr, data, indices) = self.open_csc_triplets()?;
-            let indptr = indptr.retrieve_array_subset::<Vec<u64>>(&indptr.subset_all())?;
-
-            shared::write_mtx(
-                &mut buf,
-                (nrow, ncol, nnz),
-                &indptr,
-                shared::MTX_STREAM_BLOCK,
-                |s, e| {
-                    let subset = Self::create_subset(s..e);
-                    Ok((
-                        data.retrieve_array_subset::<Vec<f32>>(&subset)?,
-                        indices.retrieve_array_subset::<Vec<u64>>(&subset)?,
-                    ))
-                },
-            )?;
-            buf.flush()?;
-            Ok(())
+                shared::write_mtx(
+                    buf,
+                    (nrow, ncol, nnz),
+                    &indptr,
+                    shared::MTX_STREAM_BLOCK,
+                    |s, e| {
+                        let subset = Self::create_subset(s..e);
+                        Ok((
+                            data.retrieve_array_subset::<Vec<f32>>(&subset)?,
+                            indices.retrieve_array_subset::<Vec<u64>>(&subset)?,
+                        ))
+                    },
+                )
+            })
         } else {
             Err(anyhow!("Unable to figure out the size of the backend data"))
         }

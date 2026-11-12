@@ -9,6 +9,7 @@
 //! but lives in `utilities::io_helpers::parse_name_file` since it is general
 //! I/O, not backend-specific.)
 
+use legume_numeric::matrix::common_io::open_buf_writer;
 use std::io::Write;
 
 /// Coalesce abutting/overlapping ranges in `tagged` (already sorted by
@@ -178,6 +179,30 @@ where
         pos = end;
     }
     Ok(())
+}
+
+/// Create `mtx_file`, let `write` fill it and flush it. A file left
+/// incomplete by a failed `write` or flush is removed, so an export that
+/// returns an error leaves nothing a reader could take for the matrix.
+///
+/// `mtx_file` follows `open_buf_writer`: `stdout` and `stderr` name the
+/// standard streams, which are never removed.
+pub(crate) fn write_mtx_file<F>(mtx_file: &str, write: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut Box<dyn Write>) -> anyhow::Result<()>,
+{
+    let mut buf = open_buf_writer(mtx_file)?;
+    let written = write(&mut buf).and_then(|()| Ok(buf.flush()?));
+    if written.is_err() && !is_standard_stream(mtx_file) {
+        // close the file before unlinking it
+        drop(buf);
+        let _ = std::fs::remove_file(mtx_file);
+    }
+    written
+}
+
+fn is_standard_stream(file: &str) -> bool {
+    file.eq_ignore_ascii_case("stdout") || file.eq_ignore_ascii_case("stderr")
 }
 
 #[cfg(test)]

@@ -3,7 +3,8 @@
 //! Behaviour every sparse backend must share, run against zarr and (when
 //! built in) HDF5: what a handle reads after its file was rebuilt in place,
 //! an all-zero matrix written by the streaming path, single-column reads,
-//! name registration, and the Matrix Market export.
+//! name registration, the Matrix Market export, and a handle whose backend is
+//! initialised again.
 
 use data_beans::sparse_io::*;
 use legume_numeric::matrix::mtx_io::read_mtx_triplets;
@@ -66,6 +67,26 @@ fn dense_triplets(raw: &Array2<f32>) -> Vec<(u64, u64, f32)> {
         }
     }
     ret
+}
+
+/// Stream `raw` into `data` as one column band, then build its CSR half.
+fn stream(
+    data: &mut dyn SparseIo<IndexIter = Vec<usize>>,
+    raw: &Array2<f32>,
+) -> anyhow::Result<()> {
+    let triplets = dense_triplets(raw);
+    let mut colptr = vec![0u64; raw.ncols()];
+    for &(_, j, _) in &triplets {
+        for start in &mut colptr[j as usize + 1..] {
+            *start += 1;
+        }
+    }
+    let rows: Vec<u64> = triplets.iter().map(|t| t.0).collect();
+    let values: Vec<f32> = triplets.iter().map(|t| t.2).collect();
+    data.begin_streaming_csc((raw.nrows(), raw.ncols(), triplets.len()))?;
+    data.append_csc_slab(0, 0, &colptr, &rows, &values)?;
+    data.finalize_streaming_csc()?;
+    data.build_csr_from_csc_streaming()
 }
 
 fn sorted(mut t: Vec<(u64, u64, f32)>) -> Vec<(u64, u64, f32)> {
@@ -235,6 +256,56 @@ fn to_mtx_file_round_trips() -> anyhow::Result<()> {
         let (triplets, shape) = read_mtx_triplets(mtx)?;
         assert_eq!(shape, (raw.nrows(), raw.ncols(), expected.len()), "{ext}");
         assert_eq!(sorted(triplets), expected, "{ext}");
+    }
+    Ok(())
+}
+
+/// An export that fails part-way, here on a stored row index outside the
+/// matrix, leaves no file behind.
+#[test]
+fn a_failed_to_mtx_file_leaves_no_file() -> anyhow::Result<()> {
+    for (backend, ext) in backends() {
+        let dir = tempfile::tempdir()?;
+        let raw = reference();
+        let (mut data, _) = build(&raw, &dir, &backend, ext)?;
+        data.cs_write_u64(CsKey::CscIndices, 0, &[raw.nrows() as u64])?;
+
+        let mtx = dir.path().join("out.mtx");
+        let err = data
+            .to_mtx_file(mtx.to_str().expect("utf8"))
+            .expect_err("a row index past the last row");
+        assert!(format!("{err:#}").contains("to_mtx_file"), "{ext}: {err:#}");
+        assert!(!mtx.exists(), "{ext}: the incomplete file is removed");
+    }
+    Ok(())
+}
+
+/// `initialize_backend` starts the file over under the open handle. Nothing
+/// the handle held of the old matrix, preloaded arrays and streaming cursor
+/// included, carries into the matrix written next.
+#[test]
+fn an_initialized_backend_keeps_nothing_of_the_old_matrix() -> anyhow::Result<()> {
+    for (backend, ext) in backends() {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(format!("again.{ext}"));
+        let mut data = create_sparse_streaming_empty(path.to_str(), Some(&backend))?;
+        let raw = reference();
+        stream(&mut *data, &raw)?;
+        data.preload_columns()?;
+        data.preload_rows()?;
+        assert!(data.csc_column_arrays().is_some(), "{ext}: preloaded");
+        assert_eq!(data.streamed_nnz(), 9, "{ext}");
+
+        data.initialize_backend()?;
+        assert!(data.csc_column_arrays().is_none(), "{ext}: preload dropped");
+        assert_eq!(data.streamed_nnz(), 0, "{ext}");
+
+        let mut next = Array2::<f32>::zeros((3, 2));
+        next[(2, 0)] = -1.0;
+        next[(0, 1)] = -2.0;
+        next[(1, 1)] = -3.0;
+        stream(&mut *data, &next)?;
+        assert_reads(&*data, &next, &format!("{ext}, same handle"));
     }
     Ok(())
 }
