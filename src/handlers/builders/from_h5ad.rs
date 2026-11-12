@@ -159,11 +159,36 @@ pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
     let var_group = file.group(var_path)?;
     let obs_group = file.group("obs")?;
 
+    // Feature IDs, names and types from var/, barcodes from obs/ (each
+    // list of candidates tried in order). Types are var/feature_type or
+    // var/feature_types (scanpy, muon), often categorical.
+    let row_ids = resolve_h5ad_field(
+        &var_group,
+        &index_candidates(&var_group, &args.row_id_field),
+        "feature IDs",
+    );
+    let row_names = resolve_h5ad_field(&var_group, &args.row_name_field, "gene symbols");
+    let typed = read_h5ad_column(&var_group, "feature_type")
+        .or_else(|_| read_h5ad_column(&var_group, "feature_types"))
+        .ok();
+    let column_names = resolve_h5ad_field(
+        &obs_group,
+        &index_candidates(&obs_group, &args.col_name_field),
+        "barcodes",
+    );
+
     // AnnData stores (obs x var) = (cells x features), but data-beans
     // convention is (features x cells). We swap the pointer type to
     // transpose: CSR -> Column pointers, CSC -> Row pointers.
-    let pointer_type = sparse_pointer_type(&x_group, x_path)?;
     let declared = declared_shape(&x_group);
+    let n_obs = declared.map(|(n_obs, _)| n_obs);
+    let n_var = declared.map(|(_, n_var)| n_var);
+    let pointer_type = sparse_pointer_type(
+        &x_group,
+        x_path,
+        n_obs.or(column_names.as_ref().map(Vec::len)),
+        n_var.or(row_ids.as_ref().map(Vec::len)),
+    )?;
 
     // Read triplets
     let CooTripletsShape { triplets, shape } = {
@@ -183,35 +208,17 @@ pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
         nnz, shape.nrows, shape.ncols
     );
 
-    // Feature IDs, names and types from var/, barcodes from obs/ (each
-    // list of candidates tried in order). Types are var/feature_type or
-    // var/feature_types (scanpy, muon), often categorical.
-    let row_ids = resolve_h5ad_field(
-        &var_group,
-        &index_candidates(&var_group, &args.row_id_field),
-        "feature IDs",
-    );
-    let row_names = resolve_h5ad_field(&var_group, &args.row_name_field, "gene symbols");
-    let typed = read_h5ad_column(&var_group, "feature_type")
-        .or_else(|_| read_h5ad_column(&var_group, "feature_types"))
-        .ok();
-    let column_names = resolve_h5ad_field(
-        &obs_group,
-        &index_candidates(&obs_group, &args.col_name_field),
-        "barcodes",
-    );
-
     // The matrix is as large as the file says, so features and cells with
     // no count past the last one that has any are kept.
-    let nrows = axis_len(
-        declared.map(|(_, n_var)| n_var),
+    let nrows = crate::convert::axis_len(
+        n_var,
         row_ids.as_ref().map(Vec::len),
         shape.nrows,
         pointer_type == IndexPointerType::Row,
         "features",
     )?;
-    let ncols = axis_len(
-        declared.map(|(n_obs, _)| n_obs),
+    let ncols = crate::convert::axis_len(
+        n_obs,
         column_names.as_ref().map(Vec::len),
         shape.ncols,
         pointer_type == IndexPointerType::Column,
@@ -263,6 +270,19 @@ pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
     listed("barcodes", &column_names, ncols)?;
     info!("Read {} barcodes", column_names.len());
 
+    // The features to keep, settled before anything is written: a backend
+    // without a row is of no use.
+    log_feature_type_histogram(args.h5ad_file.as_ref(), &row_types);
+    let select_rows =
+        filter_row_indices_by_type(&row_types, &args.select_row_type, &args.remove_row_type);
+    crate::convert::ensure_rows_kept(
+        select_rows.len(),
+        nrows,
+        has_types.then_some(&row_types[..]),
+        (&args.select_row_type, &args.remove_row_type),
+        None,
+    )?;
+
     // Create sparse backend
     let mut out = create_sparse_from_triplets_owned(
         triplets,
@@ -272,11 +292,6 @@ pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
     )?;
     info!("created sparse matrix: {}", backend_file);
     out.register_row_names_vec(&row_ids);
-
-    log_feature_type_histogram(args.h5ad_file.as_ref(), &row_types);
-
-    let select_rows =
-        filter_row_indices_by_type(&row_types, &args.select_row_type, &args.remove_row_type);
 
     // Read all obs metadata columns
     let obs_df = read_h5ad_dataframe(&obs_group)?;
@@ -385,18 +400,39 @@ fn str_attr(loc: &hdf5::Location, name: &str) -> Option<String> {
 /// Which axis the sparse group `x` (at `x_path`) is compressed along, as
 /// data-beans sees it: its `encoding-type` (`csr_matrix` / `csc_matrix`),
 /// or the `h5sparse_format` older anndata wrote. AnnData's CSR, pointers
-/// over cells, has pointers over the columns here; CSC over the rows. An
-/// error when the group names neither format.
-fn sparse_pointer_type(x: &hdf5::Group, x_path: &str) -> anyhow::Result<IndexPointerType> {
-    let format = str_attr(x, "encoding-type")
-        .or_else(|| str_attr(x, "h5sparse_format"))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{x_path} has no `encoding-type` or `h5sparse_format` attribute \
-                 to tell CSR from CSC"
-            )
-        })?
-        .to_ascii_lowercase();
+/// over cells, has pointers over the columns here; CSC over the rows.
+///
+/// A group that names no format is read by its number of compressed
+/// vectors, one less than the length of `indptr`: CSR when that is `n_obs`
+/// (the cells) and not `n_var` (the features), CSC when it is `n_var` and
+/// not `n_obs`. An error when the count matches both or neither, or the
+/// group names a format that is neither.
+fn sparse_pointer_type(
+    x: &hdf5::Group,
+    x_path: &str,
+    n_obs: Option<usize>,
+    n_var: Option<usize>,
+) -> anyhow::Result<IndexPointerType> {
+    let named = str_attr(x, "encoding-type").or_else(|| str_attr(x, "h5sparse_format"));
+    let format = match named {
+        Some(format) => format.to_ascii_lowercase(),
+        None => {
+            let vectors = x.dataset("indptr")?.size().checked_sub(1);
+            let over = |n: Option<usize>| vectors.is_some() && vectors == n;
+            match (over(n_obs), over(n_var)) {
+                (true, false) => "csr".into(),
+                (false, true) => "csc".into(),
+                _ => anyhow::bail!(
+                    "{x_path} has no `encoding-type` or `h5sparse_format` attribute to tell \
+                     CSR from CSC, and its {} compressed vectors do not tell either for \
+                     {} cells and {} features",
+                    vectors.map_or("no".into(), |n| n.to_string()),
+                    n_obs.map_or("unknown".into(), |n| n.to_string()),
+                    n_var.map_or("unknown".into(), |n| n.to_string()),
+                ),
+            }
+        }
+    };
     if format.contains("csr") {
         info!("Sparse format: CSR -> transposing to (features x cells)");
         Ok(IndexPointerType::Column)
@@ -415,27 +451,6 @@ fn declared_shape(x: &hdf5::Group) -> Option<(usize, usize)> {
         let shape: Vec<u64> = x.attr(name).ok()?.read_raw().ok()?;
         (shape.len() == 2).then(|| (shape[0] as usize, shape[1] as usize))
     })
-}
-
-/// The length of one axis of the matrix: what the sparse group declares,
-/// else the number of names obs/ or var/ lists for it, else as far as the
-/// data reaches. An error when the data reaches past that length, or, on
-/// the axis the matrix is `compressed` along, holds another number of
-/// vectors.
-fn axis_len(
-    declared: Option<usize>,
-    named: Option<usize>,
-    reach: usize,
-    compressed: bool,
-    what: &str,
-) -> anyhow::Result<usize> {
-    let n = declared.or(named).unwrap_or(reach);
-    anyhow::ensure!(
-        if compressed { reach == n } else { reach <= n },
-        "the matrix should have {n} {what} but its data {} {reach}",
-        if compressed { "holds" } else { "reaches" }
-    );
-    Ok(n)
 }
 
 /// `fields` with `_index` read as the index of the dataframe `group`: the
@@ -723,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sparse_format_is_read_not_assumed() {
+    fn the_sparse_format_is_read_where_it_is_named() {
         let dir = tempfile::tempdir().unwrap();
         let frames = |file: &hdf5::File| {
             write_dataframe(file, "obs", ("_index", &CELLS), &[]);
@@ -742,16 +757,116 @@ mod tests {
         assert_eq!(cols, CELLS.map(Box::from));
         assert_eq!(m, genes_by_cells());
 
-        for (name, format) in [("none.h5ad", None), ("coo.h5ad", Some("coo_matrix"))] {
+        let h5ad = dir.path().join("coo.h5ad");
+        let file = hdf5::File::create(&h5ad).unwrap();
+        let coo = Some(("encoding-type", "coo_matrix"));
+        write_x(&file, coo, None, &DATA, &INDICES, &INDPTR);
+        frames(&file);
+        drop(file);
+        let e = build(&h5ad).unwrap_err().to_string();
+        assert!(e.contains("CSR"), "{e}");
+    }
+
+    #[test]
+    fn an_unnamed_sparse_format_is_told_by_the_pointer_length() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three vectors, 3 cells and 4 genes: CSR over cells.
+        let h5ad = dir.path().join("csr.h5ad");
+        let file = hdf5::File::create(&h5ad).unwrap();
+        write_x(&file, None, None, &DATA, &INDICES, &INDPTR);
+        write_dataframe(&file, "obs", ("_index", &CELLS), &[]);
+        write_dataframe(&file, "var", ("_index", &GENES), &[]);
+        drop(file);
+        let (rows, cols, m) = build(&h5ad).unwrap();
+        assert_eq!(rows, GENES.map(Box::from));
+        assert_eq!(cols, CELLS.map(Box::from));
+        assert_eq!(m, genes_by_cells());
+
+        // Three vectors, 4 cells and 3 genes: CSC over genes.
+        let h5ad = dir.path().join("csc.h5ad");
+        let file = hdf5::File::create(&h5ad).unwrap();
+        let shape = Some(("shape", [4, 3]));
+        write_x(&file, None, shape, &DATA, &INDICES, &INDPTR);
+        write_dataframe(&file, "obs", ("_index", &GENES), &[]);
+        write_dataframe(&file, "var", ("_index", &CELLS), &[]);
+        drop(file);
+        let (rows, cols, m) = build(&h5ad).unwrap();
+        assert_eq!(rows, CELLS.map(Box::from));
+        assert_eq!(cols, GENES.map(Box::from));
+        assert_eq!(
+            m,
+            [[1., 0., 2., 0.], [0., 3., 0., 0.], [4., 0., 0., 0.]].map(Vec::from)
+        );
+
+        // Three vectors fit 3 cells and 3 genes alike, and neither of 4
+        // cells and 4 genes.
+        for (name, n) in [("square.h5ad", 3), ("neither.h5ad", 4)] {
             let h5ad = dir.path().join(name);
             let file = hdf5::File::create(&h5ad).unwrap();
-            let format = format.map(|f| ("encoding-type", f));
-            write_x(&file, format, None, &DATA, &INDICES, &INDPTR);
-            frames(&file);
+            write_x(&file, None, None, &DATA, &INDICES, &INDPTR);
+            write_dataframe(&file, "obs", ("_index", &GENES[..n]), &[]);
+            write_dataframe(&file, "var", ("_index", &GENES[..n]), &[]);
             drop(file);
             let e = build(&h5ad).unwrap_err().to_string();
-            assert!(e.contains("CSR"), "{e}");
+            assert!(e.contains("CSR from CSC"), "{e}");
         }
+    }
+
+    #[test]
+    fn the_declared_shape_sizes_an_axis_without_names() {
+        let dir = tempfile::tempdir().unwrap();
+        // var/ has no index, and the counts reach 3 genes of the 4 that
+        // the shape declares.
+        let h5ad = dir.path().join("unnamed.h5ad");
+        let file = hdf5::File::create(&h5ad).unwrap();
+        let csr = Some(("encoding-type", "csr_matrix"));
+        let shape = Some(("shape", [3, 4]));
+        write_x(&file, csr, shape, &DATA, &INDICES, &INDPTR);
+        write_dataframe(&file, "obs", ("_index", &CELLS), &[]);
+        file.create_group("var").unwrap();
+        drop(file);
+        let (rows, cols, m) = build(&h5ad).unwrap();
+        assert_eq!(rows, ["0", "1", "2", "3"].map(Box::from));
+        assert_eq!(cols, CELLS.map(Box::from));
+        assert_eq!(m, genes_by_cells());
+    }
+
+    #[test]
+    fn names_that_disagree_with_the_declared_shape_are_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let h5ad = dir.path().join("disagree.h5ad");
+        let file = hdf5::File::create(&h5ad).unwrap();
+        let csr = Some(("encoding-type", "csr_matrix"));
+        let shape = Some(("shape", [3, 4]));
+        write_x(&file, csr, shape, &DATA, &INDICES, &INDPTR);
+        write_dataframe(&file, "obs", ("_index", &CELLS), &[]);
+        let genes = ["G1", "G2", "G3", "G4", "G5"];
+        write_dataframe(&file, "var", ("_index", &genes), &[]);
+        drop(file);
+        let e = build(&h5ad).unwrap_err().to_string();
+        assert!(e.contains("lists 5 feature IDs but X has 4"), "{e}");
+    }
+
+    #[test]
+    fn selecting_no_feature_is_an_error_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let h5ad = dir.path().join("typed.h5ad");
+        let file = hdf5::File::create(&h5ad).unwrap();
+        let csr = Some(("encoding-type", "csr_matrix"));
+        let shape = Some(("shape", [3, 4]));
+        write_x(&file, csr, shape, &DATA, &INDICES, &INDPTR);
+        write_dataframe(&file, "obs", ("_index", &CELLS), &[]);
+        let types: [(&str, &[&str]); 1] = [("feature_types", &["Gene Expression"; 4])];
+        write_dataframe(&file, "var", ("_index", &GENES), &types);
+        drop(file);
+
+        let output = dir.path().join("typed");
+        let mut args = args(&h5ad, &output);
+        args.select_row_type = "peak".into();
+        let e = run_build_from_h5ad(&args).unwrap_err().to_string();
+        assert!(e.contains("none of the 4 rows is kept"), "{e}");
+        assert!(e.contains("Gene Expression") && e.contains("`peak`"), "{e}");
+        assert!(!output.with_extension("zarr").exists());
     }
 
     /// Two donors share a barcode. The cell metadata `from-h5ad` writes,

@@ -38,9 +38,10 @@ pub struct ToH5adArgs {
         long_help = "Optional TSV whose first column is the cell key; gzip is fine.\n\
                      Keys match against the backend column names.\n\
                      A cell named `barcode@donor` also matches the row keyed `barcode`\n\
-                     whose `donor_id` column is `donor`, or, the key listed once, `barcode`.\n\
+                     whose `donor_id` column is `donor`, or else the row keyed `barcode`.\n\
                      \n\
-                     Remaining columns become `obs` columns. Unmatched cells get `NA`.\n\
+                     Remaining columns become `obs` columns. Unmatched cells get `NA`,\n\
+                     as do cells whose key is listed on rows that differ.\n\
                      \n\
                      Pair this with the `*.cell_metadata.tsv.gz` that `from-h5ad` wrote,\n\
                      to round-trip cell annotations."
@@ -52,7 +53,8 @@ pub struct ToH5adArgs {
         help = "Feature-metadata TSV to attach as `var` columns",
         long_help = "Optional TSV whose first column is the feature key; gzip is fine.\n\
                      Keys match against the backend row names.\n\
-                     Remaining columns become `var` columns. Unmatched features get `NA`."
+                     Remaining columns become `var` columns. Unmatched features get `NA`,\n\
+                     as do features whose key is listed on rows that differ."
     )]
     pub var: Option<Box<str>>,
 }
@@ -243,8 +245,10 @@ fn write_dataframe(
 /// With `barcode_fallback`, a name `barcode@donor` that is no key itself
 /// matches the row keyed `barcode` whose `donor_id` column says `donor`
 /// (the name `from-h5ad` gives that row's cell), else the row keyed
-/// `barcode`. A key the file lists more than once names no single row: it
-/// matches nothing and the entry is left `"NA"`, with a warning.
+/// `barcode`. A key the file lists on several rows stands for them while
+/// they say the same in every kept column; once they differ it names no
+/// single row, matches nothing, and the entry is left `"NA"`, with a
+/// warning.
 #[allow(clippy::type_complexity)]
 fn load_aligned_metadata(
     path: &str,
@@ -271,12 +275,19 @@ fn load_aligned_metadata(
         .iter()
         .map(|line| line.split('\t').collect())
         .collect();
-    // Key -> its row, or `None` for a key listed more than once.
+    // What a row says in the kept columns, `NA` where it is short.
+    let kept = |row: usize| {
+        let fields = &rows[row];
+        keep_idx
+            .iter()
+            .map(move |&hidx| fields.get(hidx).copied().unwrap_or("NA"))
+    };
+    // Key -> the first row listing it, or `None` once its rows disagree.
     let mut key2row: HashMap<Box<str>, Option<usize>> = HashMap::new();
     let mut add_key = |key: Box<str>, row: usize| {
         key2row
             .entry(key)
-            .and_modify(|listed| *listed = None)
+            .and_modify(|listed| *listed = listed.filter(|&first| kept(first).eq(kept(row))))
             .or_insert(Some(row));
     };
     let donor_col = header.iter().position(|&c| c == DONOR_COLUMN);
@@ -309,9 +320,8 @@ fn load_aligned_metadata(
         match listed.copied().flatten() {
             Some(row) => {
                 n_matched += 1;
-                let fields = &rows[row];
-                for (ci, &hidx) in keep_idx.iter().enumerate() {
-                    columns[ci].push(fields.get(hidx).copied().unwrap_or("NA").into());
+                for (column, value) in columns.iter_mut().zip(kept(row)) {
+                    column.push(value.into());
                 }
             }
             None => {
@@ -323,7 +333,7 @@ fn load_aligned_metadata(
     }
     if n_ambiguous > 0 {
         log::warn!(
-            "{} of {} entries match a key that {} lists more than once; \
+            "{} of {} entries match a key that {} lists on rows that differ; \
              their metadata is left NA",
             n_ambiguous,
             names.len(),
@@ -437,5 +447,47 @@ mod tests {
         .unwrap();
         let (_, data) = load_aligned_metadata(bare.to_str().unwrap(), &cells, true).unwrap();
         assert_eq!(data[0], names(&["NA", "NA", "NK"]));
+    }
+
+    /// A key on several rows keeps its metadata while the rows agree, in an
+    /// obs table and a var table alike, and loses it once they differ.
+    #[test]
+    fn a_key_listed_twice_is_ambiguous_only_when_its_rows_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("table.tsv");
+        std::fs::write(
+            &table,
+            "key\tkind\tnote\n\
+             A\tx\tsame\n\
+             A\tx\tsame\n\
+             B\ty\tone\n\
+             B\ty\tother\n\
+             C\tz\tonly\n",
+        )
+        .unwrap();
+        let entries = names(&["A", "B", "C", "D"]);
+        for barcode_fallback in [true, false] {
+            let (cols, data) =
+                load_aligned_metadata(table.to_str().unwrap(), &entries, barcode_fallback).unwrap();
+            assert_eq!(cols, names(&["kind", "note"]));
+            assert_eq!(data[0], names(&["x", "NA", "z", "NA"]));
+            assert_eq!(data[1], names(&["same", "NA", "only", "NA"]));
+        }
+
+        // Cells named by donor: a repeated row still names its cell, by
+        // barcode and donor and by barcode alone.
+        let obs = dir.path().join("obs.tsv");
+        std::fs::write(
+            &obs,
+            "barcode\tdonor_id\tcell_type\n\
+             AAAC-1\tdonorA\tT\n\
+             AAAC-1\tdonorA\tT\n\
+             GGGT-1\tdonorA\tNK\n\
+             GGGT-1\tdonorA\tB\n",
+        )
+        .unwrap();
+        let cells = names(&["AAAC-1@donorA", "AAAC-1@donorB", "GGGT-1@donorA"]);
+        let (_, data) = load_aligned_metadata(obs.to_str().unwrap(), &cells, true).unwrap();
+        assert_eq!(data[1], names(&["T", "T", "NA"]));
     }
 }

@@ -25,15 +25,64 @@ pub struct TenxMatrix {
     pub keep_rows: Option<Vec<bool>>,
 }
 
-/// The length of one axis: the number of names the file lists for it (one
-/// per row or column, so trailing all-zero rows and columns, which leave no
-/// trace in the triplets, still count), else as far as the triplets reach.
-/// An error when the triplets reach past the names.
-fn axis_len(named: Option<usize>, reach: usize, what: &str) -> anyhow::Result<usize> {
-    match named {
-        Some(n) if n >= reach => Ok(n),
-        Some(n) => anyhow::bail!("the file names {n} {what} but its data reaches {reach}"),
-        None => Ok(reach),
+/// The length of one axis: the length the file declares for it, else the
+/// number of names it lists (one per row or column, so trailing all-zero
+/// rows and columns, which leave no trace in the triplets, still count),
+/// else as far as the triplets reach. An error when the triplets reach past
+/// that length, or, with `compressed` (the axis the file's pointers run
+/// over, one vector per row or column), hold another number of vectors.
+pub(crate) fn axis_len(
+    declared: Option<usize>,
+    named: Option<usize>,
+    reach: usize,
+    compressed: bool,
+    what: &str,
+) -> anyhow::Result<usize> {
+    let (n, source) = match (declared, named) {
+        (Some(n), _) => (n, "declares"),
+        (None, Some(n)) => (n, "names"),
+        (None, None) => return Ok(reach),
+    };
+    anyhow::ensure!(
+        if compressed { reach == n } else { reach <= n },
+        "the file {source} {n} {what} but its data {} {reach}",
+        if compressed { "holds" } else { "reaches" }
+    );
+    Ok(n)
+}
+
+/// An error when a matrix of `nrows` rows keeps none of them: `n_kept` is
+/// zero. It names the type `patterns` (select, remove) and the file's
+/// types; `row_set` is `(rows of a kept type, rows in the set)` when the
+/// rows are also limited to a set of their own ([`TenxMatrix::keep_rows`]),
+/// which may be what leaves none.
+pub(crate) fn ensure_rows_kept(
+    n_kept: usize,
+    nrows: usize,
+    row_types: Option<&[Box<str>]>,
+    patterns: (&str, &str),
+    row_set: Option<(usize, usize)>,
+) -> anyhow::Result<()> {
+    if n_kept > 0 || nrows == 0 {
+        return Ok(());
+    }
+    let types: std::collections::BTreeSet<&str> = row_types
+        .iter()
+        .flat_map(|t| t.iter())
+        .map(|t| t.as_ref())
+        .collect();
+    let patterns = format!("select `{}`, remove `{}`", patterns.0, patterns.1);
+    match row_set {
+        Some((n_typed, n_set)) => anyhow::bail!(
+            "none of the {nrows} rows is kept: {n_typed} are of a kept type ({patterns}) and \
+             {n_set} are in `keep_rows`, the rows the file itself selects (a probe set's \
+             targets), but none is both; the file's feature types are {types:?}. Name the \
+             types to keep with --select-row-type"
+        ),
+        None => anyhow::bail!(
+            "none of the {nrows} rows is kept ({patterns}); the file's feature types are \
+             {types:?}. Name the types to keep with --select-row-type"
+        ),
     }
 }
 
@@ -58,8 +107,11 @@ pub fn write_10x_matrix(
         column_names,
         keep_rows,
     } = m;
-    let nrows = axis_len(row_ids.as_ref().map(Vec::len), reach.0, "rows")?;
-    let ncols = axis_len(column_names.as_ref().map(Vec::len), reach.1, "columns")?;
+    // A 10x file declares no shape apart from its names, and a list of
+    // names longer than the pointers is taken as trailing empty vectors.
+    let nrows = axis_len(None, row_ids.as_ref().map(Vec::len), reach.0, false, "rows")?;
+    let named_columns = column_names.as_ref().map(Vec::len);
+    let ncols = axis_len(None, named_columns, reach.1, false, "columns")?;
     let index = |n: usize| {
         (0..n)
             .map(|i| i.to_string().into_boxed_str())
@@ -87,18 +139,18 @@ pub fn write_10x_matrix(
         Some(types) => filter_row_indices_by_type(types, select_row_type, remove_row_type),
         None => (0..nrows).collect(),
     };
-    if let Some(keep_rows) = &keep_rows {
+    let row_set = keep_rows.as_ref().map(|keep_rows| {
+        let n_typed = keep.len();
         keep.retain(|&i| keep_rows[i]);
-    }
-    if keep.is_empty() && nrows > 0 {
-        let types: std::collections::BTreeSet<&str> =
-            row_types.iter().flatten().map(|t| t.as_ref()).collect();
-        anyhow::bail!(
-            "none of the {nrows} rows is kept (select `{select_row_type}`, remove \
-             `{remove_row_type}`); the file's feature types are {types:?}. Name the \
-             types to keep with --select-row-type"
-        );
-    }
+        (n_typed, keep_rows.iter().filter(|&&k| k).count())
+    });
+    ensure_rows_kept(
+        keep.len(),
+        nrows,
+        row_types.as_deref(),
+        (select_row_type, remove_row_type),
+        row_set,
+    )?;
     // The other rows leave the triplets before anything is written.
     if keep.len() < nrows {
         info!("Keeping {} of {nrows} rows", keep.len());
@@ -404,23 +456,28 @@ fn staged_conversion(base: &str) -> String {
 }
 
 /// Move the backend built at `staged` to the cache path `converted`, in one
-/// rename. A usable cache already there is another conversion of the same
-/// input that finished first; it stays and `staged` is dropped. An unusable
-/// one is replaced.
+/// rename. The rename fails when a backend is already there, which is looked
+/// at only then, so nothing another conversion installs in the meantime is
+/// removed unseen: a usable one is another conversion of the same input that
+/// finished first, and it stays while `staged` is dropped; an unusable one
+/// is removed and the rename tried once more.
 fn install_conversion(staged: &str, converted: &str) -> anyhow::Result<()> {
-    if cached_conversion(converted).is_none() {
-        remove_file(converted)?;
-        match std::fs::rename(staged, converted) {
-            Ok(()) => return Ok(()),
-            // Lost the race to a conversion that renamed in between.
-            Err(_) if std::path::Path::new(converted).exists() => {}
-            Err(e) => {
-                let _ = remove_file(staged);
-                return Err(e.into());
-            }
-        }
+    let rename = || Ok(std::fs::rename(staged, converted)?);
+    let occupied = || std::path::Path::new(converted).exists();
+    let usable = || cached_conversion(converted).is_some();
+    let mut renamed: anyhow::Result<()> = rename();
+    if renamed.is_err() && occupied() && !usable() {
+        renamed = remove_file(converted).and_then(|()| rename());
     }
-    remove_file(staged)
+    let Err(e) = renamed else {
+        return Ok(());
+    };
+    remove_file(staged)?;
+    anyhow::ensure!(
+        usable(),
+        "cannot install the conversion at {converted}: {e}"
+    );
+    Ok(())
 }
 
 /// Try to open a data file directly; if that fails, attempt automatic
@@ -461,9 +518,11 @@ pub fn try_open_or_convert(
         );
     }
 
-    let convert: fn(&str, &str) -> anyhow::Result<()> = match ext.as_ref() {
+    // The conversion, and the command that does the same with options.
+    type Convert = fn(&str, &str) -> anyhow::Result<()>;
+    let (convert, command): (Convert, &str) = match ext.as_ref() {
         #[cfg(feature = "hdf5")]
-        "h5" => convert_h5_to_backend,
+        "h5" => (convert_h5_to_backend, "from-10x-matrix"),
         #[cfg(feature = "hdf5")]
         "h5ad" => anyhow::bail!(
             "{data_file} does not open as a data-beans backend ({original_err}), and an \
@@ -477,7 +536,7 @@ pub fn try_open_or_convert(
              to read .h5/.h5ad inputs.",
             data_file
         ),
-        "zarr" | "zip" => convert_zarr_to_backend,
+        "zarr" | "zip" => (convert_zarr_to_backend, "from-zarr"),
         _ => return Err(original_err),
     };
 
@@ -485,7 +544,13 @@ pub fn try_open_or_convert(
     info!("Converting {} to backend: {}", data_file, converted);
     if let Err(e) = convert(data_file, &staged) {
         let _ = remove_file(&staged);
-        return Err(e);
+        // Converted here, the file is read with the defaults of `command`,
+        // which the caller has no options to change.
+        return Err(e.context(format!(
+            "{data_file} is not converted automatically with the default options; run \
+             `data-beans {command} {data_file} -o <output>` with its options, such as \
+             --select-row-type for the feature types to keep, and use its output"
+        )));
     }
     install_conversion(&staged, &converted)?;
     open_sparse_matrix(&converted, &SparseIoBackend::Zarr)
@@ -614,8 +679,43 @@ mod tests {
         });
         std::fs::write(store.join("cell_features/.zattrs"), attrs.to_string()).unwrap();
 
-        assert!(try_open_or_convert(store.to_str().unwrap()).is_err());
+        let e = try_open_or_convert(store.to_str().unwrap())
+            .err()
+            .expect("no row is kept");
+        // The error names the command whose options keep other types, and
+        // still says what went wrong.
+        let e = format!("{e:#}");
+        assert!(e.contains("data-beans from-zarr"), "{e}");
+        assert!(e.contains("--select-row-type"), "{e}");
+        assert!(e.contains("negative_control_probe"), "{e}");
         assert_eq!(file_names(dir.path()), ["matrix.zarr"]);
+    }
+
+    #[test]
+    fn a_cache_installed_meanwhile_stays_unless_it_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("matrix.zarr");
+        xenium_like_store(&store);
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        let (cache, staged) = (path("matrix.db.zarr"), path("staged.zarr"));
+        let convert = |to: &str| convert_zarr_to_backend(store.to_str().unwrap(), to).unwrap();
+
+        // Another conversion finished first: its backend is the one kept.
+        convert(&cache);
+        let marker = Path::new(&cache).join("installed-first");
+        std::fs::write(&marker, "").unwrap();
+        convert(&staged);
+        install_conversion(&staged, &cache).unwrap();
+        assert!(marker.exists());
+        assert!(!Path::new(&staged).exists());
+
+        // What is there does not open: the staged backend takes its place.
+        remove_file(&cache).unwrap();
+        std::fs::create_dir_all(Path::new(&cache).join("by_column")).unwrap();
+        convert(&staged);
+        install_conversion(&staged, &cache).unwrap();
+        assert!(cached_conversion(&cache).is_some());
+        assert!(!Path::new(&staged).exists());
     }
 
     #[cfg(feature = "hdf5")]
@@ -720,6 +820,29 @@ mod tests {
             e.contains("Antibody Capture") && e.contains("gene,peak"),
             "{e}"
         );
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn keeping_no_row_names_the_row_set_that_leaves_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.zarr");
+        // Two rows are genes, and the only row the file selects is of
+        // another type.
+        let m = TenxMatrix {
+            triplets: vec![(0, 0, 1.0), (1, 1, 2.0), (2, 0, 3.0)],
+            reach: (3, 2),
+            row_ids: names(&["G1", "G2", "CD3"]),
+            row_names: None,
+            row_types: names(&["Gene Expression", "Gene Expression", "Antibody Capture"]),
+            column_names: None,
+            keep_rows: Some(vec![false, false, true]),
+        };
+        let e = write_10x_matrix(m, "gene", "", out.to_str().unwrap(), &SparseIoBackend::Zarr)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("2 are of a kept type"), "{e}");
+        assert!(e.contains("1 are in `keep_rows`"), "{e}");
         assert!(!out.exists());
     }
 }
