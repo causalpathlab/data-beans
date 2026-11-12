@@ -17,6 +17,7 @@ use super::index_audit;
 use super::meta::Metadata;
 use anyhow::Context;
 
+use crate::column_subset::{stream_csc_selection, RowRemap};
 use crate::sparse_data_visitors::styled_progress_bar;
 use clap::ValueEnum;
 use indicatif::ParallelProgressIterator;
@@ -26,7 +27,6 @@ use log::info;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 mod tests;
@@ -55,6 +55,10 @@ pub enum CsKey {
 /// streamed out as CSC or CSR. Bounds the staging buffers; the triplets
 /// themselves are the only full-size structure alive at that point.
 const SLAB_NNZ: usize = 1 << 20;
+
+/// Bytes one entry occupies in a transpose band: a `u64` column index and an
+/// `f32` value.
+const TRANSPOSE_BYTES_PER_NNZ: usize = 12;
 
 /// End of the slab that starts at triplet `start` of a vector sorted on the
 /// major axis `major` (column for CSC, row for CSR): at least `slab_nnz`
@@ -104,6 +108,63 @@ fn check_triplet_bounds(
              is outside the {nrow} x {ncol} matrix"
         );
     }
+    Ok(())
+}
+
+/// Replace the content of `data` with what `build` writes into a fresh
+/// backend of the same kind.
+///
+/// The replacement is written beside the original (same filesystem, so the
+/// final rename is atomic) and swapped in only when complete. CONTRACT of the
+/// swap: the original is untouched until the temporary sibling is complete; a
+/// failure in `build` leaves the original intact plus a
+/// `.data-beans-stage/{name}.{stage_tag}` leftover (cleaned on the next
+/// attempt); the unrecoverable window is only remove→rename.
+///
+/// A zip-archived backend is refused up front — streaming to a sibling
+/// DIRECTORY and renaming it over the `.zip` name would silently change the
+/// on-disk format under the old extension.
+fn replace_backend_content<S>(
+    data: &mut S,
+    stage_tag: &str,
+    build: impl FnOnce(&S, &mut dyn SparseIo<IndexIter = Vec<usize>>) -> anyhow::Result<()>,
+) -> anyhow::Result<()>
+where
+    S: SparseIo + ?Sized,
+{
+    let final_path = data.get_backend_file_name().to_string();
+    anyhow::ensure!(
+        !final_path.ends_with(".zip"),
+        "{final_path} is a zip archive; convert it to a directory \
+         backend first (data-beans convert)"
+    );
+    // In the hidden stage beside the output (same disk, so the rename
+    // stays atomic), where a sync client does not see it come and go.
+    let name = std::path::Path::new(&final_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp_path = crate::zarr_io::in_stage(&final_path, &format!("{name}.{stage_tag}"));
+    crate::zarr_io::make_stage(&temp_path)?;
+    if std::path::Path::new(&temp_path).exists() {
+        crate::sparse_io::remove_backend_path(&temp_path)?;
+    }
+
+    {
+        let backend_kind = data.backend_type();
+        let mut out =
+            crate::sparse_io::create_sparse_streaming_empty(Some(&temp_path), Some(&backend_kind))?;
+        build(data, &mut *out)?;
+        out.set_metadata(&data.metadata())?;
+    }
+
+    data.remove_backend_file()?;
+    std::fs::rename(&temp_path, &final_path)?;
+    crate::zarr_io::leave_stage(&temp_path);
+    data.reopen_backend()?;
+    data.clean_preloaded_columns();
+    data.clean_preloaded_rows();
+    info!("registered new data to {}", data.get_backend_file_name());
     Ok(())
 }
 
@@ -479,16 +540,17 @@ pub trait SparseIo: Sync + Send {
             .num_rows()
             .ok_or_else(|| anyhow::anyhow!("missing shape information"))?;
 
-        // An empty selection is refused, not honoured: this method DESTROYS the
-        // original backend, and writing a zero-column husk over real data is
-        // almost certainly a caller mistake rather than an intention.
-        // Empty and duplicated selections are refused, not honoured: this
-        // method DESTROYS the original, and a duplicate collapses in the
-        // old→new map while still counting toward the new shape — slabs then
-        // land at wrong offsets and the finalize audit rejects the build with a
-        // message about nnz tiling that names nothing the caller did.
-        let distinct = |sel: &[usize], what: &str| -> anyhow::Result<()> {
+        // Empty, duplicated and out-of-range selections are refused, not
+        // honoured: this method REPLACES the original, and writing a
+        // zero-column husk or a matrix short of the requested columns over
+        // real data is almost certainly a caller mistake rather than an
+        // intention. A duplicate would also collapse in the old→new map while
+        // still counting toward the new shape.
+        let distinct = |sel: &[usize], what: &str, ntot: usize| -> anyhow::Result<()> {
             anyhow::ensure!(!sel.is_empty(), "subset: empty {what} selection");
+            if let Some(&bad) = sel.iter().find(|&&i| i >= ntot) {
+                anyhow::bail!("subset: {what} index {bad} is outside the {ntot} {what}s");
+            }
             let mut seen = sel.to_vec();
             seen.sort_unstable();
             seen.dedup();
@@ -501,289 +563,117 @@ pub trait SparseIo: Sync + Send {
             Ok(())
         };
         if let Some(cols) = columns {
-            distinct(cols, "column")?;
+            distinct(cols, "column", ncol_data)?;
         }
         if let Some(rs) = rows {
-            distinct(rs, "row")?;
+            distinct(rs, "row", nrow_data)?;
         }
 
-        //////////////////////////////////////////////////////
-        // 0. Create a mapping from old to new columns/rows //
-        //////////////////////////////////////////////////////
-
-        let (old2new_cols, new_col_names) =
-            take_subset_indices_names_if_needed(columns, Some(ncol_data), self.column_names()?);
-        let (old2new_rows, new_row_names) =
-            take_subset_indices_names_if_needed(rows, Some(nrow_data), self.row_names()?);
-        let (new_ncol, new_nrow) = (new_col_names.len(), new_row_names.len());
-        anyhow::ensure!(new_ncol > 0, "subset: no column survived the selection");
-        anyhow::ensure!(new_nrow > 0, "subset: no row survived the selection");
-
-        // Old columns in NEW order — the selection's order is the output order.
-        let mut cols_new_order: Vec<(u64, u64)> =
-            old2new_cols.iter().map(|(&o, &n)| (n, o)).collect();
-        cols_new_order.sort_unstable();
-
-        // Dense old-row → new-row map, and whether it preserves order. A
-        // monotone map keeps within-column rows ascending after renumbering, so
-        // no per-column sort is needed; a reordering map costs one small sort
-        // per column.
-        let mut row_map: Vec<Option<u64>> = vec![None; nrow_data];
-        for (&old, &new) in &old2new_rows {
-            row_map[old as usize] = Some(new);
-        }
-        let monotone_rows = row_map.iter().flatten().is_sorted_by(|a, b| a < b);
-
-        ///////////////////////////////////////////////////////
-        // 1. Exact per-new-column nnz, without materialising //
-        ///////////////////////////////////////////////////////
-
-        // No row filter: straight off the resident indptr, zero I/O. With one:
-        // a counting pass — reads every selected column once and keeps counts,
-        // never entries.
-        let full_rows = rows.is_none();
-        let per_col_nnz: Vec<u64> = if full_rows {
-            cols_new_order
-                .iter()
-                .map(|&(_, old)| {
-                    self.column_nnz(old as usize)
-                        .ok_or_else(|| anyhow::anyhow!("subset: no indptr for column {old}"))
+        // The selection's order is the output order, for names and data alike.
+        let take_names = |sel: Option<&Vec<usize>>,
+                          names: Vec<Box<str>>,
+                          what: &str|
+         -> anyhow::Result<Vec<Box<str>>> {
+            let Some(sel) = sel else {
+                return Ok(names);
+            };
+            sel.iter()
+                .map(|&i| {
+                    names.get(i).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("subset: {what} {i} has no name ({} named)", names.len())
+                    })
                 })
-                .collect::<anyhow::Result<_>>()?
-        } else {
-            // Block reads, never one column at a time: a single-column read
-            // pays the cached-subset machinery per call, which measured two
-            // orders of magnitude slower at imaging scale. Counts only, never
-            // entries.
-            let mut counts = vec![0u64; cols_new_order.len()];
-            let coarse = legume_numeric::matrix::utils::generate_minibatch_intervals(
-                cols_new_order.len(),
-                0,
-                Some(8192),
-            );
-            for (lb, ub) in coarse {
-                let old_cols: Vec<usize> = cols_new_order[lb..ub]
-                    .iter()
-                    .map(|&(_, o)| o as usize)
-                    .collect();
-                let (_, _, triplets) =
-                    self.read_triplets_by_columns(old_cols.into_iter().collect())?;
-                for (i, c_local, _) in triplets {
-                    if row_map[i as usize].is_some() {
-                        counts[lb + c_local as usize] += 1;
-                    }
-                }
-            }
-            counts
+                .collect()
         };
-        let new_nnz: u64 = per_col_nnz.iter().sum();
+        let new_col_names = take_names(columns, self.column_names()?, "column")?;
+        let new_row_names = take_names(rows, self.row_names()?, "row")?;
 
-        ///////////////////////////////////////////////////////////
-        // 2. Stream the survivors into a TEMPORARY sibling file //
-        ///////////////////////////////////////////////////////////
+        let old_cols: Vec<usize> = match columns {
+            Some(cols) => cols.clone(),
+            None => (0..ncol_data).collect(),
+        };
+        let row_remap = rows
+            .map(|rs| RowRemap::from_selection(rs, nrow_data))
+            .transpose()?;
+        let new_nrow = rows.map_or(nrow_data, Vec::len);
 
-        // Written beside the original (same filesystem, so the final rename is
-        // atomic) and swapped in only when complete. The old implementation
-        // deleted the original FIRST and rewrote it from a RAM buffer, so a
-        // crash mid-write lost the data outright — and that buffer held every
-        // surviving triplet, which is the memory wall this replaces.
-        // CONTRACT of the swap: the original is untouched until the temporary
-        // sibling is complete and finalized; a failure mid-stream leaves the
-        // original intact plus a `.data-beans-stage/{name}.subset_tmp` leftover (cleaned on the
-        // next attempt); the unrecoverable window is only remove→rename below.
-        // A zip-archived backend is refused up front — streaming to a sibling
-        // DIRECTORY and renaming it over the `.zip` name would silently change
-        // the on-disk format under the old extension, and the old code's
-        // "store is read-only" failure was at least loud.
-        let final_path = self.get_backend_file_name().to_string();
-        anyhow::ensure!(
-            !final_path.ends_with(".zip"),
-            "subset: {final_path} is a zip archive; convert it to a directory \
-             backend first (data-beans convert)"
-        );
-        // In the hidden stage beside the output (same disk, so the rename
-        // stays atomic), where a sync client does not see it come and go.
-        let name = std::path::Path::new(&final_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let temp_path = crate::zarr_io::in_stage(&final_path, &format!("{name}.subset_tmp"));
-        crate::zarr_io::make_stage(&temp_path)?;
-        if std::path::Path::new(&temp_path).exists() {
-            crate::sparse_io::remove_backend_path(&temp_path)?;
-        }
-
-        {
-            let backend_kind = self.backend_type();
-            let mut out = crate::sparse_io::create_sparse_streaming_empty(
-                Some(&temp_path),
-                Some(&backend_kind),
-            )?;
-            out.begin_streaming_csc((new_nrow, new_ncol, new_nnz as usize))?;
-
-            // Blocks bounded by bytes of surviving triplets, from the measured
-            // per-column counts — not by a fixed column count.
-            let blocks = legume_numeric::matrix::utils::byte_budget_intervals(
-                &per_col_nnz,
-                crate::sparse_io::SLAB_BUDGET_BYTES,
-                crate::sparse_io::TRIPLET_BYTES,
-            );
-
-            let mut nnz_offset = 0u64;
-            for (lb, ub) in blocks {
-                // ONE block read per slab (see the counting pass above for why).
-                // The read returns LOCAL column ids in the requested order, rows
-                // ascending within each column.
-                let old_cols: Vec<usize> = cols_new_order[lb..ub]
-                    .iter()
-                    .map(|&(_, o)| o as usize)
-                    .collect();
-                let (_, _, triplets) =
-                    self.read_triplets_by_columns(old_cols.into_iter().collect())?;
-
-                let n_block = ub - lb;
-                let mut per_col: Vec<Vec<(u64, f32)>> = vec![Vec::new(); n_block];
-                for (i, c_local, x) in triplets {
-                    if let Some(new_row) = row_map[i as usize] {
-                        per_col[c_local as usize].push((new_row, x));
-                    }
-                }
-                let mut local_colptr = Vec::with_capacity(n_block);
-                let mut row_indices = Vec::new();
-                let mut values = Vec::new();
-                for entries in &mut per_col {
-                    if !monotone_rows {
-                        // Renumbering scrambled this column's order; restore the
-                        // ascending-rows invariant the writer enforces.
-                        entries.sort_unstable_by_key(|&(r, _)| r);
-                    }
-                    local_colptr.push(row_indices.len() as u64);
-                    for &(r, x) in entries.iter() {
-                        row_indices.push(r);
-                        values.push(x);
-                    }
-                }
-                out.append_csc_slab(lb as u64, nnz_offset, &local_colptr, &row_indices, &values)?;
-                nnz_offset += values.len() as u64;
-            }
-
-            out.finalize_streaming_csc()?;
-            out.build_csr_from_csc_streaming()?;
+        replace_backend_content(self, "subset_tmp", |data, out| {
+            stream_csc_selection(data, &old_cols, row_remap.as_ref(), new_nrow, out)?;
             out.register_row_names_vec(&new_row_names);
             out.register_column_names_vec(&new_col_names);
-            out.set_metadata(&self.metadata())?;
-        }
-
-        ////////////////////////////////////
-        // 3. Swap the finished file in  //
-        ////////////////////////////////////
-
-        self.remove_backend_file()?;
-        std::fs::rename(&temp_path, &final_path)?;
-        crate::zarr_io::leave_stage(&temp_path);
-        self.reopen_backend()?;
-        self.clean_preloaded_columns();
-        self.clean_preloaded_rows();
-        info!("registered new data to {}", self.get_backend_file_name());
-        Ok(())
+            Ok(())
+        })
     }
 
-    /// Reposition rows in a new order specified by `remap`
-    /// * `row_names_order` - a vector of row names in the new order
+    /// Reposition rows in the order of `row_names_order`: row `i` of the
+    /// result is the row named `row_names_order[i]`, all-zero when the data
+    /// has no such row; rows whose name is not listed are dropped. The result
+    /// is streamed into a sibling and swapped in once complete, like
+    /// [`subset_columns_rows`](Self::subset_columns_rows).
+    ///
+    /// # Errors
+    /// If `row_names_order` lists a name twice, or two rows of the data carry
+    /// one listed name — either would fold rows together or leave one empty.
     fn reorder_rows(&mut self, row_names_order: &[Box<str>]) -> anyhow::Result<()> {
-        // The backend is rebuilt from scratch below; its metadata comes along.
-        let meta = self.metadata();
-        let new_col_names = self.column_names()?.clone();
+        let Some(ncol) = self.num_columns() else {
+            self.clean_preloaded_columns();
+            self.clean_preloaded_rows();
+            return Ok(());
+        };
+        let nrow_data = self
+            .num_rows()
+            .ok_or_else(|| anyhow::anyhow!("missing shape information"))?;
+
         let name2new = build_name2index_map(row_names_order);
-
-        let block_size = 100;
-
-        let old2new: HashMap<u64, u64> = self
-            .row_names()?
-            .into_par_iter()
-            .enumerate()
-            .filter_map(|(idx_old, name)| {
-                name2new
-                    .get(&name)
-                    .map(|&idx_new| (idx_old as u64, idx_new as u64))
-            })
-            .collect();
-
-        if let Some(ncol) = self.num_columns() {
-            /////////////////////////////////////////////////////
-            // 1. triplets after filtering and reordering rows //
-            /////////////////////////////////////////////////////
-
-            let arc_triplets = Arc::new(Mutex::new(vec![]));
-
-            let nblock = ncol.div_ceil(block_size);
-
-            info!("remapping triplets ...");
-
-            (0..nblock)
-                .into_par_iter()
-                .progress_with(styled_progress_bar(nblock as u64, "blocks"))
-                .map(|b| {
-                    let lb = (b * block_size) as u64;
-                    let ub = ((b + 1) * block_size).min(ncol) as u64;
-                    (lb, ub)
-                })
-                .for_each(|(lb, ub)| {
-                    let (_, _, _triplets_b) = self
-                        .read_triplets_by_columns(((lb as usize)..(ub as usize)).collect())
-                        .unwrap();
-
-                    let _triplets_b = _triplets_b.into_iter().filter_map(|(i, j_loc, x)| {
-                        let j_glob = j_loc + lb;
-                        old2new.get(&i).map(|&i_new| (i_new, j_glob, x))
-                    });
-
-                    {
-                        let mut triplets = arc_triplets.lock().unwrap();
-                        triplets.extend(_triplets_b);
-                    }
-                });
-
-            /////////////////////////////////////
-            // 2. Remove previous backend file //
-            /////////////////////////////////////
-            self.remove_backend_file()?;
-
-            ///////////////////////////////
-            // 3. populate a new backend //
-            ///////////////////////////////
-            self.initialize_backend()?;
-
-            // populate data from mtx triplets
-            {
-                let mut row_col_val_triplets =
-                    arc_triplets.lock().expect("failed to lock triplets");
-
-                let nnz = row_col_val_triplets.len();
-                debug_assert!(row_col_val_triplets.len() <= nnz); // subset
-                let new_nrow = row_names_order.len();
-                let mtx_shape = (new_nrow, ncol, nnz);
-
-                info!("sorting triplets ...");
-
-                self.record_mtx_shape(Some(mtx_shape))?;
-                self.record_triplets_by_col(&mut row_col_val_triplets)?;
-                self.record_triplets_by_row(&mut row_col_val_triplets)?;
-            }
-            self.read_column_indptr()?;
-            self.read_row_indptr()?;
-
-            self.register_row_names_vec(row_names_order);
-            self.register_column_names_vec(&new_col_names);
-            self.set_metadata(&meta)?;
-            info!("registered new data to {}", self.get_backend_file_name());
+        if name2new.len() != row_names_order.len() {
+            // The map keeps the last position of a repeated name.
+            let (first, name) = row_names_order
+                .iter()
+                .enumerate()
+                .find(|&(i, name)| name2new[name] != i)
+                .expect("a shorter map means a repeated name");
+            anyhow::bail!(
+                "reorder rows: `{name}` is listed twice (positions {first} and {})",
+                name2new[name]
+            );
         }
 
-        self.clean_preloaded_columns();
-        self.clean_preloaded_rows();
-        Ok(())
+        // Dense old-row → new-row map; `claimed[new]` is the old row that
+        // already took the new position.
+        let old_names = self.row_names()?;
+        let mut map: Vec<Option<u64>> = vec![None; nrow_data];
+        let mut claimed: Vec<Option<usize>> = vec![None; row_names_order.len()];
+        for (old, name) in old_names.iter().enumerate().take(nrow_data) {
+            let Some(&new) = name2new.get(name) else {
+                continue;
+            };
+            if let Some(first) = claimed[new].replace(old) {
+                anyhow::bail!(
+                    "reorder rows: rows {first} and {old} are both named `{name}`; \
+                     they cannot share one position"
+                );
+            }
+            map[old] = Some(new as u64);
+        }
+
+        let new_col_names = self.column_names()?;
+        let old_cols: Vec<usize> = (0..ncol).collect();
+        let row_remap = RowRemap::new(map);
+
+        info!("remapping triplets ...");
+        replace_backend_content(self, "reorder_tmp", |data, out| {
+            stream_csc_selection(
+                data,
+                &old_cols,
+                Some(&row_remap),
+                row_names_order.len(),
+                out,
+            )?;
+            out.register_row_names_vec(row_names_order);
+            out.register_column_names_vec(&new_col_names);
+            Ok(())
+        })
     }
-    // fn reorder_rows(&mut self, row_names_order: &[Box<str>]) -> anyhow::Result<()>;
 
     /// Remove backend file
     fn remove_backend_file(&self) -> anyhow::Result<()>;
@@ -1201,9 +1091,26 @@ pub trait SparseIo: Sync + Send {
     }
 
     /// Build `/by_row/{data, indices, indptr}` by transposing the already-
-    /// written CSC data on disk. Uses two passes over CSC with bounded
-    /// auxiliary memory (~`24 B × nrow` plus one row-band worth of CSR).
+    /// written CSC data on disk: one pass over the CSC to count each row,
+    /// then one scatter pass per row band. The band is as large as the
+    /// process-wide preload budget still allows (never under
+    /// [`SLAB_BUDGET_BYTES`]), so a matrix that fits is transposed in a
+    /// single scatter pass.
     fn build_csr_from_csc_streaming(&mut self) -> anyhow::Result<()> {
+        let wanted = self
+            .num_non_zeros()
+            .unwrap_or(0)
+            .saturating_mul(TRANSPOSE_BYTES_PER_NNZ);
+        let band = reserve_transpose_band(wanted);
+        self.build_csr_from_csc_banded(band.bytes())
+    }
+
+    /// [`build_csr_from_csc_streaming`](Self::build_csr_from_csc_streaming)
+    /// with an explicit cap of `band_bytes` on the entries one row band
+    /// holds in memory (12 B each; a single row larger than the cap is still
+    /// one band). Every scatter pass re-reads the whole CSC, so the cap
+    /// trades memory against passes; the result does not depend on it.
+    fn build_csr_from_csc_banded(&mut self, band_bytes: usize) -> anyhow::Result<()> {
         let nrow = self
             .num_rows()
             .ok_or_else(|| anyhow::anyhow!("nrow not set before build_csr_from_csc_streaming"))?;
@@ -1267,29 +1174,25 @@ pub trait SparseIo: Sync + Send {
         self.cs_create(CsKey::CsrIndptr, nrow + 1)?;
         self.cs_write_u64(CsKey::CsrIndptr, 0, &rowptr)?;
 
-        // Per-band buffers carry 12 B/nnz (u64 col + f32 val); cap aggregate
-        // at ~256 MB so the row-banded scatter stays within a fixed budget
-        // regardless of nnz.
-        const TRANSPOSE_BAND_BYTES: usize = 256 * 1024 * 1024;
-        let avg_density = nnz.div_ceil(nrow.max(1));
-        let band_rows = (TRANSPOSE_BAND_BYTES / (12 * avg_density.max(1)))
-            .max(1)
-            .min(nrow);
-        let n_bands = nrow.div_ceil(band_rows);
-
-        let bar2 = styled_progress_bar(n_bands as u64, "transpose scatter");
+        // Row bands cut where the cumulative nnz reaches the cap, so a band
+        // of dense rows holds no more than a band of sparse ones.
+        let band_nnz_cap = (band_bytes / TRANSPOSE_BYTES_PER_NNZ).max(1) as u64;
+        let mut bands: Vec<(usize, usize)> = Vec::new();
         let mut band_lo = 0usize;
         while band_lo < nrow {
-            let band_hi = (band_lo + band_rows).min(nrow);
-            let band_nnz_start = rowptr[band_lo];
-            let band_nnz_end = rowptr[band_hi];
-            let band_nnz = (band_nnz_end - band_nnz_start) as usize;
-
-            if band_nnz == 0 {
-                band_lo = band_hi;
-                bar2.inc(1);
-                continue;
+            let fits =
+                rowptr[band_lo + 1..].partition_point(|&end| end - rowptr[band_lo] <= band_nnz_cap);
+            let band_hi = band_lo + fits.max(1);
+            if rowptr[band_hi] > rowptr[band_lo] {
+                bands.push((band_lo, band_hi));
             }
+            band_lo = band_hi;
+        }
+
+        let bar2 = styled_progress_bar(bands.len() as u64, "transpose scatter");
+        for (band_lo, band_hi) in bands {
+            let band_nnz_start = rowptr[band_lo];
+            let band_nnz = (rowptr[band_hi] - band_nnz_start) as usize;
 
             let mut out_indices = vec![0u64; band_nnz];
             let mut out_values = vec![0f32; band_nnz];
@@ -1322,7 +1225,6 @@ pub trait SparseIo: Sync + Send {
             self.cs_write_u64(CsKey::CsrIndices, band_nnz_start, &out_indices)?;
             self.cs_write_f32(CsKey::CsrData, band_nnz_start, &out_values)?;
 
-            band_lo = band_hi;
             bar2.inc(1);
         }
         bar2.finish_and_clear();

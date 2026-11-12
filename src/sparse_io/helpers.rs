@@ -12,6 +12,7 @@ pub fn build_name2index_map(_names: &[Box<str>]) -> HashMap<Box<str>, usize> {
         .collect()
 }
 
+#[allow(dead_code)] // library API; the bin has no caller
 pub fn take_subset_indices_names(
     new_indices: &[usize],
     ntot: usize,
@@ -37,6 +38,7 @@ pub fn take_subset_indices_names(
     (old2new, new_names)
 }
 
+#[allow(dead_code)] // library API; the bin has no caller
 pub fn take_subset_indices_names_if_needed(
     new_indices: Option<&Vec<usize>>,
     ntot: Option<usize>,
@@ -187,6 +189,49 @@ fn reserve_against(
     } else {
         counter.fetch_sub(cost, Ordering::Relaxed);
         None
+    }
+}
+
+/// Reserve up to `wanted` bytes of the preload budget for the row band of a
+/// CSC → CSR transpose: all of `wanted` when the budget has that much room,
+/// what room there is otherwise, and never less than [`SLAB_BUDGET_BYTES`]
+/// (or `wanted`, when smaller) so a transpose always makes progress. The
+/// grant is [`PreloadReservation::bytes`], given back when the guard drops.
+pub(crate) fn reserve_transpose_band(wanted: usize) -> PreloadReservation {
+    use std::sync::atomic::Ordering;
+    let floor = wanted.min(SLAB_BUDGET_BYTES);
+    if let Some(budget) = std::env::var("LEGUME_PRELOAD_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        // The override is per preload, so the grant is kept off the shared
+        // counter and no other preload sees it.
+        static UNSHARED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let bytes = wanted.min(budget).max(floor);
+        UNSHARED.fetch_add(bytes, Ordering::Relaxed);
+        return PreloadReservation {
+            bytes,
+            counter: &UNSHARED,
+        };
+    }
+    let budget = auto_preload_budget_bytes();
+    let mut reserved = RESERVED.load(Ordering::Relaxed);
+    loop {
+        let granted = wanted.min(budget.saturating_sub(reserved)).max(floor);
+        match RESERVED.compare_exchange_weak(
+            reserved,
+            reserved.saturating_add(granted),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                return PreloadReservation {
+                    bytes: granted,
+                    counter: &RESERVED,
+                }
+            }
+            Err(now) => reserved = now,
+        }
     }
 }
 

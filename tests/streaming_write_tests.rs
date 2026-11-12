@@ -201,3 +201,52 @@ fn a_nonmonotone_colptr_is_refused() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// The transpose in row bands of every size, down to one entry per band,
+/// against the single-band result.
+#[test]
+fn the_transpose_does_not_depend_on_the_band_size() -> anyhow::Result<()> {
+    // 37 rows x 23 columns with empty rows, empty columns and one dense row.
+    let (nrow, ncol) = (37u64, 23u64);
+    let mut triplets = Vec::new();
+    for j in 0..ncol {
+        for i in 0..nrow {
+            let dense_row = i == 5 && j % 2 == 0;
+            let scattered = (i * 7 + j * 13) % 11 == 0 && i % 9 != 4 && j != 17;
+            if dense_row || scattered {
+                triplets.push((i, j, (i * 100 + j + 1) as f32));
+            }
+        }
+    }
+    let shape = (nrow as usize, ncol as usize, triplets.len());
+    let mut by_rows = triplets.clone();
+    by_rows.sort_by_key(|t| (t.0, t.1));
+
+    let dir = tempfile::tempdir()?;
+    // 12 bytes per entry: one entry, one small row, several rows, everything.
+    for (k, band_bytes) in [1usize, 12, 60, 300, usize::MAX].into_iter().enumerate() {
+        let path = dir.path().join(format!("band{k}.zarr"));
+        let mut out = create_sparse_streaming_empty(
+            Some(path.to_str().expect("utf8")),
+            Some(&SparseIoBackend::Zarr),
+        )?;
+        out.begin_streaming_csc(shape)?;
+        let (colptr, rows, vals) = slab(&triplets, 0, ncol);
+        out.append_csc_slab(0, 0, &colptr, &rows, &vals)?;
+        out.finalize_streaming_csc()?;
+        out.build_csr_from_csc_banded(band_bytes)?;
+
+        // As stored: each row's columns ascending, rows in request order.
+        let (_, _, got) = out.read_triplets_by_rows((0..nrow as usize).collect())?;
+        assert_eq!(got, by_rows, "band of {band_bytes} bytes");
+        let (_, _, one) = out.read_triplets_by_rows(vec![5])?;
+        let dense_row = by_rows.iter().filter(|t| t.0 == 5).count();
+        assert!(dense_row >= 12);
+        assert_eq!(
+            one.len(),
+            dense_row,
+            "the dense row, band of {band_bytes} bytes"
+        );
+    }
+    Ok(())
+}
