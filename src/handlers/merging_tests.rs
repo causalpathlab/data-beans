@@ -226,26 +226,6 @@ fn read_merged(out: &std::path::Path) -> anyhow::Result<Merged> {
 }
 
 #[test]
-fn a_slab_is_laid_out_by_column_with_rows_ascending() {
-    // Out of order by column and by row, one cell twice, one column empty.
-    let triplets: Vec<(u64, u64, f32)> = vec![
-        (2, 3, 1.0),
-        (0, 0, 2.0),
-        (4, 3, 3.0),
-        (1, 3, 4.0),
-        (3, 0, 5.0),
-        (1, 3, 6.0),
-        (0, 1, 7.0),
-    ];
-    let mut sorted = triplets.clone();
-    sorted.sort_by_key(|&(row, col, _)| (col, row));
-    let (colptr, rows, values) = build_csc_slab(triplets, 4);
-    assert_eq!(colptr, [0, 2, 3, 3]);
-    assert_eq!(rows, sorted.iter().map(|t| t.0).collect::<Vec<_>>());
-    assert_eq!(values, sorted.iter().map(|t| t.2).collect::<Vec<_>>());
-}
-
-#[test]
 fn a_merge_keeps_every_value_under_its_row_and_column() -> anyhow::Result<()> {
     let (dir, a, b) = two_fixtures()?;
     // The second input holds its rows in another order, and one of its own.
@@ -264,14 +244,23 @@ fn a_merge_keeps_every_value_under_its_row_and_column() -> anyhow::Result<()> {
             (_, false) => 900.0 + (c - 4) as f32,
         }
     };
-    // In slabs cut by the byte budget, and in slabs of two columns.
-    for (name, block_size) in [("auto", None), ("two", Some(2))] {
+    // Two threads, whatever the machine has, so the windows are of two
+    // slabs each. In one slab to a batch (the whole budget); in slabs of one
+    // column, which the budget of one triplet to a thread cuts: two windows
+    // for the first batch's four columns; and in slabs of two columns.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    for (name, budget, block_size) in [
+        ("whole", SLAB_BUDGET_BYTES, None),
+        ("cut", 2 * TRIPLET_BYTES, None),
+        ("two", SLAB_BUDGET_BYTES, Some(2)),
+    ] {
         let out = dir.path().join(name);
-        run_merge_backend(&MergeBackendArgs {
+        let args = MergeBackendArgs {
             common_rows: true,
             block_size,
             ..merge_args(&[&a, &b], out.to_str().expect("utf8"))
-        })?;
+        };
+        pool.install(|| merge_backend_within(&args, true, false, budget))?;
         let (dense, rows, columns) = read_merged(&out)?;
         assert_eq!(rows, ["g0", "g2"].map(Box::from));
         assert_eq!(columns.len(), 7);
@@ -444,6 +433,89 @@ fn a_matrix_larger_than_its_name_files_is_refused_by_name() -> anyhow::Result<()
         err.contains("has 2 rows") && err.contains("genes.tsv"),
         "{err}"
     );
+    Ok(())
+}
+
+/// The names files of a set end in blank lines often enough: the matrix
+/// header says how many names there are, and blank lines past them are not
+/// names.
+#[test]
+fn blank_lines_after_the_names_a_matrix_declares_are_ignored() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let entries = [(0, 0, 1.0), (1, 1, 2.0), (1, 0, 3.0)];
+    let merged = |name: &str, genes: &str, barcodes: &str| -> anyhow::Result<Merged> {
+        let root = dir.path().join(name);
+        let set = root.join("s1");
+        write_mtx_set(&set, &["G1", "G2"], &["c1", "c2"], &entries)?;
+        std::fs::write(set.join("genes.tsv"), genes)?;
+        std::fs::write(set.join("barcodes.tsv"), barcodes)?;
+        let out = root.join("m");
+        run_merge_mtx(&mtx_args(&[&root], &out))?;
+        read_merged(&out)
+    };
+
+    let plain = merged("plain", "G1\nG2\n", "c1\nc2\n")?;
+    assert_eq!(plain.1, ["G1", "G2"].map(Box::from));
+    assert_eq!(plain.2, ["c1@s1", "c2@s1"].map(Box::from));
+    // One blank line after the names, and two.
+    assert_eq!(merged("one", "G1\nG2\n\n", "c1\nc2\n\n")?, plain);
+    assert_eq!(merged("two", "G1\nG2\n\n\n", "c1\nc2\n\n\n")?, plain);
+    Ok(())
+}
+
+#[test]
+fn names_that_do_not_fit_the_matrix_header_are_refused() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let set = dir.path().join("s1");
+    write_mtx_set(&set, &["G1", "G2"], &["c1", "c2"], &[(1, 1, 1.0)])?;
+    let args = mtx_args(&[dir.path()], &dir.path().join("m"));
+    let refused = |genes: &str, barcodes: &str| -> anyhow::Result<String> {
+        std::fs::write(set.join("genes.tsv"), genes)?;
+        std::fs::write(set.join("barcodes.tsv"), barcodes)?;
+        Ok(format!("{:#}", run_merge_mtx(&args).unwrap_err()))
+    };
+
+    // A name past those the matrix declares.
+    let err = refused("G1\nG2\nG3\n", "c1\nc2\n")?;
+    assert!(
+        err.contains("has 2 rows") && err.contains("genes.tsv names 3"),
+        "{err}"
+    );
+    // A name after a blank line is one too.
+    let err = refused("G1\nG2\n", "c1\nc2\n\nc3\n")?;
+    assert!(
+        err.contains("has 2 columns") && err.contains("barcodes.tsv names 4"),
+        "{err}"
+    );
+    // A blank line among the names leaves too few of them before the end.
+    let err = refused("G1\n\nG2\n", "c1\nc2\n")?;
+    assert!(
+        err.contains("has 2 rows") && err.contains("genes.tsv names 3"),
+        "{err}"
+    );
+    // Too few names.
+    let err = refused("G1\n", "c1\nc2\n")?;
+    assert!(
+        err.contains("has 2 rows") && err.contains("genes.tsv names 1"),
+        "{err}"
+    );
+    assert!(!dir.path().join("m.zarr").exists(), "nothing is written");
+    Ok(())
+}
+
+/// As many names as the matrix declares are its names, an empty last one
+/// included.
+#[test]
+fn an_empty_name_among_those_the_matrix_declares_is_a_name() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let set = dir.path().join("s1");
+    write_mtx_set(&set, &["G1", "G2"], &["c1", "c2"], &[(1, 1, 5.0)])?;
+    std::fs::write(set.join("genes.tsv"), "G1\n\n")?;
+    let out = dir.path().join("m");
+    run_merge_mtx(&mtx_args(&[dir.path()], &out))?;
+    let (dense, rows, _) = read_merged(&out)?;
+    assert_eq!(rows, ["", "G1"].map(Box::from));
+    assert_eq!(dense[(0, 1)], 5.0);
     Ok(())
 }
 

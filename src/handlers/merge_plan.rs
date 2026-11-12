@@ -173,14 +173,13 @@ pub(super) fn merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
     let inputs = off_screen(Some(&mut tui), || {
         (0..sets.batch_names.len())
             .map(|b| {
-                let rows = read_row_names(sets.row_files[b].clone(), args.num_feature_name_words)?;
-                let columns =
-                    read_col_names(sets.col_files[b].clone(), args.num_barcode_name_words)?.len();
+                // The names the merge itself takes for the batch.
+                let batch = read_mtx_batch(args, &sets, b)?;
                 Ok(Input {
                     label: sets.batch_names[b].clone(),
                     path: sets.mtx_files[b].to_string(),
-                    rows,
-                    columns,
+                    rows: batch.rows,
+                    columns: batch.columns.len(),
                     nnz: None,
                 })
             })

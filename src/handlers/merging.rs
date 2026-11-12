@@ -1,4 +1,5 @@
-use crate::handlers::transformation::squeeze_in_place;
+use crate::column_subset::csc_slab;
+use crate::handlers::transformation::{ensure_output_is_no_input, squeeze_in_place};
 use crate::hdf5_io::*;
 use crate::sparse_data_visitors::styled_progress_bar;
 use crate::sparse_io::*;
@@ -252,55 +253,6 @@ pub struct MergeMtxArgs {
     pub view: PlanArgs,
 }
 
-/// Lay triplets out as a CSC slab of `ncol` columns: (colptr, row indices,
-/// values), each column's rows ascending and entries of one cell in the
-/// order given.
-///
-/// `colptr[j]` is the local offset of column `j`'s first entry; the trailing
-/// sentinel is written by `finalize_streaming_csc`. Entries are counted and
-/// placed by column; only a column whose rows do not already ascend is
-/// sorted.
-fn build_csc_slab(triplets: Vec<(u64, u64, f32)>, ncol: usize) -> (Vec<u64>, Vec<u64>, Vec<f32>) {
-    let mut colptr = vec![0u64; ncol + 1];
-    for &(_, col, _) in &triplets {
-        colptr[col as usize + 1] += 1;
-    }
-    for j in 0..ncol {
-        colptr[j + 1] += colptr[j];
-    }
-    debug_assert_eq!(colptr[ncol] as usize, triplets.len());
-
-    let mut next = colptr[..ncol].to_vec();
-    let mut row_indices = vec![0u64; triplets.len()];
-    let mut values = vec![0f32; triplets.len()];
-    for (row, col, value) in triplets {
-        let at = &mut next[col as usize];
-        row_indices[*at as usize] = row;
-        values[*at as usize] = value;
-        *at += 1;
-    }
-
-    for j in 0..ncol {
-        let (lo, hi) = (colptr[j] as usize, colptr[j + 1] as usize);
-        if row_indices[lo..hi].is_sorted() {
-            continue;
-        }
-        let mut entries: Vec<(u64, f32)> = row_indices[lo..hi]
-            .iter()
-            .copied()
-            .zip(values[lo..hi].iter().copied())
-            .collect();
-        entries.sort_by_key(|&(row, _)| row);
-        for (k, (row, value)) in entries.into_iter().enumerate() {
-            row_indices[lo + k] = row;
-            values[lo + k] = value;
-        }
-    }
-
-    colptr.truncate(ncol);
-    (colptr, row_indices, values)
-}
-
 /// Where each of `rows` lands among the `n` common rows that `place`
 /// indexes by name: a name outside them nowhere, and a name `rows` repeats
 /// on its first row only.
@@ -325,22 +277,29 @@ pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
 /// `merge-backend` with the rows and squeeze decided: `common_rows` keeps
 /// the rows every file has, `squeeze` drops sparse rows and columns after.
 fn merge_backend(args: &MergeBackendArgs, common_rows: bool, squeeze: bool) -> anyhow::Result<()> {
+    merge_backend_within(args, common_rows, squeeze, SLAB_BUDGET_BYTES)
+}
+
+/// [`merge_backend`] holding at most `slab_budget` bytes of triplets at
+/// once, shared by the slabs read together.
+fn merge_backend_within(
+    args: &MergeBackendArgs,
+    common_rows: bool,
+    squeeze: bool,
+    slab_budget: usize,
+) -> anyhow::Result<()> {
     let num_batches = args.data_files.len();
     info!("merging over {} batches ...", num_batches);
 
+    ensure_output_is_no_input(
+        &args.data_files,
+        &args.output,
+        args.backend.clone(),
+        args.zip,
+    )?;
     let effective_output = apply_zip_flag(&args.output, args.zip, &args.backend);
     let (backend, backend_file) =
         resolve_backend_file(&effective_output, Some(args.backend.clone()))?;
-    // The output is cleared before the inputs are read and zipped over its
-    // name after, so it must not be one of them.
-    for input in &args.data_files {
-        for out in [&*effective_output, &*backend_file] {
-            anyhow::ensure!(
-                !same_file(input, out),
-                "the output {out} is the input {input}: give -o another name"
-            );
-        }
-    }
 
     let batch_names = generate_unique_batch_names(&args.data_files)?;
     info!("Batch names: {:?}", batch_names);
@@ -472,8 +431,10 @@ fn merge_backend(args: &MergeBackendArgs, common_rows: bool, squeeze: bool) -> a
 
     // Each batch goes through in slabs of columns, as many read at once as
     // there are threads and appended in order. The threads share one slab
-    // budget, so what is resident does not grow with the batch.
+    // budget, so what is resident does not grow with the batch; a thread's
+    // share is never under a triplet, so a slab always holds a column.
     let threads = rayon::current_num_threads().max(1);
+    let slab_share = (slab_budget / threads).max(TRIPLET_BYTES);
     let prog_bar = styled_progress_bar(num_batches as u64, "batches");
     let mut nnz_offset: u64 = 0;
     for h in &batches {
@@ -488,7 +449,7 @@ fn merge_backend(args: &MergeBackendArgs, common_rows: bool, squeeze: bool) -> a
                         })
                     })
                     .collect::<anyhow::Result<Vec<u64>>>()?;
-                byte_budget_intervals(&column_nnz, SLAB_BUDGET_BYTES / threads, TRIPLET_BYTES)
+                byte_budget_intervals(&column_nnz, slab_share, TRIPLET_BYTES)
             }
         };
         let row_map = h.row_map.as_deref();
@@ -502,14 +463,8 @@ fn merge_backend(args: &MergeBackendArgs, common_rows: bool, squeeze: bool) -> a
             let built = window
                 .par_iter()
                 .map(|&(lb, ub)| -> anyhow::Result<_> {
-                    let (_, _, mut triplets) = src.read_triplets_by_columns((lb..ub).collect())?;
-                    if let Some(map) = row_map {
-                        triplets = triplets
-                            .into_iter()
-                            .filter_map(|(i, j, x)| Some((map[i as usize]?, j, x)))
-                            .collect();
-                    }
-                    Ok(build_csc_slab(triplets, ub - lb))
+                    let (_, _, triplets) = src.read_triplets_by_columns((lb..ub).collect())?;
+                    Ok(csc_slab(triplets, ub - lb, row_map))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             for (&(lb, _), (local_colptr, row_indices, values)) in window.iter().zip(&built) {
@@ -627,6 +582,66 @@ fn common_names(lists: &[Vec<Box<str>>]) -> Vec<Box<str>> {
 
 pub fn run_merge_mtx(args: &MergeMtxArgs) -> anyhow::Result<()> {
     plan::merge_mtx(args)
+}
+
+/// The names `file` gives the `n` rows or columns (`what`) that the header
+/// of `mtx` declares. Exactly `n` names are taken as they are, an empty one
+/// included. More than `n` are cut to the first `n` when those are all named
+/// and every one after is empty: blank lines at the end of the file.
+///
+/// # Errors
+/// If the file lists fewer than `n` names, or more in any other way.
+fn names_for_header(
+    mut names: Vec<Box<str>>,
+    n: usize,
+    what: &str,
+    mtx: &str,
+    file: &str,
+) -> anyhow::Result<Vec<Box<str>>> {
+    let listed = names.len();
+    let blank_tail = listed > n
+        && names[n..].iter().all(|name| name.is_empty())
+        && names[..n].iter().all(|name| !name.is_empty());
+    anyhow::ensure!(
+        listed == n || blank_tail,
+        "{mtx} has {n} {what}s, but {file} names {listed}"
+    );
+    if blank_tail {
+        info!(
+            "{file}: ignoring {} blank line(s) after its {n} {what} names",
+            listed - n
+        );
+        names.truncate(n);
+    }
+    Ok(names)
+}
+
+/// One batch of `merge-mtx`, from its matrix header and name files.
+pub(crate) struct MtxBatch {
+    /// A name for each row the matrix declares.
+    pub(crate) rows: Vec<Box<str>>,
+    /// A name for each column the matrix declares.
+    pub(crate) columns: Vec<Box<str>>,
+    /// The entries the matrix declares.
+    pub(crate) nnz: usize,
+}
+
+/// Batch `b` of `sets`: the header of its matrix, and the feature and
+/// barcode names that header indexes (see [`names_for_header`]).
+pub(crate) fn read_mtx_batch(
+    args: &MergeMtxArgs,
+    sets: &MtxSets,
+    b: usize,
+) -> anyhow::Result<MtxBatch> {
+    let (mtx, row_file, col_file) = (&sets.mtx_files[b], &sets.row_files[b], &sets.col_files[b]);
+    let (nrow, ncol, nnz) = mtx_io::read_mtx_header(mtx)?;
+    let rows = read_row_names(row_file.clone(), args.num_feature_name_words)?;
+    let columns = read_col_names(col_file.clone(), args.num_barcode_name_words)?;
+    Ok(MtxBatch {
+        rows: names_for_header(rows, nrow, "row", mtx, row_file)?,
+        columns: names_for_header(columns, ncol, "column", mtx, col_file)?,
+        nnz,
+    })
 }
 
 /// The MTX file sets under `merge-mtx`'s directories, one batch each.
@@ -799,19 +814,13 @@ fn find_mtx_sets(args: &MergeMtxArgs) -> anyhow::Result<MtxSets> {
 
 /// `merge-mtx` over the file sets found, squeezed after when `squeeze`.
 fn merge_mtx(args: &MergeMtxArgs, sets: MtxSets, squeeze: bool) -> anyhow::Result<()> {
-    let MtxSets {
-        batch_names,
-        mtx_files,
-        row_files,
-        col_files,
-    } = sets;
-    let num_batches = batch_names.len();
+    let num_batches = sets.batch_names.len();
 
     info!("merging over {} batches ...", num_batches);
 
-    debug_assert_eq!(num_batches, mtx_files.len());
-    debug_assert_eq!(num_batches, row_files.len());
-    debug_assert_eq!(num_batches, col_files.len());
+    debug_assert_eq!(num_batches, sets.mtx_files.len());
+    debug_assert_eq!(num_batches, sets.row_files.len());
+    debug_assert_eq!(num_batches, sets.col_files.len());
 
     if num_batches == 0 {
         return Err(anyhow::anyhow!("No relevant files found"));
@@ -819,10 +828,22 @@ fn merge_mtx(args: &MergeMtxArgs, sets: MtxSets, squeeze: bool) -> anyhow::Resul
 
     info!("Finding common rows/features ...");
 
-    let batch_rows = row_files
-        .iter()
-        .map(|f| read_row_names(f.clone(), args.num_feature_name_words))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    // Each matrix indexes the names of its feature and barcode files, so
+    // its header says how many of each there are.
+    let mut batch_rows = Vec::with_capacity(num_batches);
+    let mut batch_columns = Vec::with_capacity(num_batches);
+    let mut header_nnz = Vec::with_capacity(num_batches);
+    for b in 0..num_batches {
+        let batch = read_mtx_batch(args, &sets, b)?;
+        batch_rows.push(batch.rows);
+        batch_columns.push(batch.columns);
+        header_nnz.push(batch.nnz);
+    }
+    let MtxSets {
+        batch_names,
+        mtx_files,
+        ..
+    } = sets;
 
     // The names every set has, sorted.
     let mut common_rows = common_names(&batch_rows);
@@ -859,8 +880,7 @@ fn merge_mtx(args: &MergeMtxArgs, sets: MtxSets, squeeze: bool) -> anyhow::Resul
     let mut column_batch_names = vec![];
     let mut batch_ncols: Vec<usize> = Vec::with_capacity(num_batches);
 
-    for (col_file, batch_name) in col_files.iter().zip(batch_names.iter()) {
-        let _names = read_col_names(col_file.clone(), args.num_barcode_name_words)?;
+    for (_names, batch_name) in batch_columns.into_iter().zip(batch_names.iter()) {
         let nn = _names.len();
         batch_ncols.push(nn);
         column_names.extend(
@@ -880,27 +900,10 @@ fn merge_mtx(args: &MergeMtxArgs, sets: MtxSets, squeeze: bool) -> anyhow::Resul
     let pb1 = styled_progress_bar(num_batches as u64, "batches");
     for b in 0..num_batches {
         let row_map = &row_maps[b];
-        let (nrow, ncol, header_nnz) = mtx_io::read_mtx_header(&mtx_files[b])?;
-        // The matrix indexes the lines of its feature and barcode files.
-        anyhow::ensure!(
-            nrow == row_map.len(),
-            "{} has {nrow} rows, but {} names {}",
-            mtx_files[b],
-            row_files[b],
-            row_map.len()
-        );
-        anyhow::ensure!(
-            ncol == batch_ncols[b],
-            "{} has {ncol} columns, but {} names {}",
-            mtx_files[b],
-            col_files[b],
-            batch_ncols[b]
-        );
-
         // Skip the parse if every row in this batch is kept — header nnz is exact.
         let no_filter = row_map.iter().all(Option::is_some);
         let count = if no_filter {
-            header_nnz
+            header_nnz[b]
         } else {
             let (triplets, _shape) = mtx_io::read_mtx_triplets(&mtx_files[b])?;
             triplets
@@ -948,17 +951,13 @@ fn merge_mtx(args: &MergeMtxArgs, sets: MtxSets, squeeze: bool) -> anyhow::Resul
         let row_map = &row_maps[b];
         let (triplets, _shape) = mtx_io::read_mtx_triplets(&mtx_files[b])?;
 
-        let triplets_batch: Vec<(u64, u64, f32)> = triplets
-            .into_iter()
-            .filter_map(|(batch_i, batch_j, x_ij)| {
-                Some((row_map[batch_i as usize]?, batch_j, x_ij))
-            })
-            .collect();
-
-        debug_assert_eq!(triplets_batch.len(), batch_nnz[b]);
-
+        // The whole batch as one slab. The matrix lists its entries in any
+        // order and the common rows are renumbered by name, so the slab is
+        // laid out by column and a column's rows sorted when they do not
+        // ascend; rows outside the common ones are dropped.
         let ncol_b = batch_ncols[b];
-        let (local_colptr, row_indices, values) = build_csc_slab(triplets_batch, ncol_b);
+        let (local_colptr, row_indices, values) = csc_slab(triplets, ncol_b, Some(row_map));
+        debug_assert_eq!(values.len(), batch_nnz[b]);
         out.append_csc_slab(col_offset, nnz_offset, &local_colptr, &row_indices, &values)?;
 
         col_offset += ncol_b as u64;
