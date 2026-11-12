@@ -244,3 +244,20 @@ fn test_collapse_posterior_sd_decreases_with_more_cells() -> Result<()> {
 
     Ok(())
 }
+
+/// A membership without cell types is an error, not a division by zero in
+/// the group visitor.
+#[test]
+fn test_collapse_without_cell_types_is_an_error() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (data_vec, annotations, _) = make_test_data(&dir)?;
+    let membership = CellTypeMembership {
+        matrix: DMatrix::zeros(6, 0),
+        cell_type_names: Vec::new(),
+    };
+
+    let err = collapse_pseudobulk(data_vec, &annotations, &membership, 1.0, 1.0)
+        .expect_err("no cell types to collapse into");
+    assert!(err.to_string().contains("no cell types"), "{err}");
+    Ok(())
+}
