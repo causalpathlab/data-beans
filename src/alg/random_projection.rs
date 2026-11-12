@@ -239,8 +239,7 @@ impl RandProjOps for SparseIoStack {
     where
         T: Sync + Send + std::hash::Hash + Eq + Clone + ToString,
     {
-        let ncols = self.num_columns()?;
-        let batch_membership = batch_membership.and_then(|x| x.get(0..ncols));
+        let batch_membership = membership_of_columns(batch_membership, self.num_columns()?);
 
         let proj_vec = self
             .stack
@@ -258,27 +257,7 @@ impl RandProjOps for SparseIoStack {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let basis = concatenate_vertical(
-            &proj_vec
-                .iter()
-                .map(|x| {
-                    // info!("{} x {}", x.basis.nrows(), x.basis.ncols());
-                    x.basis.to_owned()
-                })
-                .collect::<Vec<_>>(),
-        )?;
-
-        let proj = concatenate_vertical(
-            &proj_vec
-                .iter()
-                .map(|x| {
-                    // info!("{} x {}", x.proj.nrows(), x.proj.ncols());
-                    x.proj.to_owned()
-                })
-                .collect::<Vec<_>>(),
-        )?;
-
-        Ok(RandColProjOut { basis, proj })
+        stack_projections(proj_vec)
     }
 
     fn project_columns_weighted_seeded<T>(
@@ -292,8 +271,7 @@ impl RandProjOps for SparseIoStack {
     where
         T: Sync + Send + std::hash::Hash + Eq + Clone + ToString,
     {
-        let ncols = self.num_columns()?;
-        let batch_membership = batch_membership.and_then(|x| x.get(0..ncols));
+        let batch_membership = membership_of_columns(batch_membership, self.num_columns()?);
 
         // Interpret `row_weights` as the concatenated feature axis across
         // all stacked modalities, in `self.stack` order. Slice per
@@ -324,20 +302,7 @@ impl RandProjOps for SparseIoStack {
             )?);
         }
 
-        let basis = concatenate_vertical(
-            &proj_vec
-                .iter()
-                .map(|x| x.basis.to_owned())
-                .collect::<Vec<_>>(),
-        )?;
-        let proj = concatenate_vertical(
-            &proj_vec
-                .iter()
-                .map(|x| x.proj.to_owned())
-                .collect::<Vec<_>>(),
-        )?;
-
-        Ok(RandColProjOut { basis, proj })
+        stack_projections(proj_vec)
     }
 
     fn partition_columns_to_groups(
@@ -535,6 +500,33 @@ impl RandProjOps for SparseIoVec {
     }
 }
 
+/// The batch membership to correct a stack of `ncols` columns with: `None`,
+/// with a warning, when its length is not `ncols`, the rule
+/// [`adjust_batch_biases`] applies to a single modality.
+fn membership_of_columns<T>(batch_membership: Option<&[T]>, ncols: usize) -> Option<&[T]> {
+    let col_to_batch = batch_membership?;
+    if col_to_batch.len() != ncols {
+        warn!(
+            "The batch membership size {} mismatches with the number of columns {}; \
+             no batch adjustment ...",
+            col_to_batch.len(),
+            ncols
+        );
+        return None;
+    }
+    Some(col_to_batch)
+}
+
+/// The modalities' projections stacked on the feature axis: bases and
+/// projections concatenated vertically, in stack order.
+fn stack_projections(proj_vec: Vec<RandColProjOut>) -> anyhow::Result<RandColProjOut> {
+    let (bases, projs): (Vec<_>, Vec<_>) = proj_vec.into_iter().map(|x| (x.basis, x.proj)).unzip();
+    Ok(RandColProjOut {
+        basis: concatenate_vertical(&bases)?,
+        proj: concatenate_vertical(&projs)?,
+    })
+}
+
 /// Remove batch shifts from a projection, keeping each batch's cell-state
 /// composition: batches are centred within cell state (see
 /// [`crate::alg::batch_mixing`]), not by their plain means. A membership of
@@ -633,11 +625,18 @@ where
 ///
 /// # Arguments
 /// * `proj_kn` - random projection matrix (feature x column/cell)
-/// * `kk` - number of features
+/// * `kk` - number of features, one bit of the code each; fewer than the
+///   bits of a `usize`
 pub fn binary_sort_columns(
     proj_kn: &nalgebra::DMatrix<f32>,
     kk: usize,
 ) -> anyhow::Result<Vec<usize>> {
+    anyhow::ensure!(
+        kk < usize::BITS as usize,
+        "{kk} sorting features do not fit a {}-bit binary code: use fewer than {}",
+        usize::BITS,
+        usize::BITS
+    );
     // // standardization again to make sure that each coordinates is treated equally
     // let proj_nk = proj_kn.transpose().scale_columns();
     // let nn = proj_kn.ncols();
@@ -744,5 +743,105 @@ mod repro_tests {
         let b = data_vec.project_columns_with_batch_correction_seeded::<usize>(4, None, None, 2)?;
         assert_ne!(a.basis, b.basis, "distinct seeds → distinct basis");
         Ok(())
+    }
+
+    /// Two modalities over the same 12 cells.
+    fn tiny_stack(
+        dir_a: &tempfile::TempDir,
+        dir_b: &tempfile::TempDir,
+    ) -> anyhow::Result<SparseIoStack> {
+        let mut stack = SparseIoStack::new();
+        stack.push(tiny_data_vec(dir_a)?)?;
+        stack.push(tiny_data_vec(dir_b)?)?;
+        Ok(stack)
+    }
+
+    /// A stack's projection is its modalities' projections, each under its
+    /// own sub-seed, stacked on the feature axis.
+    #[test]
+    fn stacked_projection_concatenates_the_modalities() -> anyhow::Result<()> {
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let stack = tiny_stack(&dir_a, &dir_b)?;
+        let batch: Vec<usize> = (0..12).map(|j| j % 2).collect();
+        let weights: Vec<f32> = (0..16).map(|r| (r % 3) as f32).collect();
+
+        let plain =
+            stack.project_columns_with_batch_correction_seeded(4, None, Some(&batch[..]), 9)?;
+        let weighted =
+            stack.project_columns_weighted_seeded(4, None, Some(&batch[..]), &weights, 9)?;
+
+        for (out, weighted_rows) in [(&plain, false), (&weighted, true)] {
+            assert_eq!(out.basis.shape(), (16, 4));
+            assert_eq!(out.proj.shape(), (8, 12));
+            for (m, data_vec) in stack.stack.iter().enumerate() {
+                let sub_seed = mix_seed(9, m as u64);
+                let one = if weighted_rows {
+                    data_vec.project_columns_weighted_seeded(
+                        4,
+                        None,
+                        Some(&batch[..]),
+                        &weights[m * 8..(m + 1) * 8],
+                        sub_seed,
+                    )?
+                } else {
+                    data_vec.project_columns_with_batch_correction_seeded(
+                        4,
+                        None,
+                        Some(&batch[..]),
+                        sub_seed,
+                    )?
+                };
+                assert_eq!(out.basis.rows(m * 8, 8), one.basis);
+                assert_eq!(out.proj.rows(m * 4, 4), one.proj);
+            }
+        }
+        Ok(())
+    }
+
+    /// A stack treats a batch membership of the wrong length as a single
+    /// modality does: no batch adjustment, whether it is too short or too
+    /// long.
+    #[test]
+    fn stack_ignores_a_batch_membership_of_the_wrong_length() -> anyhow::Result<()> {
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let stack = tiny_stack(&dir_a, &dir_b)?;
+        let weights = vec![1.0f32; 16];
+        let none = stack.project_columns_with_batch_correction_seeded::<usize>(4, None, None, 9)?;
+        let none_weighted =
+            stack.project_columns_weighted_seeded::<usize>(4, None, None, &weights, 9)?;
+
+        let fitting: Vec<usize> = (0..12).map(|j| j % 2).collect();
+        let corrected =
+            stack.project_columns_with_batch_correction_seeded(4, None, Some(&fitting[..]), 9)?;
+        assert_ne!(
+            corrected.proj, none.proj,
+            "the adjustment changes the fixture"
+        );
+
+        for len in [11usize, 13] {
+            let batch: Vec<usize> = (0..len).map(|j| j % 2).collect();
+            let out =
+                stack.project_columns_with_batch_correction_seeded(4, None, Some(&batch[..]), 9)?;
+            assert_eq!(out.proj, none.proj, "membership of {len}");
+            let out =
+                stack.project_columns_weighted_seeded(4, None, Some(&batch[..]), &weights, 9)?;
+            assert_eq!(
+                out.proj, none_weighted.proj,
+                "weighted, membership of {len}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A binary code holds one bit per sorting feature, so as many features
+    /// as a `usize` has bits are refused rather than wrapped.
+    #[test]
+    fn more_sorting_features_than_code_bits_are_refused() {
+        let bits = usize::BITS as usize;
+        let proj = nalgebra::DMatrix::<f32>::from_fn(bits, bits, |i, j| {
+            ((i * 31 + j * 17) % 7) as f32 - 3.0
+        });
+        assert!(binary_sort_columns(&proj, bits).is_err());
+        assert!(binary_sort_columns(&proj, 6).is_ok());
     }
 }
