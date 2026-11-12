@@ -9,6 +9,7 @@ use clap::Args;
 use data_beans::sparse_data_visitors::create_jobs;
 use legume_numeric::matrix::common_io::*;
 use legume_numeric::matrix::mtx_io;
+use legume_numeric::matrix::utils::byte_budget_intervals;
 use log::info;
 use rayon::prelude::*;
 
@@ -251,31 +252,66 @@ pub struct MergeMtxArgs {
     pub view: PlanArgs,
 }
 
-/// Sort triplets into CSC layout and split into (colptr, row indices, values).
+/// Lay triplets out as a CSC slab of `ncol` columns: (colptr, row indices,
+/// values), each column's rows ascending and entries of one cell in the
+/// order given.
 ///
 /// `colptr[j]` is the local offset of column `j`'s first entry; the trailing
-/// sentinel is written by `finalize_streaming_csc`.
-fn build_csc_slab(
-    mut triplets: Vec<(u64, u64, f32)>,
-    ncol: usize,
-) -> (Vec<u64>, Vec<u64>, Vec<f32>) {
-    triplets.par_sort_by_key(|&(row, col, _)| (col, row));
-
-    let mut local_colptr = vec![0u64; ncol];
-    let mut col_counts = vec![0u64; ncol];
-    for &(_, col_local, _) in &triplets {
-        col_counts[col_local as usize] += 1;
+/// sentinel is written by `finalize_streaming_csc`. Entries are counted and
+/// placed by column; only a column whose rows do not already ascend is
+/// sorted.
+fn build_csc_slab(triplets: Vec<(u64, u64, f32)>, ncol: usize) -> (Vec<u64>, Vec<u64>, Vec<f32>) {
+    let mut colptr = vec![0u64; ncol + 1];
+    for &(_, col, _) in &triplets {
+        colptr[col as usize + 1] += 1;
     }
-    let mut acc: u64 = 0;
     for j in 0..ncol {
-        local_colptr[j] = acc;
-        acc += col_counts[j];
+        colptr[j + 1] += colptr[j];
     }
-    debug_assert_eq!(acc as usize, triplets.len());
+    debug_assert_eq!(colptr[ncol] as usize, triplets.len());
 
-    let row_indices: Vec<u64> = triplets.iter().map(|&(r, _, _)| r).collect();
-    let values: Vec<f32> = triplets.iter().map(|&(_, _, v)| v).collect();
-    (local_colptr, row_indices, values)
+    let mut next = colptr[..ncol].to_vec();
+    let mut row_indices = vec![0u64; triplets.len()];
+    let mut values = vec![0f32; triplets.len()];
+    for (row, col, value) in triplets {
+        let at = &mut next[col as usize];
+        row_indices[*at as usize] = row;
+        values[*at as usize] = value;
+        *at += 1;
+    }
+
+    for j in 0..ncol {
+        let (lo, hi) = (colptr[j] as usize, colptr[j + 1] as usize);
+        if row_indices[lo..hi].is_sorted() {
+            continue;
+        }
+        let mut entries: Vec<(u64, f32)> = row_indices[lo..hi]
+            .iter()
+            .copied()
+            .zip(values[lo..hi].iter().copied())
+            .collect();
+        entries.sort_by_key(|&(row, _)| row);
+        for (k, (row, value)) in entries.into_iter().enumerate() {
+            row_indices[lo + k] = row;
+            values[lo + k] = value;
+        }
+    }
+
+    colptr.truncate(ncol);
+    (colptr, row_indices, values)
+}
+
+/// Where each of `rows` lands among the `n` common rows that `place`
+/// indexes by name: a name outside them nowhere, and a name `rows` repeats
+/// on its first row only.
+fn common_row_map(rows: &[Box<str>], place: &HashMap<&str, u64>, n: usize) -> Vec<Option<u64>> {
+    let mut seen = vec![false; n];
+    rows.iter()
+        .map(|name| {
+            let i = *place.get(name.as_ref())?;
+            (!std::mem::replace(&mut seen[i as usize], true)).then_some(i)
+        })
+        .collect()
 }
 
 pub fn run_merge_backend(args: &MergeBackendArgs) -> anyhow::Result<()> {
@@ -395,15 +431,8 @@ fn merge_backend(args: &MergeBackendArgs, common_rows: bool, squeeze: bool) -> a
             .map(|(i, n)| (n.as_ref(), i as u64))
             .collect();
         for ((h, rows), indptr) in batches.iter_mut().zip(&batch_rows).zip(&batch_indptr) {
-            let mut seen = vec![false; row_names.len()];
             // A name a backend repeats keeps its first row only.
-            let map: Vec<Option<u64>> = rows
-                .iter()
-                .map(|n| {
-                    let i = *place.get(n.as_ref())?;
-                    (!std::mem::replace(&mut seen[i as usize], true)).then_some(i)
-                })
-                .collect();
+            let map = common_row_map(rows, &place, row_names.len());
             if map.iter().enumerate().all(|(r, m)| *m == Some(r as u64)) {
                 continue; // these are the common rows, in order
             }
@@ -441,45 +470,65 @@ fn merge_backend(args: &MergeBackendArgs, common_rows: bool, squeeze: bool) -> a
     let mut out = create_sparse_streaming_empty(Some(&backend_file), Some(&backend))?;
     out.begin_streaming_csc((total_nrow, total_ncol, total_nnz))?;
 
+    // Each batch goes through in slabs of columns, as many read at once as
+    // there are threads and appended in order. The threads share one slab
+    // budget, so what is resident does not grow with the batch.
+    let threads = rayon::current_num_threads().max(1);
     let prog_bar = styled_progress_bar(num_batches as u64, "batches");
     let mut nnz_offset: u64 = 0;
     for h in &batches {
         let src = open_sparse_matrix(&h.path, &h.backend)?;
-        let jobs = create_jobs(h.ncol, total_nrow, args.block_size);
-        // A failed block read PROPAGATES. It used to be swallowed (`.ok()`),
-        // and since the output nnz is precomputed from the file headers, the
-        // dropped block left a gap of fill values in the CSC arrays — silent
-        // corruption the finalize audit now catches post hoc; erroring here
-        // names the actual cause instead.
-        let triplets_batch: Vec<(u64, u64, f32)> = jobs
-            .par_iter()
-            .map(|(lb, ub)| -> anyhow::Result<Vec<(u64, u64, f32)>> {
-                let (_, _, t) = src.read_triplets_by_columns((*lb..*ub).collect())?;
-                let lb_u64 = *lb as u64;
-                let row_map = h.row_map.as_deref();
-                Ok(t.into_iter()
-                    .filter_map(move |(i, j_local, x)| {
-                        let i = match row_map {
-                            Some(m) => m[i as usize]?,
-                            None => i,
-                        };
-                        Some((i, j_local + lb_u64, x))
+        let slabs = match args.block_size {
+            Some(_) => create_jobs(h.ncol, total_nrow, args.block_size),
+            None => {
+                let column_nnz = (0..h.ncol)
+                    .map(|c| {
+                        src.column_nnz(c).ok_or_else(|| {
+                            anyhow::anyhow!("{} has no index entry for column {c}", h.path)
+                        })
                     })
-                    .collect())
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-
-        let (local_colptr, row_indices, values) = build_csc_slab(triplets_batch, h.ncol);
-        out.append_csc_slab(
-            h.col_offset,
-            nnz_offset,
-            &local_colptr,
-            &row_indices,
-            &values,
-        )?;
+                    .collect::<anyhow::Result<Vec<u64>>>()?;
+                byte_budget_intervals(&column_nnz, SLAB_BUDGET_BYTES / threads, TRIPLET_BYTES)
+            }
+        };
+        let row_map = h.row_map.as_deref();
+        let mut written: u64 = 0;
+        for window in slabs.chunks(threads) {
+            // A block read returns its columns in order, numbered from the
+            // block's first, rows ascending; a row map that reorders is
+            // sorted for within each column. A failed read stops the merge:
+            // the output's nnz is declared up front, so a block left out
+            // would leave a gap of fill values behind.
+            let built = window
+                .par_iter()
+                .map(|&(lb, ub)| -> anyhow::Result<_> {
+                    let (_, _, mut triplets) = src.read_triplets_by_columns((lb..ub).collect())?;
+                    if let Some(map) = row_map {
+                        triplets = triplets
+                            .into_iter()
+                            .filter_map(|(i, j, x)| Some((map[i as usize]?, j, x)))
+                            .collect();
+                    }
+                    Ok(build_csc_slab(triplets, ub - lb))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            for (&(lb, _), (local_colptr, row_indices, values)) in window.iter().zip(&built) {
+                out.append_csc_slab(
+                    h.col_offset + lb as u64,
+                    nnz_offset + written,
+                    local_colptr,
+                    row_indices,
+                    values,
+                )?;
+                written += values.len() as u64;
+            }
+        }
+        anyhow::ensure!(
+            written == h.nnz,
+            "{} holds {written} entries in the rows kept, where its index says {}",
+            h.path,
+            h.nnz
+        );
         nnz_offset += h.nnz;
 
         prog_bar.inc(1);
@@ -588,105 +637,160 @@ pub(crate) struct MtxSets {
     pub(crate) col_files: Vec<Box<str>>,
 }
 
+/// The file among `files` (a directory's) that `pattern` names: the one
+/// called exactly that, else the one whose path ends with it
+/// (`GSM1_matrix.mtx` for `matrix.mtx`). Several ending with it and none
+/// called it is an error: which was meant is not determined.
+fn file_named(files: &[String], pattern: &str) -> anyhow::Result<Option<Box<str>>> {
+    let exact = files.iter().find(|f| {
+        std::path::Path::new(f)
+            .file_name()
+            .is_some_and(|n| n == pattern)
+    });
+    if let Some(file) = exact {
+        return Ok(Some(file.as_str().into()));
+    }
+    let mut ending = files.iter().filter(|f| f.ends_with(pattern));
+    match (ending.next(), ending.next()) {
+        (Some(a), Some(b)) => anyhow::bail!(
+            "{a} and {b} both end with `{pattern}`: name the one to merge exactly, \
+             or keep one set of files to a directory"
+        ),
+        (file, _) => Ok(file.map(|f| f.as_str().into())),
+    }
+}
+
+/// The matrix, feature and barcode files directly in `dir`, when it holds
+/// all three; `None` too for what is not a directory.
+fn mtx_set_in(dir: &std::path::Path, args: &MergeMtxArgs) -> anyhow::Result<Option<[Box<str>; 3]>> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(None);
+    };
+    let mut files: Vec<String> = Vec::new();
+    for entry in entries {
+        if let Some(path) = entry?.path().to_str() {
+            files.push(path.to_string());
+        }
+    }
+    files.sort();
+    let patterns = [
+        &args.mtx_file_name,
+        &args.feature_file_name,
+        &args.barcode_file_name,
+    ];
+    // Not a set unless every kind of file is there: only then does a name
+    // that fits several files matter.
+    if !patterns
+        .iter()
+        .all(|p| files.iter().any(|f| f.ends_with(p.as_ref())))
+    {
+        return Ok(None);
+    }
+    let [Some(mtx), Some(row), Some(col)] = [
+        file_named(&files, patterns[0])?,
+        file_named(&files, patterns[1])?,
+        file_named(&files, patterns[2])?,
+    ] else {
+        return Ok(None);
+    };
+    Ok(Some([mtx, row, col]))
+}
+
+/// `names` with each one that repeats numbered (`a_0`, `a_1`); the others
+/// as they are.
+fn number_repeated_names(names: &[Box<str>]) -> Vec<Box<str>> {
+    let mut counts: HashMap<&str, usize> = Default::default();
+    for name in names {
+        *counts.entry(name.as_ref()).or_insert(0) += 1;
+    }
+    let mut numbered: HashMap<&str, usize> = Default::default();
+    names
+        .iter()
+        .map(|name| {
+            if counts[name.as_ref()] == 1 {
+                return name.clone();
+            }
+            let k = numbered.entry(name.as_ref()).or_insert(0);
+            *k += 1;
+            format!("{}_{}", name, *k - 1).into_boxed_str()
+        })
+        .collect()
+}
+
+/// A batch name for each directory holding a file set: the directory's own
+/// name, dots and all. Directories of one name (10x's
+/// `sampleA/filtered_feature_bc_matrix`, `sampleB/filtered_feature_bc_matrix`)
+/// take their parent's in front, and a number after when that is not enough,
+/// so no two batches share a name.
+fn mtx_batch_names(dirs: &[std::path::PathBuf]) -> anyhow::Result<Vec<String>> {
+    let name_of = |p: &std::path::Path| -> Option<String> {
+        Some(p.file_name()?.to_string_lossy().into_owned())
+    };
+    let own: Vec<String> = dirs
+        .iter()
+        .map(|d| name_of(d).ok_or_else(|| anyhow::anyhow!("{} has no name", d.display())))
+        .collect::<anyhow::Result<_>>()?;
+    let mut times: HashMap<&str, usize> = Default::default();
+    for name in &own {
+        *times.entry(name.as_str()).or_insert(0) += 1;
+    }
+    let named: Vec<Box<str>> = dirs
+        .iter()
+        .zip(&own)
+        .map(|(dir, name)| match dir.parent().and_then(name_of) {
+            Some(parent) if times[name.as_str()] > 1 => format!("{parent}_{name}").into(),
+            _ => name.as_str().into(),
+        })
+        .collect();
+    let names = number_repeated_names(&named);
+    let distinct: rustc_hash::FxHashSet<&str> = names.iter().map(|n| n.as_ref()).collect();
+    anyhow::ensure!(
+        distinct.len() == names.len(),
+        "the directories do not give each batch its own name: {names:?}"
+    );
+    Ok(names.into_iter().map(String::from).collect())
+}
+
 /// Find each directory's (and subdirectory's) matrix, feature and barcode
 /// files.
 fn find_mtx_sets(args: &MergeMtxArgs) -> anyhow::Result<MtxSets> {
-    let directories = args.data_directories.clone();
-
     let mut mtx_files = vec![];
     let mut row_files = vec![];
     let mut col_files = vec![];
-    let mut batch_names = vec![];
+    let mut set_dirs = vec![];
 
-    for dir in directories.iter() {
-        let dir = dir.clone().into_string();
+    for dir in args.data_directories.iter() {
+        let dir = std::path::Path::new(dir.as_ref());
 
-        if let Some(base) = std::path::Path::new(&dir).file_stem() {
-            let base = base.to_str().expect("invalid base name").to_string();
-            info!("Searching relevant files within: {}", base);
-            let batch_name = Some(base);
-
-            if let Ok(this_dir) = std::fs::read_dir(&dir) {
-                let mut mtx: Option<Box<str>> = None;
-                let mut row: Option<Box<str>> = None;
-                let mut col: Option<Box<str>> = None;
-
-                for x in this_dir {
-                    if let Some(_path) = x?.path().to_str() {
-                        let _path = _path.to_string();
-
-                        if _path.ends_with(args.mtx_file_name.as_ref()) {
-                            mtx = Some(_path.into_boxed_str());
-                        } else if _path.ends_with(args.feature_file_name.as_ref()) {
-                            row = Some(_path.into_boxed_str());
-                        } else if _path.ends_with(args.barcode_file_name.as_ref()) {
-                            col = Some(_path.into_boxed_str());
-                        }
-                    }
-                }
-
-                if let (Some(m), Some(r), Some(c), Some(b)) = (mtx, row, col, batch_name) {
-                    info!("Build {} from {}, {}, {} ", b, m, r, c);
-                    mtx_files.push(m);
-                    row_files.push(r);
-                    col_files.push(c);
-                    batch_names.push(b);
-                }
-            }
+        // The directory itself, when it has a name to give its batch, then
+        // its subdirectories by name.
+        let mut candidates = vec![];
+        if dir.file_name().is_some() {
+            candidates.push(dir.to_path_buf());
         }
-
-        info!("Searching subdir within: {}", dir);
-
-        let mut sub_dir_vec = std::fs::read_dir(&dir)?
+        info!("Searching subdir within: {}", dir.display());
+        let mut subs = std::fs::read_dir(dir)?
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
+        subs.sort_by_key(|entry| entry.file_name());
+        candidates.extend(subs.into_iter().map(|sub| sub.path()));
 
-        sub_dir_vec.sort_by_key(|entry| entry.file_name());
-
-        for sub in sub_dir_vec {
-            if let Some(sub_dir) = sub.path().to_str() {
-                let mut mtx: Option<Box<str>> = None;
-                let mut row: Option<Box<str>> = None;
-                let mut col: Option<Box<str>> = None;
-
-                if let Some(base) = std::path::Path::new(&sub_dir).file_stem() {
-                    let base = base.to_str().expect("invalid base name").to_string();
-                    info!("searching {} ...", base);
-
-                    let batch_name = Some(base);
-
-                    if let Ok(sub_dir) = std::fs::read_dir(sub_dir) {
-                        for x in sub_dir {
-                            if let Some(_path) = x?.path().to_str() {
-                                let _path = _path.to_string();
-
-                                info!("Found: {}", _path);
-
-                                if _path.ends_with(args.mtx_file_name.as_ref()) {
-                                    mtx = Some(_path.into_boxed_str());
-                                } else if _path.ends_with(args.feature_file_name.as_ref()) {
-                                    row = Some(_path.into_boxed_str());
-                                } else if _path.ends_with(args.barcode_file_name.as_ref()) {
-                                    col = Some(_path.into_boxed_str());
-                                }
-                            }
-                        }
-                    }
-
-                    if let (Some(m), Some(r), Some(c), Some(b)) = (mtx, row, col, batch_name) {
-                        info!("Build {} from {}, {}, {} ", b, m, r, c);
-                        mtx_files.push(m);
-                        row_files.push(r);
-                        col_files.push(c);
-                        batch_names.push(b);
-                    }
-                }
+        for candidate in candidates {
+            if candidate.to_str().is_none() || candidate.file_name().is_none() {
+                continue;
+            }
+            if let Some([m, r, c]) = mtx_set_in(&candidate, args)? {
+                info!("Build a batch from {}, {}, {} ", m, r, c);
+                mtx_files.push(m);
+                row_files.push(r);
+                col_files.push(c);
+                set_dirs.push(candidate);
             }
         }
     }
 
     Ok(MtxSets {
-        batch_names,
+        batch_names: mtx_batch_names(&set_dirs)?,
         mtx_files,
         row_files,
         col_files,
@@ -715,38 +819,37 @@ fn merge_mtx(args: &MergeMtxArgs, sets: MtxSets, squeeze: bool) -> anyhow::Resul
 
     info!("Finding common rows/features ...");
 
-    let mut row_hash: HashMap<Box<str>, usize> = HashMap::default();
-
-    for row_file in row_files.iter() {
-        let row_names = read_row_names(row_file.clone(), args.num_feature_name_words)?;
-        for name in row_names.iter() {
-            let n = row_hash.entry(name.clone()).or_insert(0);
-            *n += 1;
-        }
-    }
-
-    let mut common_rows: Vec<Box<str>> = row_hash
-        .into_iter()
-        .filter_map(|(k, v)| {
-            if v == num_batches {
-                Some(k.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    common_rows.sort_by_key(|x| x.to_string());
-
-    let row_pos: HashMap<Box<str>, usize> = common_rows
+    let batch_rows = row_files
         .iter()
-        .enumerate()
-        .map(|(i, v)| (v.clone(), i))
-        .collect();
+        .map(|f| read_row_names(f.clone(), args.num_feature_name_words))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    // The names every set has, sorted.
+    let mut common_rows = common_names(&batch_rows);
+    common_rows.sort();
+    anyhow::ensure!(
+        !common_rows.is_empty(),
+        "the sets share no row/feature name"
+    );
+
+    // Each set's rows among the common ones; a name a set repeats keeps its
+    // first row only.
+    let row_maps: Vec<Vec<Option<u64>>> = {
+        let place: HashMap<&str, u64> = common_rows
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_ref(), i as u64))
+            .collect();
+        batch_rows
+            .iter()
+            .map(|rows| common_row_map(rows, &place, common_rows.len()))
+            .collect()
+    };
+    drop(batch_rows);
 
     info!(
         "Found {} common row/feature names across {} file sets",
-        row_pos.len(),
+        common_rows.len(),
         num_batches
     );
 
@@ -776,18 +879,33 @@ fn merge_mtx(args: &MergeMtxArgs, sets: MtxSets, squeeze: bool) -> anyhow::Resul
     let mut batch_nnz: Vec<usize> = Vec::with_capacity(num_batches);
     let pb1 = styled_progress_bar(num_batches as u64, "batches");
     for b in 0..num_batches {
-        let row_names = read_row_names(row_files[b].clone(), args.num_feature_name_words)?;
-        let (_nrow, _ncol, header_nnz) = mtx_io::read_mtx_header(&mtx_files[b])?;
+        let row_map = &row_maps[b];
+        let (nrow, ncol, header_nnz) = mtx_io::read_mtx_header(&mtx_files[b])?;
+        // The matrix indexes the lines of its feature and barcode files.
+        anyhow::ensure!(
+            nrow == row_map.len(),
+            "{} has {nrow} rows, but {} names {}",
+            mtx_files[b],
+            row_files[b],
+            row_map.len()
+        );
+        anyhow::ensure!(
+            ncol == batch_ncols[b],
+            "{} has {ncol} columns, but {} names {}",
+            mtx_files[b],
+            col_files[b],
+            batch_ncols[b]
+        );
 
         // Skip the parse if every row in this batch is kept — header nnz is exact.
-        let no_filter = row_names.iter().all(|n| row_pos.contains_key(n));
+        let no_filter = row_map.iter().all(Option::is_some);
         let count = if no_filter {
             header_nnz
         } else {
-            let (triplets, _shape) = mtx_io::read_mtx_triplets(&mtx_files[b].clone())?;
+            let (triplets, _shape) = mtx_io::read_mtx_triplets(&mtx_files[b])?;
             triplets
                 .iter()
-                .filter(|(batch_i, _, _)| row_pos.contains_key(&row_names[*batch_i as usize]))
+                .filter(|(batch_i, _, _)| row_map[*batch_i as usize].is_some())
                 .count()
         };
         batch_nnz.push(count);
@@ -827,15 +945,13 @@ fn merge_mtx(args: &MergeMtxArgs, sets: MtxSets, squeeze: bool) -> anyhow::Resul
     let mut nnz_offset: u64 = 0;
     let pb2 = styled_progress_bar(num_batches as u64, "batches");
     for b in 0..num_batches {
-        let row_names = read_row_names(row_files[b].clone(), args.num_feature_name_words)?;
-        let (triplets, _shape) = mtx_io::read_mtx_triplets(&mtx_files[b].clone())?;
+        let row_map = &row_maps[b];
+        let (triplets, _shape) = mtx_io::read_mtx_triplets(&mtx_files[b])?;
 
         let triplets_batch: Vec<(u64, u64, f32)> = triplets
             .into_iter()
             .filter_map(|(batch_i, batch_j, x_ij)| {
-                row_pos
-                    .get(&row_names[batch_i as usize])
-                    .map(|i| (*i as u64, batch_j, x_ij))
+                Some((row_map[batch_i as usize]?, batch_j, x_ij))
             })
             .collect();
 
@@ -887,8 +1003,6 @@ fn merge_mtx(args: &MergeMtxArgs, sets: MtxSets, squeeze: bool) -> anyhow::Resul
 /// If basenames are unique, use them as-is
 /// If duplicates exist, add numeric suffixes
 pub fn generate_unique_batch_names(files: &[Box<str>]) -> anyhow::Result<Vec<Box<str>>> {
-    use rustc_hash::FxHashMap as HashMap;
-
     // Extract basenames and strip backend extensions (.zarr.zip, .zarr, .h5)
     let basenames: Vec<Box<str>> = files
         .iter()
@@ -904,32 +1018,7 @@ pub fn generate_unique_batch_names(files: &[Box<str>]) -> anyhow::Result<Vec<Box
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    // Count occurrences of each basename
-    let mut counts: HashMap<&str, usize> = Default::default();
-    for name in &basenames {
-        *counts.entry(name.as_ref()).or_insert(0) += 1;
-    }
-
-    // Generate unique names
-    let mut name_counters: HashMap<&str, usize> = Default::default();
-    let unique_names: Vec<Box<str>> = basenames
-        .iter()
-        .map(|name| {
-            let count = counts.get(name.as_ref()).unwrap();
-            if *count == 1 {
-                // Unique basename, use as-is
-                name.clone()
-            } else {
-                // Duplicate basename, add suffix
-                let counter = name_counters.entry(name.as_ref()).or_insert(0);
-                let unique_name = format!("{}_{}", name, counter).into_boxed_str();
-                *counter += 1;
-                unique_name
-            }
-        })
-        .collect();
-
-    Ok(unique_names)
+    Ok(number_repeated_names(&basenames))
 }
 
 pub fn align_backends(args: &AlignDataArgs) -> anyhow::Result<()> {
@@ -938,6 +1027,10 @@ pub fn align_backends(args: &AlignDataArgs) -> anyhow::Result<()> {
 
 /// `align-data` over `num_types` data types.
 fn align_data(args: &AlignDataArgs, num_types: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        num_types >= 1,
+        "the data types (-r) are a whole number, at least 1"
+    );
     let n_data = args.data_files.len();
     let n_data_columns = n_data.div_ceil(num_types);
     let n_expected = n_data_columns * num_types;
@@ -984,19 +1077,12 @@ fn align_data(args: &AlignDataArgs, num_types: usize) -> anyhow::Result<()> {
     for r in 0..n_data_rows {
         let data_set_idx: Vec<usize> = (r * n_data_columns..(r + 1) * n_data_columns).collect();
 
-        let fully_shared = data_set_idx.len();
-        let mut shared: HashMap<Box<str>, usize> = HashMap::default();
-        for &di in data_set_idx.iter() {
-            for v in full_data_vec[di].row_names()? {
-                let count = shared.entry(v).or_default();
-                *count += 1;
-            }
-        }
-
-        let mut shared: Vec<Box<str>> = shared
-            .into_iter()
-            .filter_map(|(v, n)| if n == fully_shared { Some(v) } else { None })
-            .collect();
+        let mut shared = common_names(
+            &data_set_idx
+                .iter()
+                .map(|&di| full_data_vec[di].row_names())
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        );
 
         info!(
             "found {} shared rows/features on the data type {}",
@@ -1024,19 +1110,12 @@ fn align_data(args: &AlignDataArgs, num_types: usize) -> anyhow::Result<()> {
             .collect::<Vec<_>>();
 
         // 1. figure out shared names for each column
-        let fully_shared = data_set_idx.len();
-        let mut shared: HashMap<Box<str>, usize> = HashMap::default();
-        for &d in subset_data_vec.iter() {
-            for v in d.column_names()? {
-                let count = shared.entry(v).or_default();
-                *count += 1;
-            }
-        }
-
-        let mut shared: Vec<Box<str>> = shared
-            .into_iter()
-            .filter_map(|(v, n)| if n == fully_shared { Some(v) } else { None })
-            .collect();
+        let mut shared = common_names(
+            &subset_data_vec
+                .iter()
+                .map(|d| d.column_names())
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        );
 
         info!("found {} shared columns", shared.len());
 
