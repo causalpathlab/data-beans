@@ -65,3 +65,74 @@ fn merged_spans_stay_bounded() {
         "but it must stay a bounded handful, got {calls}"
     );
 }
+
+/// Export a CSC matrix held in memory in `block`-sized reads; the text
+/// written and the number of reads made.
+fn mtx(
+    shape: (usize, usize, usize),
+    indptr: &[u64],
+    indices: &[u64],
+    values: &[f32],
+    block: u64,
+) -> anyhow::Result<(String, usize)> {
+    let calls = Cell::new(0usize);
+    let mut out = Vec::new();
+    write_mtx(&mut out, shape, indptr, block, |s, e| {
+        calls.set(calls.get() + 1);
+        let (s, e) = (s as usize, e as usize);
+        Ok((values[s..e].to_vec(), indices[s..e].to_vec()))
+    })?;
+    Ok((String::from_utf8(out)?, calls.get()))
+}
+
+const MTX_MAGIC: &str = "%%MatrixMarket matrix coordinate real general\n";
+
+#[test]
+fn mtx_blocks_cut_through_columns_and_skip_empty_ones() {
+    // 4 x 6; columns 0, 2 and 5 are empty, column 3 holds three entries.
+    let indptr = [0u64, 0, 2, 2, 5, 6, 6];
+    let indices = [0u64, 3, 0, 1, 2, 3];
+    let values = [1.5f32, 2.0, 3.0, 4.0, 5.0, -6.25];
+    let body = "1\t2\t1.5\n4\t2\t2\n1\t4\t3\n2\t4\t4\n3\t4\t5\n4\t5\t-6.25\n";
+    let expected = format!("{MTX_MAGIC}4\t6\t6\n{body}");
+    // whatever the block size, the same text; a block boundary inside a
+    // column and one landing exactly on a column's end are both covered
+    for (block, reads) in [(1u64, 6usize), (2, 3), (4, 2), (5, 2), (6, 1), (1 << 20, 1)] {
+        let (text, calls) = mtx((4, 6, 6), &indptr, &indices, &values, block).unwrap();
+        assert_eq!(text, expected, "block {block}");
+        assert_eq!(
+            calls, reads,
+            "block {block}: reads follow the data, not the columns"
+        );
+    }
+}
+
+#[test]
+fn mtx_of_an_empty_matrix_is_the_header() {
+    let (text, calls) = mtx((3, 2, 0), &[0, 0, 0], &[], &[], 4).unwrap();
+    assert_eq!(text, format!("{MTX_MAGIC}3\t2\t0\n"));
+    assert_eq!(calls, 0);
+}
+
+#[test]
+fn mtx_refuses_index_pointers_that_do_not_describe_the_matrix() {
+    let indices = [0u64, 1, 2];
+    let values = [1.0f32, 2.0, 3.0];
+    for (what, indptr, nnz) in [
+        ("shorter than ncol + 1", vec![0u64, 3], 3usize),
+        ("decreasing", vec![0, 2, 1, 3], 3),
+        ("ending short of the declared nnz", vec![0, 1, 2, 2], 3),
+        ("ending past the declared nnz", vec![0, 1, 2, 3], 2),
+    ] {
+        let err = mtx((3, 3, nnz), &indptr, &indices, &values, 2);
+        let msg = format!("{:#}", err.expect_err(what));
+        assert!(msg.contains("to_mtx_file"), "{what}: {msg}");
+    }
+}
+
+#[test]
+fn mtx_refuses_a_row_index_outside_the_matrix() {
+    let err = mtx((2, 1, 2), &[0, 2], &[0, 2], &[1.0, 2.0], 8);
+    let msg = format!("{:#}", err.expect_err("row 2 of a 2-row matrix"));
+    assert!(msg.contains("to_mtx_file"), "{msg}");
+}

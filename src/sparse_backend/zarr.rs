@@ -40,12 +40,6 @@ use crate::utilities::io_helpers::{chunk_elems, parse_name_file};
 
 const COMPRESSION_LEVEL: i32 = 5;
 
-/// Block size (in elements) for streaming the CSC value/row-index arrays when
-/// exporting to Matrix Market. ~1M elements ≈ 4 MiB f32 + 8 MiB u64 transient
-/// per block — large enough to amortize per-retrieve overhead, small enough to
-/// bound memory regardless of matrix size.
-const MTX_STREAM_BLOCK: u64 = 1 << 20;
-
 /// 10x-like cell-feature matrix with `zarr` backend (feature x cell)
 ///
 /// ```text
@@ -89,6 +83,30 @@ pub struct SparseMtxData {
     by_column_indices_cache: Arc<OnceLock<ChunkCacheDecodedLruChunkLimit>>,
     by_row_data_cache: Arc<OnceLock<ChunkCacheDecodedLruChunkLimit>>,
     by_row_indices_cache: Arc<OnceLock<ChunkCacheDecodedLruChunkLimit>>,
+    /// The root `nrow` / `ncol` / `nnz` attributes as last seen, so the
+    /// accessors do not open and parse the root group on every read. An
+    /// attribute is written once per store, so a value held here stays true
+    /// until the store itself is replaced; one not yet seen is looked up in
+    /// the store.
+    shape: MtxShape,
+}
+
+/// Root shape attributes of a backend; `None` for one not recorded.
+#[derive(Clone, Copy, Default)]
+struct MtxShape {
+    nrow: Option<usize>,
+    ncol: Option<usize>,
+    nnz: Option<usize>,
+}
+
+impl MtxShape {
+    fn read(store: &Arc<dyn ZReadStorageTraits>) -> Self {
+        Self {
+            nrow: SparseMtxData::_num_rows(store.clone()),
+            ncol: SparseMtxData::_num_columns(store.clone()),
+            nnz: SparseMtxData::_num_nnz(store.clone()),
+        }
+    }
 }
 
 impl SparseMtxData {
@@ -129,12 +147,8 @@ impl SparseMtxData {
     pub fn open(backend_file: &str) -> anyhow::Result<Self> {
         let (read_store, write_store) = crate::zarr_io::open_zarr_store_rw(backend_file)?;
 
-        if (
-            Self::_num_rows(read_store.clone()),
-            Self::_num_columns(read_store.clone()),
-            Self::_num_nnz(read_store.clone()),
-        ) == (None, None, None)
-        {
+        let shape = MtxShape::read(&read_store);
+        if (shape.nrow, shape.ncol, shape.nnz) == (None, None, None) {
             anyhow::bail!("Couldn't figure out the size of this sparse matrix data");
         }
 
@@ -157,6 +171,7 @@ impl SparseMtxData {
             by_column_indices_cache: Arc::new(OnceLock::new()),
             by_row_data_cache: Arc::new(OnceLock::new()),
             by_row_indices_cache: Arc::new(OnceLock::new()),
+            shape,
         };
 
         ret.read_column_indptr()?;
@@ -269,7 +284,23 @@ impl SparseMtxData {
             by_column_indices_cache: Arc::new(OnceLock::new()),
             by_row_data_cache: Arc::new(OnceLock::new()),
             by_row_indices_cache: Arc::new(OnceLock::new()),
+            shape: MtxShape::default(),
         })
+    }
+
+    /// Forget everything held in memory about the store's contents: the
+    /// decoded-chunk caches (which pin the arrays they were opened on, shape
+    /// and chunk grid included), the shape attributes and the streaming
+    /// cursor. For when the store behind this handle has been replaced;
+    /// chunks decoded from the old arrays would otherwise be served against
+    /// the new index pointers.
+    fn forget_store_contents(&mut self) {
+        self.by_column_data_cache = Arc::new(OnceLock::new());
+        self.by_column_indices_cache = Arc::new(OnceLock::new());
+        self.by_row_data_cache = Arc::new(OnceLock::new());
+        self.by_row_indices_cache = Arc::new(OnceLock::new());
+        self.shape = MtxShape::default();
+        self.streamed_nnz = 0;
     }
 
     /////////////////////
@@ -334,7 +365,9 @@ impl SparseMtxData {
     }
 
     /// Create an empty fixed-shape 1-D array with the given data type,
-    /// chunk layout, and fill value. No data is written.
+    /// chunk layout, and fill value. No data is written. The array has
+    /// exactly `nelem` elements, none for an empty one, so what a reader
+    /// finds matches the index pointers.
     ///
     /// Used by the streaming write path to pre-create `/by_column/*` and
     /// `/by_row/*` arrays at their final size before any triplets land.
@@ -361,14 +394,9 @@ impl SparseMtxData {
             FillValue::from(0)
         };
 
-        let array = ArrayBuilder::new(
-            vec![nelem.max(1) as u64],
-            vec![chunk_size.max(1) as u64],
-            dt,
-            fill,
-        )
-        .bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(COMPRESSION_LEVEL, false))])
-        .build(ws.clone(), key)?;
+        let array = ArrayBuilder::new(vec![nelem as u64], vec![chunk_size as u64], dt, fill)
+            .bytes_to_bytes_codecs(vec![Arc::new(ZstdCodec::new(COMPRESSION_LEVEL, false))])
+            .build(ws.clone(), key)?;
 
         array.store_metadata()?;
         Ok(())
@@ -465,6 +493,39 @@ impl SparseMtxData {
         }
         let _ = cell.set(Self::open_chunk_cache(&self.read_store, key)?);
         Ok(cell.get().expect("OnceLock populated above"))
+    }
+
+    /// Read the `(output column, start, end)` ranges of `tagged` (sorted by
+    /// `start`) from the CSC arrays through the decoded-chunk caches, as
+    /// `(row, output column, value)` triplets.
+    fn read_csc_ranges(
+        &self,
+        tagged: &[(u64, u64, u64)],
+        nrow: usize,
+    ) -> anyhow::Result<Vec<(u64, u64, f32)>> {
+        use zarrs::array::chunk_cache::ChunkCache;
+
+        let data_cache = self.cache_for(&self.by_column_data_cache, KEY_BY_COLUMN_DATA)?;
+        let indices_cache = self.cache_for(&self.by_column_indices_cache, KEY_BY_COLUMN_INDICES)?;
+
+        let opts = zarrs::array::CodecOptions::default();
+        shared::coalesce_and_emit(
+            tagged,
+            nrow,
+            |jj, ii, val| (ii, jj, val),
+            |s, e| {
+                let subset = Self::create_subset(s..e);
+                let data_buf = <_ as ChunkCache>::retrieve_array_subset::<Vec<f32>>(
+                    data_cache, &subset, &opts,
+                )?;
+                let indices_buf = <_ as ChunkCache>::retrieve_array_subset::<Vec<u64>>(
+                    indices_cache,
+                    &subset,
+                    &opts,
+                )?;
+                Ok((data_buf, indices_buf))
+            },
+        )
     }
 
     fn _retrieve_vector<V>(&self, key: &str) -> anyhow::Result<Vec<V>>
@@ -593,11 +654,8 @@ impl SparseIo for SparseMtxData {
         let store = Arc::new(FilesystemStore::new(&self.file_name)?);
         self.read_store = store.clone();
         self.write_store = Some(store);
-        self.by_column_data_cache = Arc::new(OnceLock::new());
-        self.by_column_indices_cache = Arc::new(OnceLock::new());
-        self.by_row_data_cache = Arc::new(OnceLock::new());
-        self.by_row_indices_cache = Arc::new(OnceLock::new());
-        self.streamed_nnz = 0;
+        self.forget_store_contents();
+        self.shape = MtxShape::read(&self.read_store);
         self.read_column_indptr()?;
         self.read_row_indptr()?;
         Ok(())
@@ -736,6 +794,11 @@ impl SparseIo for SparseMtxData {
             check_set_attr("nrow", nrow)?;
             check_set_attr("ncol", ncol)?;
             check_set_attr("nnz", nnz)?;
+            self.shape = MtxShape {
+                nrow: Some(nrow),
+                ncol: Some(ncol),
+                nnz: Some(nnz),
+            };
         }
         Ok(())
     }
@@ -757,6 +820,10 @@ impl SparseIo for SparseMtxData {
         self.max_row_name_idx = MAX_ROW_NAME_IDX;
         self.by_column_indptr = vec![];
         self.by_row_indptr = vec![];
+        // Nothing read from the removed store describes the new one.
+        self.forget_store_contents();
+        self.clean_preloaded_columns();
+        self.clean_preloaded_rows();
 
         Ok(())
     }
@@ -789,41 +856,24 @@ impl SparseIo for SparseMtxData {
         if let (Some(ncol), Some(nrow), Some(nnz)) =
             (self.num_columns(), self.num_rows(), self.num_non_zeros())
         {
-            let (nrow, ncol, nnz) = (nrow, ncol, nnz);
-
             let mut buf = open_buf_writer(mtx_file)?;
-            shared::write_mtx_header(&mut buf, nrow, ncol, nnz)?;
 
             let (indptr, data, indices) = self.open_csc_triplets()?;
             let indptr = indptr.retrieve_array_subset::<Vec<u64>>(&indptr.subset_all())?;
-            crate::sparse_io::index_audit::check_indptr("to_mtx_file", &indptr, ncol, nnz)?;
 
-            // Stream the CSC value/row-index arrays in large sequential blocks
-            // (instead of two retrieves per column) and walk `indptr` to map
-            // each stored nonzero back to its column. CSC values are laid out
-            // column-major in column order, so emitting them in storage order
-            // reproduces the same column-by-column output as a per-column scan;
-            // empty columns are skipped by advancing the column pointer.
-            let total_nnz = indptr[ncol];
-            let mut jj = 0usize; // column owning the running nnz position
-            let mut pos = 0u64;
-            while pos < total_nnz {
-                let end = (pos + MTX_STREAM_BLOCK).min(total_nnz);
-                let subset = Self::create_subset(pos..end);
-                let data_block = data.retrieve_array_subset::<Vec<f32>>(&subset)?;
-                let indices_block = indices.retrieve_array_subset::<Vec<u64>>(&subset)?;
-
-                for (k, (&val, &ii)) in data_block.iter().zip(&indices_block).enumerate() {
-                    let global = pos + k as u64;
-                    // advance to the column owning this nonzero (skips empties)
-                    while jj + 1 < indptr.len() && indptr[jj + 1] <= global {
-                        jj += 1;
-                    }
-                    // 1-based indices
-                    writeln!(buf, "{}\t{}\t{}", ii as usize + 1, jj + 1, val)?;
-                }
-                pos = end;
-            }
+            shared::write_mtx(
+                &mut buf,
+                (nrow, ncol, nnz),
+                &indptr,
+                shared::MTX_STREAM_BLOCK,
+                |s, e| {
+                    let subset = Self::create_subset(s..e);
+                    Ok((
+                        data.retrieve_array_subset::<Vec<f32>>(&subset)?,
+                        indices.retrieve_array_subset::<Vec<u64>>(&subset)?,
+                    ))
+                },
+            )?;
             buf.flush()?;
             Ok(())
         } else {
@@ -867,17 +917,23 @@ impl SparseIo for SparseMtxData {
 
     /// Number of rows in the matrix
     fn num_rows(&self) -> Option<usize> {
-        Self::_num_rows(self.read_store.clone())
+        self.shape
+            .nrow
+            .or_else(|| Self::_num_rows(self.read_store.clone()))
     }
 
     /// Number of columns in the matrix
     fn num_columns(&self) -> Option<usize> {
-        Self::_num_columns(self.read_store.clone())
+        self.shape
+            .ncol
+            .or_else(|| Self::_num_columns(self.read_store.clone()))
     }
 
     /// Number of non-zero elements in the matrix
     fn num_non_zeros(&self) -> Option<usize> {
-        Self::_num_nnz(self.read_store.clone())
+        self.shape
+            .nnz
+            .or_else(|| Self::_num_nnz(self.read_store.clone()))
     }
 
     /// Add arbitrary names (a vector of strings)
@@ -931,8 +987,6 @@ impl SparseIo for SparseMtxData {
         &self,
         j_data: usize,
     ) -> anyhow::Result<(usize, usize, Vec<(u64, u64, f32)>)> {
-        use zarrs::array::Array as ZArray;
-
         let indptr = &self.by_column_indptr;
 
         let nrow = self
@@ -958,11 +1012,6 @@ impl SparseIo for SparseMtxData {
 
             Ok((nrow, ncol_out, ret))
         } else {
-            let key = "/by_column/data";
-            let data = ZArray::open(self.read_store.clone(), key)?;
-            let key = "/by_column/indices";
-            let indices = ZArray::open(self.read_store.clone(), key)?;
-
             let ncol_out = 1;
             let jj = 0;
 
@@ -974,27 +1023,10 @@ impl SparseIo for SparseMtxData {
                 "column read: slot {j_data} points at [{start}, {end})"
             );
 
-            let mut ret: Vec<(u64, u64, f32)> = Vec::with_capacity((end - start) as usize);
-
-            if start < end {
-                let subset = Self::create_subset(start..end);
-                let data_slice = data.retrieve_array_subset::<Vec<f32>>(&subset)?;
-                let indices_slice = indices.retrieve_array_subset::<Vec<u64>>(&subset)?;
-
-                for k in 0..(end - start) {
-                    let x_ij = data_slice[k as usize];
-                    let ii = indices_slice[k as usize];
-                    if ii >= nrow as u64 {
-                        return Err(index_audit::inner_out_of_range(
-                            "column read",
-                            (start + k) as usize,
-                            ii,
-                            nrow,
-                        ));
-                    }
-                    ret.push((ii, jj, x_ij));
-                }
-            }
+            // Through the decoded-chunk caches, like a block read: columns
+            // read one after another mostly sit in the same chunk.
+            let tagged = [(jj, start, end)];
+            let ret = self.read_csc_ranges(if start < end { &tagged } else { &[] }, nrow)?;
 
             Ok((nrow, ncol_out, ret))
         }
@@ -1077,28 +1109,7 @@ impl SparseIo for SparseMtxData {
                 .collect();
             tagged.sort_by_key(|&(_, start, _)| start);
 
-            let data_cache = self.cache_for(&self.by_column_data_cache, KEY_BY_COLUMN_DATA)?;
-            let indices_cache =
-                self.cache_for(&self.by_column_indices_cache, KEY_BY_COLUMN_INDICES)?;
-
-            let opts = zarrs::array::CodecOptions::default();
-            let ret = shared::coalesce_and_emit(
-                &tagged,
-                nrow,
-                |jj, ii, val| (ii, jj, val),
-                |s, e| {
-                    let subset = Self::create_subset(s..e);
-                    let data_buf =
-                        <_ as zarrs::array::chunk_cache::ChunkCache>::retrieve_array_subset::<
-                            Vec<f32>,
-                        >(data_cache, &subset, &opts)?;
-                    let indices_buf =
-                        <_ as zarrs::array::chunk_cache::ChunkCache>::retrieve_array_subset::<
-                            Vec<u64>,
-                        >(indices_cache, &subset, &opts)?;
-                    Ok((data_buf, indices_buf))
-                },
-            )?;
+            let ret = self.read_csc_ranges(&tagged, nrow)?;
             Ok((nrow, ncol_out, ret))
         }
     }
