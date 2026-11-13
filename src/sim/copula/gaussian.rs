@@ -88,7 +88,16 @@ impl CopulaCovariance {
             // The `r_eff` largest algebraic eigenpairs, descending; the
             // reduced matrix need not be positive semi-definite, so only the
             // positive ones become factors.
-            let eig = reduced.top_eigen_with(r_eff, &TopEigenArgs::default(), warm.as_ref())?;
+            let eig = reduced
+                .top_eigen_with(r_eff, &TopEigenArgs::default(), warm.as_ref())
+                .map_err(|e| anyhow::anyhow!("copula factor fit: top eigenpairs: {e}"))?;
+            if !eig.converged {
+                log::warn!(
+                    "copula factor fit: the top-{r_eff} eigensolve stopped after {} iterations \
+                     before converging; the factor is approximate",
+                    eig.iters
+                );
+            }
             let kept = eig.values.iter().take_while(|&&v| v > 0.0).count();
             factor = DMatrix::from_fn(g, kept, |h, k| eig.vectors[(h, k)] * eig.values[k].sqrt());
             warm = Some(eig.vectors);
@@ -389,6 +398,69 @@ mod tests {
                 .rank(),
             0
         );
+    }
+
+    /// The top-r path keeps the same factor a full eigendecomposition gives,
+    /// on a reduced matrix with large negative eigenvalues: only the
+    /// leading positive eigenpairs become factors.
+    #[test]
+    fn top_eigenpairs_match_the_dense_fit_on_an_indefinite_matrix() {
+        let g = 40;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(23);
+        let normal = Normal::new(0.0_f64, 1.0).unwrap();
+        // Two positive spikes, and a negative block larger in magnitude.
+        let a = DMatrix::from_fn(g, 2, |_, _| normal.sample(&mut rng) * 0.15);
+        let b = DMatrix::from_fn(g, 3, |_, _| normal.sample(&mut rng) * 0.2);
+        let mut corr = &a * a.transpose() - &b * b.transpose();
+        for h in 0..g {
+            corr[(h, h)] = 1.0;
+        }
+        let cov = CopulaCovariance::from_correlation(&corr, 4, 1e-3).unwrap();
+
+        // The same principal-axis fit with a full eigendecomposition, as
+        // before the top-r solver.
+        let cap = 1.0 - 1e-3;
+        let mut comm: Vec<f64> = (0..g)
+            .map(|h| {
+                (0..g)
+                    .filter(|&k| k != h)
+                    .map(|k| corr[(h, k)].abs())
+                    .fold(0.0_f64, f64::max)
+                    .min(cap)
+            })
+            .collect();
+        let mut dense = DMatrix::<f64>::zeros(g, 0);
+        for _ in 0..PAF_ITERATIONS {
+            let mut reduced = corr.clone();
+            for (h, &c) in comm.iter().enumerate() {
+                reduced[(h, h)] = c;
+            }
+            let eig = reduced.symmetric_eigen();
+            let mut order: Vec<usize> = (0..g).filter(|&i| eig.eigenvalues[i] > 0.0).collect();
+            order.sort_by(|&i, &j| eig.eigenvalues[j].total_cmp(&eig.eigenvalues[i]));
+            order.truncate(4);
+            dense = DMatrix::from_fn(g, order.len(), |h, k| {
+                eig.eigenvectors[(h, order[k])] * eig.eigenvalues[order[k]].sqrt()
+            });
+            let mut change = 0.0_f64;
+            for (h, c) in comm.iter_mut().enumerate() {
+                let n2 = dense.row(h).norm_squared();
+                if n2 > cap {
+                    dense.row_mut(h).scale_mut((cap / n2).sqrt());
+                }
+                let next = n2.min(cap);
+                change = change.max((next - *c).abs());
+                *c = next;
+            }
+            if change < PAF_TOLERANCE {
+                break;
+            }
+        }
+        let want = &dense * dense.transpose();
+        let got = (&cov.factor * cov.factor.transpose()).map(|x| x as f64);
+        assert_eq!(cov.rank(), dense.ncols());
+        let worst = (&got - &want).abs().max();
+        assert!(worst < 1e-4, "top-r and dense factors differ by {worst}");
     }
 
     /// One shared factor between rows 0 and 1 comes back as one column,
