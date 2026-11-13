@@ -288,3 +288,45 @@ fn squeeze_refuses_a_backend_without_a_shape() {
         "{err}"
     );
 }
+
+/// A row's sum runs across the column blocks, and a sum of non-integer
+/// values depends on how it is grouped: the grouping follows the blocks, not
+/// the threads that read them.
+#[test]
+fn row_statistics_do_not_depend_on_the_thread_count() -> anyhow::Result<()> {
+    let (nrows, ncols) = (8u64, 600u64);
+    let mut triplets = vec![];
+    for c in 0..ncols {
+        for r in 0..nrows {
+            if (r * 5 + c * 3) % 4 != 0 {
+                triplets.push((r, c, 0.1 + ((r * 131 + c * 17) % 97) as f32 * 0.37));
+            }
+        }
+    }
+    let shape = (nrows as usize, ncols as usize, triplets.len());
+    let data = create_sparse_from_triplets(&triplets, shape, None, None)?;
+
+    let bits = |x: Vec<f32>| -> Vec<u32> { x.iter().map(|v| v.to_bits()).collect() };
+    // Blocks of two columns: several leaves of the fold, merged.
+    let run = |threads: usize| -> anyhow::Result<_> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()?
+            .install(|| {
+                let alone = collect_row_stat(data.as_ref(), Some(2))?;
+                let (_, with_columns) = collect_column_row_stat(data.as_ref(), Some(2))?;
+                Ok((
+                    bits(alone.sum()),
+                    bits(alone.variance()),
+                    bits(with_columns.sum()),
+                    bits(with_columns.variance()),
+                ))
+            })
+    };
+    let one = run(1)?;
+    assert_eq!(one.0, one.2, "the two passes group a row's sum alike");
+    for threads in [3, 6] {
+        assert_eq!(run(threads)?, one, "{threads} threads");
+    }
+    Ok(())
+}

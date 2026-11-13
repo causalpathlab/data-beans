@@ -175,45 +175,98 @@ pub fn collect_row_stat(
     block_size: Option<usize>,
 ) -> anyhow::Result<SparseRunningStatistics<f32>> {
     let nrows = data.num_rows().unwrap_or(0);
-    Ok(fold_column_blocks(
+    fold_column_blocks(
         data,
         block_size,
-        SparseRunningStatistics::new(nrows),
+        || SparseRunningStatistics::new(nrows),
         |stat, csc, _| stat.add_csc(csc),
-    ))
+        |stat, other| stat.merge(&other),
+    )
 }
 
-/// Read the columns of `data` block by block in parallel and fold each
-/// block into `stat` under one lock: `add(stat, csc, lb)` takes the block
-/// and the index of its first column. A backend without a shape has no
-/// blocks.
-fn fold_column_blocks<S, F>(
+/// Column blocks folded into one accumulator at a leaf of
+/// [`fold_in_fixed_order`] by the streaming passes: a pass over many blocks
+/// allocates one accumulator per 64 of them, not one per block.
+pub(crate) const BLOCKS_PER_LEAF: usize = 64;
+
+/// Fold `items` into one accumulator over a fixed binary tree: a run of at
+/// most `leaf` items is folded in order into a fresh accumulator; a longer
+/// run is halved, the halves folded on separate rayon tasks and merged left
+/// into right.
+///
+/// The grouping of the floating-point sums then depends on `items.len()` and
+/// `leaf` alone, not on the thread count or on how rayon schedules the work,
+/// so the result is the same bits run to run. (A plain rayon `fold`/`reduce`
+/// splits where work stealing happens to split.)
+pub(crate) fn fold_in_fixed_order<T, A, I, F, M>(
+    items: &[T],
+    leaf: usize,
+    init: &I,
+    fold: &F,
+    merge: &M,
+) -> anyhow::Result<A>
+where
+    T: Sync,
+    A: Send,
+    I: Fn() -> A + Sync,
+    F: Fn(&mut A, &T) -> anyhow::Result<()> + Sync,
+    M: Fn(&mut A, A) + Sync,
+{
+    if items.len() <= leaf.max(1) {
+        let mut acc = init();
+        for item in items {
+            fold(&mut acc, item)?;
+        }
+        return Ok(acc);
+    }
+    let (left, right) = items.split_at(items.len() / 2);
+    let (left, right) = rayon::join(
+        || fold_in_fixed_order(left, leaf, init, fold, merge),
+        || fold_in_fixed_order(right, leaf, init, fold, merge),
+    );
+    let mut acc = left?;
+    merge(&mut acc, right?);
+    Ok(acc)
+}
+
+/// Read the columns of `data` block by block in parallel and fold the blocks
+/// in a fixed order ([`fold_in_fixed_order`]): `add(acc, csc, lb)` folds a
+/// block, given the index of its first column, into the accumulator of its
+/// leaf (a fresh `init()`), and `merge` joins two accumulators. Sums that
+/// run across blocks, as a row's do, are then the same bits on any number of
+/// threads. A backend without a shape has no blocks.
+///
+/// # Errors
+/// If a block cannot be read.
+fn fold_column_blocks<A, I, F, M>(
     data: &dyn SparseIo<IndexIter = Vec<usize>>,
     block_size: Option<usize>,
-    stat: S,
+    init: I,
     add: F,
-) -> S
+    merge: M,
+) -> anyhow::Result<A>
 where
-    S: Send,
-    F: Fn(&mut S, &CscMatrix<f32>, usize) + Sync,
+    A: Send,
+    I: Fn() -> A + Sync,
+    F: Fn(&mut A, &CscMatrix<f32>, usize) + Sync,
+    M: Fn(&mut A, A) + Sync,
 {
     let ncols = data.num_columns().unwrap_or(0);
     let nrows = data.num_rows().unwrap_or(0);
-    let stat = Mutex::new(stat);
-
     let jobs = create_jobs(ncols, nrows, block_size);
-
-    jobs.par_iter()
-        .progress_with(styled_progress_bar(jobs.len() as u64, "blocks"))
-        .for_each(|&(lb, ub)| {
-            let csc = data
-                .read_columns_csc((lb..ub).collect())
-                .expect("failed to read data");
-            let mut stat = stat.lock().expect("failed to lock the statistics");
-            add(&mut stat, &csc, lb);
-        });
-
-    stat.into_inner().expect("failed to unlock the statistics")
+    let prog_bar = styled_progress_bar(jobs.len() as u64, "blocks");
+    fold_in_fixed_order(
+        &jobs,
+        BLOCKS_PER_LEAF,
+        &init,
+        &|acc, &(lb, ub)| {
+            let csc = data.read_columns_csc((lb..ub).collect())?;
+            add(acc, &csc, lb);
+            prog_bar.inc(1);
+            Ok(())
+        },
+        &merge,
+    )
 }
 
 /// The rows of `select_rows` (those within `nrows`) as a mask over all
@@ -270,18 +323,26 @@ pub fn collect_column_row_stat(
 )> {
     let ncols = data.num_columns().unwrap_or(0);
     let nrows = data.num_rows().unwrap_or(0);
-    Ok(fold_column_blocks(
+    // A column's statistics are written once, by the block that holds it,
+    // so the order the blocks reach the lock in does not show in them.
+    let col_stat = Mutex::new(SparseColumnRunningStatistics::<f32>::new(ncols, nrows));
+    let row_stat = fold_column_blocks(
         data,
         block_size,
-        (
-            SparseColumnRunningStatistics::<f32>::new(ncols, nrows),
-            SparseRunningStatistics::<f32>::new(nrows),
-        ),
-        |(col_stat, row_stat), csc, lb| {
-            col_stat.add_csc(csc, lb);
+        || SparseRunningStatistics::<f32>::new(nrows),
+        |row_stat, csc, lb| {
+            col_stat
+                .lock()
+                .expect("failed to lock the column statistics")
+                .add_csc(csc, lb);
             row_stat.add_csc(csc);
         },
-    ))
+        |row_stat, other| row_stat.merge(&other),
+    )?;
+    let col_stat = col_stat
+        .into_inner()
+        .expect("failed to unlock the column statistics");
+    Ok((col_stat, row_stat))
 }
 
 /// collect column-wise sufficient statistics for Q/C
@@ -293,12 +354,24 @@ pub fn collect_column_stat(
 ) -> anyhow::Result<SparseColumnRunningStatistics<f32>> {
     let ncols = data.num_columns().unwrap_or(0);
     let nrows = data.num_rows().unwrap_or(0);
-    Ok(fold_column_blocks(
+    // A column's statistics are written once, by the block that holds it,
+    // so the order the blocks reach the lock in does not show in them.
+    let col_stat = Mutex::new(SparseColumnRunningStatistics::<f32>::new(ncols, nrows));
+    fold_column_blocks(
         data,
         block_size,
-        SparseColumnRunningStatistics::<f32>::new(ncols, nrows),
-        |stat, csc, lb| stat.add_csc(csc, lb),
-    ))
+        || (),
+        |_, csc, lb| {
+            col_stat
+                .lock()
+                .expect("failed to lock the column statistics")
+                .add_csc(csc, lb)
+        },
+        |_, _| (),
+    )?;
+    Ok(col_stat
+        .into_inner()
+        .expect("failed to unlock the column statistics"))
 }
 
 struct EmptyArgs {}

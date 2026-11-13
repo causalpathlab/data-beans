@@ -8,54 +8,10 @@
 //! invariants in one place and gives every caller a labelled progress
 //! bar with consistent styling.
 
+use crate::qc::{fold_in_fixed_order, BLOCKS_PER_LEAF};
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::sparse_stat::SparseRunningStatistics;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
-
-/// Column blocks folded into one accumulator at a leaf of
-/// [`fold_in_fixed_order`] by the streaming passes: one, so every block is
-/// read on a task of its own.
-pub(crate) const BLOCKS_PER_LEAF: usize = 1;
-
-/// Fold `items` into one accumulator over a fixed binary tree: a run of at
-/// most `leaf` items is folded in order into a fresh accumulator; a longer
-/// run is halved, the halves folded on separate rayon tasks and merged left
-/// into right.
-///
-/// The grouping of the floating-point sums then depends on `items.len()` and
-/// `leaf` alone, not on the thread count or on how rayon schedules the work,
-/// so the result is the same bits run to run. (A plain rayon `fold`/`reduce`
-/// splits where work stealing happens to split.)
-pub(crate) fn fold_in_fixed_order<T, A, I, F, M>(
-    items: &[T],
-    leaf: usize,
-    init: &I,
-    fold: &F,
-    merge: &M,
-) -> anyhow::Result<A>
-where
-    T: Sync,
-    A: Send,
-    I: Fn() -> A + Sync,
-    F: Fn(&mut A, &T) -> anyhow::Result<()> + Sync,
-    M: Fn(&mut A, A) + Sync,
-{
-    if items.len() <= leaf.max(1) {
-        let mut acc = init();
-        for item in items {
-            fold(&mut acc, item)?;
-        }
-        return Ok(acc);
-    }
-    let (left, right) = items.split_at(items.len() / 2);
-    let (left, right) = rayon::join(
-        || fold_in_fixed_order(left, leaf, init, fold, merge),
-        || fold_in_fixed_order(right, leaf, init, fold, merge),
-    );
-    let mut acc = left?;
-    merge(&mut acc, right?);
-    Ok(acc)
-}
 
 /// Stream cells through `data_vec` in `block_size` chunks, accumulating
 /// per-feature NB sufficient statistics in parallel and merging them in a

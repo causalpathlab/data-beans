@@ -262,7 +262,7 @@ impl Profiles {
         // pb-samples.
         const ROWS_PER_LEAF: usize = 256;
         let num_features = self.num_features;
-        let (stats, ..) = crate::alg::sparse_streaming::fold_in_fixed_order(
+        let (stats, ..) = crate::qc::fold_in_fixed_order(
             &self.rows,
             ROWS_PER_LEAF,
             &|| {

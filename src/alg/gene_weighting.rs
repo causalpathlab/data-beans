@@ -13,9 +13,8 @@
 
 use crate::alg::feature_coarsening::FeatureCoarsening;
 use crate::alg::nb_dispersion::DispersionTrend;
-use crate::alg::sparse_streaming::{
-    fold_in_fixed_order, streaming_sparse_running_stats, BLOCKS_PER_LEAF,
-};
+use crate::alg::sparse_streaming::streaming_sparse_running_stats;
+use crate::qc::{fold_in_fixed_order, BLOCKS_PER_LEAF};
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::sparse_stat::SparseRunningStatistics;
 use legume_numeric::matrix::traits::{IoOps, RunningStatOps};
