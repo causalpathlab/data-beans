@@ -4,6 +4,14 @@
 //! becomes one lineage before the tree grows below it. Cells only move within their batch: the entities are cells,
 //! the groups are (node, batch) pairs, and a cell's candidates are the
 //! groups of its own batch.
+//!
+//! The pass runs without the member-count limits of
+//! [`RefineParams`]: a node that is a mix of lineages gives all its cells
+//! to the nodes of those lineages and disappears, which a floor would only
+//! turn into a node of leftovers. The number of leaves is not lost with it
+//! — the tree grown below the remaining nodes splits them to the same
+//! targets. What keeps two nodes of one lineage from merging is the score
+//! alone, which does not prefer the larger of them.
 
 use super::*;
 use crate::alg::dc_poisson::{
@@ -104,6 +112,8 @@ pub(crate) fn reassign_cells_to_nodes(
         num_greedy: params.num_greedy,
         feature_weighting: params.feature_weighting,
         seed: params.seed,
+        size_floor: 0.0,
+        size_cap: 0.0,
         ..RefineParams::default()
     };
     let mut rng = SmallRng::seed_from_u64(params.seed);

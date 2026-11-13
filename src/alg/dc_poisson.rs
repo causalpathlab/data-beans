@@ -8,6 +8,13 @@
 //! different front-ends (cross-batch BBKNN, spatial KNN graph, ...) can
 //! plug in their own neighborhood definition.
 //!
+//! The partition handed in is kept as a partition: refinement makes its
+//! blocks purer without choosing how many there are or how large. Scores
+//! are built so that a block is not preferred for being large (see
+//! [`DcPoissonStats`]), an entity moves only on evidence beyond the noise
+//! of the block estimates, and member-count limits ([`RefineParams`]) keep
+//! every block near its starting size.
+//!
 //! The name "DC-Poisson" is deliberate: we are *not* inferring a stochastic
 //! block model — the blocks are given externally (by a prior coarsening
 //! step) and we only score membership moves. Compare to the full DC-SBM
@@ -110,6 +117,29 @@ pub struct RefineParams {
     /// moves — but converges fine for the multilevel DC-Poisson use case
     /// and is roughly P× faster on large pb-sample counts.
     pub parallel: bool,
+    /// Pseudo-counts per expressed feature behind every block profile,
+    /// spread over the features by the pooled profile (default `1`).
+    /// Replaces a hard floor under `ln(0)`: a feature a block has not seen
+    /// scores as the pooled rate shrunk by the block's mass, and an empty
+    /// block scores as the pooled profile. See [`DcPoissonStats`].
+    pub prior_count: f32,
+    /// Standard deviations of block-estimate noise by which a destination
+    /// has to beat the current block (default `1.5`; `0` asks for any
+    /// positive gain). The noise is larger for smaller blocks, so this is
+    /// what keeps a small block from losing, or taking in, members on the
+    /// strength of its own sampling error. See [`DcPoissonStats`].
+    pub min_gain_z: f32,
+    /// Fraction of `min(starting size, mean block size)` below which no
+    /// block is taken (default `0.9`); any positive value also keeps the
+    /// last member of every block. `0` lets blocks shrink and empty.
+    ///
+    /// The refinement is asked to make a given partition purer, not to
+    /// choose the number of blocks: by the likelihood alone, the members of
+    /// a mixed block all do better elsewhere, and the block dissolves.
+    pub size_floor: f32,
+    /// Multiple of `max(starting size, mean block size)` above which no
+    /// block is taken (default `1.5`). `0` lifts the limit.
+    pub size_cap: f32,
 }
 
 impl Default for RefineParams {
@@ -122,6 +152,10 @@ impl Default for RefineParams {
             gibbs_stagnation: 0.005,
             profile_source: ProfileSource::Raw,
             parallel: true,
+            prior_count: 1.0,
+            min_gain_z: 1.5,
+            size_floor: 0.9,
+            size_cap: 1.5,
         }
     }
 }
@@ -233,6 +267,59 @@ impl Profiles {
             });
     }
 
+    /// Rescale each entity's features by `pooled rate / rate in its batch`,
+    /// then recompute the size factors.
+    ///
+    /// `batch[e]` is the batch of entity `e`. A batch effect multiplies a
+    /// feature's rate in every entity of the batch, so entities of one
+    /// batch fit a block by how much of that batch it holds, whatever its
+    /// content, and a refinement on the raw profiles sorts them by batch.
+    /// Dividing by the batch's marginal rate removes the shared factor and
+    /// leaves the differences between entities of the same batch. A feature
+    /// a batch never shows is left as it is.
+    pub fn rescale_batches_to_pooled(&mut self, batch: &[usize]) {
+        assert_eq!(batch.len(), self.rows.len(), "one batch per entity");
+        let nb = batch.iter().copied().max().map_or(0, |b| b + 1);
+        if nb < 2 {
+            return;
+        }
+        let m = self.num_features;
+        let mut sums = vec![0f64; nb * m];
+        let mut batch_total = vec![0f64; nb];
+        for (row, &b) in self.rows.iter().zip(batch) {
+            for &(g, v) in row {
+                sums[b * m + g as usize] += v as f64;
+                batch_total[b] += v as f64;
+            }
+        }
+        let total: f64 = batch_total.iter().sum();
+        if total <= 0.0 {
+            return;
+        }
+        let mut ratio = vec![1f32; nb * m];
+        for g in 0..m {
+            let pooled = (0..nb).map(|b| sums[b * m + g]).sum::<f64>() / total;
+            for b in 0..nb {
+                let s = sums[b * m + g];
+                if s > 0.0 {
+                    ratio[b * m + g] = (pooled * batch_total[b] / s) as f32;
+                }
+            }
+        }
+        self.rows
+            .par_iter_mut()
+            .zip(self.size_factor.par_iter_mut())
+            .zip(batch.par_iter())
+            .for_each(|((row, sf), &b)| {
+                let mut new_sf = 0f32;
+                for (g, v) in row.iter_mut() {
+                    *v *= ratio[b * m + *g as usize];
+                    new_sf += *v;
+                }
+                *sf = new_sf;
+            });
+    }
+
     /// Apply the chosen feature weighting in place.
     ///
     /// [`FeatureWeighting::None`] is a no-op; [`FeatureWeighting::FisherInfoNb`]
@@ -313,6 +400,21 @@ impl Profiles {
 // Poisson sufficient statistics //
 ///////////////////////////////////
 
+/// `ln(x + a)` plus half the relative variance of a count `x` around
+/// `x + a`: the log of a smoothed block total, corrected for the downward
+/// bias of the plain log (see [`DcPoissonStats`]).
+///
+/// The variance of a Poisson count is the count. A total below one is not
+/// a count but a weighted fraction of one (`w · n` has variance `w² · n`,
+/// at most its square), so the variance is taken as `min(x, x²)`. That
+/// keeps the correction within `[0, 1/2]` whatever `a`, where `x / (x + a)²`
+/// alone would grow without bound for a small total on a rare feature.
+#[inline(always)]
+fn log_total(x: f64, a: f64) -> f64 {
+    let t = x + a;
+    fast_ln(t) + x.min(x * x) / (2.0 * t * t)
+}
+
 /// Sufficient statistics with cached log quantities for O(K · nnz(row)) scoring.
 ///
 /// `gene_sum[g·K + k]` = Σ_{e : z_e = k} y_eg; `size_sum[k]` = Σ_{e : z_e = k} s_e.
@@ -324,9 +426,45 @@ impl Profiles {
 /// leave-one-out score takes one `fast_ln` per nonzero feature, and
 /// `delta_move` refreshes the logs of the columns a move touches.
 ///
-/// Log caches are `f32` — values live in roughly `[-20, +25]` (dominated by
-/// `-ln(LOG_EPS)` at the floor), and scoring is noise-dominated so f32's
-/// ~7-digit precision is ample. Halves the largest allocation versus f64.
+/// # The score
+///
+/// Block `k`'s rate for feature `g` is the smoothed share
+/// `(G_kg + a_g) / (S_k + α)`, with `a_g = α · π_g`, `π` the pooled feature
+/// profile and `α = prior_count · M₊` (`M₊` = features with positive pooled
+/// mass): on average `prior_count` pseudo-counts per expressed feature. A
+/// feature a block has not seen costs `ln(a_g / (S_k + α))`, the pooled rate
+/// shrunk by the block's own mass, and an empty block scores as the pooled
+/// profile. The mass is set in counts per feature, not in entities: the
+/// expansions below need `a_g` of the order of one count, which a mass tied
+/// to the entity size loses at low depth and overshoots at high depth,
+/// where it would pull small distinct blocks toward the pooled profile.
+///
+/// A block's total `G_kg` is a noisy count. With `G ~ Poisson(μ)`,
+/// `E ln(G + a) ≈ ln(μ + a) − μ / (2 (μ + a)²)`: the plain log is biased
+/// low, by more the smaller the block. Summed over an entity's counts the
+/// deficit is about `s_e · M₊ / (2 S_k)`, that is `(s_e / s̄) · M₊ / (2 n_k)`
+/// nats for a block of `n_k` typical entities: it depends on the block's
+/// size, not on its profile, and not on the depth. Left in, it makes every
+/// entity prefer the larger of two blocks with one profile, and small
+/// blocks drain. The cached value is therefore
+/// `ln(G + a) + G / (2 (G + a)²)`, which cancels that term to first order,
+/// so that blocks of one profile score alike whatever their size (for a
+/// total below one count, as weighted profiles have, the variance is taken
+/// as `G²`, which bounds the correction by one half).
+///
+/// What remains is zero-mean noise. Its variance is
+/// `Σ_g y_eg² · μ_g / (μ_g + a_g)²`, which for a block that shares the
+/// pooled profile (`μ_g = S_k π_g`) is `r_e · v_k` with
+/// `r_e = Σ_g y_eg² / π_g` and `v_k = S_k / (S_k + α)²`. A destination is
+/// charged `min_gain_z` standard deviations of the difference between its
+/// score and the current block's, `z · sqrt(r_e · (v_cur + v_k))`: a move
+/// has to beat what the block estimates alone would produce between two
+/// blocks of one profile. Everything is in nats derived from the same
+/// Poisson model, so `z` means the same at every depth.
+///
+/// Log caches are `f32` — values live in roughly `[-25, +25]` and scoring
+/// is noise-dominated, so f32's ~7-digit precision is ample. Halves the
+/// largest allocation versus f64.
 #[derive(Clone)]
 pub struct DcPoissonStats {
     pub k: usize,
@@ -335,9 +473,23 @@ pub struct DcPoissonStats {
     /// Feature-major `M × K`: entry `g·K + k`.
     pub gene_sum: Vec<f64>,
     pub size_sum: Vec<f64>,
-    /// Feature-major `M × K`: entry `g·K + k`.
+    /// Feature-major `M × K`: entry `g·K + k`. Holds the bias-corrected
+    /// log `ln(G + a_g) + min(G, G²) / (2 (G + a_g)²)`.
     pub log_gene: Vec<f32>,
+    /// `−ln(S_k + α)`.
     pub log_size_offset: Vec<f32>,
+    /// Members per block.
+    pub count: Vec<usize>,
+    /// Pseudo-count `a_g` of each feature (never below [`LOG_EPS`]).
+    pub prior: Vec<f64>,
+    /// Total pseudo-count mass `Σ_g a_g`.
+    pub prior_mass: f64,
+    /// Noise weight `r_e = Σ_g y_eg² / π_g` of each entity.
+    pub noise: Vec<f32>,
+    /// Estimate variance `v_k = S_k / (S_k + α)²` of each block.
+    pub block_var: Vec<f64>,
+    /// Standard deviations of estimate noise a move has to clear.
+    pub min_gain_z: f64,
 }
 
 impl DcPoissonStats {
@@ -347,35 +499,96 @@ impl DcPoissonStats {
         g * self.k + k
     }
 
+    /// Statistics under the default [`RefineParams`] scoring.
     pub fn from_profiles(profiles: &Profiles, k: usize, membership: &[usize]) -> Self {
+        Self::from_profiles_with(profiles, k, membership, &RefineParams::default())
+    }
+
+    /// Statistics scored with `params.prior_count` and `params.min_gain_z`.
+    pub fn from_profiles_with(
+        profiles: &Profiles,
+        k: usize,
+        membership: &[usize],
+        params: &RefineParams,
+    ) -> Self {
         let m = profiles.num_features;
         let mut gene_sum = vec![0f64; k * m];
         let mut size_sum = vec![0f64; k];
+        let mut count = vec![0usize; k];
+        let mut pooled = vec![0f64; m];
         for (e, row) in profiles.rows.iter().enumerate() {
             let z = membership[e];
             assert!(z < k, "membership[{}]={} out of range 0..{}", e, z, k);
             for &(g, v) in row {
                 gene_sum[g as usize * k + z] += v as f64;
+                pooled[g as usize] += v as f64;
             }
             size_sum[z] += profiles.size_factor[e] as f64;
+            count[z] += 1;
         }
-        let log_gene: Vec<f32> = gene_sum
-            .iter()
-            .map(|&s| fast_ln(s + LOG_EPS) as f32)
+        let total: f64 = pooled.iter().sum();
+        let expressed = pooled.iter().filter(|&&x| x > 0.0).count() as f64;
+        let alpha = (params.prior_count.max(0.0) as f64) * expressed;
+        // r_e = Σ y² / π_g = Σ y² · total / pooled_g; a feature an entity
+        // has a positive count in has positive pooled mass.
+        let noise: Vec<f32> = profiles
+            .rows
+            .par_iter()
+            .map(|row| {
+                row.iter()
+                    .filter(|&&(_, v)| v > 0.0)
+                    .map(|&(g, v)| (v as f64) * (v as f64) * total / pooled[g as usize])
+                    .sum::<f64>() as f32
+            })
             .collect();
-        let m_eps = m as f64 * LOG_EPS;
-        let log_size_offset: Vec<f32> = size_sum
-            .iter()
-            .map(|&s| -fast_ln(s + m_eps) as f32)
-            .collect();
-        Self {
+        let scale = if total > 0.0 { alpha / total } else { 0.0 };
+        let prior: Vec<f64> = pooled.iter().map(|&x| x * scale + LOG_EPS).collect();
+        let prior_mass = alpha + m as f64 * LOG_EPS;
+        let mut stats = Self {
             k,
             num_features: m,
             membership: membership.to_vec(),
             gene_sum,
             size_sum,
-            log_gene,
-            log_size_offset,
+            log_gene: vec![0f32; k * m],
+            log_size_offset: vec![0f32; k],
+            count,
+            prior,
+            prior_mass,
+            noise,
+            block_var: vec![0f64; k],
+            min_gain_z: params.min_gain_z.max(0.0) as f64,
+        };
+        stats.refresh_caches();
+        stats
+    }
+
+    /// `v = S / (S + α)²` for a block of mass `s`.
+    #[inline(always)]
+    fn var_of(&self, s: f64) -> f64 {
+        let t = s + self.prior_mass;
+        s / (t * t)
+    }
+
+    /// Refresh the per-block caches of block `k`.
+    #[inline]
+    fn refresh_block(&mut self, k: usize) {
+        self.log_size_offset[k] = -fast_ln(self.size_sum[k] + self.prior_mass) as f32;
+        self.block_var[k] = self.var_of(self.size_sum[k]);
+    }
+
+    /// Rebuild every cache from the running sums.
+    fn refresh_caches(&mut self) {
+        let k = self.k;
+        for (g, &a) in self.prior.iter().enumerate() {
+            let sums = &self.gene_sum[g * k..(g + 1) * k];
+            let logs = &mut self.log_gene[g * k..(g + 1) * k];
+            for (l, &s) in logs.iter_mut().zip(sums) {
+                *l = log_total(s, a) as f32;
+            }
+        }
+        for b in 0..k {
+            self.refresh_block(b);
         }
     }
 
@@ -385,26 +598,27 @@ impl DcPoissonStats {
             return;
         }
         let kk = self.k;
-        let m = self.num_features;
-        let m_eps = m as f64 * LOG_EPS;
 
         // Subtractions clamp at zero: the running sums accumulate rounding
         // residues, and a block drained back to (true) zero can otherwise be
-        // left with a negative residue larger than LOG_EPS — feeding
-        // `ln(negative) = NaN` into the log caches.
+        // left with a negative residue larger than its pseudo-count —
+        // feeding `ln(negative) = NaN` into the log caches.
         for &(g, v) in &profiles.rows[e] {
             let base = g as usize * kk;
+            let a = self.prior[g as usize];
             let (i_from, i_to) = (base + k_from, base + k_to);
             self.gene_sum[i_from] = (self.gene_sum[i_from] - v as f64).max(0.0);
             self.gene_sum[i_to] += v as f64;
-            self.log_gene[i_from] = fast_ln(self.gene_sum[i_from] + LOG_EPS) as f32;
-            self.log_gene[i_to] = fast_ln(self.gene_sum[i_to] + LOG_EPS) as f32;
+            self.log_gene[i_from] = log_total(self.gene_sum[i_from], a) as f32;
+            self.log_gene[i_to] = log_total(self.gene_sum[i_to], a) as f32;
         }
         let sf = profiles.size_factor[e] as f64;
         self.size_sum[k_from] = (self.size_sum[k_from] - sf).max(0.0);
         self.size_sum[k_to] += sf;
-        self.log_size_offset[k_from] = -fast_ln(self.size_sum[k_from] + m_eps) as f32;
-        self.log_size_offset[k_to] = -fast_ln(self.size_sum[k_to] + m_eps) as f32;
+        self.count[k_from] = self.count[k_from].saturating_sub(1);
+        self.count[k_to] += 1;
+        self.refresh_block(k_from);
+        self.refresh_block(k_to);
 
         self.membership[e] = k_to;
     }
@@ -413,23 +627,18 @@ impl DcPoissonStats {
     #[cfg(test)]
     fn recompute(&mut self, profiles: &Profiles) {
         let k = self.k;
-        let m = self.num_features;
         self.gene_sum.iter_mut().for_each(|x| *x = 0.0);
         self.size_sum.iter_mut().for_each(|x| *x = 0.0);
+        self.count.iter_mut().for_each(|x| *x = 0);
         for (e, row) in profiles.rows.iter().enumerate() {
             let z = self.membership[e];
             for &(g, v) in row {
                 self.gene_sum[g as usize * k + z] += v as f64;
             }
             self.size_sum[z] += profiles.size_factor[e] as f64;
+            self.count[z] += 1;
         }
-        for i in 0..k * m {
-            self.log_gene[i] = fast_ln(self.gene_sum[i] + LOG_EPS) as f32;
-        }
-        let m_eps = m as f64 * LOG_EPS;
-        for i in 0..k {
-            self.log_size_offset[i] = -fast_ln(self.size_sum[i] + m_eps) as f32;
-        }
+        self.refresh_caches();
     }
 }
 
@@ -437,33 +646,22 @@ impl DcPoissonStats {
 // Scoring kernels //
 /////////////////////
 
-/// Score entity `e` for one destination `k` (Poisson plug-in MAP, up to a
-/// common constant):
-/// `  s(e, k) = Σ_{g : y_eg > 0} y_eg · ln(gene_sum⁻ᵉ[k, g] + ε) − size_factor[e] · ln(size_sum⁻ᵉ[k] + Mε)`
-///
-/// where `⁻ᵉ` means entity `e`'s own contribution is excluded. Candidate
-/// blocks never contain `e`, so they read straight from the log caches; the
-/// entity's *current* block subtracts `e`'s row before taking logs
-/// (leave-one-out). Scoring the current block with `e` included would give
-/// "stay put" a self-inclusion bonus that grows with the entity's size
-/// factor and shrinks with block mass — anchoring large entities in place.
-///
-/// Reference for [`compute_log_probs_restricted`], which scores all allowed
-/// blocks in one pass with the same per-block summation order (so the two
-/// agree bit for bit).
+/// Score entity `e` for one destination `k`, as documented on
+/// [`compute_log_probs_restricted`], which scores all allowed blocks in one
+/// pass with the same per-block summation order (so the two agree bit for
+/// bit). Test reference.
 #[cfg(test)]
 fn score_move(e: usize, k: usize, stats: &DcPoissonStats, profiles: &Profiles) -> f64 {
-    let m = stats.num_features;
     let sf = profiles.size_factor[e] as f64;
     let row = &profiles.rows[e];
-    if stats.membership[e] == k {
-        let m_eps = m as f64 * LOG_EPS;
+    let cur = stats.membership[e];
+    if cur == k {
         let loo_size = (stats.size_sum[k] - sf).max(0.0);
-        let mut acc = -sf * fast_ln(loo_size + m_eps);
+        let mut acc = -sf * fast_ln(loo_size + stats.prior_mass);
         for &(g, v) in row {
             let vg = v as f64;
             let loo = (stats.gene_sum[stats.idx(k, g as usize)] - vg).max(0.0);
-            acc += vg * fast_ln(loo + LOG_EPS);
+            acc += vg * log_total(loo, stats.prior[g as usize]);
         }
         acc
     } else {
@@ -471,18 +669,27 @@ fn score_move(e: usize, k: usize, stats: &DcPoissonStats, profiles: &Profiles) -
         for &(g, v) in row {
             acc += v as f64 * stats.log_gene[stats.idx(k, g as usize)] as f64;
         }
-        acc
+        let v_cur = stats.var_of((stats.size_sum[cur] - sf).max(0.0));
+        acc - stats.min_gain_z * (stats.noise[e] as f64 * (v_cur + stats.block_var[k])).sqrt()
     }
 }
 
 /// Log-probability of placing entity `e` into each of the `allowed` blocks.
 ///
-/// `  s(e, k) = Σ_{g : y_eg > 0} y_eg · ln(gene_sum⁻ᵉ[k, g] + ε) − size_factor[e] · ln(size_sum⁻ᵉ[k] + Mε)`
+/// `  s(e, k) = Σ_{g : y_eg > 0} y_eg · L(G⁻ᵉ[k, g], a_g) − size_factor[e] · ln(S⁻ᵉ[k] + α)`
 ///
-/// `⁻ᵉ` means entity `e`'s own contribution is excluded: candidate blocks
-/// never contain `e` and read the log caches, while `e`'s *current* block
+/// with `L(G, a) = ln(G + a) + min(G, G²) / (2 (G + a)²)` the bias-corrected
+/// log of the smoothed block total (see [`DcPoissonStats`]). `⁻ᵉ` means
+/// entity `e`'s own contribution is excluded: candidate blocks never
+/// contain `e` and read the log caches, while `e`'s *current* block
 /// subtracts `e`'s row before taking logs (leave-one-out) — otherwise
 /// "stay put" earns a self-inclusion bonus that anchors large entities.
+///
+/// Every block other than the current one is then charged
+/// `min_gain_z · sqrt(r_e · (v_cur + v_k))`, the estimate noise of the
+/// difference to the current block's score, so that comparing a slot with
+/// the current block's — by argmax or by sampling — already asks for a gain
+/// beyond that noise.
 ///
 /// All blocks are scored in one pass over `e`'s nonzero features: per
 /// feature, the `K` cached values sit side by side (feature-major layout),
@@ -506,7 +713,6 @@ pub fn compute_log_probs_restricted(
     log_probs: &mut [f64],
 ) {
     let kk = stats.k;
-    let m = stats.num_features;
     let sf = profiles.size_factor[e] as f64;
     let row = &profiles.rows[e];
     let cur = stats.membership[e];
@@ -516,18 +722,24 @@ pub fn compute_log_probs_restricted(
     let score_cur = dense || allowed.contains(&cur);
 
     // Leave-one-out score of the current block.
+    let loo_size = (stats.size_sum[cur] - sf).max(0.0);
     let mut cur_acc = if score_cur {
-        let loo_size = (stats.size_sum[cur] - sf).max(0.0);
-        -sf * fast_ln(loo_size + m as f64 * LOG_EPS)
+        -sf * fast_ln(loo_size + stats.prior_mass)
     } else {
         0.0
     };
-    let mut add_cur = |base: usize, vg: f64| {
+    let mut add_cur = |g: usize, base: usize, vg: f64| {
         if score_cur {
             let loo = (stats.gene_sum[base + cur] - vg).max(0.0);
-            cur_acc += vg * fast_ln(loo + LOG_EPS);
+            cur_acc += vg * log_total(loo, stats.prior[g]);
         }
     };
+
+    // Estimate noise of a move out of the current block, per destination.
+    let z = stats.min_gain_z;
+    let noise = stats.noise[e] as f64;
+    let v_cur = stats.var_of(loo_size);
+    let charge = |k: usize| z * (noise * (v_cur + stats.block_var[k])).sqrt();
 
     // Cached (non-leave-one-out) scores for every allowed block, including
     // the current one, which is overwritten at the end.
@@ -542,7 +754,12 @@ pub fn compute_log_probs_restricted(
             for (slot, &l) in log_probs[..kk].iter_mut().zip(logs) {
                 *slot += vg * l as f64;
             }
-            add_cur(base, vg);
+            add_cur(g as usize, base, vg);
+        }
+        if z > 0.0 {
+            for (k, slot) in log_probs[..kk].iter_mut().enumerate() {
+                *slot -= charge(k);
+            }
         }
     } else {
         thread_local! {
@@ -563,10 +780,10 @@ pub fn compute_log_probs_restricted(
                 for (acc, &k) in scratch.iter_mut().zip(allowed) {
                     *acc += vg * logs[k] as f64;
                 }
-                add_cur(base, vg);
+                add_cur(g as usize, base, vg);
             }
             for (&acc, &k) in scratch.iter().zip(allowed) {
-                log_probs[k] = acc;
+                log_probs[k] = if z > 0.0 { acc - charge(k) } else { acc };
             }
         });
     }
@@ -623,19 +840,63 @@ pub fn argmax_log_restricted(log_probs: &[f64], allowed: &[usize]) -> usize {
     best
 }
 
-/// Argmax over `allowed` indices that leaves `current` only for a strictly
-/// better block: a tie with the current label (an entity with no evidence
-/// scores every block alike) is not a move. With `current` outside
-/// `allowed`, ties go to the first allowed index.
-pub fn argmax_log_restricted_from(log_probs: &[f64], allowed: &[usize], current: usize) -> usize {
-    let mut best = if allowed.contains(&current) {
-        current
+/// Score of the entity's `current` block, the bar a destination has to
+/// clear. A candidate list without the current block (which a
+/// [`CandidateProposer`] must not return) leaves that slot stale, so the
+/// bar is then absent and any finite destination clears it.
+#[inline]
+fn staying_score(log_probs: &[f64], allowed: &[usize], current: usize) -> f64 {
+    if allowed.contains(&current) {
+        log_probs[current]
     } else {
-        allowed[0]
+        f64::NEG_INFINITY
+    }
+}
+
+/// Gumbel-max draw among the entity's `current` block and the `allowed`
+/// blocks that score strictly above it; non-finite scores are skipped.
+///
+/// A block that does not beat the current one is never drawn, so an entity
+/// with no evidence for a move stays where it is, and a sweep of draws
+/// cannot shuffle entities between blocks that score alike.
+fn sample_improving_log(
+    log_probs: &[f64],
+    allowed: &[usize],
+    current: usize,
+    rng: &mut SmallRng,
+) -> usize {
+    let cur_val = staying_score(log_probs, allowed, current);
+    let mut gumbel = |lp: f64| {
+        let u: f64 = rng.random_range(1e-12..1.0_f64);
+        lp - (-u.ln()).ln()
     };
-    let mut best_val = log_probs[best];
+    let mut best_idx = current;
+    let mut best_key = if cur_val.is_finite() {
+        gumbel(cur_val)
+    } else {
+        f64::NEG_INFINITY
+    };
     for &k in allowed {
-        if log_probs[k] > best_val {
+        let lp = log_probs[k];
+        if k != current && lp.is_finite() && lp > cur_val {
+            let key = gumbel(lp);
+            if key > best_key {
+                best_key = key;
+                best_idx = k;
+            }
+        }
+    }
+    best_idx
+}
+
+/// Best-scoring block of `allowed`, keeping `current` unless another block
+/// scores strictly higher: a tie, or a score that does not compare, is no
+/// evidence for a move.
+fn argmax_log_staying(log_probs: &[f64], allowed: &[usize], current: usize) -> usize {
+    let mut best = current;
+    let mut best_val = staying_score(log_probs, allowed, current);
+    for &k in allowed {
+        if k != current && log_probs[k] > best_val {
             best = k;
             best_val = log_probs[k];
         }
@@ -790,14 +1051,6 @@ pub fn intersect_with_siblings_fallback(
 // Sweep drivers //
 ///////////////////
 
-/// Refine `labels` in place for one level by running Gibbs + greedy sweeps
-/// over `profiles` with the given pre-built `candidates` and a custom
-/// [`MoveGuard`]. Returns total accepted moves across all sweeps.
-///
-/// A proposed move `from → to` is applied only when `guard.accept_move(...)`
-/// returns `true`. In Gibbs sweeps, a vetoed move leaves the entity in its
-/// current group for this sweep. Greedy sweeps likewise skip the move.
-///
 /// Shared sweep-driver context bundling the readonly inputs that every
 /// `refine_with_*` variant needs. Kept as a struct so the driver fns don't
 /// exceed clippy's argument-count threshold.
@@ -815,24 +1068,168 @@ struct SweepCounts {
     vetoed: usize,
 }
 
-/// Apply a precomputed `proposals` vector to `stats` sequentially, consulting
-/// the move guard. Shared by both Jacobi sweeps after the parallel proposal
-/// phase. The guard sees the membership-being-updated, matching the
-/// sequential semantics.
+/// Member-count limits of every block, fixed from the partition a
+/// refinement starts with.
+///
+/// With `n₀` a block's starting size and `n̄` the mean size of the occupied
+/// blocks, a block is never taken below
+/// `ceil(size_floor · min(n₀, n̄))` members nor above
+/// `ceil(size_cap · max(n₀, n̄))`. A block larger than the mean can give
+/// members down to the mean and one smaller than the mean can take them up
+/// to it, so sizes may even out, but a small block cannot be drained nor a
+/// large one keep growing. Any positive floor is at least one member: no
+/// block is emptied.
+///
+/// The limits are checked against the live counts when a move is applied,
+/// not when it is proposed: the proposals of a Jacobi sweep are made
+/// against one snapshot and would otherwise all pass together.
+struct SizeLimits {
+    floor: Vec<usize>,
+    cap: Vec<usize>,
+}
+
+impl SizeLimits {
+    fn new(count: &[usize], params: &RefineParams) -> Self {
+        let occupied = count.iter().filter(|&&c| c > 0).count().max(1);
+        let n_bar = count.iter().sum::<usize>() as f64 / occupied as f64;
+        let size_floor = params.size_floor as f64;
+        let size_cap = params.size_cap as f64;
+        let floor = count
+            .iter()
+            .map(|&n0| {
+                if size_floor > 0.0 {
+                    ((size_floor * (n0 as f64).min(n_bar)).ceil() as usize).max(1)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let cap = count
+            .iter()
+            .map(|&n0| {
+                if size_cap > 0.0 {
+                    (size_cap * (n0 as f64).max(n_bar)).ceil() as usize
+                } else {
+                    usize::MAX
+                }
+            })
+            .collect();
+        Self { floor, cap }
+    }
+
+    /// May a member leave `from` at all, given the member counts?
+    #[inline]
+    fn can_leave(&self, count: &[usize], from: usize) -> bool {
+        count[from] > self.floor[from]
+    }
+
+    /// May a member move `from → to`, given the member counts?
+    #[inline]
+    fn admits(&self, count: &[usize], from: usize, to: usize) -> bool {
+        self.can_leave(count, from) && count[to] < self.cap[to]
+    }
+}
+
+/// What every sweep of one refinement reads.
+struct SweepEnv<'a, G> {
+    candidates: &'a [Vec<usize>],
+    profiles: &'a Profiles,
+    limits: &'a SizeLimits,
+    guard: &'a G,
+}
+
+/// Buffers of a Jacobi sweep, allocated once per refinement.
+struct JacobiScratch {
+    /// Destination each entity proposes (its current block: no move).
+    proposals: Vec<usize>,
+    /// Score gain of each proposed move over staying.
+    gains: Vec<f32>,
+    /// Entities that proposed a move, in the order they are applied.
+    movers: Vec<u32>,
+    /// Blocks a move of this sweep has already changed.
+    changed: Vec<bool>,
+    /// Score buffer for re-checking a move against the live statistics.
+    log_probs: Vec<f64>,
+}
+
+impl JacobiScratch {
+    fn new(num_entities: usize, k: usize) -> Self {
+        Self {
+            proposals: vec![0; num_entities],
+            gains: vec![0.0; num_entities],
+            movers: Vec::with_capacity(num_entities),
+            changed: vec![false; k],
+            log_probs: vec![f64::NEG_INFINITY; k],
+        }
+    }
+}
+
+/// Apply the proposals of a Jacobi sweep to `stats`, largest gain first.
+///
+/// Every proposal was scored against the pre-sweep snapshot, so it is only
+/// as good as that snapshot still is when its turn comes:
+/// - the size limits are read off the live member counts;
+/// - a move between blocks that an earlier move of this sweep has changed
+///   is scored again on the live statistics and dropped unless it still
+///   gains. Without this, entities that each want to leave the same
+///   company all leave together and all come back the next sweep.
+///
+/// Applying in order of gain makes a mixed block shed its worst-fitting
+/// members first; the members that fit are re-scored against what is left
+/// and stay.
 fn apply_proposals<G: MoveGuard>(
-    proposals: &[usize],
+    env: &SweepEnv<G>,
+    scratch: &mut JacobiScratch,
     stats: &mut DcPoissonStats,
-    profiles: &Profiles,
-    guard: &G,
 ) -> SweepCounts {
+    let SweepEnv {
+        profiles,
+        limits,
+        guard,
+        ..
+    } = *env;
     let mut sc = SweepCounts::default();
-    for (e, &new) in proposals.iter().enumerate() {
+    let JacobiScratch {
+        proposals,
+        gains,
+        movers,
+        changed,
+        log_probs,
+    } = scratch;
+    movers.clear();
+    movers.extend(
+        proposals
+            .iter()
+            .zip(&stats.membership)
+            .enumerate()
+            .filter(|(_, (new, old))| new != old)
+            .map(|(e, _)| e as u32),
+    );
+    movers.sort_unstable_by(|&a, &b| {
+        gains[b as usize]
+            .total_cmp(&gains[a as usize])
+            .then(a.cmp(&b))
+    });
+    changed.iter_mut().for_each(|c| *c = false);
+    for &e in movers.iter() {
+        let e = e as usize;
+        let new = proposals[e];
         let old = stats.membership[e];
-        if new == old {
+        if !limits.admits(&stats.count, old, new) {
             continue;
+        }
+        if changed[old] || changed[new] {
+            compute_log_probs_restricted(e, stats, profiles, &[old, new], log_probs);
+            // `partial_cmp` so that a score that does not compare keeps
+            // the entity in place.
+            if log_probs[new].partial_cmp(&log_probs[old]) != Some(std::cmp::Ordering::Greater) {
+                continue;
+            }
         }
         if guard.accept_move(e, old, &stats.membership) {
             stats.delta_move(e, old, new, profiles);
+            changed[old] = true;
+            changed[new] = true;
             sc.moves += 1;
         } else {
             sc.vetoed += 1;
@@ -844,13 +1241,11 @@ fn apply_proposals<G: MoveGuard>(
 /// Gauss–Seidel sequential sweep. For each entity visited in `order`, scores
 /// the candidate destinations under the live (mutated) stats, picks one via
 /// `pick(log_probs, candidates, current_label)`, and applies the move through
-/// the guard. Gibbs callers shuffle `order` and pass a categorical-sampling
-/// closure; greedy callers pass `0..n` and an argmax closure.
+/// the size limits and the guard. Gibbs callers shuffle `order` and pass a
+/// sampling closure; greedy callers pass `0..n` and an argmax closure.
 fn sweep_sequential<G, F, I>(
-    candidates: &[Vec<usize>],
+    env: &SweepEnv<G>,
     stats: &mut DcPoissonStats,
-    profiles: &Profiles,
-    guard: &G,
     log_probs: &mut [f64],
     order: I,
     mut pick: F,
@@ -860,16 +1255,22 @@ where
     F: FnMut(&[f64], &[usize], usize) -> usize,
     I: IntoIterator<Item = usize>,
 {
+    let SweepEnv {
+        candidates,
+        profiles,
+        limits,
+        guard,
+    } = *env;
     let mut sc = SweepCounts::default();
     for e in order {
         let cand = &candidates[e];
-        if cand.len() < 2 {
+        let old = stats.membership[e];
+        if cand.len() < 2 || !limits.can_leave(&stats.count, old) {
             continue;
         }
         compute_log_probs_restricted(e, stats, profiles, cand, log_probs);
-        let old = stats.membership[e];
         let new = pick(log_probs, cand, old);
-        if new == old {
+        if new == old || !limits.admits(&stats.count, old, new) {
             continue;
         }
         if guard.accept_move(e, old, &stats.membership) {
@@ -884,52 +1285,73 @@ where
 
 /// Jacobi sweep: every entity computes its proposal against a frozen pre-sweep
 /// snapshot of `stats` (rayon `par_iter`); proposals are then applied
-/// sequentially with the move guard.
+/// sequentially by [`apply_proposals`].
 ///
 /// `pick(log_probs, cand, e, current)` chooses the destination given the
 /// restricted log-likelihoods. For Gibbs it derives a per-entity RNG from
-/// `(sweep_seed, e)` and samples categorically; for greedy it ignores `e`
-/// and argmaxes.
-/// `proposals` is a reusable scratch buffer of length `candidates.len()` —
-/// hoisted by the driver across sweeps to avoid re-allocating.
+/// `(sweep_seed, e)` and samples; for greedy it ignores `e` and argmaxes.
 fn sweep_jacobi<G: MoveGuard, F>(
-    candidates: &[Vec<usize>],
+    env: &SweepEnv<G>,
     stats: &mut DcPoissonStats,
-    profiles: &Profiles,
-    guard: &G,
-    k: usize,
-    proposals: &mut [usize],
+    scratch: &mut JacobiScratch,
     pick: F,
 ) -> SweepCounts
 where
     F: Fn(&[f64], &[usize], usize, usize) -> usize + Sync,
 {
-    debug_assert_eq!(proposals.len(), candidates.len());
+    let SweepEnv {
+        candidates,
+        profiles,
+        limits,
+        ..
+    } = *env;
+    debug_assert_eq!(scratch.proposals.len(), candidates.len());
     {
         // Immutable reborrow so the rayon closure can capture `&stats: Sync`
         // while the outer `&mut` is held across the propose / apply phases.
         let stats: &DcPoissonStats = stats;
-        proposals
+        let k = stats.k;
+        scratch
+            .proposals
             .par_iter_mut()
+            .zip(scratch.gains.par_iter_mut())
             .enumerate()
             .with_min_len(256)
             .for_each_init(
                 || vec![f64::NEG_INFINITY; k],
-                |log_probs, (e, prop)| {
+                |log_probs, (e, (prop, gain))| {
                     let cand = &candidates[e];
                     let current = stats.membership[e];
-                    if cand.len() < 2 {
-                        *prop = current;
+                    *prop = current;
+                    // A block at its floor gives no member this sweep.
+                    if cand.len() < 2 || !limits.can_leave(&stats.count, current) {
                         return;
                     }
                     compute_log_probs_restricted(e, stats, profiles, cand, log_probs);
-                    *prop = pick(log_probs, cand, e, current);
+                    let new = pick(log_probs, cand, e, current);
+                    if new != current {
+                        *prop = new;
+                        *gain = (log_probs[new] - log_probs[current]) as f32;
+                    }
                 },
             );
     }
-    apply_proposals(proposals, stats, profiles, guard)
+    apply_proposals(env, scratch, stats)
 }
 
+/// Refine `labels` in place for one level by running Gibbs + greedy sweeps
+/// over `profiles` with the given pre-built `candidates` and a custom
+/// [`MoveGuard`]. Returns total accepted moves across all sweeps.
+///
+/// An entity moves only to a block that scores above its current one by
+/// more than the noise of the two block estimates (see [`DcPoissonStats`]);
+/// equal scores keep it where it is. Gibbs sweeps draw among such blocks,
+/// greedy sweeps take the best, and greedy sweeps stop at the first one
+/// that moves nothing. A move is applied only when the size limits of
+/// [`RefineParams::size_floor`] / [`RefineParams::size_cap`] allow it and
+/// `guard.accept_move(...)` returns `true`; otherwise the entity stays in
+/// its current group for this sweep.
+///
 /// This is the lowest-level driver. Pass [`NoGuard`] to get the unguarded
 /// behavior; most callers should prefer the convenience wrappers
 /// [`refine_with_candidates`] / [`refine_with_proposer`] /
@@ -952,21 +1374,23 @@ pub fn refine_with_candidates_guarded<G: MoveGuard>(
         level_label,
     } = *ctx;
     let num_entities = labels.len();
-    let mut stats = DcPoissonStats::from_profiles(profiles, k, labels);
-    let mut log_probs = vec![f64::NEG_INFINITY; k];
+    let mut stats = DcPoissonStats::from_profiles_with(profiles, k, labels, params);
+    let limits = SizeLimits::new(&stats.count, params);
+    let env = SweepEnv {
+        candidates,
+        profiles,
+        limits: &limits,
+        guard,
+    };
     let mut total_moves = 0usize;
     let mut total_vetoed = 0usize;
 
-    // Reusable proposal scratch for Jacobi sweeps — hoisted so the
-    // num_sweeps × num_entities allocation isn't repeated each sweep.
-    let mut proposals: Vec<usize> = if params.parallel {
-        vec![0usize; num_entities]
-    } else {
-        Vec::new()
-    };
-
-    // Reusable shuffled-order buffer for sequential Gibbs sweeps. Greedy
-    // sequential iterates `0..num_entities` directly and ignores this.
+    // Reusable buffers, hoisted so that no sweep allocates: the proposal
+    // scratch for Jacobi sweeps, or the score buffer and the visiting order
+    // for sequential ones (greedy sequential iterates `0..num_entities`
+    // directly and ignores the order).
+    let mut scratch = JacobiScratch::new(if params.parallel { num_entities } else { 0 }, k);
+    let mut log_probs = vec![f64::NEG_INFINITY; if params.parallel { 0 } else { k }];
     let mut order: Vec<usize> = if !params.parallel {
         (0..num_entities).collect()
     } else {
@@ -992,30 +1416,23 @@ pub fn refine_with_candidates_guarded<G: MoveGuard>(
             let sc = if params.parallel {
                 let sweep_seed = jacobi_base_seed.wrapping_mul(sweep as u64 + 1);
                 sweep_jacobi(
-                    candidates,
+                    &env,
                     &mut stats,
-                    profiles,
-                    guard,
-                    k,
-                    &mut proposals,
+                    &mut scratch,
                     |log_probs, cand, e, current| {
                         let vertex_seed = sweep_seed ^ (e as u64).wrapping_mul(2654435761);
                         let mut rng = SmallRng::seed_from_u64(vertex_seed);
-                        sample_categorical_log_restricted(log_probs, cand, current, &mut rng)
+                        sample_improving_log(log_probs, cand, current, &mut rng)
                     },
                 )
             } else {
                 order.shuffle(rng);
                 sweep_sequential(
-                    candidates,
+                    &env,
                     &mut stats,
-                    profiles,
-                    guard,
                     &mut log_probs,
                     order.iter().copied(),
-                    |log_probs, cand, current| {
-                        sample_categorical_log_restricted(log_probs, cand, current, rng)
-                    },
+                    |log_probs, cand, current| sample_improving_log(log_probs, cand, current, rng),
                 )
             };
             total_moves += sc.moves;
@@ -1037,23 +1454,18 @@ pub fn refine_with_candidates_guarded<G: MoveGuard>(
     for _sweep in 0..params.num_greedy {
         let sc = if params.parallel {
             sweep_jacobi(
-                candidates,
+                &env,
                 &mut stats,
-                profiles,
-                guard,
-                k,
-                &mut proposals,
-                |log_probs, cand, _e, current| argmax_log_restricted_from(log_probs, cand, current),
+                &mut scratch,
+                |log_probs, cand, _e, current| argmax_log_staying(log_probs, cand, current),
             )
         } else {
             sweep_sequential(
-                candidates,
+                &env,
                 &mut stats,
-                profiles,
-                guard,
                 &mut log_probs,
                 0..num_entities,
-                argmax_log_restricted_from,
+                argmax_log_staying,
             )
         };
         total_moves += sc.moves;
