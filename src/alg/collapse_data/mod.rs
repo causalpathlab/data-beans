@@ -823,8 +823,10 @@ where
 /// entry point). Typical use: `senna {topic, itopic, ce-topic} --from`
 /// inheriting a prior run's partition.
 ///
-/// Each level's pb-sample → group label is decided by majority vote
-/// across the cells in that pb-sample. The downstream `optimize` step
+/// The finest level's pb-sample → group label is decided by majority vote
+/// across the cells in that pb-sample; each coarser level's label is then
+/// voted per group of the level below it, so the returned levels always
+/// nest, whether or not the inherited ones do. The downstream `optimize` step
 /// still runs per level, so the returned `CollapsedOut` posteriors
 /// reflect this run's batch model and priors — only the expensive
 /// clustering work is bypassed.
@@ -1285,6 +1287,9 @@ where
 
     // Use first layer for num_batches (all layers share the same columns)
     let num_batches = stack.stack[0].num_batches();
+    // The matches below are read off the first layer's lookup (the layers
+    // share columns and projection); the other layers are given theirs so
+    // that every layer of the stack carries one afterwards.
     if num_batches >= 2 {
         for layer in stack.stack.iter_mut() {
             layer.build_hnsw_per_batch(proj_kn, batch_membership)?;

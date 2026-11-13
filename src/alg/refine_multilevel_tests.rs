@@ -198,12 +198,14 @@ fn refinement_with_a_given_match_table_is_the_same_refinement() {
     let given = refine_assignments_with_matches(&inputs, &toy_params(), Some(&matches)).unwrap();
     assert_eq!(own.pbsamp_to_group, given.pbsamp_to_group);
     assert_eq!(own.num_groups_per_level, given.num_groups_per_level);
-    assert_ne!(own.pbsamp_to_group, levels, "the sweeps moved something");
+    // The result is relabelled densely, so the start is compared the same way.
+    let start: Vec<Vec<usize>> = levels.iter().map(|l| compact_labels(l).0).collect();
+    assert_ne!(own.pbsamp_to_group, start, "the sweeps moved something");
 }
 
 /// A stratum present in one batch only has no cross-batch match, so its
 /// pb-samples fall back to their siblings. Refinement must still leave every
-/// group, at every level, within one stratum.
+/// group of the finest level within one stratum.
 #[test]
 fn refinement_never_merges_a_private_stratum() {
     let mut t = toy();

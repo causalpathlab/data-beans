@@ -362,12 +362,14 @@ pub(crate) fn refine_assignments_with_matches(
                 level_label: &label,
             },
         );
-        info!("  level {} refined: {} moves; k={} groups", level, moves, k);
-
         // Compact in case greedy emptied groups (keeps K monotone without gaps).
         let (compact, new_k) = compact_labels(pbsamp_to_group);
         *pbsamp_to_group = compact;
         ks[level] = new_k;
+        info!(
+            "  level {} refined: {} moves; {} of {} groups remain",
+            level, moves, new_k, k
+        );
     }
 
     Ok(RefinedAssignment {
