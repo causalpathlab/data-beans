@@ -168,3 +168,69 @@ fn inactive_cells_keep_their_node() {
     );
     assert_eq!((node[0], node[1]), frozen);
 }
+
+fn node_sizes(node: &[usize]) -> Vec<usize> {
+    let k = node.iter().max().map_or(0, |m| m + 1);
+    let mut n = vec![0usize; k];
+    node.iter().for_each(|&x| n[x] += 1);
+    n
+}
+
+#[test]
+fn nodes_of_one_lineage_are_not_merged() {
+    // Each lineage starts as three clean nodes of 10, 30 and 50 cells.
+    // Nothing separates the nodes of a lineage, so the small ones must not
+    // drain into the large one.
+    let (csc, lineage, batch) = lineages(2, 90, 200, 1, 23);
+    let n = csc.ncols();
+    let start: Vec<usize> = (0..n)
+        .map(|c| {
+            let i = c % 90;
+            lineage[c] * 3 + usize::from(i >= 10) + usize::from(i >= 40)
+        })
+        .collect();
+    assert_eq!(node_sizes(&start), vec![10, 30, 50, 10, 30, 50]);
+    let mut node = start.clone();
+    reassign_cells_to_nodes(
+        &csc,
+        &batch,
+        1,
+        &vec![true; n],
+        &mut node,
+        &ReassignCellsParams::default(),
+    );
+    assert!(purity(&node, &lineage) >= 0.999);
+    let sizes = node_sizes(&node);
+    assert_eq!(sizes.len(), 6);
+    for (b, (&now, &was)) in sizes.iter().zip(&[10, 30, 50, 10, 30, 50]).enumerate() {
+        assert!(2 * now >= was, "node {b}: {was} -> {now} cells ({sizes:?})");
+    }
+    let stayed = node.iter().zip(&start).filter(|(a, b)| a == b).count();
+    assert!(stayed * 10 >= n * 8, "{stayed} of {n} cells stayed");
+}
+
+#[test]
+fn a_mixed_node_gives_its_cells_to_the_clean_ones() {
+    // Two clean nodes and one that is half of each lineage: its cells go
+    // to the nodes of their lineages, and the clean nodes keep theirs.
+    let (csc, lineage, batch) = lineages(2, 60, 200, 1, 29);
+    let n = csc.ncols();
+    let mut node: Vec<usize> = (0..n)
+        .map(|c| if c % 60 < 40 { lineage[c] } else { 2 })
+        .collect();
+    assert_eq!(node_sizes(&node), vec![40, 40, 40]);
+    reassign_cells_to_nodes(
+        &csc,
+        &batch,
+        1,
+        &vec![true; n],
+        &mut node,
+        &ReassignCellsParams::default(),
+    );
+    assert!(purity(&node, &lineage) >= 0.98);
+    for (c, &nd) in node.iter().enumerate() {
+        if c % 60 < 40 {
+            assert_eq!(nd, lineage[c], "cell {c} left its clean node");
+        }
+    }
+}

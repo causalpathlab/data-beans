@@ -6,7 +6,11 @@
 //! under the same parent group (sibling-constrained) and are drawn from the
 //! batch-balanced KNN neighborhood. Moves are scored by a DC-Poisson
 //! log-likelihood with NB Fisher-info feature weighting (see
-//! [`crate::alg::dc_poisson::FeatureWeighting`]).
+//! [`crate::alg::dc_poisson::FeatureWeighting`]), on pb-sample profiles
+//! rescaled by their batch's marginal rates
+//! ([`Profiles::rescale_batches_to_pooled`]): a group pools the pb-samples
+//! of several batches, and on raw profiles a pb-sample would fit the group
+//! that holds most of its own batch.
 //!
 //! Candidate-set construction is BBKNN-specific and lives here ([`BbknnProposer`]).
 //! The generic scoring core lives in [`crate::alg::dc_poisson`] and is shared with
@@ -273,6 +277,11 @@ pub(crate) fn refine_assignments_with_matches(
         ProfileSource::Raw => Profiles::from_gene_sums(gene_sums, num_genes),
         ProfileSource::Projected { basis } => Profiles::from_projection(basis, pb_sample_to_cells),
     };
+    // Batch effects first: the NB trend behind the feature weights is then
+    // fitted to profiles that no longer carry them as extra dispersion.
+    if matches!(params.profile_source, ProfileSource::Raw) {
+        profiles.rescale_batches_to_pooled(&layout.pb_sample_to_batch);
+    }
     if matches!(params.profile_source, ProfileSource::Raw)
         && !matches!(
             params.feature_weighting,
@@ -354,7 +363,7 @@ pub(crate) fn refine_assignments_with_matches(
                 level_label: &label,
             },
         );
-        // Compact in case greedy emptied groups (keeps K monotone without gaps).
+        // Compact in case a group was emptied (keeps K monotone without gaps).
         let (compact, new_k) = compact_labels(pbsamp_to_group);
         *pbsamp_to_group = compact;
         ks[level] = new_k;
