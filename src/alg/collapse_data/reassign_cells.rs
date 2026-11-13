@@ -4,6 +4,20 @@
 //! becomes one lineage before the tree grows below it. Cells only move within their batch: the entities are cells,
 //! the groups are (node, batch) pairs, and a cell's candidates are the
 //! groups of its own batch.
+//!
+//! The pass runs without the member-count limits of [`RefineParams`]. The
+//! top nodes of the marginal sketch are mixes of lineages, and making them
+//! one lineage each takes more than a trade of members: a mixed node gives
+//! its cells to the nodes of their lineages and may empty, and a node that
+//! gathers a lineage grows. Under a floor the leftovers of every mixed
+//! node stay where they are, and the nodes end up far less pure. The
+//! number of leaves is not lost with the emptied nodes: the tree grown
+//! below the remaining ones splits them to the same targets.
+//!
+//! So nodes do empty and grow here, by the profiles of their cells. What
+//! the score does not do is move cells between two nodes of one profile
+//! for their size alone (see
+//! [`DcPoissonStats`](crate::alg::dc_poisson::DcPoissonStats)).
 
 use super::*;
 use crate::alg::dc_poisson::{
@@ -104,6 +118,8 @@ pub(crate) fn reassign_cells_to_nodes(
         num_greedy: params.num_greedy,
         feature_weighting: params.feature_weighting,
         seed: params.seed,
+        size_floor: 0.0,
+        size_cap: 0.0,
         ..RefineParams::default()
     };
     let mut rng = SmallRng::seed_from_u64(params.seed);
