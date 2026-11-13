@@ -398,7 +398,7 @@ fn merge_backend_within(
             // The rows kept hold this many entries: the row index says.
             h.nnz = nnz_of_kept_rows(indptr, &map).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "{} has no by-row index to count its common rows' entries",
+                    "{} has no usable by-row index to count its common rows' entries",
                     h.path
                 )
             })?;

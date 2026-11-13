@@ -148,6 +148,16 @@ mod tests {
         );
     }
 
+    /// A coordinate listed once keeps its value; one listed several times
+    /// holds their sum; the result is ordered by column, then row.
+    #[test]
+    fn duplicates_are_summed_and_singletons_kept() {
+        let (a, b, c) = (0.1_f32, 0.2, 0.3);
+        let mut triplets = vec![(1, 0, a), (0, 1, 2.0), (1, 0, b), (0, 0, 5.0), (1, 0, c)];
+        sum_duplicate_triplets(&mut triplets);
+        assert_eq!(triplets, [(0, 0, 5.0), (1, 0, (a + b) + c), (0, 1, 2.0)]);
+    }
+
     /// The triplets a sequential walk of the compressed vectors gives.
     fn walk(
         values: &[f32],

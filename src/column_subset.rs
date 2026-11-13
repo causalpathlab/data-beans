@@ -4,7 +4,7 @@
 //! by the in-place subset and reorder of [`SparseIo`], and by downstream
 //! crates (faba's `qc`) that filter a matrix by cells and features.
 
-use crate::sparse_io::SparseIo;
+use crate::sparse_io::{SparseIo, SLAB_BUDGET_BYTES, TRIPLET_BYTES};
 use rayon::prelude::*;
 
 /// Every index of `selection` is below `n` and listed once; `what` names the
@@ -233,7 +233,7 @@ pub(crate) fn plan_csc_selection<S>(
 where
     S: SparseIo + Sync + ?Sized,
 {
-    plan_within(src, old_cols, rows, crate::sparse_io::SLAB_BUDGET_BYTES)
+    plan_within(src, old_cols, rows, SLAB_BUDGET_BYTES)
 }
 
 /// [`plan_csc_selection`] with `slab_budget` bytes of triplets to a slab.
@@ -246,7 +246,6 @@ fn plan_within<S>(
 where
     S: SparseIo + Sync + ?Sized,
 {
-    use crate::sparse_io::TRIPLET_BYTES;
     use legume_numeric::matrix::utils::byte_budget_intervals;
 
     let nrow_src = src
@@ -319,9 +318,12 @@ where
 /// renumbered by `rows[old]` and an entry whose row maps to `None` is
 /// dropped. Returns the number of entries written.
 ///
-/// The slabs go through a window at a time: as many as there are threads are
-/// read at once and laid out, then appended as one stretch. A caller that
-/// bounds what is resident cuts each slab at a thread's share of its budget.
+/// The slabs go through a window at a time: the slabs of a window are read
+/// at once, one to a thread, and laid out, then appended as one stretch. A
+/// window closes at as many slabs as there are threads, or sooner when the
+/// stored entries of its columns reach [`SLAB_BUDGET_BYTES`], so what is
+/// resident follows the budget, not the thread count, even where single
+/// columns outgrow a thread's share and each make a slab of their own.
 ///
 /// # Errors
 /// If a block read fails. Nothing is skipped: the output's nnz is declared
@@ -340,8 +342,26 @@ where
     O: SparseIo + ?Sized,
 {
     let threads = rayon::current_num_threads().max(1);
+    let stored_bytes = |&(lb, ub): &(usize, usize)| -> usize {
+        let nnz: u64 = cols[lb..ub].iter().filter_map(|&c| src.column_nnz(c)).sum();
+        (nnz as usize).saturating_mul(TRIPLET_BYTES)
+    };
     let mut written = 0u64;
-    for window in slabs.chunks(threads) {
+    let mut rest = slabs;
+    while !rest.is_empty() {
+        // The first slab always goes in, so a window is never empty.
+        let mut resident = 0usize;
+        let len = rest
+            .iter()
+            .take(threads)
+            .take_while(|&slab| {
+                let fits = resident == 0 || resident + stored_bytes(slab) <= SLAB_BUDGET_BYTES;
+                resident += stored_bytes(slab);
+                fits
+            })
+            .count();
+        let (window, later) = rest.split_at(len);
+        rest = later;
         // One block read per slab, never a read per column: a single-column
         // read pays the cached-subset machinery per call, which dominates at
         // hundreds of thousands of columns. The block read numbers its
