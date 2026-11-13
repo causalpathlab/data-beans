@@ -2,7 +2,7 @@
 //!
 //! The copula assumes each gene's count is a step function of a standard
 //! normal latent `z`: count `x` is observed when `z` falls in
-//! `(a_x, b_x] = (Φ⁻¹F(x−1), Φ⁻¹F(x)]` of the gene's NB marginal. The plain
+//! `(a_x, b_x] = (Φ⁻¹F(x−1), Φ⁻¹F(x)]` of the gene's marginal `F`. The plain
 //! Pearson correlation of any one score per count (the PIT mid-point, say)
 //! underestimates the latent correlation, badly for sparse genes, where one
 //! score stands for the whole zero mass.
@@ -34,7 +34,7 @@
 //! whose correlation the reference barely identifies, do not hand the
 //! factor model noise.
 
-use crate::sim::copula::marginals::inv_phi;
+use crate::sim::copula::marginals::{inv_phi, std_normal_pdf};
 use crate::sim::copula::reference::library_coordinate;
 use nalgebra::DMatrix;
 use nalgebra_sparse::CscMatrix;
@@ -118,14 +118,6 @@ fn threshold(cdf: f64, surv: f64) -> f64 {
         inv_phi(cdf.max(EPS))
     } else {
         -inv_phi(surv.max(EPS))
-    }
-}
-
-fn std_normal_pdf(t: f64) -> f64 {
-    if t.is_finite() {
-        (-0.5 * t * t).exp() / (2.0 * std::f64::consts::PI).sqrt()
-    } else {
-        0.0
     }
 }
 
@@ -253,7 +245,8 @@ pub fn pairwise_correlation(m: &DMatrix<f32>, scores: &[LatentScores]) -> DMatri
         .flat_map_iter(|blk| {
             let i0 = blk * GRAM_BLOCK;
             let len = GRAM_BLOCK.min(h - i0);
-            let gram = m.columns(i0, len).tr_mul(m);
+            // Rows i0.. against columns i0..: only k > i is read.
+            let gram = m.columns(i0, len).tr_mul(&m.columns(i0, h - i0));
             (0..len)
                 .map(|di| {
                     let i = i0 + di;
@@ -261,7 +254,7 @@ pub fn pairwise_correlation(m: &DMatrix<f32>, scores: &[LatentScores]) -> DMatri
                         .map(|k| {
                             let a: [f64; HERMITE_ORDER] =
                                 std::array::from_fn(|q| scores[i].c[q] * scores[k].c[q]);
-                            let rho = solve_moment(gram[(di, k)] as f64 / n, &a);
+                            let rho = solve_moment(gram[(di, k - i0)] as f64 / n, &a);
                             let c11 = (scores[i].c[0] * scores[k].c[0]).max(f64::MIN_POSITIVE);
                             shrink(rho, 1.0 / (n * c11))
                         })
@@ -360,7 +353,7 @@ impl ReferenceLatent {
             .iter()
             .map(|&g| scores[g].clone().expect("HVG scores were built"))
             .collect();
-        let m = centred_scores(mat, libs.len(), hvg, &hvg_scores);
+        let m = centred_scores(mat, libs.len(), hvg, &hvg_scores, hist);
         let joint = pairwise_correlation(&m, &hvg_scores);
         let hvg_residual = DMatrix::from_fn(hvg.len(), hvg.len(), |i, k| {
             if i == k {
@@ -411,22 +404,27 @@ fn centred_scores(
     n_cells: usize,
     hvg: &[usize],
     scores: &[LatentScores],
+    hist: &[Option<Vec<f64>>],
 ) -> DMatrix<f32> {
     let mut pos = vec![usize::MAX; mat.nrows()];
     for (h, &g) in hvg.iter().enumerate() {
         pos[g] = h;
     }
     let n = n_cells.max(1) as f64;
-    // m̄_h = m_h(0) + Σ_nz (m_h(x) − m_h(0)) / N.
-    let mut mean: Vec<f64> = scores.iter().map(|s| s.score(0)).collect();
-    for col in mat.col_iter() {
-        for (&g, &v) in col.row_indices().iter().zip(col.values()) {
-            let h = pos[g];
-            if h != usize::MAX {
-                mean[h] += (scores[h].score(v as usize) - scores[h].score(0)) / n;
-            }
-        }
-    }
+    // m̄_h = Σ_x hist_h[x] · m_h(x) / N.
+    let mean: Vec<f64> = hvg
+        .iter()
+        .zip(scores)
+        .map(|(&g, s)| {
+            hist[g].as_deref().map_or(0.0, |h| {
+                h.iter()
+                    .enumerate()
+                    .map(|(x, &c)| c * s.score(x))
+                    .sum::<f64>()
+                    / n
+            })
+        })
+        .collect();
     let mut m = DMatrix::<f32>::from_fn(n_cells, hvg.len(), |_, h| {
         (scores[h].score(0) - mean[h]) as f32
     });
@@ -444,7 +442,27 @@ fn centred_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::copula::marginals::{nb_inverse_cdf, phi, NbFit};
+    use crate::sim::copula::marginals::phi;
+
+    /// A negative binomial of mean `mu` and size `r` (`∞`: Poisson), the
+    /// test marginal.
+    #[derive(Debug, Clone, Copy)]
+    struct NbFit {
+        mu: f32,
+        r: f32,
+    }
+
+    /// `min { x : F(x) ≥ u }` of `fit`.
+    fn nb_inverse_cdf(u: f64, fit: NbFit) -> usize {
+        let mut cdf = 0.0;
+        for (x, p) in support_pmf(fit).into_iter().enumerate() {
+            cdf += p;
+            if cdf >= u {
+                return x;
+            }
+        }
+        usize::MAX
+    }
 
     /// PMF of `fit` over `0..=end`, `end` the first count past which the
     /// tail mass is below 1e-12.
@@ -536,7 +554,7 @@ mod tests {
             let shared = normal.sample(&mut rng);
             for (g, fit) in fits.iter().enumerate() {
                 let z = rho.sqrt() * shared + (1.0 - rho).sqrt() * normal.sample(&mut rng);
-                counts[g].push(nb_inverse_cdf(phi(z), *fit, 500) as usize);
+                counts[g].push(nb_inverse_cdf(phi(z), *fit));
             }
         }
         // The model marginal here; the empirical one in `ReferenceLatent`.

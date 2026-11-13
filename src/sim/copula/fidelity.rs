@@ -4,7 +4,6 @@
 //! Written next to the simulation as `{out}.fidelity.json`, and drawn by
 //! `data-beans-sim view` (feature `tui`).
 
-use nalgebra::DMatrix;
 use nalgebra_sparse::CscMatrix;
 use serde::{Deserialize, Serialize};
 
@@ -508,39 +507,54 @@ pub fn profile<C: Counts + ?Sized>(
     for (h, &i) in corr_genes.iter().enumerate() {
         row[genes[i]] = h;
     }
-    let mut x = DMatrix::<f64>::zeros(corr_genes.len(), n_cells);
+    // `log1p(0) = 0`, so the correlation needs only each cell's non-zero
+    // entries among the correlation genes.
+    let mut entries: Vec<(usize, usize, f64)> = Vec::new();
     counts.for_each(|g, c, v| {
         let h = row[g];
-        if h != usize::MAX && library[c] > 0.0 {
-            x[(h, c)] = (NORMALIZED_DEPTH * v as f64 / library[c]).ln_1p();
+        if h != usize::MAX && library[c] > 0.0 && v > 0.0 {
+            entries.push((c, h, (NORMALIZED_DEPTH * v as f64 / library[c]).ln_1p()));
         }
     });
+    entries.sort_by_key(|e| e.0);
     Profile {
         library: library.iter().map(|&l| l as f32).collect(),
         detected,
         moments,
-        correlation: upper_correlation(x),
+        correlation: upper_correlation(&entries, corr_genes.len(), n_cells),
     }
 }
 
-/// Upper triangle of the Pearson correlation of the rows of `x`; a constant
-/// row correlates 0 with everything.
-fn upper_correlation(mut x: DMatrix<f64>) -> Vec<f32> {
-    let n = x.ncols().max(1) as f64;
-    for mut r in x.row_iter_mut() {
-        let mean = r.sum() / n;
-        r.add_scalar_mut(-mean);
-        let norm = r.norm();
-        if norm > 0.0 {
-            r /= norm;
+/// Upper triangle, row by row, of the Pearson correlation over `n_cells`
+/// cells of `h` variables, from the non-zero `(cell, variable, value)`
+/// `entries` sorted by cell; a constant variable correlates 0.
+fn upper_correlation(entries: &[(usize, usize, f64)], h: usize, n_cells: usize) -> Vec<f32> {
+    let n = n_cells.max(1) as f64;
+    let (mut s1, mut s2) = (vec![0.0_f64; h], vec![0.0_f64; h]);
+    let mut cross = vec![0.0_f64; h * h];
+    for cell in entries.chunk_by(|a, b| a.0 == b.0) {
+        for (i, &(_, a, x)) in cell.iter().enumerate() {
+            s1[a] += x;
+            s2[a] += x * x;
+            for &(_, b, y) in &cell[i + 1..] {
+                let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                cross[lo * h + hi] += x * y;
+            }
         }
     }
-    let gram = &x * x.transpose();
-    let h = x.nrows();
+    let sd: Vec<f64> = (0..h)
+        .map(|a| (s2[a] / n - (s1[a] / n).powi(2)).max(0.0).sqrt())
+        .collect();
     let mut out = Vec::with_capacity(h * h.saturating_sub(1) / 2);
     for i in 0..h {
         for k in (i + 1)..h {
-            out.push(gram[(i, k)] as f32);
+            let cov = cross[i * h + k] / n - (s1[i] / n) * (s1[k] / n);
+            let denom = sd[i] * sd[k];
+            out.push(if denom > 0.0 {
+                (cov / denom) as f32
+            } else {
+                0.0
+            });
         }
     }
     out
@@ -582,8 +596,22 @@ mod tests {
         assert_eq!(p.moments.zero, vec![0.25, 0.5]);
         // Gene 0: 2, 4, 0, 2 → sample variance 8/3.
         assert!((p.moments.var[0] - 8.0 / 3.0).abs() < 1e-6);
+        // Genes 0 and 1 over the four cells, log1p(1e4·x/library).
+        let x0: Vec<f64> = [(2.0, 3.0), (4.0, 4.0), (0.0, 5.0), (2.0, 5.0)]
+            .iter()
+            .map(|&(v, l): &(f64, f64)| (1e4 * v / l).ln_1p())
+            .collect();
+        let x1: Vec<f64> = [(1.0, 3.0), (0.0, 4.0), (0.0, 5.0), (3.0, 5.0)]
+            .iter()
+            .map(|&(v, l): &(f64, f64)| (1e4 * v / l).ln_1p())
+            .collect();
+        let m = |v: &[f64]| v.iter().sum::<f64>() / 4.0;
+        let (m0, m1) = (m(&x0), m(&x1));
+        let cov: f64 = x0.iter().zip(&x1).map(|(a, b)| (a - m0) * (b - m1)).sum();
+        let v0: f64 = x0.iter().map(|a| (a - m0).powi(2)).sum();
+        let v1: f64 = x1.iter().map(|b| (b - m1).powi(2)).sum();
         assert_eq!(p.correlation.len(), 1);
-        assert!(p.correlation[0].abs() <= 1.0);
+        assert!((p.correlation[0] as f64 - cov / (v0 * v1).sqrt()).abs() < 1e-5);
     }
 
     #[test]

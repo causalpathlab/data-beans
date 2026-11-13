@@ -1,5 +1,5 @@
-//! Reference loading, per-gene stats, HVG selection, and PIT z-build for the
-//! global copula structure used by `run_simulate --reference`.
+//! Reference loading, per-gene stats, HVG selection, and the library-size
+//! coordinate for the global copula fit used by `run_simulate --reference`.
 
 use crate::sparse_io::*;
 use legume_numeric::matrix::common_io::file_ext;
@@ -39,12 +39,19 @@ pub struct GeneStats {
 /// `legume_numeric::matrix::sparse_stat::SparseRunningStatistics` (one CSC
 /// pass), with each cell's library size. The CSC itself is returned too:
 /// the latent fit reads the same counts again.
+///
+/// The reference is read as counts: every value is rounded to the nearest
+/// whole number (negatives to 0) first, so the statistics, the histograms
+/// and the marginals all see one matrix.
 pub fn per_gene_stats(
     sc: &SparseRef,
     cells: &[usize],
     n_genes: usize,
 ) -> anyhow::Result<(Vec<GeneStats>, Vec<f64>, CscMatrix<f32>)> {
-    let mat = sc.read_columns_csc(cells.to_vec())?;
+    let mut mat = sc.read_columns_csc(cells.to_vec())?;
+    for v in mat.values_mut() {
+        *v = v.round().max(0.0);
+    }
     let mut acc = SparseRunningStatistics::<f64>::new(n_genes);
     let mut libs = Vec::with_capacity(cells.len());
     for col in mat.col_iter() {

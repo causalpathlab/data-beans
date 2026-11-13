@@ -1,7 +1,7 @@
 use crate::hdf5_io::*;
 use crate::sim::copula::reference::open_reference;
 use crate::sim::copula::sampler::{depth_log_offset, sample_reference_counts, CellPrograms};
-use crate::sim::copula::{fit_global_copula, GlobalCopulaArgs};
+use crate::sim::copula::{fit_global_copula, ReferenceFitArgs};
 use crate::sim::core as simulate;
 use crate::sim::multimodal as simulate_multimodal;
 use crate::sparse_io::*;
@@ -64,69 +64,8 @@ pub struct RunSimulateArgs {
     )]
     pub reference: Option<Box<str>>,
 
-    #[arg(
-        long,
-        default_value_t = 2000,
-        help = "HVG count for the gene-gene copula",
-        long_help = "HVG count for the gene-gene copula.\n\
-                     Genes outside the HVG set are sampled independently given depth.\n\
-                     This is used only with `--reference`."
-    )]
-    pub n_hvg: usize,
-
-    #[arg(
-        long,
-        default_value_t = 100,
-        help = "Maximum rank of the HVGs' latent correlation factor",
-        long_help = "Maximum rank of the factor fitted to the HVGs' latent correlation.\n\
-                     Only factors with positive eigenvalues are kept, so the effective rank\n\
-                     is at most `n_hvg`.\n\
-                     This is used only with `--reference`."
-    )]
-    pub copula_rank: usize,
-
-    #[arg(
-        long,
-        default_value_t = 1e-3,
-        help = "Smallest share of each HVG's latent variance kept outside the shared factors",
-        long_help = "Smallest share of each HVG's latent variance kept as its own,\n\
-                     outside the shared factors, so no gene is a copy of another.\n\
-                     This is used only with `--reference`."
-    )]
-    pub regularization: f32,
-
-    #[arg(
-        long,
-        hide = true,
-        help = "No longer used: reference marginals are Poisson mixtures, with no NB size to bound"
-    )]
-    pub r_floor: Option<f32>,
-
-    #[arg(
-        long,
-        default_value_t = 0.005,
-        help = "Smallest share of reference cells an HVG must be detected in",
-        long_help = "Smallest share of reference cells an HVG must be detected in,\n\
-                     and never fewer than 50 cells. Genes seen in fewer cells carry no\n\
-                     gene-gene correlation the reference can estimate; they are drawn\n\
-                     independently given depth.\n\
-                     This is used only with `--reference`."
-    )]
-    pub hvg_min_detection: f32,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Do not couple genes to a per-cell depth (reference mode)",
-        long_help = "Do not couple genes to a per-cell depth.\n\
-                     By default each cell draws a depth coordinate, and every gene follows\n\
-                     it as strongly as it follows library size in the reference, so the\n\
-                     library sizes and detected-gene counts vary as the reference's do.\n\
-                     With this flag every cell has the same expected depth. Each gene keeps\n\
-                     the reference's mean and variance either way.\n\
-                     This is used only with `--reference`."
-    )]
-    pub fixed_depth: bool,
+    #[command(flatten)]
+    pub fit: ReferenceFitArgs,
 
     #[arg(
         long,
@@ -701,17 +640,7 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
     info!("opening reference: {}", reference_path);
     let sc = open_reference(reference_path)?;
 
-    let global_args = GlobalCopulaArgs {
-        sc: &sc,
-        n_hvg: cmd_args.n_hvg,
-        copula_rank: cmd_args.copula_rank,
-        regularization: cmd_args.regularization,
-        hvg_min_detection: cmd_args.hvg_min_detection,
-    };
-    if cmd_args.r_floor.is_some() {
-        log::warn!("--r-floor is no longer used: reference marginals are Poisson mixtures");
-    }
-    let fit = fit_global_copula(&global_args)?;
+    let fit = fit_global_copula(&cmd_args.fit.global_args(&sc))?;
 
     let dd = fit.n_genes;
     let nn = cmd_args.cols;
@@ -806,13 +735,13 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
         &fit,
         depth_offset,
         &programs,
-        !cmd_args.fixed_depth,
+        !cmd_args.fit.fixed_depth,
         cmd_args.rseed,
         0x5a5a_5a5a,
     )?;
 
     info!(
-        "sampled {} cells producing {} nonzero triplets via two-stage NB+copula",
+        "sampled {} cells producing {} nonzero triplets from the reference",
         nn,
         triplets.len()
     );
@@ -879,15 +808,7 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
         info!("hierarchy node probabilities: {}", hierarchy_file);
     }
 
-    // The NB size with each gene's extra-Poisson variance; none (`r = ∞`)
-    // is encoded as a large finite sentinel so parquet readers don't choke
-    // on infinity.
-    let mut r_col = DMatrix::<f32>::zeros(dd, 1);
-    for (g, r) in fit.effective_nb_size().into_iter().enumerate() {
-        r_col[(g, 0)] = if r.is_finite() { r } else { 1e9 };
-    }
-    let r_label = ["r_hat".to_string().into_boxed_str()];
-    r_col.to_parquet_with_names(&r_file, (Some(&row_names), Some("feature")), Some(&r_label))?;
+    fit.write_effective_nb_size(&r_file, &row_names)?;
     info!("per-gene NB size of the same variance: {}", r_file);
 
     let hvg_lines: Vec<Box<str>> = fit

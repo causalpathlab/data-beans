@@ -46,16 +46,9 @@ use mixture::PoissonMixture;
 use rayon::prelude::*;
 use reference::SparseRef;
 
-/// Genes with `μ̂_g` below this threshold are excluded from the per-cell
-/// sampling loop entirely (they can't produce a nonzero count even with the
-/// maximum log-mean perturbation `≈ exp(3.5)` from topic+batch+noise stages).
-/// Saves the cost of CDF construction + inverse-CDF lookup for genes that
-/// would always yield 0.
-const MU_HAT_ACTIVE_THRESHOLD: f32 = 1e-5;
-
-/// Output of [`fit_global_copula`]. Owns the fitted reference dispersions,
-/// the per-gene reference mean `μ̂_g`, and the low-rank Gaussian copula
-/// factor — everything needed to drive the two-stage GLM + NB+copula sampler.
+/// Output of [`fit_global_copula`]: the reference's Poisson-mixture
+/// marginals, each gene's coupling to depth, and the low-rank latent copula
+/// of the HVGs — everything the reference sampler ([`sampler`]) needs.
 pub struct GlobalCopulaFit {
     pub gene_names: Vec<Box<str>>,
     pub n_genes: usize,
@@ -70,9 +63,8 @@ pub struct GlobalCopulaFit {
     /// Per-gene latent correlation `ρ_gs` with the library-size coordinate,
     /// length `n_genes`; 0 for inactive genes.
     pub depth_rho: Vec<f32>,
-    /// Subset of gene indices `g` with `μ̂_g >= MU_HAT_ACTIVE_THRESHOLD`.
-    /// The per-cell sampling loop iterates only these — undetectable genes
-    /// (always-zero) skip CDF construction.
+    /// Genes detected in at least one reference cell. The per-cell sampling
+    /// loop iterates only these; a gene never seen is never drawn.
     pub active_genes: Vec<usize>,
     /// `hvg_pos[g] = Some(h)` iff gene `g` is the `h`-th HVG; `None` for
     /// non-HVG genes. Length = `n_genes`.
@@ -86,21 +78,26 @@ pub struct GlobalCopulaFit {
 }
 
 impl GlobalCopulaFit {
-    /// Each gene's NB size with its marginal's extra-Poisson variance,
-    /// `1 / cv²` of the mixture's rates (`∞` without any): what the
-    /// `.r.parquet` output reports.
-    pub fn effective_nb_size(&self) -> Vec<f32> {
-        self.marginals
-            .iter()
-            .map(|m| {
+    /// Write each gene's NB size with its marginal's extra-Poisson
+    /// variance, `1 / cv²` of the mixture's rates, as the one-column
+    /// `r_hat` parquet `path`, rows named `names`. A gene with none
+    /// (`r = ∞`) is written as 1e9, which parquet readers take.
+    pub fn write_effective_nb_size(&self, path: &str, names: &[Box<str>]) -> anyhow::Result<()> {
+        use legume_numeric::matrix::traits::IoOps;
+        let r = nalgebra::DMatrix::<f32>::from_iterator(
+            self.n_genes,
+            1,
+            self.marginals.iter().map(|m| {
                 let cv2 = m.rate_cv2();
                 if cv2 > 0.0 {
                     (1.0 / cv2) as f32
                 } else {
-                    f32::INFINITY
+                    1e9
                 }
-            })
-            .collect()
+            }),
+        );
+        let label = ["r_hat".to_string().into_boxed_str()];
+        r.to_parquet_with_names(path, (Some(names), Some("feature")), Some(&label))
     }
 
     /// Write the fidelity report of `triplets`, a simulation of `n_cells`
@@ -140,10 +137,93 @@ impl GlobalCopulaFit {
     }
 }
 
+/// The reference-fit settings `topic --reference` and `multiome
+/// --reference-*` share, on the command line.
+#[derive(clap::Args, Debug, Clone)]
+pub struct ReferenceFitArgs {
+    #[arg(
+        long,
+        default_value_t = 2000,
+        help = "Features (HVGs) in the latent copula",
+        long_help = "Features (HVGs) in the latent copula, per reference.\n\
+                     Features outside it are drawn independently given depth.\n\
+                     This is used only with a reference."
+    )]
+    pub n_hvg: usize,
+
+    #[arg(
+        long,
+        default_value_t = 100,
+        help = "Maximum rank of the copula's latent correlation factor",
+        long_help = "Maximum rank of the factor fitted to the HVGs' latent correlation.\n\
+                     Only factors with positive eigenvalues are kept, so the effective rank\n\
+                     is at most `n_hvg`. This is used only with a reference."
+    )]
+    pub copula_rank: usize,
+
+    #[arg(
+        long,
+        default_value_t = 1e-3,
+        help = "Smallest share of each HVG's latent variance kept outside the shared factors",
+        long_help = "Smallest share of each HVG's latent variance kept as its own,\n\
+                     outside the shared factors, so no feature is a copy of another.\n\
+                     This is used only with a reference."
+    )]
+    pub regularization: f32,
+
+    #[arg(
+        long,
+        default_value_t = 0.005,
+        help = "Smallest share of reference cells an HVG must be detected in",
+        long_help = "Smallest share of reference cells an HVG must be detected in,\n\
+                     and never fewer than 50 cells. Features seen in fewer cells carry no\n\
+                     correlation the reference can estimate; they are drawn independently\n\
+                     given depth. This is used only with a reference."
+    )]
+    pub hvg_min_detection: f32,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Do not couple features to a per-cell depth (reference mode)",
+        long_help = "Do not couple features to a per-cell depth.\n\
+                     By default each cell draws a depth coordinate (one per modality), and\n\
+                     every feature follows it as strongly as it follows library size in the\n\
+                     reference, so library sizes and detected features vary as the\n\
+                     reference's do. With this flag every cell has the same expected depth.\n\
+                     Each feature keeps the reference's distribution either way.\n\
+                     This is used only with a reference."
+    )]
+    pub fixed_depth: bool,
+
+    #[arg(
+        long,
+        hide = true,
+        help = "No longer used: reference marginals are Poisson mixtures, with no NB size to bound"
+    )]
+    pub r_floor: Option<f32>,
+}
+
+impl ReferenceFitArgs {
+    /// The fit's settings for the reference `sc`; warns about a retired flag.
+    pub fn global_args<'a>(&self, sc: &'a SparseRef) -> GlobalCopulaArgs<'a> {
+        if self.r_floor.is_some() {
+            log::warn!("--r-floor is no longer used: reference marginals are Poisson mixtures");
+        }
+        GlobalCopulaArgs {
+            sc,
+            n_hvg: self.n_hvg,
+            copula_rank: self.copula_rank,
+            regularization: self.regularization,
+            hvg_min_detection: self.hvg_min_detection,
+        }
+    }
+}
+
 pub struct GlobalCopulaArgs<'a> {
     pub sc: &'a SparseRef,
     /// HVGs included in the copula dependence structure. Genes outside the
-    /// HVG set are sampled independently from their NB fits at run time.
+    /// HVG set are drawn independently given depth.
     pub n_hvg: usize,
     /// Maximum rank of the low-rank Σ̂ factor. Effective rank is at most
     /// the number of HVGs.
@@ -179,16 +259,9 @@ pub fn fit_global_copula(args: &GlobalCopulaArgs) -> anyhow::Result<GlobalCopula
     let cells: Vec<usize> = (0..n_cells).collect();
     let (stats, libs, mat) = reference::per_gene_stats(args.sc, &cells, n_genes)?;
     let mu_hat: Vec<f32> = stats.iter().map(|s| s.mu as f32).collect();
-    let active_genes: Vec<usize> = mu_hat
-        .iter()
-        .enumerate()
-        .filter_map(|(g, &m)| (m >= MU_HAT_ACTIVE_THRESHOLD).then_some(g))
-        .collect();
-    // Copula genes are sampled, so they are active: a gene detected in many
-    // cells can still have a tiny mean in fractional (normalised) data.
-    let mut hvg_indices =
-        reference::select_hvg(&stats, n_cells, args.n_hvg, args.hvg_min_detection);
-    hvg_indices.retain(|&g| mu_hat[g] >= MU_HAT_ACTIVE_THRESHOLD);
+    let active_genes: Vec<usize> = (0..n_genes).filter(|&g| stats[g].nnz > 0).collect();
+    // HVGs are detected in at least 50 cells, so they are active.
+    let hvg_indices = reference::select_hvg(&stats, n_cells, args.n_hvg, args.hvg_min_detection);
     anyhow::ensure!(
         !hvg_indices.is_empty(),
         "no gene is detected in {:.1}% (and 50) of the {} reference cells; lower --hvg-min-detection",
@@ -196,8 +269,7 @@ pub fn fit_global_copula(args: &GlobalCopulaArgs) -> anyhow::Result<GlobalCopula
         n_cells
     );
     info!(
-        "active genes (μ̂ ≥ {:.0e}): {}/{} ({:.1}% — undetectable genes skipped from sampling)",
-        MU_HAT_ACTIVE_THRESHOLD,
+        "active genes (detected in the reference): {}/{} ({:.1}%)",
         active_genes.len(),
         n_genes,
         100.0 * active_genes.len() as f32 / n_genes as f32

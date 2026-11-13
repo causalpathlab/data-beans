@@ -29,54 +29,56 @@ fn main() -> anyhow::Result<()> {
             .ok();
     }
 
-    match &cli.commands {
+    // A reference-mode run's fidelity reports, and whether `--view` asked
+    // to open them.
+    let (reports, view) = match &cli.commands {
         Commands::Topic(args) => {
             run_simulate(args)?;
-            let report = fidelity_report_path(args);
-            if let Some(path) = report.as_deref() {
-                eprintln!("fidelity report: {path} (open with `data-beans-sim view {path}`)");
-            }
-            if args.view {
-                view_all(report.as_slice(), false)?;
-            }
+            (fidelity_report_path(args).into_iter().collect(), args.view)
         }
-        Commands::Bulk(args) => generate_convoluted_data(args)?,
-        Commands::Multimodal(args) => run_simulate_multimodal(args)?,
+        Commands::Bulk(args) => {
+            generate_convoluted_data(args)?;
+            (Vec::new(), false)
+        }
+        Commands::Multimodal(args) => {
+            run_simulate_multimodal(args)?;
+            (Vec::new(), false)
+        }
         Commands::Multiome(args) => {
             run_multiome(args)?;
-            let reports = fidelity_report_paths(args);
-            for path in &reports {
-                eprintln!("fidelity report: {path} (open with `data-beans-sim view {path}`)");
-            }
-            if args.view {
-                view_all(&reports, false)?;
-            }
+            (fidelity_report_paths(args), args.view)
         }
-        Commands::Faba(args) => run_faba(args)?,
-        Commands::View(args) => view_all(std::slice::from_ref(&args.report), true)?,
+        Commands::Faba(args) => {
+            run_faba(args)?;
+            (Vec::new(), false)
+        }
+        Commands::View(args) => return view_reports(std::slice::from_ref(&args.report)),
         #[cfg(feature = "mcp")]
-        Commands::Mcp => sim_mcp::run_mcp()?,
+        Commands::Mcp => return sim_mcp::run_mcp(),
+    };
+    for path in &reports {
+        eprintln!("fidelity report: {path} (open with `data-beans-sim view {path}`)");
     }
-
+    if view {
+        // The simulation's outputs are written: a view that cannot open is
+        // a note, not a failure.
+        if reports.is_empty() {
+            eprintln!("no fidelity report to view: --view draws reference-mode runs only");
+        } else if let Err(e) = view_reports(&reports) {
+            eprintln!("{e}");
+        }
+    }
     Ok(())
 }
 
-/// Open the fidelity view of each report in turn (`q` moves on). Without a
-/// terminal it fails when the view is what was asked for (`view`), and only
-/// says so after a simulation (`--view`), whose outputs are written.
+/// Open the fidelity view of each report in turn (`q` moves on); an error
+/// when there is no terminal to draw it on.
 #[cfg(feature = "tui")]
-fn view_all(reports: &[String], required: bool) -> anyhow::Result<()> {
-    if reports.is_empty() {
-        eprintln!("no fidelity report to view: --view draws reference-mode runs only");
-        return Ok(());
-    }
-    if !data_beans::interactive::tui_available() {
-        let line =
-            format!("the fidelity view needs a terminal; the reports are written: {reports:?}");
-        anyhow::ensure!(!required, "{line}");
-        eprintln!("{line}");
-        return Ok(());
-    }
+fn view_reports(reports: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        data_beans::interactive::tui_available(),
+        "the fidelity view needs a terminal; the reports are written: {reports:?}"
+    );
     for path in reports {
         data_beans::interactive::sim_tui::view_fidelity(path)?;
     }
@@ -84,14 +86,7 @@ fn view_all(reports: &[String], required: bool) -> anyhow::Result<()> {
 }
 
 #[cfg(not(feature = "tui"))]
-fn view_all(reports: &[String], required: bool) -> anyhow::Result<()> {
-    if reports.is_empty() {
-        return Ok(());
-    }
-    if !required {
-        eprintln!("data-beans-sim was built without the `tui` feature; the reports are written: {reports:?}");
-        return Ok(());
-    }
+fn view_reports(reports: &[String]) -> anyhow::Result<()> {
     anyhow::bail!(
         "data-beans-sim was built without the `tui` feature; the reports are written: {reports:?}"
     )
@@ -133,7 +128,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     #[command(
-        about = "Log-normal topic factor model (with optional reference-conditioned NB+copula sampling)",
+        about = "Log-normal topic factor model (with optional reference-conditioned sampling)",
         long_about = "Synthetic mode (no `--reference`):\n\
                       `Y(g,j) ~ Poisson( (depth/G) · δ(g,B(j)) · Σ_k β(g,k) θ(k,j) )`,\n\
             with an explicit log-space variance decomposition for both β and δ:\n\
@@ -144,7 +139,7 @@ enum Commands {
                       both can be 1. `depth` is the **expected** library size. It is emergent,\n\
                       with no per-cell rescaling.\n\
                       \n\
-                      Reference mode (`--reference <h5/zarr>`): NB + Gaussian copula sampling.\n\
+                      Reference mode (`--reference <h5/zarr>`): Poisson-mixture marginals + latent Gaussian copula.\n\
                       Each gene keeps its reference count distribution F_g, a Poisson mixture:\n\
                       \x20 log λ = log μ̂_g + a_g·t − ln M1_g + b_g·ε − b_g²/2 + δ_{g,b} − c_g\n\
                       \x20 z*_g  = ρ_gs·z_s + √(1−ρ_gs²)·e_g,   y = F⁻¹_g(Φ(z*_g); rates × λ/μ̂_g)\n\
@@ -233,8 +228,8 @@ enum Commands {
                       Ground truth is M[G,P].\n\
                       \n\
                       Reference mode uses `--reference-rna` or `--reference-atac`.\n\
-                      Each modality with a reference gets a two-stage GLM,\n\
-                      with NB+copula PIT sampling.\n\
+                      Each modality with a reference draws from its features' reference count\n\
+                      distributions (Poisson mixtures), coupled by depth and a latent copula.\n\
                       A modality without one keeps its synthetic step.\n\
                       A normalized {topic, noise, batch} budget weights the log-rate;\n\
                       there is no cis term.\n\

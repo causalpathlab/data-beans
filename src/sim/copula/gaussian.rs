@@ -422,7 +422,7 @@ mod tests {
         }
     }
 
-    /// Sub-unit-variance input (mimics PIT-Z from sparse discrete NB): the
+    /// Sub-unit-variance input (like PIT z-scores of sparse counts): the
     /// fit works on correlations, so every sampled marginal has Var≈1
     /// whatever the scale of the rows it came from. Var ≪ 1 would give
     /// `Φ(z*) ≈ 0.5` and an inverse CDF that always returns 0.
