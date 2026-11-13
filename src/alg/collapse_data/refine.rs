@@ -189,13 +189,13 @@ impl CrossBatchMatches {
 /// Match the pb-samples of `layout` across batches for a collapse over
 /// `batch_knn_lookup` (fewer than two batches: no tables). The pooled table
 /// is skipped when nothing reads it — anchors source the counterfactual and
-/// `refines` is false.
+/// `refine_params` asks for no refinement sweep.
 pub(super) fn cross_batch_matches(
     layout: &PbSampleLayout,
     batch_knn_lookup: &[ColumnDict<usize>],
     knn: usize,
     anchor_batches: Option<&[usize]>,
-    refines: bool,
+    refine_params: &crate::alg::refine_multilevel::RefineParams,
 ) -> anyhow::Result<CrossBatchMatches> {
     if batch_knn_lookup.len() < 2 {
         return Ok(CrossBatchMatches {
@@ -203,6 +203,7 @@ pub(super) fn cross_batch_matches(
             anchored: None,
         });
     }
+    let refines = refine_params.num_gibbs > 0 || refine_params.num_greedy > 0;
     let pooled = (refines || anchor_batches.is_none())
         .then(|| per_batch_sc_neighbors(layout, batch_knn_lookup, knn, None))
         .transpose()?;
@@ -424,7 +425,7 @@ pub(super) fn refine_and_collect_single_layer(
         batch_knn,
         knn,
         ctx.anchor_batches,
-        refine_params.num_gibbs > 0 || refine_params.num_greedy > 0,
+        refine_params,
     )?;
     let refined = split_anchored_finest_groups(
         refine_or_identity(
@@ -719,13 +720,7 @@ pub(super) fn refine_and_collect_stack(
     };
     // One set of tables for every layer: the layers share the layout and
     // index the same projection, so their lookups return the same matches.
-    let matches = cross_batch_matches(
-        &layout,
-        batch_knn,
-        knn,
-        ctx.anchor_batches,
-        refine_params.num_gibbs > 0 || refine_params.num_greedy > 0,
-    )?;
+    let matches = cross_batch_matches(&layout, batch_knn, knn, ctx.anchor_batches, refine_params)?;
     let refined = refine_or_identity(
         num_batches >= 2,
         &inputs,

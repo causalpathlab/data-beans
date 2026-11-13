@@ -46,7 +46,8 @@ pub struct CellTypeMembership {
 }
 
 /// The data rows of an annotation table (TSV, CSV, or whitespace-separated,
-/// plain or gzipped), each split into its fields.
+/// plain or gzipped), unsplit, and the delimiter of their fields (`None`:
+/// runs of whitespace); see [`id_and_label`].
 ///
 /// The header line names the delimiter for the whole file: tab when it holds
 /// a tab, else comma when it holds a comma; a header with neither leaves it
@@ -56,8 +57,8 @@ pub struct CellTypeMembership {
 /// whitespace-separated table (`B,naive`) is part of the label. Comment lines
 /// (`#`, `%`) and blank lines are skipped; the first remaining line is the
 /// header and is dropped.
-fn read_annotation_rows(path: &str) -> Result<Vec<Vec<Box<str>>>> {
-    let lines: Vec<Box<str>> = read_lines(path)?
+fn read_annotation_rows(path: &str) -> Result<(Vec<Box<str>>, Option<char>)> {
+    let mut lines: Vec<Box<str>> = read_lines(path)?
         .into_iter()
         .filter(|line| !line.trim().is_empty() && !line.starts_with(['#', '%']))
         .collect();
@@ -73,17 +74,31 @@ fn read_annotation_rows(path: &str) -> Result<Vec<Vec<Box<str>>>> {
                 .any(|line| line.contains('\t'))
                 .then_some('\t')
         });
-    Ok(lines
-        .iter()
-        .skip(1)
-        .map(|line| match delim {
-            Some(d) => line.split(d).map(|x| unquote_field(x).into()).collect(),
-            None => line.split_whitespace().map(Box::from).collect(),
-        })
-        .collect())
+    if !lines.is_empty() {
+        lines.remove(0);
+    }
+    Ok((lines, delim))
 }
 
-/// Each row's cell id and its label in field `label_idx`, in file order.
+/// The cell id (field 0) and the label (field `label_idx`, 1 or later) of
+/// the row `line`, whose fields `delim` separates; `None` for a row too short
+/// to hold the label.
+fn id_and_label(line: &str, delim: Option<char>, label_idx: usize) -> Option<(&str, &str)> {
+    debug_assert!(label_idx > 0, "field 0 is the cell id");
+    match delim {
+        Some(d) => {
+            let mut fields = line.split(d).map(unquote_field);
+            Some((fields.next()?, fields.nth(label_idx - 1)?))
+        }
+        None => {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?, fields.nth(label_idx - 1)?))
+        }
+    }
+}
+
+/// Each row's cell id and its label in field `label_idx` (1 or later), in
+/// file order.
 /// A row too short to hold the label is skipped; so is a row whose cell id or
 /// label is empty. Both are counted in a warning, and a file that yields no
 /// row at all is an error: its rows do not follow the header's delimiter, or
@@ -92,17 +107,17 @@ fn read_cell_labels(path: &str, label_idx: usize) -> Result<Vec<(Box<str>, Box<s
     let mut n_short = 0usize;
     let mut n_empty = 0usize;
     let mut out = Vec::new();
-    for mut words in read_annotation_rows(path)? {
-        if words.len() <= label_idx {
+    let (rows, delim) = read_annotation_rows(path)?;
+    for row in &rows {
+        let Some((cell_id, label)) = id_and_label(row, delim, label_idx) else {
             n_short += 1;
             continue;
-        }
-        if words[0].is_empty() || words[label_idx].is_empty() {
+        };
+        if cell_id.is_empty() || label.is_empty() {
             n_empty += 1;
             continue;
         }
-        let label = words.swap_remove(label_idx);
-        out.push((words.swap_remove(0), label));
+        out.push((cell_id.into(), label.into()));
     }
     let n_fields = label_idx + 1;
     if out.is_empty() {

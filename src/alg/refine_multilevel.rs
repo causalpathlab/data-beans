@@ -50,25 +50,6 @@ pub struct RefinedAssignment {
 // Candidate set construction (siblings ∩ BBKNN with sibling fallback) //
 /////////////////////////////////////////////////////////////////////////
 
-/// Per-pb-sample BBKNN proposals: for every non-own batch, query that
-/// batch's cell-level HNSW (`SparseIoVec::batch_knn_lookup`) with the
-/// pb-sample's centroid, dedup returned cells to their owning pb-samples
-/// via `layout.cell_to_pbsamp`, and keep up to `knn` distinct pb-samples per
-/// other batch.
-///
-/// Total candidate set per pb-sample is up to `knn · (num_batches − 1)`.
-fn build_bbknn_neighbors(
-    layout: &PbSampleLayout,
-    batch_knn_lookup: &[legume_numeric::matrix::knn_match::ColumnDict<usize>],
-    knn: usize,
-) -> anyhow::Result<Vec<Vec<usize>>> {
-    // Pooled (None): the DC-SBM refinement graph should connect across
-    // every batch pair regardless of anchoring — anchoring shapes the
-    // counterfactual for δ, not the clustering topology.
-    let matches = per_batch_sc_neighbors(layout, batch_knn_lookup, knn, None)?;
-    Ok(candidate_ids(&matches))
-}
-
 /// The candidate pb-sample ids of a match table — distances are unused for
 /// refinement.
 fn candidate_ids(matches: &[Vec<(usize, f32)>]) -> Vec<Vec<usize>> {
@@ -302,14 +283,25 @@ pub(crate) fn refine_assignments_with_matches(
         profiles.apply_feature_weighting(params.feature_weighting);
     }
 
-    // BBKNN proposals via the shared per-batch cell HNSW.
+    // BBKNN proposals via the shared per-batch cell HNSW: for every non-own
+    // batch, that batch's cell-level index is queried with the pb-sample's
+    // centroid and the cells returned are deduplicated to their owning
+    // pb-samples, up to `k_per_batch` per other batch.
     info!(
         "Building BBKNN candidate sets (knn={} per non-own batch) ...",
         k_per_batch
     );
     let bbknn = match pooled_matches {
         Some(matches) => candidate_ids(matches),
-        None => build_bbknn_neighbors(layout, batch_knn_lookup, k_per_batch)?,
+        // Pooled (None): the DC-SBM refinement graph should connect across
+        // every batch pair regardless of anchoring — anchoring shapes the
+        // counterfactual for δ, not the clustering topology.
+        None => candidate_ids(&per_batch_sc_neighbors(
+            layout,
+            batch_knn_lookup,
+            k_per_batch,
+            None,
+        )?),
     };
 
     let mut rng = SmallRng::seed_from_u64(params.seed);
