@@ -7,10 +7,13 @@
 //! batch-balanced KNN neighborhood. Moves are scored by a DC-Poisson
 //! log-likelihood with NB Fisher-info feature weighting (see
 //! [`crate::alg::dc_poisson::FeatureWeighting`]), on pb-sample profiles
-//! rescaled by their batch's marginal rates
-//! ([`Profiles::rescale_batches_to_pooled`]): a group pools the pb-samples
-//! of several batches, and on raw profiles a pb-sample would fit the group
-//! that holds most of its own batch.
+//! divided by their batch's per-gene factor ([`Profiles::rescale_batches`]):
+//! a group pools the pb-samples of several batches, and on raw profiles a
+//! pb-sample would fit the group that holds most of its own batch. The
+//! factors are fitted within the groups of the coarsest level, so that
+//! batches of different cell-type composition are not corrected for their
+//! composition; what differs between batches within one such group is
+//! taken for a batch factor (see [`refine_assignments`]).
 //!
 //! Candidate-set construction is BBKNN-specific and lives here ([`BbknnProposer`]).
 //! The generic scoring core lives in [`crate::alg::dc_poisson`] and is shared with
@@ -206,6 +209,18 @@ pub struct RefineInputs<'a> {
 /// Levels in `inputs.initial_sc_to_group_per_level` follow the existing
 /// finest → coarsest convention. The returned `RefinedAssignment` uses the
 /// same ordering.
+///
+/// With [`ProfileSource::Raw`], the pb-sample profiles are first divided by
+/// a per-gene factor of their batch ([`Profiles::rescale_batches`]), fitted
+/// within the starting groups of the coarsest level. This assumes that
+/// pb-samples of one such group have the same expected profile in every
+/// batch up to that factor. Where a coarse group mixes cell types in
+/// proportions that differ between batches, or where the coarsest level is
+/// too fine to compare batches within a group (then the batches are
+/// compared with the pooled profile, which assumes batches of one
+/// composition), part of that difference is removed as if it were
+/// technical, and pb-samples of one type are matched less well across
+/// those batches.
 pub fn refine_assignments(
     inputs: &RefineInputs<'_>,
     params: &RefineParams,
@@ -277,19 +292,22 @@ pub(crate) fn refine_assignments_with_matches(
         ProfileSource::Raw => Profiles::from_gene_sums(gene_sums, num_genes),
         ProfileSource::Projected { basis } => Profiles::from_projection(basis, pb_sample_to_cells),
     };
-    // Batch effects first: the NB trend behind the feature weights is then
-    // fitted to profiles that no longer carry them as extra dispersion.
     if matches!(params.profile_source, ProfileSource::Raw) {
-        profiles.rescale_batches_to_pooled(&layout.pb_sample_to_batch);
-    }
-    if matches!(params.profile_source, ProfileSource::Raw)
-        && !matches!(
+        // Batch factors first: the NB trend behind the feature weights is
+        // then fitted to profiles that no longer carry them as extra
+        // dispersion.
+        let coarsest = num_levels - 1;
+        profiles.rescale_batches(
+            &layout.pb_sample_to_batch,
+            batch_strata(&refined[coarsest], ks[coarsest]),
+        );
+        if !matches!(
             params.feature_weighting,
             crate::alg::dc_poisson::FeatureWeighting::None
-        )
-    {
-        info!("Computing NB Fisher-info feature weights ...");
-        profiles.apply_feature_weighting(params.feature_weighting);
+        ) {
+            info!("Computing NB Fisher-info feature weights ...");
+            profiles.apply_feature_weighting(params.feature_weighting);
+        }
     }
 
     // BBKNN proposals via the shared per-batch cell HNSW: for every non-own
@@ -377,6 +395,21 @@ pub(crate) fn refine_assignments_with_matches(
         pbsamp_to_group: refined,
         num_groups_per_level: ks,
     })
+}
+
+/// Fewest pb-samples a group of the coarsest level holds on average for
+/// those groups to serve as the strata of the batch-factor fit.
+const MIN_PB_PER_STRATUM: usize = 8;
+
+/// The strata within which batches are compared for their factors
+/// ([`Profiles::rescale_batches`]): the `k` groups of the coarsest level as
+/// they start, which follow the cell types closely enough to keep a
+/// difference in composition between batches from being read as a batch
+/// factor. Groups of fewer than [`MIN_PB_PER_STRATUM`] pb-samples on
+/// average leave too little of each batch in a group to compare, and the
+/// batches are then compared with the pooled profile.
+fn batch_strata(coarsest: &[usize], k: usize) -> Option<&[usize]> {
+    (coarsest.len() >= MIN_PB_PER_STRATUM * k).then_some(coarsest)
 }
 
 /// Re-label `child` so it is a strict refinement of `parent`: two entities

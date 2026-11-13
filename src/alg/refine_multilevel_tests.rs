@@ -95,6 +95,12 @@ const TOY_STATES: usize = 4;
 const TOY_GENES: usize = 8;
 
 fn toy() -> Toy {
+    toy_with(60.0, 1.0)
+}
+
+/// The toy with `marker` counts on a state's two marker genes, and the
+/// even genes of batch 1 multiplied by `batch_factor`.
+fn toy_with(marker: f32, batch_factor: f32) -> Toy {
     use legume_numeric::matrix::knn_match::ColumnDict;
     use nalgebra::DMatrix;
     let num_pb = 2 * TOY_STATES * 2;
@@ -125,7 +131,15 @@ fn toy() -> Toy {
                 // Two marker genes per state over a flat background.
                 gene_sums.push(
                     (0..TOY_GENES)
-                        .map(|g| (g, if g / 2 == k { 60.0 } else { 3.0 } + rep as f32))
+                        .map(|g| {
+                            let v = if g / 2 == k { marker } else { 3.0 } + rep as f32;
+                            let factor = if batch == 1 && g % 2 == 0 {
+                                batch_factor
+                            } else {
+                                1.0
+                            };
+                            (g, v * factor)
+                        })
                         .collect(),
                 );
             }
@@ -177,10 +191,13 @@ fn toy_params() -> RefineParams {
 #[test]
 fn refinement_with_a_given_match_table_is_the_same_refinement() {
     let t = toy();
-    // A scrambled start: finest groups pair pb-samples across states.
+    // One finest group per state, with a pb-sample of state 0 and one of
+    // state 1 exchanged; states 0 and 1 share a parent, as do 2 and 3.
     let num_pb = t.state.len();
-    let finest: Vec<usize> = (0..num_pb).map(|p| (p * 3) % 6).collect();
-    let coarse: Vec<usize> = finest.iter().map(|&g| g / 3).collect();
+    let mut finest = t.state.clone();
+    finest.swap(1, 3);
+    assert_ne!(finest, t.state);
+    let coarse: Vec<usize> = finest.iter().map(|&g| g / 2).collect();
     let levels = vec![finest, coarse];
     let inputs = RefineInputs {
         layout: &t.layout,
@@ -198,9 +215,10 @@ fn refinement_with_a_given_match_table_is_the_same_refinement() {
     let given = refine_assignments_with_matches(&inputs, &toy_params(), Some(&matches)).unwrap();
     assert_eq!(own.pbsamp_to_group, given.pbsamp_to_group);
     assert_eq!(own.num_groups_per_level, given.num_groups_per_level);
-    // The result is relabelled densely, so the start is compared the same way.
-    let start: Vec<Vec<usize>> = levels.iter().map(|l| compact_labels(l).0).collect();
-    assert_ne!(own.pbsamp_to_group, start, "the sweeps moved something");
+    // The sweeps put the two pb-samples back: the finest groups are the
+    // states (the result is relabelled densely, in order of appearance).
+    assert_eq!(num_pb, own.pbsamp_to_group[0].len());
+    assert_eq!(own.pbsamp_to_group[0], compact_labels(&t.state).0);
 }
 
 /// A stratum present in one batch only has no cross-batch match, so its
@@ -247,5 +265,53 @@ fn refinement_never_merges_a_private_stratum() {
                 );
             }
         }
+    }
+}
+
+/// Batch 1 carries a per-gene factor larger than the difference between
+/// two states, and the finest groups start as one batch each, two states
+/// mixed. Refinement sorts the pb-samples by state: every group ends with
+/// both batches and one state.
+#[test]
+fn refinement_groups_by_state_across_batches() {
+    let t = toy_with(60.0, 8.0);
+    let num_pb = t.state.len();
+    let batch = &t.layout.pb_sample_to_batch;
+    // States 0, 1 under one parent and 2, 3 under the other; below each
+    // parent, one group per batch.
+    let coarse: Vec<usize> = t.state.iter().map(|&k| k / 2).collect();
+    let finest: Vec<usize> = (0..num_pb).map(|p| 2 * coarse[p] + batch[p]).collect();
+    let levels = vec![finest, coarse];
+    let inputs = RefineInputs {
+        layout: &t.layout,
+        gene_sums: &t.gene_sums,
+        num_genes: TOY_GENES,
+        pb_sample_to_cells: &t.pb_sample_to_cells,
+        batch_knn_lookup: &t.batch_knn,
+        k_per_batch: 3,
+        initial_sc_to_group_per_level: &levels,
+        reproject_offsets_per_level: &[],
+    };
+    // Every gene of the toy marks a state, which the NB trend reads as
+    // overdispersion and weights away; the counts are scored as they are.
+    let params = RefineParams {
+        feature_weighting: crate::alg::dc_poisson::FeatureWeighting::None,
+        ..toy_params()
+    };
+    let refined = refine_assignments(&inputs, &params).unwrap();
+    let groups = &refined.pbsamp_to_group[0];
+    assert_eq!(refined.num_groups_per_level[0], TOY_STATES);
+    for g in 0..TOY_STATES {
+        let members: Vec<usize> = (0..num_pb).filter(|&p| groups[p] == g).collect();
+        assert_eq!(members.len(), 4, "group {g}: {members:?}");
+        assert!(
+            members.iter().all(|&p| t.state[p] == t.state[members[0]]),
+            "group {g} mixes states: {members:?}"
+        );
+        assert_eq!(
+            members.iter().filter(|&&p| batch[p] == 0).count(),
+            2,
+            "group {g} is not half of each batch: {members:?}"
+        );
     }
 }

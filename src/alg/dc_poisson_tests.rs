@@ -701,10 +701,9 @@ fn small_distinct_block_keeps_its_members() {
 
 #[test]
 fn small_block_of_the_same_profile_is_not_drained() {
-    // Same profile, a tenth of the size: by the old score every member of
-    // the small block left it. Nothing tells the blocks apart, so members
-    // may go either way, but the small block must not empty — with the
-    // size limits lifted too.
+    // Same profile, a tenth of the size. Nothing tells the blocks apart, so
+    // members may go either way, but the small block must not empty — with
+    // the size limits lifted too.
     for limits in [true, false] {
         for seed in 0..4 {
             let (rows, start) = small_against_large(true, 20 + seed);
@@ -766,12 +765,22 @@ fn mislabelled_entities_are_corrected() {
     }
 }
 
-#[test]
-fn mixed_blocks_are_purified_within_the_size_limits() {
-    // Twelve blocks of unequal size over three profiles, each two-thirds
-    // one profile. The members that do not belong move out; no block falls
-    // under its floor, exceeds its cap, or empties, and the members a
-    // block is named after stay.
+/// Twelve blocks over three profiles, sizes 6 to 48: every block starts
+/// with two-thirds of its members of one profile and the rest of the two
+/// others.
+struct MixedBlocks {
+    rows: Vec<Vec<(usize, f32)>>,
+    /// Profile of each entity.
+    truth: Vec<usize>,
+    /// Starting block of each entity.
+    start: Vec<usize>,
+    /// Number of blocks.
+    k: usize,
+    /// Number of profiles.
+    t: usize,
+}
+
+fn mixed_blocks_fixture() -> MixedBlocks {
     let (k, t) = (12, 3);
     let mut rng = SmallRng::seed_from_u64(40);
     let profs: Vec<Vec<f64>> = (0..t).map(|_| sim_profile(&mut rng, 0, SIM_M)).collect();
@@ -791,6 +800,28 @@ fn mixed_blocks_are_purified_within_the_size_limits() {
             start.push(b);
         }
     }
+    MixedBlocks {
+        rows,
+        truth,
+        start,
+        k,
+        t,
+    }
+}
+
+#[test]
+fn mixed_blocks_are_purified_within_the_size_limits() {
+    // Twelve blocks of unequal size over three profiles, each two-thirds
+    // one profile. The members that do not belong move out; no block falls
+    // under its floor, exceeds its cap, or empties, and the members a
+    // block is named after stay.
+    let MixedBlocks {
+        rows,
+        truth,
+        start,
+        k,
+        t,
+    } = mixed_blocks_fixture();
     let purity = |labels: &[usize]| {
         let mut c = vec![0usize; k * t];
         for (&l, &ty) in labels.iter().zip(&truth) {
@@ -800,19 +831,26 @@ fn mixed_blocks_are_purified_within_the_size_limits() {
         dom as f64 / labels.len() as f64
     };
     let n0 = block_sizes(&start, k);
-    let n_bar = start.len() as f64 / k as f64;
+    // 270 members in 12 blocks: a mean of 22.5. Nine tenths of
+    // min(n0, mean) and five quarters of max(n0, mean), rounded up.
+    assert_eq!(start.len(), 270);
+    let limit_of = |n: usize, limits: [usize; 4]| {
+        limits[[6, 12, 24, 48].iter().position(|&x| x == n).unwrap()]
+    };
+    let floor = |n: usize| limit_of(n, [6, 11, 21, 21]);
+    let cap = |n: usize| limit_of(n, [29, 29, 30, 60]);
     for params in sim_param_sets() {
         let mut labels = start.clone();
         sim_refine(&rows, &mut labels, k, &params);
         let n1 = block_sizes(&labels, k);
         for b in 0..k {
-            let floor = (0.9 * (n0[b] as f64).min(n_bar)).ceil() as usize;
-            let cap = (1.5 * (n0[b] as f64).max(n_bar)).ceil() as usize;
             assert!(
-                (floor..=cap).contains(&n1[b]),
-                "block {b}: {} -> {} outside {floor}..={cap}",
+                (floor(n0[b])..=cap(n0[b])).contains(&n1[b]),
+                "block {b}: {} -> {} outside {}..={}",
                 n0[b],
-                n1[b]
+                n1[b],
+                floor(n0[b]),
+                cap(n0[b])
             );
         }
         assert!(
@@ -829,8 +867,10 @@ fn mixed_blocks_are_purified_within_the_size_limits() {
             stayed += usize::from(labels[e] == start[e]);
         }
         // A Jacobi sweep applies its moves by gain, so the members that fit
-        // worst leave first; a sequential sweep takes them as it visits.
-        let share = if params.parallel { 0.9 } else { 0.8 };
+        // worst leave first; a sequential sweep takes them as it visits,
+        // and more of a block's own members leave for a purer block of
+        // their profile.
+        let share = if params.parallel { 0.9 } else { 0.6 };
         assert!(
             stayed as f64 >= share * all as f64,
             "{stayed} of {all} stayed (parallel={})",
@@ -840,10 +880,12 @@ fn mixed_blocks_are_purified_within_the_size_limits() {
 }
 
 #[test]
-fn lifted_floor_lets_a_mixed_block_dissolve() {
+fn lifted_floor_lets_a_mixed_block_shed_one_profile() {
     // Without a floor the likelihood alone decides: a block that is half
-    // one profile and half another gives all its members to the two pure
-    // blocks.
+    // one profile and half another gives the members of one of them to
+    // that profile's pure block. What is left is a small block of the
+    // other profile, which nothing tells apart from the large pure block
+    // of that profile, so it stays.
     let mut rng = SmallRng::seed_from_u64(50);
     let pa = sim_profile(&mut rng, 0, SIM_M);
     let pb = sim_profile(&mut rng, 0, SIM_M);
@@ -868,7 +910,17 @@ fn lifted_floor_lets_a_mixed_block_dissolve() {
     };
     let mut labels = start.clone();
     sim_refine(&rows, &mut labels, 3, &free);
-    assert_eq!(block_sizes(&labels, 3), vec![60, 60, 0]);
+    let left: Vec<usize> = (80..120).filter(|&e| labels[e] == 2).collect();
+    assert!(left.len() <= 20, "{} of 40 left", left.len());
+    assert!(
+        left.iter().all(|e| e % 2 == 0) || left.iter().all(|e| e % 2 == 1),
+        "what is left is of one profile"
+    );
+    assert_eq!(
+        labels[..80],
+        start[..80],
+        "the pure blocks keep their members"
+    );
 
     let mut labels = start.clone();
     sim_refine(&rows, &mut labels, 3, &RefineParams::default());
@@ -892,8 +944,14 @@ fn log_caches_follow_delta_moves_with_counts() {
     let fresh = DcPoissonStats::from_profiles(&profiles, 3, &stats.membership);
     assert_eq!(stats.count, fresh.count);
     assert_eq!(stats.count.iter().sum::<usize>(), n);
-    for b in 0..3 {
-        assert!((stats.block_var[b] - fresh.block_var[b]).abs() < 1e-9);
+    for (moved, built) in [
+        (&stats.class_null, &fresh.class_null),
+        (&stats.class_var, &fresh.class_var),
+    ] {
+        assert_eq!(moved.len(), built.len());
+        for (a, b) in moved.iter().zip(built) {
+            assert!((a - b).abs() < 1e-9, "{a} vs {b}");
+        }
     }
 }
 
@@ -927,6 +985,566 @@ fn empty_block_scores_as_the_pooled_profile() {
 }
 
 #[test]
+fn repeated_calls_do_not_empty_a_block() {
+    // The limits are those of each call's input, so a block may shrink a
+    // step per call: a tenth of its members while it has ten or more, and
+    // not at all below ten. Called again and again on its own output, no
+    // block of the mixed partition falls under min(its start, nine).
+    let MixedBlocks { rows, start, k, .. } = mixed_blocks_fixture();
+    let n0 = block_sizes(&start, k);
+    for parallel in [true, false] {
+        let params = RefineParams {
+            parallel,
+            ..Default::default()
+        };
+        let mut labels = start.clone();
+        for call in 0..12 {
+            sim_refine(&rows, &mut labels, k, &params);
+            let n = block_sizes(&labels, k);
+            for b in 0..k {
+                assert!(
+                    n[b] >= n0[b].min(9),
+                    "call {call}, block {b}: {} -> {} (parallel={parallel})",
+                    n0[b],
+                    n[b]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn size_limits_of_small_and_empty_blocks() {
+    let limits = |count: &[usize], size_floor: f32, size_cap: f32| {
+        let l = SizeLimits::new(
+            count,
+            &RefineParams {
+                size_floor,
+                size_cap,
+                ..Default::default()
+            },
+        );
+        (l.floor, l.cap)
+    };
+    // Four occupied blocks of 120 members: a mean of 30.
+    let count = [0, 1, 9, 10, 100];
+    let (floor, cap) = limits(&count, 0.9, 1.5);
+    // An empty block and a block of one have a floor of one; nine members
+    // stay nine and ten may fall to nine; the large block may fall to nine
+    // tenths of the mean.
+    assert_eq!(floor, vec![1, 1, 9, 9, 27]);
+    assert_eq!(cap, vec![45, 45, 45, 45, 150]);
+    let l = SizeLimits::new(
+        &count,
+        &RefineParams {
+            size_floor: 0.9,
+            size_cap: 1.5,
+            ..Default::default()
+        },
+    );
+    assert!(!l.can_leave(&count, 0) && !l.can_leave(&count, 1));
+    assert!(!l.can_leave(&count, 2) && l.can_leave(&count, 3));
+    assert!(l.admits(&count, 4, 0), "an empty block takes members");
+    assert!(l.admits(&count, 3, 2), "a block at its floor takes members");
+
+    // Zero switches a limit off.
+    let (floor, cap) = limits(&count, 0.0, 0.0);
+    assert_eq!(floor, vec![0; 5]);
+    assert_eq!(cap, vec![usize::MAX; 5]);
+
+    // A decimal fraction gives the limit it gives on paper: eight tenths of
+    // ten is eight, both ways.
+    let (floor, cap) = limits(&[10, 10], 0.8, 0.8);
+    assert_eq!((floor, cap), (vec![8, 8], vec![8, 8]));
+    let (floor, cap) = limits(&[10, 10, 10], 0.7, 1.1);
+    assert_eq!((floor, cap), (vec![7; 3], vec![11; 3]));
+    // A mean that is no whole number: 7 members in 2 blocks.
+    let (floor, cap) = limits(&[3, 4], 1.0, 1.0);
+    assert_eq!((floor, cap), (vec![3, 4], vec![4, 4]));
+    // No block at all.
+    let (floor, cap) = limits(&[], 0.9, 1.5);
+    assert!(floor.is_empty() && cap.is_empty());
+}
+
+/// Blocks 0 (ten of profile A), 1 (ten of B) and 2 (ten of C and twenty of
+/// A, which belong in block 0). The mean size is 50 / 3.
+fn crowded_block_fixture() -> (Vec<Vec<(usize, f32)>>, Vec<usize>) {
+    let mut rng = SmallRng::seed_from_u64(80);
+    let profs: Vec<Vec<f64>> = (0..3).map(|_| sim_profile(&mut rng, 0, SIM_M)).collect();
+    let mut rows = Vec::new();
+    let mut start = Vec::new();
+    for (block, ty, n) in [(0, 0, 10), (1, 1, 10), (2, 2, 10), (2, 0, 20)] {
+        for _ in 0..n {
+            rows.push(sim_entity(&mut rng, &profs[ty], 800.0));
+            start.push(block);
+        }
+    }
+    (rows, start)
+}
+
+#[test]
+fn the_cap_and_the_floor_bind() {
+    let (rows, start) = crowded_block_fixture();
+    for parallel in [true, false] {
+        let run = |size_floor: f32, size_cap: f32| {
+            let params = RefineParams {
+                size_floor,
+                size_cap,
+                parallel,
+                ..Default::default()
+            };
+            let mut labels = start.clone();
+            sim_refine(&rows, &mut labels, 3, &params);
+            block_sizes(&labels, 3)
+        };
+        // Cap of block 0: the mean, rounded up.
+        assert_eq!(run(0.9, 1.0), vec![17, 10, 23], "parallel={parallel}");
+        // No cap: block 2 gives members down to nine tenths of the mean.
+        assert_eq!(run(0.9, 0.0), vec![25, 10, 15], "parallel={parallel}");
+        // No limits: every member of profile A joins block 0.
+        assert_eq!(run(0.0, 0.0), vec![30, 10, 10], "parallel={parallel}");
+    }
+}
+
+/// Vetoes every move of an entity with an even index.
+struct EvenStay;
+
+impl MoveGuard for EvenStay {
+    fn accept_move(&self, entity: usize, _from: usize, _labels: &[usize]) -> bool {
+        entity % 2 == 1
+    }
+}
+
+#[test]
+fn a_vetoed_move_changes_no_count() {
+    // The limits are read off the member counts, so a move the guard
+    // refuses must leave them as they were: afterwards the counts are those
+    // of the labels, the vetoed entities are where they started, and the
+    // cap still holds.
+    let (rows, start) = crowded_block_fixture();
+    let mut profiles = Profiles::from_gene_sums(&rows, SIM_M);
+    profiles.apply_feature_weighting(FeatureWeighting::FisherInfoNb);
+    let candidates: Vec<Vec<usize>> = vec![(0..3).collect(); start.len()];
+    for parallel in [true, false] {
+        let params = RefineParams {
+            size_cap: 1.0,
+            parallel,
+            ..Default::default()
+        };
+        let ctx = RefineContext {
+            profiles: &profiles,
+            k: 3,
+            params: &params,
+            level_label: "test",
+        };
+        let mut labels = start.clone();
+        let mut rng = SmallRng::seed_from_u64(1);
+        let moves =
+            refine_with_candidates_guarded(&mut labels, &candidates, &EvenStay, &mut rng, &ctx);
+        for e in (0..labels.len()).step_by(2) {
+            assert_eq!(labels[e], start[e], "entity {e} moved past the guard");
+        }
+        let moved = labels.iter().zip(&start).filter(|(a, b)| a != b).count();
+        assert!(moved > 0 && moves >= moved, "parallel={parallel}");
+        // Seven places under the cap of block 0, ten odd entities that want
+        // them: the vetoed ones did not use any up.
+        assert_eq!(
+            block_sizes(&labels, 3),
+            vec![17, 10, 23],
+            "parallel={parallel}"
+        );
+    }
+}
+
+/// Vetoes every move of one entity.
+struct Pinned(usize);
+
+impl MoveGuard for Pinned {
+    fn accept_move(&self, entity: usize, _from: usize, _labels: &[usize]) -> bool {
+        entity != self.0
+    }
+}
+
+#[test]
+fn small_blocks_exchange_their_misfits() {
+    // Eight entities in two blocks of four, `n_a` of profile A and the
+    // rest of profile B. Nine tenths of four, rounded up, is four: neither
+    // block may give a member.
+    let refine = |n_a: usize, start: &[usize], params: &RefineParams, pinned: Option<usize>| {
+        let mut rng = SmallRng::seed_from_u64(85);
+        let pa = sim_profile(&mut rng, 0, SIM_M);
+        let pb = sim_profile(&mut rng, 0, SIM_M);
+        let rows: Vec<Vec<(usize, f32)>> = (0..8)
+            .map(|e| sim_entity(&mut rng, if e < n_a { &pa } else { &pb }, 500.0))
+            .collect();
+        let profiles = Profiles::from_gene_sums(&rows, SIM_M);
+        let candidates: Vec<Vec<usize>> = vec![vec![0, 1]; 8];
+        let ctx = RefineContext {
+            profiles: &profiles,
+            k: 2,
+            params,
+            level_label: "test",
+        };
+        let mut labels = start.to_vec();
+        let mut rng = SmallRng::seed_from_u64(1);
+        let moves = match pinned {
+            Some(e) => {
+                refine_with_candidates_guarded(&mut labels, &candidates, &Pinned(e), &mut rng, &ctx)
+            }
+            None => refine_with_candidates(&mut labels, &candidates, &mut rng, &ctx),
+        };
+        (labels, moves)
+    };
+    for parallel in [true, false] {
+        let params = RefineParams {
+            feature_weighting: FeatureWeighting::None,
+            parallel,
+            ..Default::default()
+        };
+        // One member of each block belongs in the other: the two change
+        // places, and the sizes stay.
+        let swapped = [0, 0, 0, 1, 0, 1, 1, 1];
+        assert_eq!(
+            refine(4, &swapped, &params, None),
+            (vec![0, 0, 0, 0, 1, 1, 1, 1], 2),
+            "parallel={parallel}"
+        );
+        // With either of the two held by the guard, neither moves.
+        for held in [3, 4] {
+            assert_eq!(
+                refine(4, &swapped, &params, Some(held)).0,
+                swapped,
+                "parallel={parallel}, entity {held} held"
+            );
+        }
+        // Three of profile A and one of B against four of B: the misfit
+        // has no counterpart and stays, since its block would shrink.
+        let lone = [0, 0, 0, 0, 1, 1, 1, 1];
+        assert_eq!(
+            refine(3, &lone, &params, None),
+            (lone.to_vec(), 0),
+            "parallel={parallel}"
+        );
+        // Without the floor it joins its own.
+        let free = RefineParams {
+            size_floor: 0.0,
+            ..params.clone()
+        };
+        assert_eq!(
+            refine(3, &lone, &free, None).0,
+            vec![0, 0, 0, 1, 1, 1, 1, 1],
+            "parallel={parallel}"
+        );
+    }
+}
+
+#[test]
+fn a_jacobi_sweep_rescores_moves_out_of_a_changed_block() {
+    // Block 2 is half profile A, half profile B, next to a pure block of
+    // each. Against the snapshot every member of block 2 gains by leaving.
+    // Applied in turn, the moves of one half leave a block of the other
+    // half only, which the rest then has no reason to leave: one sweep
+    // moves all of one half and keeps the block.
+    let mut rng = SmallRng::seed_from_u64(90);
+    let pa = sim_profile(&mut rng, 0, SIM_M);
+    let pb = sim_profile(&mut rng, 0, SIM_M);
+    let mut rows = Vec::new();
+    let mut start = Vec::new();
+    for (block, p, n) in [(0, &pa, 30), (1, &pb, 30), (2, &pa, 6), (2, &pb, 6)] {
+        for _ in 0..n {
+            rows.push(sim_entity(&mut rng, p, 500.0));
+            start.push(block);
+        }
+    }
+    let params = RefineParams {
+        num_gibbs: 0,
+        num_greedy: 1,
+        size_floor: 0.0,
+        size_cap: 0.0,
+        parallel: true,
+        ..Default::default()
+    };
+    // Every member of block 2 proposes to leave.
+    let profiles = Profiles::from_gene_sums(&rows, SIM_M);
+    let stats = DcPoissonStats::from_profiles_with(&profiles, 3, &start, &params);
+    let mut lp = vec![0f64; 3];
+    for e in 60..72 {
+        compute_log_probs_restricted(e, &stats, &profiles, &[0, 1, 2], &mut lp);
+        assert_ne!(argmax_log_staying(&lp, &[0, 1, 2], 2), 2, "entity {e}");
+    }
+    let mut labels = start.clone();
+    let moves = sim_refine(&rows, &mut labels, 3, &params);
+    let left: Vec<usize> = (60..72).filter(|&e| labels[e] == 2).collect();
+    assert_eq!(moves, 12 - left.len());
+    assert!(left.len() >= 2, "part of one half stays: {left:?}");
+    assert!(
+        left.iter().all(|&e| e < 66) || left.iter().all(|&e| e >= 66),
+        "what stays is of one profile: {left:?}"
+    );
+}
+
+#[test]
+fn zero_prior_count_scores_stay_finite() {
+    // `prior_count = 0` is the floor under the log and nothing more: scores
+    // are finite, empty blocks included, and distinct profiles are still
+    // told apart.
+    let k = 4;
+    let mut rng = SmallRng::seed_from_u64(100);
+    let mut rows = Vec::new();
+    let mut truth = Vec::new();
+    for b in 0..3 {
+        let p = sim_profile(&mut rng, 0, SIM_M);
+        for _ in 0..40 {
+            rows.push(sim_entity(&mut rng, &p, 500.0));
+            truth.push(b);
+        }
+    }
+    let mut start = truth.clone();
+    for e in (0..start.len()).step_by(5) {
+        start[e] = (truth[e] + 1) % 3;
+    }
+    let profiles = Profiles::from_gene_sums(&rows, SIM_M);
+    for parallel in [true, false] {
+        let params = RefineParams {
+            prior_count: 0.0,
+            parallel,
+            ..Default::default()
+        };
+        let stats = DcPoissonStats::from_profiles_with(&profiles, k, &start, &params);
+        let all: Vec<usize> = (0..k).collect();
+        let mut lp = vec![0f64; k];
+        for e in 0..rows.len() {
+            compute_log_probs_restricted(e, &stats, &profiles, &all, &mut lp);
+            assert!(lp.iter().all(|x| x.is_finite()), "entity {e}: {lp:?}");
+        }
+        let mut labels = start.clone();
+        sim_refine(&rows, &mut labels, k, &params);
+        assert!(labels.iter().all(|&l| l < k));
+        let right = labels.iter().zip(&truth).filter(|(a, b)| a == b).count();
+        assert!(right >= truth.len() - 2, "{right} of {} right", truth.len());
+    }
+}
+
+#[test]
+fn labels_do_not_depend_on_the_thread_count() {
+    // Eight blocks of forty, a fifth mislabelled. Every third entity is
+    // given a candidate list without its current block, which leaves that
+    // block's slot of the score buffer to whatever a thread scored last.
+    let k = 8;
+    let mut rng = SmallRng::seed_from_u64(110);
+    let mut rows = Vec::new();
+    let mut start = Vec::new();
+    let base = sim_profile(&mut rng, 0, SIM_M);
+    for b in 0..k {
+        let p = sim_perturbed(&mut rng, &base);
+        for _ in 0..40 {
+            rows.push(sim_entity(&mut rng, &p, 400.0));
+            start.push(if rng.random::<f64>() < 0.2 {
+                (b + 1 + rng.random_range(0..k - 1)) % k
+            } else {
+                b
+            });
+        }
+    }
+    let mut profiles = Profiles::from_gene_sums(&rows, SIM_M);
+    profiles.apply_feature_weighting(FeatureWeighting::FisherInfoNb);
+    let candidates: Vec<Vec<usize>> = (0..rows.len())
+        .map(|e| {
+            (0..k)
+                .filter(|&b| e % 3 != 0 || b != start[e])
+                .collect::<Vec<usize>>()
+        })
+        .collect();
+    for parallel in [true, false] {
+        let params = RefineParams {
+            parallel,
+            ..Default::default()
+        };
+        let on_threads = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool")
+                .install(|| {
+                    let ctx = RefineContext {
+                        profiles: &profiles,
+                        k,
+                        params: &params,
+                        level_label: "test",
+                    };
+                    let mut labels = start.clone();
+                    let mut rng = SmallRng::seed_from_u64(params.seed);
+                    let moves = refine_with_candidates(&mut labels, &candidates, &mut rng, &ctx);
+                    (labels, moves)
+                })
+        };
+        let one = on_threads(1);
+        assert!(one.1 > 0, "the fixture has moves to make");
+        for threads in [3, 6] {
+            assert_eq!(
+                on_threads(threads),
+                one,
+                "{threads} threads, parallel={parallel}"
+            );
+        }
+    }
+}
+
+/////////////////////////////////////////////
+// Many features, most of them rarely seen //
+/////////////////////////////////////////////
+
+/// Lognormal(0, `sd`) rates on `m` features, normalised to one.
+fn heavy_tailed_profile(rng: &mut SmallRng, m: usize, sd: f64) -> Vec<f64> {
+    let ln = LogNormal::new(0.0, sd).unwrap();
+    let mut p: Vec<f64> = (0..m).map(|_| ln.sample(rng)).collect();
+    let s: f64 = p.iter().sum();
+    p.iter_mut().for_each(|x| *x /= s);
+    p
+}
+
+/// Blocks 0 (`n_small` entities) and 1 (`n_big`) of one heavy-tailed
+/// profile over 20,000 features, `N_OUT` further entities of the same
+/// profile in block 2, and `n_rest` more in block 3. Returns, for each
+/// entity of block 2, its score for the small block less its score for
+/// the large one, and the charge on a move between the two.
+fn size_gap(n_small: usize, n_big: usize, n_rest: usize, depth: f64, seed: u64) -> Vec<(f64, f64)> {
+    const N_OUT: usize = 24;
+    let m = 20_000;
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let p = heavy_tailed_profile(&mut rng, m, 2.0);
+    let mut labels = vec![0; n_small];
+    labels.extend(vec![1; n_big]);
+    labels.extend(vec![2; N_OUT]);
+    labels.extend(vec![3; n_rest]);
+    let rows: Vec<Vec<(usize, f32)>> = labels
+        .iter()
+        .map(|_| sim_entity(&mut rng, &p, depth))
+        .collect();
+    let profiles = Profiles::from_gene_sums(&rows, m);
+    let flat = RefineParams {
+        min_gain_z: 0.0,
+        ..Default::default()
+    };
+    let mut raw = DcPoissonStats::from_profiles_with(&profiles, 4, &labels, &flat);
+    let mut charged = DcPoissonStats::from_profiles(&profiles, 4, &labels);
+    let mut lp = vec![0f64; 4];
+    (n_small + n_big..n_small + n_big + N_OUT)
+        .map(|e| {
+            // As a member of the small block, the entity's leave-one-out
+            // score there is its score against the block as an outsider.
+            raw.delta_move(e, 2, 0, &profiles);
+            charged.delta_move(e, 2, 0, &profiles);
+            compute_log_probs_restricted(e, &raw, &profiles, &[0, 1], &mut lp);
+            let gap = lp[0] - lp[1];
+            compute_log_probs_restricted(e, &charged, &profiles, &[0, 1], &mut lp);
+            let charge = (lp[0] - lp[1]) - gap;
+            raw.delta_move(e, 0, 2, &profiles);
+            charged.delta_move(e, 0, 2, &profiles);
+            (gap, charge)
+        })
+        .collect()
+}
+
+#[test]
+fn blocks_of_one_profile_neither_attract_nor_repel_by_size() {
+    // Most of 20,000 heavy-tailed features have a total of zero or one in
+    // the small block. The score difference between the two blocks stays
+    // within the charge a move has to clear, whichever way. (The two
+    // blocks are a quarter of the entities: a block that makes up most of
+    // the pooled profile is its own null, and is favoured for it.)
+    for (n_small, n_big, depth) in [(6, 60, 3000.0), (3, 50, 1000.0)] {
+        let gaps = size_gap(n_small, n_big, 200, depth, 120);
+        let n = gaps.len() as f64;
+        let mean_gap = gaps.iter().map(|g| g.0).sum::<f64>() / n;
+        let mean_charge = gaps.iter().map(|g| g.1).sum::<f64>() / n;
+        let beyond = gaps.iter().filter(|g| g.0.abs() > g.1).count();
+        assert!(mean_charge > 0.0);
+        assert!(
+            mean_gap.abs() < 0.5 * mean_charge,
+            "{n_small} vs {n_big}: mean gap {mean_gap:.1}, charge {mean_charge:.1}"
+        );
+        assert!(
+            beyond as f64 <= 0.25 * n,
+            "{n_small} vs {n_big}: {beyond} of {n} entities beyond the charge"
+        );
+    }
+}
+
+#[test]
+fn rate_classes_reproduce_the_score_feature_by_feature() {
+    // The null means are kept on a grid of pooled rates. Against the same
+    // score with every feature's null mean taken at its own rate, the grid
+    // costs a small fraction of a nat per thousand counts.
+    let m = 4000;
+    let mut rng = SmallRng::seed_from_u64(130);
+    let p = heavy_tailed_profile(&mut rng, m, 2.0);
+    let labels: Vec<usize> = (0..60).map(|e| [0, 1, 1, 2, 2, 2][e % 6]).collect();
+    let rows: Vec<Vec<(usize, f32)>> = labels
+        .iter()
+        .map(|_| sim_entity(&mut rng, &p, 1500.0))
+        .collect();
+    let profiles = Profiles::from_gene_sums(&rows, m);
+    let flat = RefineParams {
+        min_gain_z: 0.0,
+        ..Default::default()
+    };
+    let stats = DcPoissonStats::from_profiles_with(&profiles, 3, &labels, &flat);
+    let mut pooled = vec![0f64; m];
+    for row in &profiles.rows {
+        for &(g, v) in row {
+            pooled[g as usize] += v as f64;
+        }
+    }
+    let total: f64 = pooled.iter().sum();
+    let mut lp = vec![0f64; 3];
+    let mut worst = 0f64;
+    for (e, row) in profiles.rows.iter().enumerate() {
+        compute_log_probs_restricted(e, &stats, &profiles, &[0, 1, 2], &mut lp);
+        let sf = profiles.size_factor[e] as f64;
+        for (k, &score) in lp.iter().enumerate() {
+            let own = usize::from(k == labels[e]) as f64;
+            let size = stats.size_sum[k] - own * sf;
+            let exact: f64 = row
+                .iter()
+                .map(|&(g, v)| {
+                    let v = v as f64;
+                    let total_k = stats.gene_sum[stats.idx(k, g as usize)] - own * v;
+                    let rate = (pooled[g as usize] - v) / (total - sf);
+                    let mu = size * rate;
+                    v * ((total_k + stats.prior).ln() - stats.null.at(mu.ln(), mu).0)
+                })
+                .sum();
+            worst = worst.max((score - exact).abs() / sf);
+        }
+    }
+    assert!(worst < 2e-4, "{worst} nats per count");
+}
+
+////////////////////
+// Batch factors  //
+////////////////////
+
+/// Mean profile (normalised to one) of the entities `pick` selects.
+fn mean_profile(profiles: &Profiles, pick: impl Fn(usize) -> bool) -> Vec<f64> {
+    let mut sum = vec![0f64; profiles.num_features];
+    for (e, row) in profiles.rows.iter().enumerate() {
+        if pick(e) {
+            for &(g, v) in row {
+                sum[g as usize] += v as f64;
+            }
+        }
+    }
+    let s: f64 = sum.iter().sum();
+    sum.iter_mut().for_each(|x| *x /= s);
+    sum
+}
+
+fn l1(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum()
+}
+
+#[test]
 fn rescaling_removes_a_batch_factor() {
     // Batch 1 doubles the even features. After rescaling, entities of the
     // two batches drawn from one profile have the same expected profile.
@@ -943,32 +1561,149 @@ fn rescaling_removes_a_batch_factor() {
         rows.push(sim_entity(&mut rng, if b == 0 { &p } else { &q }, 2000.0));
         batch.push(b);
     }
+    let plain = Profiles::from_gene_sums(&rows, SIM_M);
+    let apart = l1(
+        &mean_profile(&plain, |e| batch[e] == 0),
+        &mean_profile(&plain, |e| batch[e] == 1),
+    );
     let mut profiles = Profiles::from_gene_sums(&rows, SIM_M);
-    profiles.rescale_batches_to_pooled(&batch);
-    let mut share = vec![[0f64; 2]; SIM_M];
-    let mut tot = [0f64; 2];
-    for (row, &b) in profiles.rows.iter().zip(&batch) {
-        for &(g, v) in row {
-            share[g as usize][b] += v as f64;
-            tot[b] += v as f64;
-        }
-    }
-    // (features both batches show; one a batch never shows keeps its values)
-    let seen: f64 = share.iter().filter(|s| s[0] > 0.0 && s[1] > 0.0).count() as f64;
-    assert!(seen > 0.9 * SIM_M as f64);
-    for (g, s) in share.iter().enumerate() {
-        if s[0] > 0.0 && s[1] > 0.0 {
-            let (a, b) = (s[0] / tot[0], s[1] / tot[1]);
-            assert!((a - b).abs() <= 1e-2 * (a + b), "feature {g}: {a} vs {b}");
-        }
-    }
+    profiles.rescale_batches(&batch, None);
+    let together = l1(
+        &mean_profile(&profiles, |e| batch[e] == 0),
+        &mean_profile(&profiles, |e| batch[e] == 1),
+    );
+    assert!(apart > 0.3, "the batches start apart: {apart}");
+    assert!(together < 0.1 * apart, "{apart} -> {together}");
     for (row, &sf) in profiles.rows.iter().zip(&profiles.size_factor) {
         let sum: f32 = row.iter().map(|&(_, v)| v).sum();
         assert!((sum - sf).abs() <= 1e-3 * sf);
     }
     // One batch: nothing to remove.
     let mut single = Profiles::from_gene_sums(&rows, SIM_M);
-    single.rescale_batches_to_pooled(&vec![0; rows.len()]);
-    let plain = Profiles::from_gene_sums(&rows, SIM_M);
+    single.rescale_batches(&vec![0; rows.len()], None);
+    assert_eq!(single.rows, plain.rows);
     assert_eq!(single.size_factor, plain.size_factor);
+}
+
+#[test]
+fn a_stray_count_and_a_lone_entity_are_left_nearly_as_they_are() {
+    // Feature 0: a thousand counts in batch 0, one stray count in batch 1.
+    // Feature 1: five counts in batch 0, one in batch 1. Feature 2 carries
+    // the bulk of every entity. Batch 2 is a single entity with a profile
+    // of its own.
+    let mut rows: Vec<Vec<(usize, f32)>> = Vec::new();
+    let mut batch = Vec::new();
+    for e in 0..40 {
+        let b = e % 2;
+        let mut row = vec![(2usize, 500.0f32), (3, 100.0 + (e % 7) as f32)];
+        if b == 0 {
+            row.push((0, 50.0));
+        }
+        if e < 10 && b == 0 {
+            row.push((1, 1.0));
+        }
+        rows.push(row);
+        batch.push(b);
+    }
+    rows[1].push((0, 1.0));
+    rows[3].push((1, 1.0));
+    rows.push(vec![(2, 10.0), (3, 700.0), (4, 90.0)]);
+    batch.push(2);
+    let plain = Profiles::from_gene_sums(&rows, 5);
+    let mut profiles = Profiles::from_gene_sums(&rows, 5);
+    profiles.rescale_batches(&batch, None);
+    let value = |p: &Profiles, e: usize, g: u32| {
+        p.rows[e]
+            .iter()
+            .find(|&&(f, _)| f == g)
+            .map_or(0.0, |&(_, v)| v)
+    };
+    // The stray count: the raw ratio of pooled to batch rate is in the
+    // hundreds; the factor is bounded.
+    let stray = value(&profiles, 1, 0);
+    assert!(
+        (1.0..=BATCH_FACTOR_BOUND).contains(&stray),
+        "stray count became {stray}"
+    );
+    // Thin evidence either way: nearly untouched.
+    let thin = value(&profiles, 3, 1);
+    assert!((0.8..=1.25).contains(&thin), "thin count became {thin}");
+    // The lone entity of batch 2 keeps its profile exactly.
+    let lone = rows.len() - 1;
+    assert_eq!(profiles.rows[lone], plain.rows[lone]);
+    assert_eq!(profiles.size_factor[lone], plain.size_factor[lone]);
+}
+
+#[test]
+fn strata_keep_a_type_alike_across_batches_of_unequal_composition() {
+    // Two types; batch 0 is nine tenths type 0, batch 1 one tenth, and
+    // batch 1 doubles the even features. Compared with the pooled profile,
+    // batch 0 looks like "too much of type 0" and the fit scales the
+    // type's features down there and up in batch 1: the type no longer
+    // matches itself across the batches. Compared within the types, only
+    // the doubling is taken out.
+    let mut rng = SmallRng::seed_from_u64(140);
+    let types = [
+        sim_profile(&mut rng, 0, SIM_M),
+        sim_profile(&mut rng, 0, SIM_M),
+    ];
+    let doubled: Vec<Vec<f64>> = types
+        .iter()
+        .map(|p| {
+            let mut q = p.clone();
+            q.iter_mut().step_by(2).for_each(|x| *x *= 2.0);
+            let s: f64 = q.iter().sum();
+            q.iter_mut().for_each(|x| *x /= s);
+            q
+        })
+        .collect();
+    let mut rows = Vec::new();
+    let mut batch = Vec::new();
+    let mut ty = Vec::new();
+    for e in 0..400 {
+        let b = e % 2;
+        let t = usize::from((e / 2) % 10 == 0) ^ b;
+        rows.push(sim_entity(
+            &mut rng,
+            if b == 0 { &types[t] } else { &doubled[t] },
+            2000.0,
+        ));
+        batch.push(b);
+        ty.push(t);
+    }
+    assert_eq!(
+        (0..400).filter(|&e| batch[e] == 0 && ty[e] == 0).count(),
+        180
+    );
+    assert_eq!(
+        (0..400).filter(|&e| batch[e] == 1 && ty[e] == 0).count(),
+        20
+    );
+    // Distance between the two batches' entities of one type, summed over
+    // the types.
+    let apart = |p: &Profiles| -> f64 {
+        (0..2)
+            .map(|t| {
+                l1(
+                    &mean_profile(p, |e| ty[e] == t && batch[e] == 0),
+                    &mean_profile(p, |e| ty[e] == t && batch[e] == 1),
+                )
+            })
+            .sum()
+    };
+    let raw = apart(&Profiles::from_gene_sums(&rows, SIM_M));
+    let mut pooled = Profiles::from_gene_sums(&rows, SIM_M);
+    pooled.rescale_batches(&batch, None);
+    let mut within = Profiles::from_gene_sums(&rows, SIM_M);
+    within.rescale_batches(&batch, Some(&ty));
+    let (pooled, within) = (apart(&pooled), apart(&within));
+    assert!(raw > 0.6, "the doubling sets the batches apart: {raw}");
+    assert!(
+        within < 0.3 * raw,
+        "within the types the factor is removed: {raw} -> {within}"
+    );
+    assert!(
+        pooled > raw,
+        "against the pool the composition is taken for a factor: {raw} -> {pooled}"
+    );
 }

@@ -5,13 +5,19 @@
 //! the groups are (node, batch) pairs, and a cell's candidates are the
 //! groups of its own batch.
 //!
-//! The pass runs without the member-count limits of
-//! [`RefineParams`]: a node that is a mix of lineages gives all its cells
-//! to the nodes of those lineages and disappears, which a floor would only
-//! turn into a node of leftovers. The number of leaves is not lost with it
-//! — the tree grown below the remaining nodes splits them to the same
-//! targets. What keeps two nodes of one lineage from merging is the score
-//! alone, which does not prefer the larger of them.
+//! The pass runs without the member-count limits of [`RefineParams`]. The
+//! top nodes of the marginal sketch are mixes of lineages, and making them
+//! one lineage each takes more than a trade of members: a mixed node gives
+//! its cells to the nodes of their lineages and may empty, and a node that
+//! gathers a lineage grows. Under a floor the leftovers of every mixed
+//! node stay where they are, and the nodes end up far less pure. The
+//! number of leaves is not lost with the emptied nodes: the tree grown
+//! below the remaining ones splits them to the same targets.
+//!
+//! So nodes do empty and grow here, by the profiles of their cells. What
+//! the score does not do is move cells between two nodes of one profile
+//! for their size alone (see
+//! [`DcPoissonStats`](crate::alg::dc_poisson::DcPoissonStats)).
 
 use super::*;
 use crate::alg::dc_poisson::{
