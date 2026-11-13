@@ -126,8 +126,8 @@ fn qc_properties(data: &Value) -> Value {
         "mito_max_frac": { "type": "number", "description": "Hard cap on the mito fraction, 0..1" },
         "ribo_pattern": { "type": "string", "description": "Regex for ribosomal genes, e.g. (?i)^RP[SL]" },
         "ribo_max_frac": { "type": "number", "description": "Hard cap on the ribo fraction, 0..1" },
-        "feature_min_cells": { "type": "integer", "minimum": 0, "description": "Also drop features detected in fewer cells (default 0, off)" },
-        "auto_cutoff": { "type": "boolean", "description": "Also drop cells below the trough between ambient and real cells' detected genes" },
+        "feature_min_cells": { "type": "integer", "minimum": 0, "description": "Also drop features detected in fewer cells (default 0, off; under auto_cutoff the default is its gene trough, and 0 given keeps every feature)" },
+        "auto_cutoff": { "type": "boolean", "description": "Also drop cells below the trough between ambient and real cells' detected genes and, unless feature_min_cells is given, features below the trough of cells per feature" },
     })
 }
 
@@ -546,12 +546,15 @@ impl Arguments {
                     _temp: None,
                 },
                 None => {
-                    let temp = tempfile::Builder::new()
-                        .suffix(".png")
-                        .tempfile()?
-                        .into_temp_path();
+                    // A new name in a folder of its own: the command does
+                    // not write over a file that is there.
+                    let temp = tempfile::tempdir()?;
                     Figure {
-                        path: temp.to_string_lossy().into_owned(),
+                        path: temp
+                            .path()
+                            .join("figure.png")
+                            .to_string_lossy()
+                            .into_owned(),
                         kept: false,
                         _temp: Some(temp),
                     }
@@ -596,12 +599,12 @@ fn results_name(
         .context("no free name in the results folder")
 }
 
-/// A figure a tool writes: where, and whether it is kept (else a temporary
-/// file, gone with this).
+/// A figure a tool writes: where, and whether it is kept (else in a
+/// temporary folder, gone with this).
 struct Figure {
     path: String,
     kept: bool,
-    _temp: Option<tempfile::TempPath>,
+    _temp: Option<tempfile::TempDir>,
 }
 
 impl Figure {
@@ -627,7 +630,7 @@ impl Arguments {
             backend_target(c).map_or(true, |t| {
                 let stem = strip_backend_suffix(&t.effective);
                 held(cx, &[&t.effective, &t.found])
-                    || being_written(stem).is_some()
+                    || being_written(cx, stem).is_some()
                     || outputs_beside(stem).map_or(true, |v| !v.is_empty())
             })
         })
@@ -768,10 +771,25 @@ fn fresh(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// The stems being written (all `{stem}.*` is theirs): by a call still
-/// running, or by a background job for as long as the server runs. Until
-/// a command has made its outputs, only this says they are spoken for.
-static WRITING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// A stem being written (all `{stem}.*` is its writer's): by a call still
+/// running, or by the background job writing `job`, for as long as that
+/// job runs.
+struct Writing {
+    stem: String,
+    job: Option<Vec<PathBuf>>,
+}
+
+/// The stems being written. Until a command has made its outputs, only
+/// this says they are spoken for.
+static WRITING: Mutex<Vec<Writing>> = Mutex::new(Vec::new());
+
+/// [`WRITING`], less the stems of background jobs that have ended: what
+/// those wrote is on disk, and found there.
+fn writing(cx: &Call) -> std::sync::MutexGuard<'static, Vec<Writing>> {
+    let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    writing.retain(|w| w.job.as_ref().is_none_or(|o| cx.ensure_free(o).is_err()));
+    writing
+}
 
 /// Whether a running job writes one of `paths`, however spelled.
 fn held(cx: &Call, paths: &[&str]) -> bool {
@@ -787,31 +805,49 @@ fn overlap(a: &str, b: &str) -> bool {
 }
 
 /// The stem being written that `stem` would touch, if any.
-fn being_written(stem: &str) -> Option<String> {
+fn being_written(cx: &Call, stem: &str) -> Option<String> {
     let stem = absolute(stem);
-    let writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    writing.iter().find(|w| overlap(w, &stem)).cloned()
+    let writing = writing(cx);
+    writing
+        .iter()
+        .find(|w| overlap(&w.stem, &stem))
+        .map(|w| w.stem.clone())
 }
 
-/// `stems` spoken for until the claim drops, or, [`Claim::keep`]ed, for
-/// good; refused when another call or job has one.
+/// `stems` spoken for until the claim drops, or, [`Claim::keep`]ed, until
+/// the background job writing them ends; refused when another call or job
+/// has one.
 struct Claim(Vec<String>);
 
 impl Claim {
-    fn new(stems: &[&str]) -> Result<Self> {
+    fn new(cx: &Call, stems: &[&str]) -> Result<Self> {
         let stems: Vec<String> = stems.iter().map(|s| absolute(s)).collect();
-        let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(w) = writing.iter().find(|w| stems.iter().any(|s| overlap(w, s))) {
+        let mut writing = writing(cx);
+        if let Some(w) = writing
+            .iter()
+            .find(|w| stems.iter().any(|s| overlap(&w.stem, s)))
+        {
             anyhow::bail!(
-                "{w} is being written by another call or a background job: choose another `out`"
+                "{} is being written by another call or a background job: choose another `out`",
+                w.stem
             );
         }
-        writing.extend(stems.iter().cloned());
+        writing.extend(stems.iter().map(|s| Writing {
+            stem: s.clone(),
+            job: None,
+        }));
         Ok(Self(stems))
     }
 
-    /// For a background job: the server cannot tell when it is done.
-    fn keep(self) {
+    /// For the background job just started that writes `outputs`: the
+    /// stems are its own while it holds them.
+    fn keep(self, outputs: &[impl AsRef<Path>]) {
+        let outputs: Vec<PathBuf> = outputs.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        for w in writing.iter_mut().filter(|w| self.0.contains(&w.stem)) {
+            w.job = Some(outputs.clone());
+        }
+        drop(writing);
         std::mem::forget(self);
     }
 }
@@ -819,7 +855,7 @@ impl Claim {
 impl Drop for Claim {
     fn drop(&mut self) {
         let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-        writing.retain(|w| !self.0.contains(w));
+        writing.retain(|w| !self.0.contains(&w.stem));
     }
 }
 
@@ -878,10 +914,10 @@ fn written_with(
     let path: &str = &target.found;
     let mut outputs = vec![path];
     outputs.extend(also);
-    let claim = Claim::new(&[&[stem.as_str()], also].concat())?;
+    let claim = Claim::new(cx, &[&[stem.as_str()], also].concat())?;
     if background {
         let job = data_beans_job(cx, &argv, &outputs, what, json!(absolute(path)))?;
-        claim.keep();
+        claim.keep(&outputs);
         return Ok((job, String::new()));
     }
     let printed = data_beans_making(cx, &argv, &outputs, what)?;
@@ -1529,7 +1565,7 @@ fn subsample(a: &Arguments, cx: &Call) -> Result<Value> {
 fn split(a: &Arguments, cx: &Call) -> Result<Value> {
     let data = a.path("data")?;
     let prefix = a.out_or(cx, (&named(&data, "split"), ""), |c| {
-        being_written(c).is_some() || outputs_beside(c).map_or(true, |v| !v.is_empty())
+        being_written(cx, c).is_some() || outputs_beside(c).map_or(true, |v| !v.is_empty())
     })?;
     let before = outputs_beside(&prefix)?;
     anyhow::ensure!(
@@ -1551,11 +1587,11 @@ fn split(a: &Arguments, cx: &Call) -> Result<Value> {
     argv.extend(a.numbers(&["test_frac", "folds", "seed"])?);
     argv.extend(a.options()?);
     let what = format!("cells of {data} split for testing");
-    let claim = Claim::new(&[&prefix])?;
+    let claim = Claim::new(cx, &[&prefix])?;
     if a.flag("background")? {
         let written: Vec<String> = halves.iter().map(|h| absolute(h)).collect();
         let job = data_beans_job(cx, &argv, &halves, &what, json!(written))?;
-        claim.keep();
+        claim.keep(&halves);
         return Ok(Value::Object(job));
     }
     data_beans_making(cx, &argv, &halves, &what)?;
@@ -1604,6 +1640,19 @@ mod tests {
         assert!(
             readme.contains(super::INSTRUCTIONS),
             "README.md's \"What the agent is told\" block differs from mcp.rs INSTRUCTIONS"
+        );
+    }
+
+    /// `auto_cutoff` alone lets the command put the gene rule at its
+    /// trough; a `feature_min_cells` given, 0 included, reaches the command
+    /// to stand instead.
+    #[test]
+    fn a_gene_rule_given_with_auto_cutoff_is_passed() {
+        let flags = |args| super::qc_flags(&super::Arguments(args)).unwrap();
+        assert_eq!(flags(json!({ "auto_cutoff": true })), ["--qc-auto-cutoff"]);
+        assert_eq!(
+            flags(json!({ "auto_cutoff": true, "feature_min_cells": 0 })),
+            ["--qc-feature-min-cells=0", "--qc-auto-cutoff"]
         );
     }
 

@@ -132,13 +132,21 @@ pub(super) fn build_reproject_offsets(
 
 /// Run refinement when `allow_refine`, else return the compacted initial
 /// mapping unchanged (single-batch → no BBKNN candidates, nothing to refine).
+///
+/// `pooled_matches` is the pooled cross-batch match table of `inputs` when the
+/// caller already holds it (see [`cross_batch_matches`]).
 pub(super) fn refine_or_identity(
     allow_refine: bool,
     inputs: &crate::alg::refine_multilevel::RefineInputs<'_>,
     refine_params: &crate::alg::refine_multilevel::RefineParams,
+    pooled_matches: Option<&[Vec<(usize, f32)>]>,
 ) -> anyhow::Result<crate::alg::refine_multilevel::RefinedAssignment> {
     if allow_refine {
-        crate::alg::refine_multilevel::refine_assignments(inputs, refine_params)
+        crate::alg::refine_multilevel::refine_assignments_with_matches(
+            inputs,
+            refine_params,
+            pooled_matches,
+        )
     } else {
         let mut pbsamp_to_group: Vec<Vec<usize>> =
             Vec::with_capacity(inputs.initial_sc_to_group_per_level.len());
@@ -154,6 +162,55 @@ pub(super) fn refine_or_identity(
             num_groups_per_level,
         })
     }
+}
+
+/// The cross-batch match tables one collapse needs, each computed once:
+/// `pooled` (every pb-sample against every other batch) feeds the refinement's
+/// candidate sets and, without anchors, the matched statistics; `anchored`
+/// (every pb-sample against the anchor batches) feeds the matched statistics
+/// when there are anchors.
+pub(super) struct CrossBatchMatches {
+    pooled: Option<Vec<Vec<(usize, f32)>>>,
+    anchored: Option<Vec<Vec<(usize, f32)>>>,
+}
+
+impl CrossBatchMatches {
+    /// The table the refinement proposes moves from.
+    pub(super) fn for_refinement(&self) -> Option<&[Vec<(usize, f32)>]> {
+        self.pooled.as_deref()
+    }
+
+    /// The table the counterfactual is drawn from; `None` on a single batch.
+    pub(super) fn for_matched_stat(&self) -> Option<&[Vec<(usize, f32)>]> {
+        self.anchored.as_deref().or(self.pooled.as_deref())
+    }
+}
+
+/// Match the pb-samples of `layout` across batches for a collapse over
+/// `batch_knn_lookup` (fewer than two batches: no tables). The pooled table
+/// is skipped when nothing reads it — anchors source the counterfactual and
+/// `refine_params` asks for no refinement sweep.
+pub(super) fn cross_batch_matches(
+    layout: &PbSampleLayout,
+    batch_knn_lookup: &[ColumnDict<usize>],
+    knn: usize,
+    anchor_batches: Option<&[usize]>,
+    refine_params: &crate::alg::refine_multilevel::RefineParams,
+) -> anyhow::Result<CrossBatchMatches> {
+    if batch_knn_lookup.len() < 2 {
+        return Ok(CrossBatchMatches {
+            pooled: None,
+            anchored: None,
+        });
+    }
+    let refines = refine_params.num_gibbs > 0 || refine_params.num_greedy > 0;
+    let pooled = (refines || anchor_batches.is_none())
+        .then(|| per_batch_sc_neighbors(layout, batch_knn_lookup, knn, None))
+        .transpose()?;
+    let anchored = anchor_batches
+        .map(|anchors| per_batch_sc_neighbors(layout, batch_knn_lookup, knn, Some(anchors)))
+        .transpose()?;
+    Ok(CrossBatchMatches { pooled, anchored })
 }
 
 /// Append-only memory: give each anchored (carried) pb-sample its own
@@ -363,8 +420,20 @@ pub(super) fn refine_and_collect_single_layer(
         initial_sc_to_group_per_level: &initial_per_level,
         reproject_offsets_per_level: &reproject_offsets,
     };
+    let matches = cross_batch_matches(
+        &pb_samples.layout,
+        batch_knn,
+        knn,
+        ctx.anchor_batches,
+        refine_params,
+    )?;
     let refined = split_anchored_finest_groups(
-        refine_or_identity(num_batches >= 2, &inputs, refine_params)?,
+        refine_or_identity(
+            num_batches >= 2,
+            &inputs,
+            refine_params,
+            matches.for_refinement(),
+        )?,
         &pb_samples.layout,
     );
 
@@ -403,9 +472,9 @@ pub(super) fn refine_and_collect_single_layer(
         );
     }
 
-    // 5. Build finest CollapsedStat once from a full data pass, then derive
-    //    coarser levels by `merge_stat` on column-aggregated sums — avoids
-    //    re-reading all cells at every level (matches legacy merge descent).
+    // 5. Build finest CollapsedStat once from the pb-sample aggregates (the
+    //    data was read when those were summed), then derive coarser levels by
+    //    `merge_stat` on column-aggregated sums.
     let num_levels = level_dims.len();
     let k_finest = refined.num_groups_per_level[0];
     let mut cell_to_group_finest = vec![0usize; ncols];
@@ -426,17 +495,18 @@ pub(super) fn refine_and_collect_single_layer(
 
     let mut fine_stat = CollapsedStat::new(num_features, k_finest, num_batches);
     fine_stat.exclude_unmatched_from_delta = ctx.exclude_unmatched_from_delta;
-    info!("Collecting basic stats over {} groups ...", k_finest);
-    data_vec.collect_basic_stat(&mut fine_stat)?;
-    if num_batches >= 2 {
-        info!(
-            "Collecting per-batch stats over {} groups × {} batches ...",
-            k_finest, num_batches
-        );
-        data_vec.collect_batch_stat(&mut fine_stat)?;
-        let batch_knn = data_vec
-            .batch_knn_lookup()
-            .ok_or_else(|| anyhow::anyhow!("batch_knn_lookup not built"))?;
+    info!(
+        "Collecting observed stats over {} groups × {} batches from {} pb-samples ...",
+        k_finest, num_batches, num_pb
+    );
+    collect_observed_stat_from_pb_samples(
+        data_vec,
+        &pb_samples.layout,
+        &pb_samples.gene_sums,
+        &refined.pbsamp_to_group[0],
+        &mut fine_stat,
+    )?;
+    if let Some(matches) = matches.for_matched_stat() {
         info!(
             "Collecting cross-batch matched stats (knn={}) over {} pb-samples ...",
             knn, num_pb
@@ -445,15 +515,14 @@ pub(super) fn refine_and_collect_single_layer(
             &pb_samples.layout,
             &pb_samples.gene_sums,
             &refined.pbsamp_to_group[0],
-            batch_knn.as_slice(),
-            knn,
+            matches,
             ctx.anchor_batches,
             &mut fine_stat,
         )?;
     }
 
     info!(
-        "Level 1/{}: refined k={} (finest; {} cells read)",
+        "Level 1/{}: refined k={} (finest; {} cells)",
         num_levels, k_finest, ncols
     );
     if ctx.observe_panels {
@@ -649,7 +718,15 @@ pub(super) fn refine_and_collect_stack(
         initial_sc_to_group_per_level: &initial_per_level,
         reproject_offsets_per_level: &reproject_offsets,
     };
-    let refined = refine_or_identity(num_batches >= 2, &inputs, refine_params)?;
+    // One set of tables for every layer: the layers share the layout and
+    // index the same projection, so their lookups return the same matches.
+    let matches = cross_batch_matches(&layout, batch_knn, knn, ctx.anchor_batches, refine_params)?;
+    let refined = refine_or_identity(
+        num_batches >= 2,
+        &inputs,
+        refine_params,
+        matches.for_refinement(),
+    )?;
 
     // Per-layer gene_sums for the remaining layers (layer 0 reuses `gene_sums_owner`).
     let mut per_layer_gene_sums: Vec<GeneSums> = Vec::with_capacity(num_layers);
@@ -666,8 +743,8 @@ pub(super) fn refine_and_collect_stack(
         }
     }
 
-    // Finest CollapsedStat per layer via a single data pass, then descend
-    //    into coarser levels by `merge_stat` on column aggregates.
+    // Finest CollapsedStat per layer from its pb-sample aggregates, then
+    //    descend into coarser levels by `merge_stat` on column aggregates.
     let num_levels = level_dims.len();
     let k_finest = refined.num_groups_per_level[0];
     let mut cell_to_group_finest = vec![0usize; ncols];
@@ -694,23 +771,20 @@ pub(super) fn refine_and_collect_stack(
         let mut stat = CollapsedStat::new(num_features, k_finest, num_batches);
         stat.exclude_unmatched_from_delta = exclude_unmatched_from_delta;
         info!(
-            "Layer {}/{}: collecting basic stats over {} groups ...",
+            "Layer {}/{}: collecting observed stats over {} groups × {} batches ...",
             d + 1,
             num_layers,
-            k_finest
+            k_finest,
+            num_batches
         );
-        layer.collect_basic_stat(&mut stat)?;
-        if num_batches >= 2 {
-            info!(
-                "Layer {}/{}: collecting per-batch stats ({} batches) ...",
-                d + 1,
-                num_layers,
-                num_batches
-            );
-            layer.collect_batch_stat(&mut stat)?;
-            let batch_knn = layer
-                .batch_knn_lookup()
-                .ok_or_else(|| anyhow::anyhow!("batch_knn_lookup not built"))?;
+        collect_observed_stat_from_pb_samples(
+            layer,
+            &layout,
+            &per_layer_gene_sums[d],
+            &refined.pbsamp_to_group[0],
+            &mut stat,
+        )?;
+        if let Some(matches) = matches.for_matched_stat() {
             info!(
                 "Layer {}/{}: collecting cross-batch matched stats (knn={}) over {} pb-samples ...",
                 d + 1,
@@ -722,8 +796,7 @@ pub(super) fn refine_and_collect_stack(
                 &layout,
                 &per_layer_gene_sums[d],
                 &refined.pbsamp_to_group[0],
-                batch_knn.as_slice(),
-                knn,
+                matches,
                 ctx.anchor_batches,
                 &mut stat,
             )?;

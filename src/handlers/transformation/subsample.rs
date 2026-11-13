@@ -1,6 +1,6 @@
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
-use crate::zarr_io::{finalize_output, prepare_output};
+use crate::zarr_io::finalize_output;
 
 use clap::Args;
 use legume_numeric::matrix::common_io::write_lines;
@@ -536,8 +536,12 @@ fn write_subsample(
     let out_row_names: Vec<Box<str>> = gene_idx.iter().map(|&i| row_names_all[i].clone()).collect();
     let out_col_names: Vec<Box<str>> = cell_idx.iter().map(|&i| col_names_all[i].clone()).collect();
 
-    let (effective_output, backend_out, file_out) =
-        prepare_output(&args.output, args.backend.clone(), args.zip)?;
+    let (effective_output, backend_out, file_out) = super::prepare_output_beside(
+        &args.data_file,
+        &args.output,
+        args.backend.clone(),
+        args.zip,
+    )?;
 
     // Streamed: the survivors never sit in memory at once. Both index sets
     // are ascending, which is what lets the row renumbering stay monotone

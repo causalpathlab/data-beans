@@ -14,15 +14,15 @@ use legume_numeric::param::traits::TwoStatParam;
 
 /// Accumulates gene-level count sums per (individual × cell_type).
 ///
-/// Layout: genes × (n_individuals * n_cell_types)
-/// Column index for (individual i, cell_type k) = k * n_individuals + i
+/// Layout: genes × (n_groups * n_cell_types)
+/// Column index for (individual group i, cell_type k) = k * n_groups + i
 struct CollapseStat {
-    /// Weighted sum of counts: genes × (n_indv * n_ct)
+    /// Weighted sum of counts: genes × (n_groups * n_ct)
     count_sum: DMatrix<f32>,
-    /// Effective cell count per (individual, cell_type): n_indv * n_ct
+    /// Effective cell count per (individual group, cell_type): n_groups * n_ct
     cell_weight: DVector<f32>,
-    /// Number of cell types
-    n_cell_types: usize,
+    /// Number of individual groups (the column stride of one cell type)
+    n_groups: usize,
 }
 
 /// Input to the visitor: cell-level membership matrix.
@@ -92,6 +92,10 @@ pub fn collapse_pseudobulk_weighted(
         );
     }
 
+    if n_cell_types == 0 {
+        bail!("Membership has no cell types; nothing to collapse into");
+    }
+
     if membership.matrix.nrows() != num_cells || membership.matrix.ncols() != n_cell_types {
         bail!(
             "Membership matrix shape ({}, {}) doesn't match (cells={}, cell_types={})",
@@ -145,7 +149,7 @@ pub fn collapse_pseudobulk_weighted(
     let mut stat = CollapseStat {
         count_sum: DMatrix::zeros(num_genes, stat_cols),
         cell_weight: DVector::zeros(stat_cols),
-        n_cell_types,
+        n_groups,
     };
 
     let visitor_input = VisitorInput {
@@ -249,7 +253,7 @@ fn collect_stat_visitor(
     let z_k = DVector::from_fn(n_ct, |k, _| z_nk.column(k).sum());
 
     let mut stat = arc_stat.lock().expect("lock");
-    let n_groups = stat.cell_weight.len() / stat.n_cell_types;
+    let n_groups = stat.n_groups;
 
     for k in 0..n_ct {
         let col = k * n_groups + group_id;

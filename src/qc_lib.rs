@@ -4,13 +4,16 @@
 //! CLI — so it lives in its own module that the binary never compiles (keeps
 //! `qc` fully bin-used and avoids dead-code in the bin target).
 
-use crate::qc::{collect_column_stat_across_vec, collect_row_stat_across_vec};
+use crate::qc::{collect_column_stat_across_vec, masked_column_stat};
+use crate::sparse_data_visitors::VisitColumnsOps;
 use crate::sparse_io_stack::SparseIoStack;
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::common_io::write_lines;
+use legume_numeric::matrix::sparse_stat::{SparseColumnRunningStatistics, SparseRunningStatistics};
 use legume_numeric::matrix::traits::RunningStatOps;
 use log::warn;
 use regex::Regex;
+use std::sync::{Arc, Mutex};
 
 ///////////////////////////////////////////////////////////////////////////////////
 // Cell-axis quality control: robust (MAD) outlier detection + near-empty floor. //
@@ -320,14 +323,8 @@ pub fn compute_qc_metrics(
 ) -> anyhow::Result<QcMetrics> {
     let row_names = data.row_names()?;
 
-    // Per-cell totals across all rows (nnz = n_genes, tot = total_counts).
-    // Use the running-stat accessors directly to skip the unused mean/std.
-    let col_stat = collect_column_stat_across_vec(data, None, block_size)?;
-    let n_genes = col_stat.count_positives();
-    let total_counts = col_stat.sum();
-
-    // Optional mito / ribo fractions via row-name regex subsets.
-    let frac_for = |pattern: &Option<String>| -> anyhow::Result<Option<Vec<f32>>> {
+    // Optional mito / ribo row subsets via row-name regex.
+    let rows_for = |pattern: &Option<String>| -> anyhow::Result<Option<Vec<usize>>> {
         let Some(pat) = pattern else {
             return Ok(None);
         };
@@ -339,23 +336,40 @@ pub fn compute_qc_metrics(
             );
             return Ok(None);
         }
-        let sub_tot = collect_column_stat_across_vec(data, Some(&rows), block_size)?.sum();
-        let frac = sub_tot
-            .iter()
-            .zip(total_counts.iter())
-            .map(|(&s, &t)| if t > 0.0 { s / t } else { 0.0 })
-            .collect::<Vec<f32>>();
-        Ok(Some(frac))
+        Ok(Some(rows))
     };
-    let mito_frac = frac_for(&cfg.mito_pattern)?;
-    let ribo_frac = frac_for(&cfg.ribo_pattern)?;
+    let mito_rows = rows_for(&cfg.mito_pattern)?;
+    let ribo_rows = rows_for(&cfg.ribo_pattern)?;
+    let subsets: Vec<&[usize]> = [&mito_rows, &ribo_rows]
+        .into_iter()
+        .filter_map(|rows| rows.as_deref())
+        .collect();
 
-    // Feature axis stat (only when asked).
-    let feature_n_cells = if feature_cells {
-        Some(collect_row_stat_across_vec(data, block_size)?.count_positives())
-    } else {
-        None
+    // Every metric from one pass over the data: per-cell totals across all
+    // rows (nnz = n_genes, tot = total_counts), the subset totals, and the
+    // feature axis stat (only when asked). Use the running-stat accessors
+    // directly to skip the unused mean/std.
+    let stat = collect_qc_stat(data, &subsets, feature_cells, block_size)?;
+    let n_genes = stat.columns.count_positives();
+    let total_counts = stat.columns.sum();
+
+    // Fractions of the subsets measured, in the order they were asked for.
+    let mut subset_totals = stat.subsets.iter().map(|s| s.sum());
+    let mut frac_for = |rows: &Option<Vec<usize>>| -> Option<Vec<f32>> {
+        rows.as_ref()?;
+        let sub_tot = subset_totals.next()?;
+        Some(
+            sub_tot
+                .iter()
+                .zip(total_counts.iter())
+                .map(|(&s, &t)| if t > 0.0 { s / t } else { 0.0 })
+                .collect(),
+        )
     };
+    let mito_frac = frac_for(&mito_rows);
+    let ribo_frac = frac_for(&ribo_rows);
+
+    let feature_n_cells = stat.rows.map(|rows| rows.count_positives());
 
     Ok(QcMetrics {
         n_genes,
@@ -365,6 +379,61 @@ pub fn compute_qc_metrics(
         feature_n_cells,
         n_rows: data.num_rows(),
     })
+}
+
+/// What [`collect_qc_stat`] collects in its one pass.
+struct QcStat {
+    /// Column statistics over all rows.
+    columns: SparseColumnRunningStatistics<f32>,
+    /// Column statistics over each row subset asked for, in that order.
+    subsets: Vec<SparseColumnRunningStatistics<f32>>,
+    /// Row statistics, when asked for.
+    rows: Option<SparseRunningStatistics<f32>>,
+}
+
+/// Collect, reading every block once, the column statistics over all rows
+/// (`collect_column_stat_across_vec` with no selection), those over each
+/// of `row_subsets` (the same with each as its selection) and, with
+/// `with_rows`, the row statistics (`collect_row_stat_across_vec`).
+fn collect_qc_stat(
+    data: &SparseIoVec,
+    row_subsets: &[&[usize]],
+    with_rows: bool,
+    block_size: Option<usize>,
+) -> anyhow::Result<QcStat> {
+    let ncols = data.num_columns();
+    let nrows = data.num_rows();
+
+    let (masks, subsets): (Vec<Vec<bool>>, Vec<_>) = row_subsets
+        .iter()
+        .map(|sel| masked_column_stat(ncols, nrows, sel))
+        .unzip();
+    let mut stat = QcStat {
+        columns: SparseColumnRunningStatistics::new(ncols, nrows),
+        subsets,
+        rows: with_rows.then(|| SparseRunningStatistics::new(nrows)),
+    };
+    data.visit_columns_by_block(&qc_stat_visitor, &masks, &mut stat, block_size)?;
+    Ok(stat)
+}
+
+fn qc_stat_visitor(
+    job: (usize, usize),
+    data: &SparseIoVec,
+    masks: &Vec<Vec<bool>>,
+    arc_stat: Arc<Mutex<&mut QcStat>>,
+) -> anyhow::Result<()> {
+    let (lb, ub) = job;
+    let csc = data.read_columns_csc(lb..ub)?;
+    let mut stat = arc_stat.lock().expect("failed to lock qc stat");
+    stat.columns.add_csc(&csc, lb);
+    for (sub, mask) in stat.subsets.iter_mut().zip(masks) {
+        sub.add_csc_masked(&csc, lb, mask);
+    }
+    if let Some(rows) = stat.rows.as_mut() {
+        rows.add_csc(&csc);
+    }
+    Ok(())
 }
 
 /// Modality-agnostic cell QC for a [`SparseIoStack`]: per-cell `n_genes` /
@@ -453,11 +522,13 @@ impl Verdicts {
 fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcReport {
     // The histogram + cutoff, optionally printed.
     if cfg.drop_outliers && (cfg.auto_cell_cutoff || cfg.qc_histogram) {
-        let suggested = crate::qc::suggest_nnz_cutoff(&m.n_genes);
+        // Of the cells alone, as the cutoff is found among them.
+        let cells = cell_values(&m.n_genes, exempt);
+        let suggested = crate::qc::suggest_nnz_cutoff(&cells);
         // Display cutoff: the trough suggestion if found, else the
         // near-empty floor (what the non-auto tier would use).
         let shown = suggested.unwrap_or(cfg.min_cell_nnz);
-        crate::qc::eprint_nnz_summary("Cell", "nnz", &m.n_genes, shown, suggested);
+        crate::qc::eprint_nnz_summary("Cell", "nnz", &cells, shown, suggested);
     }
     let v = cell_verdicts(&m, cfg, exempt);
     let QcMetrics {
@@ -477,6 +548,20 @@ fn qc_from_metrics(m: QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>) -> QcR
         ribo_frac,
         n_cells_dropped: v.n_cells_dropped,
         n_features_dropped: v.n_features_dropped,
+    }
+}
+
+/// `values` of the columns that are cells: all of them, or those `exempt`
+/// does not mark.
+fn cell_values<'a>(values: &'a [f32], exempt: Option<&[bool]>) -> std::borrow::Cow<'a, [f32]> {
+    match exempt {
+        Some(e) => values
+            .iter()
+            .zip(e)
+            .filter(|&(_, &x)| !x)
+            .map(|(&v, _)| v)
+            .collect(),
+        None => values.into(),
     }
 }
 
@@ -588,10 +673,12 @@ fn verdicts(m: &QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>, warn: bool) 
         // is authoritative — there is NO redundant `min_cell_nnz` floor on it.
         // When the data is unimodal the trough search returns `None`, so no auto
         // cutoff is applied and the near-empty floor / MAD tiers stand alone.
+        // The trough is sought among the cells: exempt columns neither
+        // shape it nor fall to it.
         if cfg.auto_cell_cutoff {
-            if let Some(cut) = crate::qc::suggest_nnz_cutoff(n_genes) {
+            if let Some(cut) = crate::qc::suggest_nnz_cutoff(&cell_values(n_genes, exempt)) {
                 for (c, &g) in n_genes.iter().enumerate() {
-                    if (g as usize) < cut {
+                    if !is_exempt(c) && (g as usize) < cut {
                         outlier[c] = true;
                     }
                 }
@@ -602,18 +689,30 @@ fn verdicts(m: &QcMetrics, cfg: &QcConfig, exempt: Option<&[bool]>, warn: bool) 
     let mut train_keep: Vec<bool> = outlier.iter().map(|&o| !o).collect();
     let mut n_cells_dropped = outlier.iter().filter(|&&o| o).count();
 
-    // Guardrail: never produce an empty matrix.
+    // Guardrail: never produce a matrix with no cell. Exempt columns are
+    // never dropped, so the drops are held against the cells alone.
+    let n_cells = (0..n_cols).filter(|&c| !is_exempt(c)).count();
     let mut guarded = false;
-    if n_cols > 0 && n_cells_dropped >= n_cols {
+    if n_cells > 0 && n_cells_dropped >= n_cells {
         if warn {
             warn!(
                 "QC would drop all {} cells — keeping all (check thresholds)",
-                n_cols
+                n_cells
             );
         }
         train_keep = vec![true; n_cols];
         n_cells_dropped = 0;
         guarded = true;
+    }
+    // Cells kept in training reach the output only above the near-empty
+    // floor; where none does, the verdicts stand and the output is empty.
+    let emits = |c: usize| !is_exempt(c) && train_keep[c] && !near_empty[c];
+    if warn && n_cells > 0 && !(0..n_cols).any(emits) {
+        warn!(
+            "QC leaves none of the {} cells in the output: each is near-empty \
+             (fewer than {} detected features) or dropped (check thresholds)",
+            n_cells, cfg.min_cell_nnz
+        );
     }
 
     // Feature axis (only when feature_n_cells was computed).

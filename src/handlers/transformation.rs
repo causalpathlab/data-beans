@@ -1,6 +1,8 @@
+use crate::handlers::merging::same_file;
 use crate::hdf5_io::resolve_backend_file;
 use crate::qc::{squeeze_by_nnz, SqueezeCutoffs};
-use crate::sparse_io::open_sparse_matrix;
+use crate::sparse_io::{open_sparse_matrix, SparseIoBackend};
+use crate::zarr_io::{output_target, prepare_output};
 use clap::Args;
 use log::info;
 
@@ -24,7 +26,7 @@ pub struct ReorderRowsArgs {
     #[arg(short, long, required = true)]
     pub row_file: Box<str>,
 
-    /// output header
+    /// output header; it must not be the input: write to a new name
     #[arg(short, long, required = true)]
     pub output: Box<str>,
 
@@ -39,7 +41,7 @@ pub struct SubsetArgs {
     pub data_file: Box<str>,
 
     /// output file, in the input's format unless the name gives `.zarr` or
-    /// `.zarr.zip`
+    /// `.zarr.zip`; it must not be the input: write to a new name
     #[arg(short, long, required = true)]
     pub output: Box<str>,
 
@@ -114,7 +116,7 @@ pub struct SubsetColumnsArgs {
     #[arg(long, default_value_t = 1)]
     pub column_nnz_cutoff: usize,
 
-    /// output file
+    /// output file; it must not be the input: write to a new name
     #[arg(short, long, required = true)]
     pub output: Box<str>,
 
@@ -185,13 +187,50 @@ pub struct SubsetRowsArgs {
     #[arg(long, default_value_t = 1)]
     pub column_nnz_cutoff: usize,
 
-    /// output file
+    /// output file; it must not be the input: write to a new name
     #[arg(short, long, required = true)]
     pub output: Box<str>,
 
     /// keep a `.zarr` directory instead of producing a `.zarr.zip` archive
     #[arg(long = "no-zip", default_value_t = true, action = clap::ArgAction::SetFalse)]
     pub zip: bool,
+}
+
+/// Refuse an output that is one of `inputs`: the path `output` resolves to
+/// under `backend` and `zip`, the path it is built at, or the path found
+/// there already. The output is cleared before the inputs are read and,
+/// zipped, renamed over its own name after, so none of the three may be an
+/// input.
+pub(crate) fn ensure_output_is_no_input<S: AsRef<str>>(
+    inputs: &[S],
+    output: &str,
+    backend: SparseIoBackend,
+    zip: bool,
+) -> anyhow::Result<()> {
+    let target = output_target(output, backend, zip)?;
+    for input in inputs {
+        let input = input.as_ref();
+        for p in [&target.effective, &target.working, &target.found] {
+            anyhow::ensure!(
+                !same_file(input, p),
+                "the output {p} is the input {input}: give -o another name"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// [`prepare_output`] for a handler that derives its output from `input`:
+/// refused, before anything is cleared, when the output is the input (see
+/// [`ensure_output_is_no_input`]).
+pub(crate) fn prepare_output_beside(
+    input: &str,
+    output: &str,
+    backend: SparseIoBackend,
+    zip: bool,
+) -> anyhow::Result<(Box<str>, SparseIoBackend, Box<str>)> {
+    ensure_output_is_no_input(&[input], output, backend.clone(), zip)?;
+    prepare_output(output, backend, zip)
 }
 
 /// Cut, in place, the rows and columns of the backend at `backend_file`
@@ -221,3 +260,6 @@ pub fn squeeze_in_place(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

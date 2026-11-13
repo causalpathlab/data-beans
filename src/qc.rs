@@ -32,22 +32,24 @@ pub fn below_nnz_cutoff(nnz: f32, cutoff: usize) -> bool {
 }
 
 /// squeeze out rows and columns with excessive zero values
+///
+/// The two cutoffs apply independently, each to the non-zeros counted over
+/// the whole matrix before anything is removed: a row is kept by its count
+/// across every column, the removed ones included, and a column likewise.
+/// So a kept row can end below `cutoffs.row` among the kept columns (all
+/// zero, even), and squeezing the result again can remove more.
 pub fn squeeze_by_nnz(
     data: &dyn SparseIo<IndexIter = Vec<usize>>,
     cutoffs: SqueezeCutoffs,
     block_size: Option<usize>,
     preload: bool,
 ) -> anyhow::Result<()> {
-    let col_stat = collect_column_stat(data, block_size)?;
-    let row_stat = collect_row_stat(data, block_size)?;
-
-    let file = data.get_backend_file_name();
-    let backend = data.backend_type();
-
-    let mut data = open_sparse_matrix(file, &backend)?;
-    if preload {
-        data.preload_columns()?;
-    }
+    // Without a shape there are no counts to compare with the cutoffs.
+    anyhow::ensure!(
+        data.num_rows().is_some() && data.num_columns().is_some(),
+        "missing shape information"
+    );
+    let (col_stat, row_stat) = collect_column_row_stat(data, block_size)?;
 
     fn nnz_index(nnz: &[f32], cutoff: usize) -> Option<Vec<usize>> {
         let ret: Vec<usize> = nnz
@@ -85,6 +87,21 @@ pub fn squeeze_by_nnz(
         );
     }
 
+    // A side on which nothing falls below its cutoff is left whole, and the
+    // backend as it is when that is both.
+    let row_idx = row_idx.filter(|kept| kept.len() < row_nnz_vec.len());
+    let col_idx = col_idx.filter(|kept| kept.len() < col_nnz_vec.len());
+    if row_idx.is_none() && col_idx.is_none() {
+        return Ok(());
+    }
+
+    let file = data.get_backend_file_name();
+    let backend = data.backend_type();
+
+    let mut data = open_sparse_matrix(file, &backend)?;
+    if preload {
+        data.preload_columns()?;
+    }
     data.subset_columns_rows(col_idx.as_ref(), row_idx.as_ref())
 }
 
@@ -158,22 +175,123 @@ pub fn collect_row_stat(
     block_size: Option<usize>,
 ) -> anyhow::Result<SparseRunningStatistics<f32>> {
     let nrows = data.num_rows().unwrap_or(0);
-    let mut row_stat = SparseRunningStatistics::new(nrows);
-    let arc_stat = Arc::new(Mutex::new(&mut row_stat));
+    fold_column_blocks(
+        data,
+        block_size,
+        || SparseRunningStatistics::new(nrows),
+        |stat, csc, _| stat.add_csc(csc),
+        |stat, other| stat.merge(&other),
+    )
+}
 
-    let jobs = create_jobs(data.num_columns().unwrap_or(0), nrows, block_size);
+/// Column blocks folded into one accumulator at a leaf of
+/// [`fold_in_fixed_order`] by a streaming pass over `n_blocks` of them. A
+/// leaf is folded on one thread and allocates one accumulator the size of
+/// the feature axis, so the pass is cut into at most a few hundred leaves:
+/// each block is its own leaf, and its own task, up to that many blocks,
+/// and a longer pass shares an accumulator among neighbouring blocks. The
+/// leaf depends on the number of blocks alone, as the fold's order must.
+pub(crate) fn blocks_per_leaf(n_blocks: usize) -> usize {
+    const LEAVES: usize = 256;
+    n_blocks.div_ceil(LEAVES).max(1)
+}
 
-    jobs.par_iter()
-        .progress_with(styled_progress_bar(jobs.len() as u64, "blocks"))
-        .for_each(|&(lb, ub)| {
-            let csc = data
-                .read_columns_csc((lb..ub).collect())
-                .expect("failed to read data");
-            let mut stat = arc_stat.lock().expect("failed to lock row_stat");
-            stat.add_csc(&csc);
-        });
+/// Fold `items` into one accumulator over a fixed binary tree: a run of at
+/// most `leaf` items is folded in order into a fresh accumulator; a longer
+/// run is halved, the halves folded on separate rayon tasks and merged left
+/// into right.
+///
+/// The grouping of the floating-point sums then depends on `items.len()` and
+/// `leaf` alone, not on the thread count or on how rayon schedules the work,
+/// so the result is the same bits run to run. (A plain rayon `fold`/`reduce`
+/// splits where work stealing happens to split.)
+pub(crate) fn fold_in_fixed_order<T, A, I, F, M>(
+    items: &[T],
+    leaf: usize,
+    init: &I,
+    fold: &F,
+    merge: &M,
+) -> anyhow::Result<A>
+where
+    T: Sync,
+    A: Send,
+    I: Fn() -> A + Sync,
+    F: Fn(&mut A, &T) -> anyhow::Result<()> + Sync,
+    M: Fn(&mut A, A) + Sync,
+{
+    if items.len() <= leaf.max(1) {
+        let mut acc = init();
+        for item in items {
+            fold(&mut acc, item)?;
+        }
+        return Ok(acc);
+    }
+    let (left, right) = items.split_at(items.len() / 2);
+    let (left, right) = rayon::join(
+        || fold_in_fixed_order(left, leaf, init, fold, merge),
+        || fold_in_fixed_order(right, leaf, init, fold, merge),
+    );
+    let mut acc = left?;
+    merge(&mut acc, right?);
+    Ok(acc)
+}
 
-    Ok(row_stat)
+/// Read the columns of `data` block by block in parallel and fold the blocks
+/// in a fixed order ([`fold_in_fixed_order`]): `add(acc, csc, lb)` folds a
+/// block, given the index of its first column, into the accumulator of its
+/// leaf (a fresh `init()`), and `merge` joins two accumulators. Sums that
+/// run across blocks, as a row's do, are then the same bits on any number of
+/// threads. A backend without a shape has no blocks.
+///
+/// # Errors
+/// If a block cannot be read.
+fn fold_column_blocks<A, I, F, M>(
+    data: &dyn SparseIo<IndexIter = Vec<usize>>,
+    block_size: Option<usize>,
+    init: I,
+    add: F,
+    merge: M,
+) -> anyhow::Result<A>
+where
+    A: Send,
+    I: Fn() -> A + Sync,
+    F: Fn(&mut A, &CscMatrix<f32>, usize) + Sync,
+    M: Fn(&mut A, A) + Sync,
+{
+    let ncols = data.num_columns().unwrap_or(0);
+    let nrows = data.num_rows().unwrap_or(0);
+    let jobs = create_jobs(ncols, nrows, block_size);
+    let prog_bar = styled_progress_bar(jobs.len() as u64, "blocks");
+    fold_in_fixed_order(
+        &jobs,
+        blocks_per_leaf(jobs.len()),
+        &init,
+        &|acc, &(lb, ub)| {
+            let csc = data.read_columns_csc((lb..ub).collect())?;
+            add(acc, &csc, lb);
+            prog_bar.inc(1);
+            Ok(())
+        },
+        &merge,
+    )
+}
+
+/// The rows of `select_rows` (those within `nrows`) as a mask over all
+/// rows, and empty statistics of `ncols` columns over them: the rows
+/// selected are the denominator of the mean.
+pub fn masked_column_stat(
+    ncols: usize,
+    nrows: usize,
+    select_rows: &[usize],
+) -> (Vec<bool>, SparseColumnRunningStatistics<f32>) {
+    let mut mask = vec![false; nrows];
+    for &r in select_rows {
+        if r < nrows {
+            mask[r] = true;
+        }
+    }
+    let selected = mask.iter().filter(|x| **x).count();
+    (mask, SparseColumnRunningStatistics::new(ncols, selected))
 }
 
 /// collect column-wise sufficient statistics for Q/C
@@ -188,23 +306,50 @@ pub fn collect_column_stat_across_vec(
     let ncols = data.num_columns();
     let nrows_total = data.num_rows();
 
-    let row_mask: Option<Vec<bool>> = select_rows.map(|sel| {
-        let mut m = vec![false; nrows_total];
-        for &r in sel {
-            if r < nrows_total {
-                m[r] = true;
-            }
+    let (row_mask, mut col_stat) = match select_rows {
+        Some(sel) => {
+            let (mask, stat) = masked_column_stat(ncols, nrows_total, sel);
+            (Some(mask), stat)
         }
-        m
-    });
-    let nrows_denom = row_mask
-        .as_ref()
-        .map(|m| m.iter().filter(|x| **x).count())
-        .unwrap_or(nrows_total);
-
-    let mut col_stat = SparseColumnRunningStatistics::<f32>::new(ncols, nrows_denom);
+        None => (None, SparseColumnRunningStatistics::new(ncols, nrows_total)),
+    };
     data.visit_columns_by_block(&col_stat_visitor, &row_mask, &mut col_stat, block_size)?;
     Ok(col_stat)
+}
+
+/// collect column-wise and row-wise sufficient statistics for Q/C, reading
+/// every block once ([`collect_column_stat`] and [`collect_row_stat`])
+/// * `data` - `SparseIo`
+/// * `block_size` - a block size for each parallelized job
+pub fn collect_column_row_stat(
+    data: &dyn SparseIo<IndexIter = Vec<usize>>,
+    block_size: Option<usize>,
+) -> anyhow::Result<(
+    SparseColumnRunningStatistics<f32>,
+    SparseRunningStatistics<f32>,
+)> {
+    let ncols = data.num_columns().unwrap_or(0);
+    let nrows = data.num_rows().unwrap_or(0);
+    // A column's statistics are written once, by the block that holds it,
+    // so the order the blocks reach the lock in does not show in them.
+    let col_stat = Mutex::new(SparseColumnRunningStatistics::<f32>::new(ncols, nrows));
+    let row_stat = fold_column_blocks(
+        data,
+        block_size,
+        || SparseRunningStatistics::<f32>::new(nrows),
+        |row_stat, csc, lb| {
+            col_stat
+                .lock()
+                .expect("failed to lock the column statistics")
+                .add_csc(csc, lb);
+            row_stat.add_csc(csc);
+        },
+        |row_stat, other| row_stat.merge(&other),
+    )?;
+    let col_stat = col_stat
+        .into_inner()
+        .expect("failed to unlock the column statistics");
+    Ok((col_stat, row_stat))
 }
 
 /// collect column-wise sufficient statistics for Q/C
@@ -216,22 +361,24 @@ pub fn collect_column_stat(
 ) -> anyhow::Result<SparseColumnRunningStatistics<f32>> {
     let ncols = data.num_columns().unwrap_or(0);
     let nrows = data.num_rows().unwrap_or(0);
-    let mut col_stat = SparseColumnRunningStatistics::<f32>::new(ncols, nrows);
-    let arc_stat = Arc::new(Mutex::new(&mut col_stat));
-
-    let jobs = create_jobs(ncols, nrows, block_size);
-
-    jobs.par_iter()
-        .progress_with(styled_progress_bar(jobs.len() as u64, "blocks"))
-        .for_each(|&(lb, ub)| {
-            let csc = data
-                .read_columns_csc((lb..ub).collect())
-                .expect("failed to read data");
-            let mut stat = arc_stat.lock().expect("failed to lock col_stat");
-            stat.add_csc(&csc, lb);
-        });
-
-    Ok(col_stat)
+    // A column's statistics are written once, by the block that holds it,
+    // so the order the blocks reach the lock in does not show in them.
+    let col_stat = Mutex::new(SparseColumnRunningStatistics::<f32>::new(ncols, nrows));
+    fold_column_blocks(
+        data,
+        block_size,
+        || (),
+        |_, csc, lb| {
+            col_stat
+                .lock()
+                .expect("failed to lock the column statistics")
+                .add_csc(csc, lb)
+        },
+        |_, _| (),
+    )?;
+    Ok(col_stat
+        .into_inner()
+        .expect("failed to unlock the column statistics"))
 }
 
 struct EmptyArgs {}
@@ -465,7 +612,14 @@ const PRINTED_BINS: usize = 40;
 /// statistic (nnz, sum, mean, sd); the ranges stay exact `f32` so
 /// count-like stats still print as integers.
 fn create_log_histogram(values: &[f32], cutoff: usize) -> Vec<HistBin> {
-    let axis = Axis::fit(values, true).including(cutoff as f64);
+    // The axis reaches a cutoff that is set; with none (cutoff == 0) it
+    // spans the values alone.
+    let axis = Axis::fit(values, true);
+    let axis = if cutoff > 0 {
+        axis.including(cutoff as f64)
+    } else {
+        axis
+    };
     let mut bins: Vec<(usize, f32, f32)> =
         vec![(0, f32::INFINITY, f32::NEG_INFINITY); PRINTED_BINS];
     for &val in values.iter().filter(|v| v.is_finite()) {
@@ -581,8 +735,9 @@ pub fn write_nnz_summary(
     // Calculate basic statistics
     let min = values.iter().copied().fold(f32::INFINITY, f32::min);
     let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = values.iter().sum();
-    let mean = if total > 0 { sum / total as f32 } else { 0.0 };
+    // Summed in f64: an f32 sum stops growing once it dwarfs its addends.
+    let sum: f64 = values.iter().map(|&v| v as f64).sum();
+    let mean = if total > 0 { sum / total as f64 } else { 0.0 };
 
     let mut sorted = values.to_vec();
     sorted.sort_unstable_by(f32::total_cmp);

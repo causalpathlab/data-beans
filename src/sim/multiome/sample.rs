@@ -49,6 +49,10 @@ pub fn sample_cell_depths(
 /// Sample nested topic proportions [K_total, N] with hierarchical assignments.
 ///
 /// Each cell gets a coarse topic (PVE-controlled), then a subtype within it.
+/// The dominant coarse topic `k*` is mixed with a uniform background,
+/// `θ_coarse[k*] = pve_coarse + (1 − pve_coarse)/K` and `(1 − pve_coarse)/K`
+/// elsewhere, and likewise for the dominant subtype within `k*` with
+/// `pve_sub` and `K_sub`, so every column of both matrices sums to 1.
 /// Returns (θ_full[K_total, N], θ_coarse[K, N]) where K_total = K × K_sub.
 /// θ_coarse is the marginalization: θ_coarse[k,n] = Σ_s θ_full[k*K_sub+s, n].
 ///
@@ -64,8 +68,8 @@ pub fn sample_nested_topic_proportions(
     let k_total = k * k_sub;
     let pve_c = pve_coarse.clamp(0.0, 1.0);
     let pve_s = pve_sub.clamp(0.0, 1.0);
-    let bg_coarse = (1.0 - pve_c) / (k - 1).max(1) as f32;
-    let bg_sub = (1.0 - pve_s) / (k_sub - 1).max(1) as f32;
+    let bg_coarse = (1.0 - pve_c) / k.max(1) as f32;
+    let bg_sub = (1.0 - pve_s) / k_sub.max(1) as f32;
 
     let cells: Vec<(Vec<f32>, Vec<f32>)> = (0..n)
         .into_par_iter()
@@ -268,12 +272,59 @@ pub fn sample_poisson_from_logits(
         .collect()
 }
 
+/// One `Poisson(rate)` draw; 0 for a rate the distribution rejects
+/// (non-positive or non-finite).
 fn sample_poisson_safe(rate: f32, rng: &mut impl Rng) -> f32 {
-    if rate > 700.0 {
-        rate.round()
-    } else {
-        Poisson::new(rate as f64)
-            .map(|d| d.sample(rng) as f32)
-            .unwrap_or(0.0)
+    Poisson::new(rate as f64)
+        .map(|d| d.sample(rng) as f32)
+        .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both θ matrices are column-stochastic, θ_full marginalizes to
+    /// θ_coarse, and the dominant topic carries `pve + (1 − pve)/K`.
+    #[test]
+    fn nested_proportions_are_proportions() {
+        for &(k, k_sub, pve_c, pve_s) in &[
+            (10usize, 1usize, 0.8f32, 1.0f32),
+            (8, 1, 0.5, 1.0),
+            (4, 2, 0.6, 0.5),
+            (3, 3, 0.0, 0.0),
+            (1, 1, 0.3, 0.3),
+        ] {
+            let n = 25;
+            let (full, coarse) = sample_nested_topic_proportions(k, k_sub, n, pve_c, pve_s, 5);
+            for j in 0..n {
+                let sc: f32 = coarse.column(j).sum();
+                let sf: f32 = full.column(j).sum();
+                assert!((sc - 1.0).abs() < 1e-5, "K={k}: coarse column sums to {sc}");
+                assert!((sf - 1.0).abs() < 1e-5, "K={k}: full column sums to {sf}");
+                for kk in 0..k {
+                    let block: f32 = (0..k_sub).map(|s| full[(kk * k_sub + s, j)]).sum();
+                    assert!((block - coarse[(kk, j)]).abs() < 1e-5);
+                }
+                let top = coarse.column(j).max();
+                let want = pve_c + (1.0 - pve_c) / k as f32;
+                assert!((top - want).abs() < 1e-5, "dominant {top} vs {want}");
+            }
+        }
+    }
+
+    /// A high rate is still a random draw: it varies between seeds and its
+    /// spread is Poisson (variance ≈ mean), not a rounded constant.
+    #[test]
+    fn high_rates_keep_poisson_noise() {
+        let rate = 2000.0_f32;
+        let mut rng = StdRng::seed_from_u64(1);
+        let draws: Vec<f64> = (0..2000)
+            .map(|_| sample_poisson_safe(rate, &mut rng) as f64)
+            .collect();
+        let mean = draws.iter().sum::<f64>() / draws.len() as f64;
+        let var = draws.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / draws.len() as f64;
+        assert!((mean - rate as f64).abs() < 10.0, "mean {mean}");
+        assert!((0.7..1.3).contains(&(var / rate as f64)), "variance {var}");
     }
 }

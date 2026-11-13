@@ -169,3 +169,40 @@ fn dimension_and_count_mismatches_are_refused() -> anyhow::Result<()> {
     assert!(retrieval_impute(&query, &short_ref, &ref_data, &cfg).is_err());
     Ok(())
 }
+
+#[test]
+fn zero_neighbours_are_refused() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ref_latent = Mat::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]);
+    let triplets: Vec<(u64, u64, f32)> = vec![(0, 0, 5.0), (1, 1, 7.0)];
+    let ref_data = make_ref_data(&dir, &triplets, 2, 2)?;
+    let query_latent = Mat::from_row_slice(1, 2, &[1.0, 0.0]);
+    let result = retrieval_impute(
+        &query_latent,
+        &ref_latent,
+        &ref_data,
+        &RetrievalImputeConfig {
+            knn: 0,
+            temperature: 1.0,
+            chunk: 64,
+        },
+    );
+    assert!(result.is_err());
+    Ok(())
+}
+
+/// A searched row the index returned nothing for is a short list, not a
+/// zero-latent row: only rows that were not searched count as those.
+#[test]
+fn empty_search_results_count_as_short_not_zero_latent() {
+    let found = |n: usize| {
+        Some(QueryNeighbours {
+            ids: (0..n as u32).collect(),
+            weights: vec![1.0 / n.max(1) as f32; n],
+        })
+    };
+    let neighbours = vec![found(3), None, found(0), found(2), None, found(0)];
+    assert_eq!(count_zero_latent_and_short(&neighbours, 3), (2, 3));
+    assert_eq!(count_zero_latent_and_short(&neighbours, 2), (2, 2));
+    assert_eq!(count_zero_latent_and_short(&[], 3), (0, 0));
+}

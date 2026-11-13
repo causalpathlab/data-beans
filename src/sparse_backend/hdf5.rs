@@ -14,6 +14,18 @@ use crate::utilities::io_helpers::{chunk_elems, parse_name_file};
 
 const COMPRESSION_LEVEL: u8 = 5;
 
+/// The rayon pool size as a Blosc thread count: Blosc takes a `u8`, so a
+/// larger pool is capped at 255 threads instead of wrapping around.
+fn blosc_threads(pool_threads: usize) -> u8 {
+    u8::try_from(pool_threads.max(1)).unwrap_or(u8::MAX)
+}
+
+/// Match Blosc compression threads to the active rayon pool so
+/// `--n-threads` (and `RAYON_NUM_THREADS`) cap total CPU usage.
+fn match_blosc_threads_to_pool() {
+    blosc_set_nthreads(blosc_threads(rayon::current_num_threads()));
+}
+
 /// 10x-like cell-feature matrix with hdf5 (feature x cell)
 ///
 /// ```text
@@ -226,6 +238,38 @@ impl SparseMtxData {
         Ok(())
     }
 
+    /// Read a whole 1-D dataset into a `Vec`. The array the read fills owns
+    /// one contiguous buffer, which is handed over as it is rather than
+    /// copied, so the dataset is held in memory once.
+    fn read_vec<T: hdf5::H5Type>(dataset: &hdf5::Dataset) -> anyhow::Result<Vec<T>> {
+        let (vec, offset) = dataset.read_1d::<T>()?.into_raw_vec_and_offset();
+        debug_assert!(matches!(offset, None | Some(0)));
+        Ok(vec)
+    }
+
+    /// Store `names` as the string dataset `key` under the root, replacing
+    /// one already there: names are registered again when they change after
+    /// the first registration (cell names gaining a hashtag suffix, say).
+    fn write_names(
+        &mut self,
+        key: &str,
+        names: &[hdf5::types::VarLenUnicode],
+    ) -> anyhow::Result<()> {
+        use hdf5::types::VarLenUnicode;
+
+        let root = self.backend.group("/")?;
+        if root.link_exists(key) {
+            root.unlink(key)?;
+        }
+        // A chunk dimension must be positive, also for an empty list.
+        root.new_dataset::<VarLenUnicode>()
+            .shape(names.len())
+            .chunk([names.len().max(1)])
+            .create(key)?
+            .write(names)?;
+        Ok(())
+    }
+
     /////////////////////
     // backend related //
     /////////////////////
@@ -251,6 +295,16 @@ impl SparseMtxData {
             row_preload: None,
         })
     }
+
+    /// Forget everything held in memory about the file's contents: the
+    /// preloaded columns and rows and the streaming cursor. For when the
+    /// file behind this handle has been replaced; arrays preloaded from the
+    /// old file would otherwise be served against the new index pointers.
+    fn forget_file_contents(&mut self) {
+        self.clean_preloaded_columns();
+        self.clean_preloaded_rows();
+        self.streamed_nnz = 0;
+    }
 }
 
 impl SparseIo for SparseMtxData {
@@ -264,6 +318,8 @@ impl SparseIo for SparseMtxData {
         self.max_row_name_idx = MAX_ROW_NAME_IDX;
         self.by_column_indptr = vec![];
         self.by_row_indptr = vec![];
+        // Nothing read from the removed file describes the new one.
+        self.forget_file_contents();
 
         Ok(())
     }
@@ -326,7 +382,7 @@ impl SparseIo for SparseMtxData {
         // The open handle points at the deleted inode after the swap; reopen on
         // the path and refresh the resident indptrs.
         self.backend = hdf5::File::open_rw(&self.file_name)?.into();
-        self.streamed_nnz = 0;
+        self.forget_file_contents();
         self.read_column_indptr()?;
         self.read_row_indptr()?;
         Ok(())
@@ -375,8 +431,8 @@ impl SparseIo for SparseMtxData {
             None => None,
         };
         let by_column = self.backend.group("/by_column")?;
-        let data = by_column.dataset("data")?.read_1d::<f32>()?.to_vec();
-        let indices = by_column.dataset("indices")?.read_1d::<u64>()?.to_vec();
+        let data = Self::read_vec::<f32>(&by_column.dataset("data")?)?;
+        let indices = Self::read_vec::<u64>(&by_column.dataset("indices")?)?;
 
         index_audit::check_preload(
             index_audit::Major::Column,
@@ -411,8 +467,8 @@ impl SparseIo for SparseMtxData {
             None => None,
         };
         let by_row = self.backend.group("/by_row")?;
-        let data = by_row.dataset("data")?.read_1d::<f32>()?.to_vec();
-        let indices = by_row.dataset("indices")?.read_1d::<u64>()?.to_vec();
+        let data = Self::read_vec::<f32>(&by_row.dataset("data")?)?;
+        let indices = Self::read_vec::<u64>(&by_row.dataset("indices")?)?;
 
         index_audit::check_preload(
             index_audit::Major::Row,
@@ -465,23 +521,25 @@ impl SparseIo for SparseMtxData {
         if let (Some(ncol), Some(nrow), Some(nnz)) =
             (self.num_columns(), self.num_rows(), self.num_non_zeros())
         {
-            let mut buf = open_buf_writer(mtx_file)?;
-            shared::write_mtx_header(&mut buf, nrow, ncol, nnz)?;
+            let indptr = indptr
+                .as_slice()
+                .ok_or_else(|| anyhow!("column pointers are not contiguous in memory"))?;
 
-            for jj in 0..ncol {
-                let start = indptr[jj] as usize;
-                let end = indptr[jj + 1] as usize;
-
-                let data_slice = data.read_slice_1d::<f32, _>(start..end)?;
-                let indices_slice = indices.read_slice_1d::<u64, _>(start..end)?;
-                // write them with 1-based indices
-                for k in 0..(end - start) {
-                    let val = data_slice[k];
-                    let ii = indices_slice[k] as usize;
-                    writeln!(buf, "{}\t{}\t{}", ii + 1, jj + 1, val)?;
-                }
-            }
-            buf.flush()?;
+            shared::write_mtx_file(mtx_file, |buf| {
+                shared::write_mtx(
+                    buf,
+                    (nrow, ncol, nnz),
+                    indptr,
+                    shared::MTX_STREAM_BLOCK,
+                    |s, e| {
+                        let range = (s as usize)..(e as usize);
+                        Ok((
+                            data.read_slice_1d::<f32, _>(range.clone())?,
+                            indices.read_slice_1d::<u64, _>(range)?,
+                        ))
+                    },
+                )
+            })?;
             info!(
                 "{}: {} rows, {} columns, {} non-zeros",
                 mtx_file, nrow, ncol, nnz
@@ -565,14 +623,7 @@ impl SparseIo for SparseMtxData {
             .map(|x| x.parse().expect("invalid name"))
             .collect();
 
-        let root = self.backend.group("/")?;
-        root.new_dataset::<VarLenUnicode>()
-            .shape(_names.len())
-            .chunk([_names.len()])
-            .create(key)?
-            .write(&_names)?;
-
-        Ok(())
+        self.write_names(key, &_names)
     }
 
     /// Add arbitrary names (a vector of strings)
@@ -586,14 +637,7 @@ impl SparseIo for SparseMtxData {
             .map(|x| x.to_string().parse().expect("invalid name"))
             .collect::<Vec<_>>();
 
-        let root = self.backend.group("/")?;
-        root.new_dataset::<VarLenUnicode>()
-            .shape(_names.len())
-            .chunk([_names.len()])
-            .create(key)?
-            .write(&_names)?;
-
-        Ok(())
+        self.write_names(key, &_names)
     }
 
     fn row_names(&self) -> anyhow::Result<Vec<Box<str>>> {
@@ -908,12 +952,7 @@ impl SparseIo for SparseMtxData {
             // info!("Group: {:?} created", root);
         }
 
-        {
-            // Match Blosc compression threads to the active rayon pool so
-            // `--n-threads` (and `RAYON_NUM_THREADS`) cap total CPU usage.
-            let num_threads = rayon::current_num_threads().max(1);
-            blosc_set_nthreads(num_threads as u8);
-        }
+        match_blosc_threads_to_pool();
 
         let csr = self.backend.group("/by_row")?;
 
@@ -957,29 +996,25 @@ impl SparseIo for SparseMtxData {
             self.backend.create_group(group_path)?;
         }
 
-        {
-            // Match Blosc compression threads to the active rayon pool so
-            // `--n-threads` (and `RAYON_NUM_THREADS`) cap total CPU usage.
-            let num_threads = rayon::current_num_threads().max(1);
-            blosc_set_nthreads(num_threads as u8);
-        }
+        match_blosc_threads_to_pool();
 
+        // Exactly `len` elements, none for an empty array, so what a reader
+        // finds matches the index pointers.
         let group = self.backend.group(group_path)?;
-        let shape_len = len.max(1);
         match key {
             CsKey::CscData | CsKey::CsrData => {
                 group
                     .new_dataset::<f32>()
-                    .shape(shape_len)
-                    .chunk([chunk_elems(shape_len, std::mem::size_of::<f32>())])
+                    .shape(len)
+                    .chunk([chunk_elems(len, std::mem::size_of::<f32>())])
                     .blosc_blosclz(COMPRESSION_LEVEL, true)
                     .create(ds_name)?;
             }
             _ => {
                 group
                     .new_dataset::<u64>()
-                    .shape(shape_len)
-                    .chunk([chunk_elems(shape_len, std::mem::size_of::<u64>())])
+                    .shape(len)
+                    .chunk([chunk_elems(len, std::mem::size_of::<u64>())])
                     .blosc_blosclz(COMPRESSION_LEVEL, true)
                     .create(ds_name)?;
             }
@@ -1049,12 +1084,7 @@ impl SparseIo for SparseMtxData {
             // info!("Group: {:?} created", root);
         }
 
-        {
-            // Match Blosc compression threads to the active rayon pool so
-            // `--n-threads` (and `RAYON_NUM_THREADS`) cap total CPU usage.
-            let num_threads = rayon::current_num_threads().max(1);
-            blosc_set_nthreads(num_threads as u8);
-        }
+        match_blosc_threads_to_pool();
 
         let csc = self.backend.group("/by_column")?;
 
@@ -1084,3 +1114,7 @@ impl SparseIo for SparseMtxData {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "hdf5_tests.rs"]
+mod tests;

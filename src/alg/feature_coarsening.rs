@@ -298,15 +298,29 @@ fn residual_profiles(
     let n_pb = sizes.len();
     let total_size: f32 = sizes.iter().sum();
     let clip = (n_pb as f32).sqrt();
-    let mut z = DMatrix::<f32>::zeros(rows.len(), n_pb);
-    for (i, &g) in rows.iter().enumerate() {
-        let t: f32 = counts.row(g).sum();
-        for s in 0..n_pb {
-            let e = t * sizes[s] / total_size.max(f32::MIN_POSITIVE);
-            if e > 0.0 {
-                z[(i, s)] = ((counts[(g, s)] - e) / e.sqrt()).clamp(-clip, clip);
-            }
+    // Row totals, then the residuals: both walk `counts` one column at a
+    // time, the order it is stored in, and the residual columns are filled
+    // in parallel.
+    let mut totals = vec![0f32; rows.len()];
+    for col in counts.column_iter() {
+        for (t, &g) in totals.iter_mut().zip(rows) {
+            *t += col[g];
         }
+    }
+    let mut z = DMatrix::<f32>::zeros(rows.len(), n_pb);
+    if !rows.is_empty() {
+        z.as_mut_slice()
+            .par_chunks_mut(rows.len())
+            .enumerate()
+            .for_each(|(s, z_col)| {
+                let col = counts.column(s);
+                for ((z_is, &t), &g) in z_col.iter_mut().zip(&totals).zip(rows) {
+                    let e = t * sizes[s] / total_size.max(f32::MIN_POSITIVE);
+                    if e > 0.0 {
+                        *z_is = ((col[g] - e) / e.sqrt()).clamp(-clip, clip);
+                    }
+                }
+            });
     }
     if n_pb > MAX_PROFILE_DIM {
         let basis = DMatrix::<f32>::rnorm_seeded(n_pb, SKETCH_DIM, mix_seed(seed, 0x5343_4854));
@@ -405,7 +419,12 @@ pub fn coarsen_features(
             } else {
                 kmeans_centroids_seeded(&centroids, k, KMEANS_ITER, mix_seed(seed, l as u64)).1
             };
-            let level = level_from_labels(d, &rows, &fine_label, &to_level, has_background);
+            // A level with no informative slot is all background.
+            let level = if to_level.is_empty() {
+                level_from_labels(d, &[], &[], &[], has_background)
+            } else {
+                level_from_labels(d, &rows, &fine_label, &to_level, has_background)
+            };
             info!(
                 "feature coarsening level {l} (target {target}): {}",
                 group_sizes(&level, has_background)
@@ -594,8 +613,11 @@ fn informative_groups(
 
 /// Proportional shares of `budget` slots over blocks with `weight` informative
 /// features each: at least one per block, the remainder to the blocks with the
-/// most features per slot.
+/// most features per slot. No block, no share.
 fn block_shares(weight: &[usize], budget: usize) -> Vec<usize> {
+    if weight.is_empty() {
+        return Vec::new();
+    }
     let total: usize = weight.iter().sum();
     let mut alloc: Vec<usize> = weight
         .iter()

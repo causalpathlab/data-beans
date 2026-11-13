@@ -805,13 +805,17 @@ impl<'a> StatExplorer<'a> {
         let selected = self.selected();
         if let Some(i) = selected {
             let v = self.values[self.stat][i];
-            let above = n - self.sorted.partition_point(|&x| x <= v);
-            lines.push(Line::from(vec![
+            let mut line = vec![
                 Span::styled(format!("▲ {}", self.names[i]), HIGHLIGHT),
                 dim(&format!(" {stat} ")),
                 Span::raw(fmt(v)),
-                dim(&format!("   rank {} of {}", above + 1, n)),
-            ]));
+            ];
+            // Ranked among the values the histogram shows.
+            if v.is_finite() {
+                let above = n - self.sorted.partition_point(|&x| x <= v);
+                line.push(dim(&format!("   rank {} of {}", above + 1, n)));
+            }
+            lines.push(Line::from(line));
         }
         frame.render_widget(Paragraph::new(lines), summary);
 
@@ -852,7 +856,10 @@ impl<'a> StatExplorer<'a> {
             subset: self.shown.as_deref(),
             y_scale: self.y_scale,
             y_max: None,
-            pointer: selected.map(|i| bins.key(self.values[self.stat][i] as f64)),
+            pointer: selected
+                .map(|i| self.values[self.stat][i])
+                .filter(|v| v.is_finite())
+                .map(|v| bins.key(v as f64)),
             marks: Vec::new(),
             x_label: None,
             tick_every: None,
@@ -1144,8 +1151,11 @@ fn scroll(cursor: usize, offset: usize, height: usize) -> (usize, usize) {
     (cursor, offset)
 }
 
+/// The finite `values`, ascending: what the histogram and its summary are
+/// of, as in the figure. An entry whose statistic is not a number (the
+/// mean of nothing) stays in the table only.
 fn sorted_copy(values: &[f32]) -> Vec<f32> {
-    let mut sorted = values.to_vec();
+    let mut sorted: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
     sorted.sort_unstable_by(f32::total_cmp);
     sorted
 }

@@ -172,3 +172,76 @@ fn called_cells_are_left_alone() {
     .expect("load");
     assert_eq!(loaded.data.num_columns(), 40);
 }
+
+////////////////////////////////////////////////////////////////////
+// batch labels                                                    //
+////////////////////////////////////////////////////////////////////
+
+fn batch_file(dir: &std::path::Path, name: &str, labels: &[&str]) -> Box<str> {
+    let path = dir.join(name);
+    std::fs::write(&path, labels.join("\n") + "\n").unwrap();
+    path.to_string_lossy().into_owned().into()
+}
+
+#[test]
+fn each_batch_file_must_cover_its_own_data_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = backend(dir.path(), "a", &["G1", "G2"]);
+    let b = backend(dir.path(), "b", &["G1", "G2"]);
+    let load = |batch_files: Vec<Box<str>>| {
+        read_data_on_shared_rows(ReadSharedRowsArgs {
+            data_files: vec![a.clone(), b.clone()],
+            batch_files: Some(batch_files),
+            ..Default::default()
+        })
+    };
+
+    // One line long and one line short: the total fits, the labels do not.
+    let long = batch_file(dir.path(), "long.txt", &["x", "x", "x"]);
+    let short = batch_file(dir.path(), "short.txt", &["y"]);
+    let err = load(vec![long, short]).err().expect("miscounted files");
+    assert!(err.to_string().contains("3 lines"), "{err}");
+
+    let xs = batch_file(dir.path(), "xs.txt", &["x", "x"]);
+    let ys = batch_file(dir.path(), "ys.txt", &["y1", "y2"]);
+    let loaded = load(vec![xs, ys]).expect("load");
+    let batch: Vec<&str> = loaded.batch.iter().map(|b| b.as_ref()).collect();
+    assert_eq!(batch, vec!["x", "x", "y1", "y2"]);
+}
+
+#[test]
+fn union_cells_without_a_sample_tag_share_one_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let tagged = backend(dir.path(), "tagged", &["G1", "G2"]);
+    let bare = backend(dir.path(), "bare", &["G1", "G2"]);
+    // Either file order: the first cell's name does not decide for the rest.
+    for (files, suffixes) in [
+        (
+            vec![tagged.clone(), bare.clone()],
+            vec![Some("s1".into()), None],
+        ),
+        (
+            vec![bare.clone(), tagged.clone()],
+            vec![None, Some("s1".into())],
+        ),
+    ] {
+        let loaded = read_data_on_shared_rows(ReadSharedRowsArgs {
+            data_files: files,
+            column_alignment: crate::sparse_io_vector::ColumnAlignment::Union,
+            keep_empty_barcodes: true,
+            per_file_barcode_suffix: Some(suffixes),
+            ..Default::default()
+        })
+        .expect("load");
+        let names = loaded.data.column_names().unwrap();
+        assert_eq!(names.len(), 4);
+        for (name, batch) in names.iter().zip(&loaded.batch) {
+            let want = if name.starts_with("tagged") {
+                "s1"
+            } else {
+                "all"
+            };
+            assert_eq!(batch.as_ref(), want, "{name}");
+        }
+    }
+}

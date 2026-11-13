@@ -335,7 +335,10 @@ impl CellRules {
         self.recount();
     }
 
-    /// Hold `rule` to `value` of its own, off the MAD band.
+    /// Hold `rule` to `value` of its own, off the MAD band. A floor on a
+    /// whole-number metric (genes per cell, cells per gene) is the least
+    /// whole number at or above `value`: what is at or above the one is at
+    /// or above the other, so a fractional band edge keeps the same cells.
     pub fn set_value(&mut self, rule: Rule, value: f32) {
         let c = &mut self.cfg;
         let value = value.max(0.0);
@@ -343,7 +346,7 @@ impl CellRules {
             Rule::Genes => {
                 c.mad_on_n_genes = false;
                 c.auto_cell_cutoff = false;
-                c.min_cell_nnz = value.round() as usize;
+                c.min_cell_nnz = value.ceil() as usize;
             }
             Rule::Counts => {
                 c.mad_on_counts = false;
@@ -354,7 +357,7 @@ impl CellRules {
                 c.mito_max_frac = Some(value.min(1.0));
             }
             Rule::Ribo => c.ribo_max_frac = Some(value.min(1.0)),
-            Rule::GeneCells => c.feature_min_cells = value.round() as usize,
+            Rule::GeneCells => c.feature_min_cells = value.ceil() as usize,
         }
         self.recount();
     }

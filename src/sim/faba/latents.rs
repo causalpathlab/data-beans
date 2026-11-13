@@ -74,6 +74,11 @@ pub fn sample_all(args: &FabaArgs, pi_meas: &[f32], rng: &mut impl Rng) -> anyho
 
     anyhow::ensure!(k >= 1, "k-topics must be ≥ 1");
     anyhow::ensure!(c_mod >= 1, "components-per-modifier must be ≥ 1");
+    anyhow::ensure!(
+        args.alpha_mix.is_finite() && args.alpha_mix > 0.0,
+        "alpha-mix must be a positive number (got {})",
+        args.alpha_mix
+    );
     if args.trajectory {
         anyhow::ensure!(args.n_branches >= 1, "trajectory: --n-branches must be ≥ 1");
         anyhow::ensure!(
@@ -200,7 +205,7 @@ pub fn sample_all(args: &FabaArgs, pi_meas: &[f32], rng: &mut impl Rng) -> anyho
         let c = if mi == 0 { 2 } else { c_mod };
         let mut alpha = DMatrix::<f32>::zeros(c, g);
         for gi in 0..g {
-            let raws = sample_dirichlet(c, args.alpha_mix, rng);
+            let raws = sample_dirichlet(c, args.alpha_mix, rng)?;
             for (ci, v) in raws.into_iter().enumerate() {
                 alpha[(ci, gi)] = v;
             }
@@ -413,11 +418,16 @@ fn sigmoid(x: f32) -> f32 {
 
 /// Sample a Dirichlet(α · 1_k). For α < 1 the draws are sharply
 /// unequal (most mass on one component); for α = 1 they're
-/// uniform-on-simplex. Delegates to `rand_distr::Dirichlet`.
-fn sample_dirichlet(k: usize, alpha: f32, rng: &mut impl Rng) -> Vec<f32> {
+/// uniform-on-simplex. Delegates to `rand_distr::Dirichlet`, which needs
+/// `k ≥ 2`; a single component takes all the mass without a draw.
+fn sample_dirichlet(k: usize, alpha: f32, rng: &mut impl Rng) -> anyhow::Result<Vec<f32>> {
+    if k == 1 {
+        return Ok(vec![1.0]);
+    }
     let alphas = vec![alpha as f64; k];
-    let dist = rand_distr::multi::Dirichlet::new(&alphas).expect("Dirichlet: alpha > 0, k > 0");
-    dist.sample(rng).into_iter().map(|x| x as f32).collect()
+    let dist = rand_distr::multi::Dirichlet::new(&alphas)
+        .map_err(|e| anyhow::anyhow!("Dirichlet({alpha} · 1_{k}): {e}"))?;
+    Ok(dist.sample(rng).into_iter().map(|x| x as f32).collect())
 }
 
 #[cfg(test)]

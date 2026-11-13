@@ -514,6 +514,24 @@ fn matched_columns_across_batches() -> anyhow::Result<()> {
         assert!(d >= 0.0);
     }
 
+    // The same match, naming the matched column behind each matrix column:
+    // a batch-1 cell (columns 20..40) whose stored data the column carries.
+    let (csc_named, sources_named, matched, distances_named) =
+        vec.read_matched_columns_with_targets_csc(0..5, &[1], knn, true)?;
+    assert_eq!(csc_named, csc);
+    assert_eq!(sources_named, sources);
+    assert_eq!(distances_named, distances);
+    assert_eq!(matched.len(), csc.ncols());
+    for (t, &m) in matched.iter().enumerate() {
+        assert!(
+            (20..ncol).contains(&m),
+            "matched column {m} is not in batch 1"
+        );
+        let stored = vec.read_columns_csc(std::iter::once(m))?;
+        assert_eq!(csc.col(t).row_indices(), stored.col(0).row_indices());
+        assert_eq!(csc.col(t).values(), stored.col(0).values());
+    }
+
     Ok(())
 }
 
@@ -1516,5 +1534,296 @@ fn mask_columns_is_reentrant() -> anyhow::Result<()> {
     for (new_i, &old_i) in surv2_old.iter().enumerate() {
         assert!((row0[(0, new_i)] - before[(0, old_i)]).abs() < 1e-6);
     }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────
+// Folded rows, shared cells, and state that must survive
+// ─────────────────────────────────────────────────────
+
+/// One backend whose three rows canonicalize to GENE1, GENE1, GENE2.
+fn folded_rows_vec(preload: bool) -> anyhow::Result<SparseIoVec> {
+    let rows: Vec<Box<str>> = vec![
+        "ENSG_A_GENE1".into(),
+        "ENSG_B_GENE1".into(),
+        "ENSG_C_GENE2".into(),
+    ];
+    let raw = Array2::from_shape_vec(
+        (3, 4),
+        vec![1.0, 0.0, 3.0, 0.0, 4.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0],
+    )?;
+    let sp = if preload {
+        make_named_sparse(&raw, &rows, &str_vec(4, "cell"))
+    } else {
+        make_named_sparse_no_preload(&raw, &rows, &str_vec(4, "cell"))
+    };
+    let mut vec = SparseIoVec::new()
+        .with_row_canonicalizer(|name: &str| name.rsplit('_').next().unwrap_or(name).into())?;
+    vec.push(sp, Some("A".into()))?;
+    Ok(vec)
+}
+
+#[test]
+fn row_reads_sum_every_row_folded_by_the_canonicalizer() -> anyhow::Result<()> {
+    for preload in [true, false] {
+        let vec = folded_rows_vec(preload)?;
+        let by_columns = vec.read_columns_ndarray(0..4)?;
+        let gene1 = vec
+            .row_names()?
+            .iter()
+            .position(|n| n.as_ref() == "GENE1")
+            .expect("merged row");
+        assert_eq!(by_columns.row(gene1).to_vec(), vec![5.0, 5.0, 3.0, 0.0]);
+
+        assert_eq!(vec.read_rows_ndarray(0..2)?, by_columns);
+        assert_eq!(csc_to_dense(&vec.read_rows_csc(0..2)?), by_columns);
+        let dm = vec.read_rows_dmatrix(0..2)?;
+        assert_eq!(dm, ndarray_to_dmatrix(&by_columns));
+        // One requested row, both of its local rows.
+        let one = vec.read_rows_ndarray(gene1..gene1 + 1)?;
+        assert_eq!(one.row(0).to_vec(), vec![5.0, 5.0, 3.0, 0.0]);
+    }
+    Ok(())
+}
+
+/// Two backends observing the same cell `c1` at the same gene `g0`.
+fn shared_cell_and_row_vec() -> anyhow::Result<SparseIoVec> {
+    let genes: Vec<Box<str>> = vec!["g0".into(), "g1".into()];
+    let mut a = Array2::<f32>::zeros((2, 2));
+    a[(0, 1)] = 3.0; // g0, c1
+    a[(1, 0)] = 1.0; // g1, c0
+    let mut b = Array2::<f32>::zeros((2, 2));
+    b[(0, 0)] = 4.0; // g0, c1
+    b[(1, 1)] = 2.0; // g1, c2
+    let sp_a = make_named_sparse(&a, &genes, &["c0".into(), "c1".into()]);
+    let sp_b = make_named_sparse_no_preload(&b, &genes, &["c1".into(), "c2".into()]);
+    let mut vec = SparseIoVec::new().with_column_alignment(ColumnAlignment::Union)?;
+    vec.push(sp_a, None)?;
+    vec.push(sp_b, None)?;
+    Ok(vec)
+}
+
+#[test]
+fn dense_reads_sum_what_two_backends_put_on_one_cell() -> anyhow::Result<()> {
+    let vec = shared_cell_and_row_vec()?;
+    assert_eq!(vec.num_columns(), 3);
+    let names = vec.column_names()?;
+    let c1 = names.iter().position(|n| n.as_ref() == "c1").unwrap();
+
+    let sparse = csc_to_dense(&vec.read_columns_csc(0..3)?);
+    assert_eq!(sparse[(0, c1)], 7.0);
+
+    let dense = vec.read_columns_ndarray(0..3)?;
+    assert_eq!(dense, sparse, "dense and sparse column reads must agree");
+    assert_eq!(vec.read_columns_dmatrix(0..3)?, ndarray_to_dmatrix(&sparse));
+    assert_eq!(vec.read_rows_ndarray(0..2)?, sparse);
+    assert_eq!(vec.read_rows_dmatrix(0..2)?, ndarray_to_dmatrix(&sparse));
+
+    // No coordinate is reported twice, in one slab or one column per slab.
+    for chunk in [1, 3] {
+        let mut seen = std::collections::HashSet::new();
+        vec.for_each_triplet(0..3, chunk, |r, c, _| {
+            assert!(seen.insert((r, c)), "({r}, {c}) emitted twice");
+        })?;
+        assert_eq!(seen.len(), 3);
+    }
+    Ok(())
+}
+
+#[test]
+fn neighbouring_columns_are_the_matched_columns_read_in_order() -> anyhow::Result<()> {
+    let nrow = 6;
+    let ncol = 60;
+    let raw = Array2::<f32>::runif(nrow, ncol);
+    let features = Array2::<f32>::runif(5, ncol);
+    let batch_labels: Vec<usize> = (0..ncol).map(|i| i / 20).collect();
+
+    for preload in [true, false] {
+        let sp = if preload {
+            make_named_sparse(&raw, &str_vec(nrow, "r"), &str_vec(ncol, "c"))
+        } else {
+            make_named_sparse_no_preload(&raw, &str_vec(nrow, "r"), &str_vec(ncol, "c"))
+        };
+        let mut vec = SparseIoVec::new();
+        vec.push(sp, None)?;
+        vec.register_batches_ndarray(&features, &batch_labels)?;
+
+        // Several sources share neighbours, so matched columns repeat.
+        let (csc, sources, matched, distances) =
+            vec.read_neighbouring_columns_csc(0..20, 2, 5, true, None)?;
+        assert!(!matched.is_empty());
+        assert_eq!(csc.ncols(), matched.len());
+        assert_eq!(sources.len(), matched.len());
+        assert_eq!(distances.len(), matched.len());
+        let mut distinct = matched.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(distinct.len() < matched.len(), "expected repeated matches");
+
+        let expected = vec.read_columns_csc(matched.iter().copied())?;
+        assert_eq!(csc_to_dense(&csc), csc_to_dense(&expected));
+
+        let (dm, sources_dm, _) = vec.read_neighbouring_columns_dmatrix(0..20, 2, 5, true, None)?;
+        assert_eq!(sources_dm, sources);
+        assert_eq!(dm, ndarray_to_dmatrix(&csc_to_dense(&expected)));
+
+        let (matched_csc, matched_sources, _) =
+            vec.read_matched_columns_csc(0..20, &[1, 2], 3, true)?;
+        assert_eq!(matched_csc.ncols(), matched_sources.len());
+        assert_eq!(matched_csc.ncols(), 20 * 3 * 2);
+    }
+    Ok(())
+}
+
+#[test]
+fn column_multiplicity_survives_clone_clear_and_mask() -> anyhow::Result<()> {
+    let ncol = 5;
+    let raw = Array2::<f32>::runif(3, ncol);
+    let sp = make_named_sparse(&raw, &str_vec(3, "r"), &str_vec(ncol, "c"));
+    let mut vec = SparseIoVec::new();
+    vec.push(sp, None)?;
+    let weights = [250.0, 1.0, 30.0, 4.0, 5.0];
+    vec.register_column_multiplicity(&weights)?;
+
+    let copy = vec.clone_for_collapse();
+    assert_eq!(copy.column_multiplicities(), Some(&weights[..]));
+
+    vec.assign_groups(&["a", "a", "b", "b", "b"], None);
+    vec.clear_column_membership();
+    assert!(vec.take_grouped_columns().is_none());
+    assert_eq!(vec.column_multiplicities(), Some(&weights[..]));
+
+    vec.mask_columns(&[true, false, true, false, true])?;
+    assert_eq!(vec.column_multiplicities(), Some(&[250.0, 30.0, 5.0][..]));
+    assert_eq!(vec.column_multiplicity(1), 30.0);
+    Ok(())
+}
+
+#[test]
+#[should_panic(expected = "batch membership has 4 entries but there are 6 columns")]
+fn a_short_batch_membership_is_refused() {
+    let raw = Array2::<f32>::runif(3, 6);
+    let sp = make_named_sparse(&raw, &str_vec(3, "r"), &str_vec(6, "c"));
+    let mut vec = SparseIoVec::new();
+    vec.push(sp, None).unwrap();
+    vec.register_batch_membership(&["a", "a", "b", "b"]);
+}
+
+#[test]
+fn a_short_batch_membership_is_an_error_to_the_fallible_form() -> anyhow::Result<()> {
+    let raw = Array2::<f32>::runif(3, 6);
+    let sp = make_named_sparse(&raw, &str_vec(3, "r"), &str_vec(6, "c"));
+    let mut vec = SparseIoVec::new();
+    vec.push(sp, None)?;
+    let err = vec
+        .try_register_batch_membership(&["a", "a", "b", "b"])
+        .expect_err("4 labels for 6 columns");
+    assert_eq!(
+        err.to_string(),
+        "batch membership has 4 entries but there are 6 columns"
+    );
+    assert_eq!(vec.num_batches(), 0, "nothing is registered");
+    vec.try_register_batch_membership(&["a", "a", "b", "b", "c", "c"])?;
+    assert_eq!(vec.num_batches(), 3);
+    Ok(())
+}
+
+#[test]
+fn batch_registration_checks_the_number_of_labels() -> anyhow::Result<()> {
+    let raw = Array2::<f32>::runif(3, 6);
+    let sp = make_named_sparse(&raw, &str_vec(3, "r"), &str_vec(6, "c"));
+    let mut vec = SparseIoVec::new();
+    vec.push(sp, None)?;
+
+    // One label per feature column, but fewer than the data's columns.
+    let features = Array2::<f32>::runif(2, 4);
+    let err = vec
+        .register_batches_ndarray(&features, &["a", "a", "b", "b"])
+        .expect_err("four labels for six columns");
+    assert!(err.to_string().contains("6 columns"), "got: {err}");
+
+    // Labels that do not match the feature matrix.
+    let features = Array2::<f32>::runif(2, 6);
+    assert!(vec
+        .register_batches_ndarray(&features, &["a", "a", "b", "b"])
+        .is_err());
+    assert_eq!(vec.num_batches(), 0);
+    Ok(())
+}
+
+#[test]
+fn a_refused_push_leaves_the_vector_unchanged() -> anyhow::Result<()> {
+    let genes: Vec<Box<str>> = vec!["g0".into(), "g1".into()];
+    let mut a = Array2::<f32>::zeros((2, 2));
+    a[(0, 0)] = 1.0; // c0
+    a[(1, 1)] = 2.0; // c1
+    let bad = Array2::<f32>::from_elem((2, 3), 100.0);
+    let mut c = Array2::<f32>::zeros((2, 2));
+    c[(1, 0)] = 30.0; // c3
+    c[(0, 1)] = 40.0; // c4
+
+    let mut vec = SparseIoVec::new().with_column_alignment(ColumnAlignment::Union)?;
+    vec.push(
+        make_named_sparse(&a, &genes, &["c0".into(), "c1".into()]),
+        None,
+    )?;
+    let before = vec.read_columns_ndarray(0..2)?;
+
+    // `c1` and the first `c2` are placed before the repeat is reached.
+    let bad_genes: Vec<Box<str>> = vec!["g0".into(), "x9".into()];
+    let bad_cells: Vec<Box<str>> = vec!["c1".into(), "c2".into(), "c2".into()];
+    assert!(vec
+        .push(make_named_sparse(&bad, &bad_genes, &bad_cells), None)
+        .is_err());
+
+    assert_eq!(vec.len(), 1);
+    assert_eq!(vec.num_columns(), 2);
+    assert_eq!(vec.column_names()?.len(), 2);
+    assert_eq!(vec.num_rows(), 2);
+    assert!((0..2).all(|c| vec.column_locations(c).len() == 1));
+    assert_eq!(vec.read_columns_ndarray(0..2)?, before);
+
+    // The next backend takes the refused one's index and reads its own data.
+    vec.push(
+        make_named_sparse(&c, &genes, &["c3".into(), "c4".into()]),
+        None,
+    )?;
+    assert_eq!(vec.num_columns(), 4);
+    let names = vec.column_names()?;
+    assert_eq!(
+        names.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+        vec!["c0", "c1", "c3", "c4"]
+    );
+    let all = vec.read_columns_ndarray(0..4)?;
+    assert_eq!(all.sum(), 1.0 + 2.0 + 30.0 + 40.0);
+    assert_eq!(all[(1, 2)], 30.0);
+    assert_eq!(all[(0, 3)], 40.0);
+    assert_eq!(vec.read_rows_ndarray(0..2)?, all);
+    Ok(())
+}
+
+#[test]
+fn a_column_left_out_of_every_group_has_no_membership() -> anyhow::Result<()> {
+    let ncol = 6;
+    let raw = Array2::<f32>::runif(3, ncol);
+    let sp = make_named_sparse(&raw, &str_vec(3, "r"), &str_vec(ncol, "c"));
+    let mut vec = SparseIoVec::new();
+    vec.push(sp, None)?;
+    vec.assign_groups(&["A", "A", "A", "B", "B", "B"], Some(2));
+
+    let grouped = vec.take_grouped_columns().unwrap().clone();
+    assert_eq!(grouped.len(), 2);
+    for (g, cols) in grouped.iter().enumerate() {
+        assert_eq!(cols.len(), 2);
+        assert_eq!(vec.get_group_membership(cols.iter().copied())?, vec![g; 2]);
+    }
+    let left_out: Vec<usize> = (0..ncol)
+        .filter(|c| grouped.iter().all(|cols| !cols.contains(c)))
+        .collect();
+    assert_eq!(left_out.len(), 2);
+    for c in left_out {
+        assert!(vec.get_group_membership(std::iter::once(c)).is_err());
+    }
+    assert!(vec.get_group_membership(std::iter::once(ncol)).is_err());
     Ok(())
 }

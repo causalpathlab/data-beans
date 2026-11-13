@@ -6,7 +6,7 @@ use crate::interactive::stat_tui::Side;
 use crate::interactive::ui::Tui;
 use crate::sparse_io::*;
 use crate::utilities::io_helpers::{
-    parse_index_spec_within, read_col_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
+    parse_index_spec_within, read_col_names, read_row_names, MAX_COLUMN_NAME_IDX, MAX_ROW_NAME_IDX,
 };
 use crate::utilities::name_matching::match_by_substring;
 use clap::Args;
@@ -256,8 +256,8 @@ pub fn show_info(cmd_args: &InfoArgs) -> anyhow::Result<()> {
     }
 
     if !output.is_empty() {
-        use {mkdir, write_lines};
-        mkdir(&output)?;
+        // `output` is a file prefix: its folder is made, not one of its name.
+        mkdir_parent(&output)?;
         let row_names = data.row_names()?;
         let col_names = data.column_names()?;
         write_lines(&row_names, &(output.to_string() + ".rows.gz"))?;
@@ -398,7 +398,7 @@ pub fn take_rows(args: &TakeRowsArgs) -> anyhow::Result<()> {
 
             (data_backend.read_rows_dmatrix(rows)?, row_names)
         } else if let Some(row_name_file) = row_name_file {
-            let row_names_to_match = read_col_names(row_name_file, MAX_ROW_NAME_IDX)?;
+            let row_names_to_match = read_row_names(row_name_file, MAX_ROW_NAME_IDX)?;
             let all_names = data_backend.row_names()?;
             let (matched_indices, row_names) =
                 match_by_substring(&all_names, &row_names_to_match, "row")?;
@@ -437,3 +437,7 @@ pub fn take_rows(args: &TakeRowsArgs) -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+#[cfg(test)]
+#[path = "inspection_tests.rs"]
+mod tests;

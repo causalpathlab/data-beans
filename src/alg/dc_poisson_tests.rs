@@ -379,3 +379,80 @@ fn fast_ln_is_ln_to_f32_rounding() {
     assert_eq!(fast_ln(0.0), f64::NEG_INFINITY);
     assert_eq!(fast_ln(f64::INFINITY), f64::INFINITY);
 }
+
+#[test]
+fn argmax_from_current_moves_only_for_a_strictly_better_block() {
+    let lp = [0.0, 1.0, 5.0, 1.0];
+    // A tie with the current label stays put, whichever comes first.
+    assert_eq!(argmax_log_restricted_from(&lp, &[1, 3], 3), 3);
+    assert_eq!(argmax_log_restricted_from(&lp, &[1, 3], 1), 1);
+    // A strictly better block wins.
+    assert_eq!(argmax_log_restricted_from(&lp, &[0, 1, 2], 1), 2);
+    // A current label outside the candidates is never returned.
+    assert_eq!(argmax_log_restricted_from(&lp, &[1, 3], 2), 1);
+}
+
+/// An entity with an empty profile scores every block alike; a greedy sweep
+/// leaves it where it is instead of moving it to its first candidate.
+fn greedy_keeps_an_entity_without_evidence(parallel: bool) {
+    let (n, m, k) = (24, 16, 4);
+    let planted: Vec<usize> = (0..n).map(|i| i % k).collect();
+    let mut gs = toy_gene_sums(n, m, &planted, 5);
+    let blank = 7;
+    gs[blank].clear();
+    let profiles = make_profiles(&gs, m);
+    assert_eq!(profiles.size_factor[blank], 0.0);
+
+    let mut labels = planted.clone();
+    assert_eq!(labels[blank], 3);
+    let candidates: Vec<Vec<usize>> = vec![vec![1, 3]; n];
+    let params = RefineParams {
+        num_gibbs: 0,
+        num_greedy: 3,
+        parallel,
+        ..Default::default()
+    };
+    let ctx = RefineContext {
+        profiles: &profiles,
+        k,
+        params: &params,
+        level_label: "test",
+    };
+    let mut rng = SmallRng::seed_from_u64(1);
+    refine_with_candidates(&mut labels, &candidates, &mut rng, &ctx);
+    assert_eq!(labels[blank], 3, "parallel={parallel}");
+}
+
+#[test]
+fn greedy_keeps_an_entity_without_evidence_sequential() {
+    greedy_keeps_an_entity_without_evidence(false);
+}
+
+#[test]
+fn greedy_keeps_an_entity_without_evidence_jacobi() {
+    greedy_keeps_an_entity_without_evidence(true);
+}
+
+/// The Fisher weights of (non-integer) profiles come out the same bits on
+/// any number of threads.
+#[test]
+fn nb_fisher_weights_do_not_depend_on_the_thread_count() {
+    let (n, m, k) = (3000, 24, 4);
+    let labels: Vec<usize> = (0..n).map(|i| i % k).collect();
+    let profiles = make_profiles(&toy_gene_sums(n, m, &labels, 11), m);
+    let on_threads = |threads: usize| -> Vec<u32> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("thread pool")
+            .install(|| profiles.nb_fisher_weights())
+            .iter()
+            .map(|w| w.to_bits())
+            .collect()
+    };
+    let one = on_threads(1);
+    assert_eq!(one.len(), m);
+    for threads in [3, 6] {
+        assert_eq!(on_threads(threads), one, "{threads} threads");
+    }
+}

@@ -67,6 +67,23 @@ fn args(input: &str, output: &str) -> SubsampleArgs {
 }
 
 #[test]
+fn an_output_that_is_the_input_is_refused_and_the_input_kept() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let input = dir.path().join("in.zarr");
+    let input = input.to_str().expect("utf8");
+    fixture_at(input)?;
+    // `-o in --no-zip` is in.zarr itself, cleared before it is read.
+    let mut a = args(input, dir.path().join("in").to_str().expect("utf8"));
+    a.cells = Some(3);
+    let err = run_subsample(&a).unwrap_err();
+    assert!(format!("{err:#}").contains("is the input"), "{err:#}");
+    let kept = open_sparse_matrix(input, &SparseIoBackend::Zarr)?;
+    assert_eq!(kept.num_columns(), Some(6));
+    assert_eq!(kept.num_non_zeros(), Some(24));
+    Ok(())
+}
+
+#[test]
 fn a_cell_subsample_keeps_whole_columns_untouched() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let input = dir.path().join("in.zarr");

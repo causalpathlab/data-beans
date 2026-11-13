@@ -25,15 +25,64 @@ pub struct TenxMatrix {
     pub keep_rows: Option<Vec<bool>>,
 }
 
-/// The length of one axis: the number of names the file lists for it (one
-/// per row or column, so trailing all-zero rows and columns, which leave no
-/// trace in the triplets, still count), else as far as the triplets reach.
-/// An error when the triplets reach past the names.
-fn axis_len(named: Option<usize>, reach: usize, what: &str) -> anyhow::Result<usize> {
-    match named {
-        Some(n) if n >= reach => Ok(n),
-        Some(n) => anyhow::bail!("the file names {n} {what} but its data reaches {reach}"),
-        None => Ok(reach),
+/// The length of one axis: the length the file declares for it, else the
+/// number of names it lists (one per row or column, so trailing all-zero
+/// rows and columns, which leave no trace in the triplets, still count),
+/// else as far as the triplets reach. An error when the triplets reach past
+/// that length, or, with `compressed` (the axis the file's pointers run
+/// over, one vector per row or column), hold another number of vectors.
+pub(crate) fn axis_len(
+    declared: Option<usize>,
+    named: Option<usize>,
+    reach: usize,
+    compressed: bool,
+    what: &str,
+) -> anyhow::Result<usize> {
+    let (n, source) = match (declared, named) {
+        (Some(n), _) => (n, "declares"),
+        (None, Some(n)) => (n, "names"),
+        (None, None) => return Ok(reach),
+    };
+    anyhow::ensure!(
+        if compressed { reach == n } else { reach <= n },
+        "the file {source} {n} {what} but its data {} {reach}",
+        if compressed { "holds" } else { "reaches" }
+    );
+    Ok(n)
+}
+
+/// An error when a matrix of `nrows` rows keeps none of them: `n_kept` is
+/// zero. It names the type `patterns` (select, remove) and the file's
+/// types; `row_set` is `(rows of a kept type, rows in the set)` when the
+/// rows are also limited to a set of their own ([`TenxMatrix::keep_rows`]),
+/// which may be what leaves none.
+pub(crate) fn ensure_rows_kept(
+    n_kept: usize,
+    nrows: usize,
+    row_types: Option<&[Box<str>]>,
+    patterns: (&str, &str),
+    row_set: Option<(usize, usize)>,
+) -> anyhow::Result<()> {
+    if n_kept > 0 || nrows == 0 {
+        return Ok(());
+    }
+    let types: std::collections::BTreeSet<&str> = row_types
+        .iter()
+        .flat_map(|t| t.iter())
+        .map(|t| t.as_ref())
+        .collect();
+    let patterns = format!("select `{}`, remove `{}`", patterns.0, patterns.1);
+    match row_set {
+        Some((n_typed, n_set)) => anyhow::bail!(
+            "none of the {nrows} rows is kept: {n_typed} are of a kept type ({patterns}) and \
+             {n_set} are in `keep_rows`, the rows the file itself selects (a probe set's \
+             targets), but none is both; the file's feature types are {types:?}. Name the \
+             types to keep with --select-row-type"
+        ),
+        None => anyhow::bail!(
+            "none of the {nrows} rows is kept ({patterns}); the file's feature types are \
+             {types:?}. Name the types to keep with --select-row-type"
+        ),
     }
 }
 
@@ -58,8 +107,11 @@ pub fn write_10x_matrix(
         column_names,
         keep_rows,
     } = m;
-    let nrows = axis_len(row_ids.as_ref().map(Vec::len), reach.0, "rows")?;
-    let ncols = axis_len(column_names.as_ref().map(Vec::len), reach.1, "columns")?;
+    // A 10x file declares no shape apart from its names, and a list of
+    // names longer than the pointers is taken as trailing empty vectors.
+    let nrows = axis_len(None, row_ids.as_ref().map(Vec::len), reach.0, false, "rows")?;
+    let named_columns = column_names.as_ref().map(Vec::len);
+    let ncols = axis_len(None, named_columns, reach.1, false, "columns")?;
     let index = |n: usize| {
         (0..n)
             .map(|i| i.to_string().into_boxed_str())
@@ -87,9 +139,18 @@ pub fn write_10x_matrix(
         Some(types) => filter_row_indices_by_type(types, select_row_type, remove_row_type),
         None => (0..nrows).collect(),
     };
-    if let Some(keep_rows) = &keep_rows {
+    let row_set = keep_rows.as_ref().map(|keep_rows| {
+        let n_typed = keep.len();
         keep.retain(|&i| keep_rows[i]);
-    }
+        (n_typed, keep_rows.iter().filter(|&&k| k).count())
+    });
+    ensure_rows_kept(
+        keep.len(),
+        nrows,
+        row_types.as_deref(),
+        (select_row_type, remove_row_type),
+        row_set,
+    )?;
     // The other rows leave the triplets before anything is written.
     if keep.len() < nrows {
         info!("Keeping {} of {nrows} rows", keep.len());
@@ -369,11 +430,72 @@ pub fn convert_zarr_to_backend(zarr_file: &str, output: &str) -> anyhow::Result<
     })
 }
 
+/// The backend cached at `converted`, when it is there and whole: it opens
+/// and knows its shape. `None` for a missing or unusable one.
+fn cached_conversion(converted: &str) -> Option<Box<dyn SparseIo<IndexIter = Vec<usize>>>> {
+    if !std::path::Path::new(converted).exists() {
+        return None;
+    }
+    let data = open_sparse_matrix(converted, &SparseIoBackend::Zarr).ok()?;
+    let whole =
+        data.num_rows().is_some() && data.num_columns().is_some() && data.num_non_zeros().is_some();
+    whole.then_some(data)
+}
+
+/// Where a conversion cached as `{base}.db.zarr` is built: a sibling no
+/// other conversion writes to, in this process or another, so the cache
+/// path only ever holds a finished backend.
+fn staged_conversion(base: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NTH: AtomicUsize = AtomicUsize::new(0);
+    format!(
+        "{base}.db.partial-{}-{}.zarr",
+        std::process::id(),
+        NTH.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Move the backend built at `staged` to the cache path `converted`, in one
+/// rename. The rename fails when a backend is already there, which is looked
+/// at only then: a usable one is another conversion of the same input that
+/// finished first, and it stays while `staged` is dropped. An unusable one
+/// is moved aside, in one rename too, before `staged` takes its place, and
+/// only what was moved aside is deleted; a backend another conversion
+/// installs in between is therefore never deleted, it makes the second
+/// rename fail and is then the cache.
+fn install_conversion(staged: &str, converted: &str) -> anyhow::Result<()> {
+    let rename = || Ok(std::fs::rename(staged, converted)?);
+    let occupied = || std::path::Path::new(converted).exists();
+    let usable = || cached_conversion(converted).is_some();
+    let mut renamed: anyhow::Result<()> = rename();
+    if renamed.is_err() && occupied() && !usable() {
+        let stale = format!("{staged}.stale");
+        if std::fs::rename(converted, &stale).is_ok() {
+            renamed = rename();
+            remove_file(&stale)?;
+        }
+    }
+    let Err(e) = renamed else {
+        return Ok(());
+    };
+    remove_file(staged)?;
+    anyhow::ensure!(
+        usable(),
+        "cannot install the conversion at {converted}: {e}"
+    );
+    Ok(())
+}
+
 /// Try to open a data file directly; if that fails, attempt automatic
-/// conversion from raw 10x formats (h5/h5ad, zarr/zarr.zip).
+/// conversion from raw 10x formats (Cell Ranger h5, Xenium zarr/zarr.zip).
+/// An AnnData `.h5ad` is not converted here: `data-beans from-h5ad` reads
+/// it, with its own layout and metadata files.
 ///
 /// Converted backends are cached as `{data_file}.db.zarr` next to
-/// the original file so subsequent calls skip conversion.
+/// the original file so subsequent calls skip conversion. The conversion is
+/// built beside the cache path and renamed onto it when done, so an
+/// interrupted or concurrent conversion never leaves a partial cache; a
+/// cache that does not open is converted again.
 pub fn try_open_or_convert(
     data_file: &str,
 ) -> anyhow::Result<Box<dyn SparseIo<IndexIter = Vec<usize>>>> {
@@ -383,47 +505,61 @@ pub fn try_open_or_convert(
         _ => SparseIoBackend::Zarr,
     };
 
-    match open_sparse_matrix(data_file, &backend) {
-        Ok(data) => Ok(data),
-        Err(original_err) => {
-            let base = strip_backend_suffix(data_file);
-            let converted = format!("{}.db.zarr", base);
+    let original_err = match open_sparse_matrix(data_file, &backend) {
+        Ok(data) => return Ok(data),
+        Err(e) => e,
+    };
+    let base = strip_backend_suffix(data_file);
+    let converted = format!("{}.db.zarr", base);
 
-            if std::path::Path::new(&converted).exists() {
-                info!("Using cached conversion: {}", converted);
-                return open_sparse_matrix(&converted, &SparseIoBackend::Zarr);
-            }
-
-            match ext.as_ref() {
-                "h5" | "h5ad" => {
-                    #[cfg(feature = "hdf5")]
-                    {
-                        info!(
-                            "Converting h5/h5ad to backend: {} -> {}",
-                            data_file, converted
-                        );
-                        convert_h5_to_backend(data_file, &converted)?;
-                    }
-                    #[cfg(not(feature = "hdf5"))]
-                    {
-                        anyhow::bail!(
-                            "{} is an HDF5 file but data-beans was built without the `hdf5` \
-                             feature. Reinstall with `--features hdf5` (and a working libhdf5) \
-                             to read .h5/.h5ad inputs.",
-                            data_file
-                        );
-                    }
-                }
-                "zarr" | "zip" => {
-                    info!("Converting zarr to backend: {} -> {}", data_file, converted);
-                    convert_zarr_to_backend(data_file, &converted)?;
-                }
-                _ => return Err(original_err),
-            }
-
-            open_sparse_matrix(&converted, &SparseIoBackend::Zarr)
-        }
+    if let Some(data) = cached_conversion(&converted) {
+        info!("Using cached conversion: {}", converted);
+        return Ok(data);
     }
+    if std::path::Path::new(&converted).exists() {
+        log::warn!(
+            "the cached conversion {} is incomplete; converting {} again",
+            converted,
+            data_file
+        );
+    }
+
+    // The conversion, and the command that does the same with options.
+    type Convert = fn(&str, &str) -> anyhow::Result<()>;
+    let (convert, command): (Convert, &str) = match ext.as_ref() {
+        #[cfg(feature = "hdf5")]
+        "h5" => (convert_h5_to_backend, "from-10x-matrix"),
+        #[cfg(feature = "hdf5")]
+        "h5ad" => anyhow::bail!(
+            "{data_file} does not open as a data-beans backend ({original_err}), and an \
+             AnnData .h5ad is not converted automatically; run `data-beans from-h5ad \
+             {data_file} -o <output>` and use its output"
+        ),
+        #[cfg(not(feature = "hdf5"))]
+        "h5" | "h5ad" => anyhow::bail!(
+            "{} is an HDF5 file but data-beans was built without the `hdf5` \
+             feature. Reinstall with `--features hdf5` (and a working libhdf5) \
+             to read .h5/.h5ad inputs.",
+            data_file
+        ),
+        "zarr" | "zip" => (convert_zarr_to_backend, "from-zarr"),
+        _ => return Err(original_err),
+    };
+
+    let staged = staged_conversion(base);
+    info!("Converting {} to backend: {}", data_file, converted);
+    if let Err(e) = convert(data_file, &staged) {
+        let _ = remove_file(&staged);
+        // Converted here, the file is read with the defaults of `command`,
+        // which the caller has no options to change.
+        return Err(e.context(format!(
+            "{data_file} is not converted automatically with the default options; run \
+             `data-beans {command} {data_file} -o <output>` with its options, such as \
+             --select-row-type for the feature types to keep, and use its output"
+        )));
+    }
+    install_conversion(&staged, &converted)?;
+    open_sparse_matrix(&converted, &SparseIoBackend::Zarr)
 }
 
 #[cfg(test)]
@@ -500,6 +636,113 @@ mod tests {
         );
     }
 
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_partial_cached_conversion_is_converted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("matrix.zarr");
+        xenium_like_store(&store);
+        // What an interrupted conversion left at the cache path.
+        let cache = dir.path().join("matrix.db.zarr");
+        std::fs::create_dir_all(cache.join("by_column")).unwrap();
+        std::fs::write(cache.join(".zgroup"), r#"{"zarr_format": 2}"#).unwrap();
+
+        let data = try_open_or_convert(store.to_str().unwrap()).unwrap();
+        assert_eq!(
+            data.row_names().unwrap(),
+            ["FID1_GENE1", "FID2_GENE2"].map(Box::from)
+        );
+        assert_eq!(data.num_columns(), Some(4));
+        drop(data);
+        // Nothing is left of the build but the cache, which the next call
+        // opens as it is.
+        assert_eq!(file_names(dir.path()), ["matrix.db.zarr", "matrix.zarr"]);
+        let stamp = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        let built = stamp(&cache);
+        let again = try_open_or_convert(store.to_str().unwrap()).unwrap();
+        assert_eq!(again.num_non_zeros(), Some(4));
+        assert_eq!(stamp(&cache), built);
+    }
+
+    #[test]
+    fn a_failed_conversion_leaves_no_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("matrix.zarr");
+        xenium_like_store(&store);
+        // No feature is of a kept type, so the conversion fails.
+        let attrs = serde_json::json!({
+            "feature_ids": ["FID1", "FID2", "FID3"],
+            "feature_keys": ["A", "B", "C"],
+            "feature_types": vec!["negative_control_probe"; 3],
+        });
+        std::fs::write(store.join("cell_features/.zattrs"), attrs.to_string()).unwrap();
+
+        let e = try_open_or_convert(store.to_str().unwrap())
+            .err()
+            .expect("no row is kept");
+        // The error names the command whose options keep other types, and
+        // still says what went wrong.
+        let e = format!("{e:#}");
+        assert!(e.contains("data-beans from-zarr"), "{e}");
+        assert!(e.contains("--select-row-type"), "{e}");
+        assert!(e.contains("negative_control_probe"), "{e}");
+        assert_eq!(file_names(dir.path()), ["matrix.zarr"]);
+    }
+
+    #[test]
+    fn a_cache_installed_meanwhile_stays_unless_it_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("matrix.zarr");
+        xenium_like_store(&store);
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+        let (cache, staged) = (path("matrix.db.zarr"), path("staged.zarr"));
+        let convert = |to: &str| convert_zarr_to_backend(store.to_str().unwrap(), to).unwrap();
+
+        // Another conversion finished first: its backend is the one kept.
+        convert(&cache);
+        let marker = Path::new(&cache).join("installed-first");
+        std::fs::write(&marker, "").unwrap();
+        convert(&staged);
+        install_conversion(&staged, &cache).unwrap();
+        assert!(marker.exists());
+        assert!(!Path::new(&staged).exists());
+
+        // What is there does not open: the staged backend takes its place.
+        remove_file(&cache).unwrap();
+        std::fs::create_dir_all(Path::new(&cache).join("by_column")).unwrap();
+        convert(&staged);
+        install_conversion(&staged, &cache).unwrap();
+        assert!(cached_conversion(&cache).is_some());
+        assert!(!Path::new(&staged).exists());
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn an_h5ad_file_is_sent_to_from_h5ad() {
+        let dir = tempfile::tempdir().unwrap();
+        let h5ad = dir.path().join("cells.h5ad");
+        let file = hdf5::File::create(&h5ad).unwrap();
+        file.create_group("X").unwrap();
+        file.create_group("obs").unwrap();
+        file.create_group("var").unwrap();
+        drop(file);
+
+        let e = try_open_or_convert(h5ad.to_str().unwrap())
+            .err()
+            .expect("an AnnData file is not a backend")
+            .to_string();
+        assert!(e.contains("from-h5ad"), "{e}");
+        assert_eq!(file_names(dir.path()), ["cells.h5ad"]);
+    }
+
     fn names(xs: &[&str]) -> Option<Vec<Box<str>>> {
         Some(xs.iter().map(|&x| Box::from(x)).collect())
     }
@@ -555,5 +798,57 @@ mod tests {
         };
         let e = write_10x_matrix(m, "gene", "", out.to_str().unwrap(), &SparseIoBackend::Zarr);
         assert!(e.unwrap_err().to_string().contains("names 2 rows"));
+    }
+
+    #[test]
+    fn keeping_no_row_is_an_error_naming_the_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.zarr");
+        let m = TenxMatrix {
+            triplets: vec![(0, 0, 1.0), (1, 1, 2.0)],
+            reach: (2, 2),
+            row_ids: names(&["HTO1", "CD3"]),
+            row_names: None,
+            row_types: names(&["Multiplexing Capture", "Antibody Capture"]),
+            column_names: None,
+            keep_rows: None,
+        };
+        let e = write_10x_matrix(
+            m,
+            MatrixLayout::SELECT_ROW_TYPES,
+            MatrixLayout::REMOVE_ROW_TYPES,
+            out.to_str().unwrap(),
+            &SparseIoBackend::Zarr,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("Antibody Capture") && e.contains("gene,peak"),
+            "{e}"
+        );
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn keeping_no_row_names_the_row_set_that_leaves_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.zarr");
+        // Two rows are genes, and the only row the file selects is of
+        // another type.
+        let m = TenxMatrix {
+            triplets: vec![(0, 0, 1.0), (1, 1, 2.0), (2, 0, 3.0)],
+            reach: (3, 2),
+            row_ids: names(&["G1", "G2", "CD3"]),
+            row_names: None,
+            row_types: names(&["Gene Expression", "Gene Expression", "Antibody Capture"]),
+            column_names: None,
+            keep_rows: Some(vec![false, false, true]),
+        };
+        let e = write_10x_matrix(m, "gene", "", out.to_str().unwrap(), &SparseIoBackend::Zarr)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("2 are of a kept type"), "{e}");
+        assert!(e.contains("1 are in `keep_rows`"), "{e}");
+        assert!(!out.exists());
     }
 }

@@ -61,14 +61,38 @@ fn group_means(x: &DMatrix<f32>, group: &[usize], n_groups: usize) -> DMatrix<f3
     sum
 }
 
-/// `x_j - offsets[group_j]` for every column.
-fn subtract(x: &DMatrix<f32>, offsets: &DMatrix<f32>, group: &[usize]) -> DMatrix<f32> {
-    let mut out = x.clone();
+/// Per-`group` column means of `x_j - offsets[offset_group_j]`, the residual
+/// taken entry by entry as it is summed; empty groups stay zero.
+fn group_means_of_residuals(
+    x: &DMatrix<f32>,
+    offsets: &DMatrix<f32>,
+    offset_group: &[usize],
+    group: &[usize],
+    n_groups: usize,
+) -> DMatrix<f32> {
+    let mut sum = DMatrix::<f32>::zeros(x.nrows(), n_groups);
+    let mut count = vec![0f32; n_groups];
+    for (j, (&g, &o)) in group.iter().zip(offset_group).enumerate() {
+        let (x_j, o_j) = (x.column(j), offsets.column(o));
+        for ((acc, &v), &off) in sum.column_mut(g).iter_mut().zip(x_j.iter()).zip(o_j.iter()) {
+            *acc += v - off;
+        }
+        count[g] += 1.0;
+    }
+    for (g, &c) in count.iter().enumerate() {
+        if c > 0.0 {
+            sum.column_mut(g).unscale_mut(c);
+        }
+    }
+    sum
+}
+
+/// Subtract `offsets[group_j]` from every column `x_j`, in place.
+fn subtract_offsets(x: &mut DMatrix<f32>, offsets: &DMatrix<f32>, group: &[usize]) {
     for (j, &g) in group.iter().enumerate() {
-        let mut col = out.column_mut(j);
+        let mut col = x.column_mut(j);
         col -= offsets.column(g);
     }
-    out
 }
 
 /// Centre each batch within cell state (see the module docs). Starts from
@@ -89,10 +113,13 @@ pub fn centre_batches_within_state(
     let n_batches = batch.iter().max().map_or(0, |&m| m + 1);
     let bits = bits.min(proj.nrows()).min(proj.ncols()).max(1);
 
+    // One buffer holds the projection centred by the current shifts; it is
+    // rewritten in place whenever the shifts change.
     let mut shift = group_means(proj, batch, n_batches);
+    let mut centred = proj.clone();
+    subtract_offsets(&mut centred, &shift, batch);
     let mut codes: Vec<usize> = Vec::new();
     for _ in 0..CENTRING_ROUNDS {
-        let centred = subtract(proj, &shift, batch);
         let next = binary_sort_columns(&centred, bits)?;
         if next == codes {
             break;
@@ -100,9 +127,10 @@ pub fn centre_batches_within_state(
         codes = next;
         let n_bins = codes.iter().max().map_or(0, |&m| m + 1);
         let states = group_means(&centred, &codes, n_bins);
-        shift = group_means(&subtract(proj, &states, &codes), batch, n_batches);
+        shift = group_means_of_residuals(proj, &states, &codes, batch, n_batches);
+        centred.copy_from(proj);
+        subtract_offsets(&mut centred, &shift, batch);
     }
-    let mut centred = subtract(proj, &shift, batch);
     let mean = centred.column_mean();
     for mut col in centred.column_iter_mut() {
         col -= &mean;

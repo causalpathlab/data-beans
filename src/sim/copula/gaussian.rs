@@ -98,6 +98,34 @@ impl CopulaCovariance {
         Ok(Self { factor, ridge_sd })
     }
 
+    /// Per-batch log shifts of the reference means: one draw `z_b` per
+    /// batch, centred across batches per gene, so the shifts of a gene sum to
+    /// zero and only the contrast between batches remains. Each shift is
+    /// rescaled by `√(B/(B−1))` to keep the variance `scale²` that centring
+    /// would otherwise shrink. With fewer than two batches there is nothing
+    /// to contrast and every shift is zero.
+    pub fn sample_batch_shifts<R: Rng + ?Sized>(
+        &self,
+        n_batches: usize,
+        scale: f32,
+        rng: &mut R,
+    ) -> Vec<DVector<f32>> {
+        if n_batches < 2 {
+            return vec![DVector::zeros(self.dim()); n_batches];
+        }
+        let draws: Vec<DVector<f32>> = (0..n_batches).map(|_| self.sample(rng)).collect();
+        let b = n_batches as f32;
+        let mean = draws
+            .iter()
+            .fold(DVector::zeros(self.dim()), |acc, z| acc + z)
+            / b;
+        let contrast_scale = scale * (b / (b - 1.0)).sqrt();
+        draws
+            .into_iter()
+            .map(|z| (z - &mean).scale(contrast_scale))
+            .collect()
+    }
+
     /// Sample `z*[h] = F[h,:]·η + ridge_sd[h]·ε_h`, `η ~ N(0, I_rank)`,
     /// `ε ~ N(0, I_g)`. After the per-row rescale in `fit`, `Var(z*[h]) = 1`.
     pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> DVector<f32> {
@@ -129,6 +157,28 @@ impl CopulaCovariance {
             ridge_sd[h] = (1.0 - row_norm_sq).max(0.0).sqrt();
         }
         Self { factor, ridge_sd }
+    }
+
+    /// Lift a covariance over a feature subset to all `dim` features: row `h`
+    /// of `self` becomes row `indices[h]`, and every feature outside
+    /// `indices` gets a zero factor row with `ridge_sd = 1` (an independent
+    /// unit-variance draw). The copula is fit on HVGs only, so this is what
+    /// turns its truncated factor into a per-gene batch program.
+    pub fn embed(&self, indices: &[usize], dim: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            indices.len() == self.dim(),
+            "embed: {} indices for a {}-row covariance",
+            indices.len(),
+            self.dim()
+        );
+        let mut factor = DMatrix::<f32>::zeros(dim, self.rank());
+        let mut ridge_sd = DVector::<f32>::from_element(dim, 1.0);
+        for (h, &g) in indices.iter().enumerate() {
+            anyhow::ensure!(g < dim, "embed: index {} out of range for dim {}", g, dim);
+            factor.set_row(g, &self.factor.row(h));
+            ridge_sd[g] = self.ridge_sd[h];
+        }
+        Ok(Self { factor, ridge_sd })
     }
 
     /// Construct a fresh low-rank factor from iid N(0, 1) entries, then
@@ -172,6 +222,60 @@ impl CopulaCovariance {
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    /// Embedding keeps the subset's rows where the index map puts them and
+    /// gives every other feature an independent unit-variance draw.
+    #[test]
+    fn embed_scatters_rows_and_fills_unit_ridge() {
+        let (h, n, dim) = (6usize, 400usize, 15usize);
+        let normal = Normal::new(0.0_f32, 1.0_f32).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        let z = DMatrix::from_fn(h, n, |_, _| normal.sample(&mut rng));
+        let sub = CopulaCovariance::fit(&z, 4, 1e-3).unwrap().truncate_rank(2);
+        let indices = [12usize, 0, 7, 3, 14, 9];
+
+        let full = sub.embed(&indices, dim).unwrap();
+        assert_eq!(full.dim(), dim);
+        assert_eq!(full.rank(), 2);
+        assert_eq!(full.sample(&mut rng).len(), dim);
+        for (row, &g) in indices.iter().enumerate() {
+            assert_eq!(full.factor.row(g), sub.factor.row(row));
+            assert_eq!(full.ridge_sd[g], sub.ridge_sd[row]);
+        }
+        for g in (0..dim).filter(|g| !indices.contains(g)) {
+            assert!(full.factor.row(g).iter().all(|&v| v == 0.0));
+            assert_eq!(full.ridge_sd[g], 1.0);
+        }
+        assert!(sub.embed(&indices[..3], dim).is_err());
+        assert!(sub.embed(&indices, 10).is_err());
+    }
+
+    /// One batch has no other batch to differ from, so its shift is zero;
+    /// with several, each batch gets its own shift at the requested scale,
+    /// and a gene's shifts sum to zero.
+    #[test]
+    fn batch_shifts_are_contrasts_between_batches() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        // Rank 0: every gene's draw is its own N(0, 1), so the variance
+        // over genes of one batch's shift is the squared scale.
+        let cov = CopulaCovariance::random_low_rank(2000, 0, &mut rng);
+
+        let one = cov.sample_batch_shifts(1, 1.0, &mut rng);
+        assert_eq!(one.len(), 1);
+        assert!(one[0].iter().all(|&v| v == 0.0));
+
+        let three = cov.sample_batch_shifts(3, 0.5, &mut rng);
+        assert_eq!(three.len(), 3);
+        assert_ne!(three[0], three[1]);
+        for shift in &three {
+            let var = shift.iter().map(|v| v * v).sum::<f32>() / shift.len() as f32;
+            assert!((var - 0.25).abs() < 0.05, "shift variance {var}");
+        }
+        // The shifts of each gene cancel across batches.
+        let total = &three[0] + &three[1] + &three[2];
+        assert!(total.iter().all(|v| v.abs() < 1e-5));
+        assert!(cov.sample_batch_shifts(0, 1.0, &mut rng).is_empty());
+    }
 
     #[test]
     fn identity_recovery_full_rank() {

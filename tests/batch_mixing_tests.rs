@@ -221,3 +221,69 @@ fn mixed_partition_holds_enough_batches() {
     }
     assert!(per_group.values().all(|bs| bs.len() >= 3));
 }
+
+/// The alternation written out plainly, a fresh matrix for every
+/// intermediate: the reference `centre_batches_within_state` must match bit
+/// for bit.
+fn centre_reference(proj: &DMatrix<f32>, batch: &[usize], bits: usize) -> DMatrix<f32> {
+    use data_beans::alg::random_projection::binary_sort_columns;
+    fn means(x: &DMatrix<f32>, group: &[usize], n_groups: usize) -> DMatrix<f32> {
+        let mut sum = DMatrix::<f32>::zeros(x.nrows(), n_groups);
+        let mut count = vec![0f32; n_groups];
+        for (j, &g) in group.iter().enumerate() {
+            let mut col = sum.column_mut(g);
+            col += x.column(j);
+            count[g] += 1.0;
+        }
+        for (g, &c) in count.iter().enumerate() {
+            if c > 0.0 {
+                sum.column_mut(g).unscale_mut(c);
+            }
+        }
+        sum
+    }
+    fn subtract(x: &DMatrix<f32>, offsets: &DMatrix<f32>, group: &[usize]) -> DMatrix<f32> {
+        let mut out = x.clone();
+        for (j, &g) in group.iter().enumerate() {
+            let mut col = out.column_mut(j);
+            col -= offsets.column(g);
+        }
+        out
+    }
+    let n_batches = batch.iter().max().map_or(0, |&m| m + 1);
+    let bits = bits.min(proj.nrows()).min(proj.ncols()).max(1);
+    let mut shift = means(proj, batch, n_batches);
+    let mut codes: Vec<usize> = Vec::new();
+    for _ in 0..CENTRING_ROUNDS {
+        let centred = subtract(proj, &shift, batch);
+        let next = binary_sort_columns(&centred, bits).unwrap();
+        if next == codes {
+            break;
+        }
+        codes = next;
+        let n_bins = codes.iter().max().map_or(0, |&m| m + 1);
+        let states = means(&centred, &codes, n_bins);
+        shift = means(&subtract(proj, &states, &codes), batch, n_batches);
+    }
+    let mut centred = subtract(proj, &shift, batch);
+    let mean = centred.column_mean();
+    for mut col in centred.column_iter_mut() {
+        col -= &mean;
+    }
+    centred
+}
+
+#[test]
+fn centring_matches_the_plain_alternation_exactly() {
+    for seed in 0..4u64 {
+        let (proj, batch, _) = two_states(seed);
+        for bits in [1usize, 2, 3] {
+            let got = centre_batches_within_state(&proj, &batch, bits).unwrap();
+            let want = centre_reference(&proj, &batch, bits);
+            assert_eq!(got.shape(), want.shape());
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert_eq!(g.to_bits(), w.to_bits(), "seed {seed}, {bits} bits");
+            }
+        }
+    }
+}

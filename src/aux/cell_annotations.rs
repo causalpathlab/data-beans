@@ -1,10 +1,10 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use anyhow::{bail, Result};
-use log::info;
+use log::{info, warn};
 use nalgebra::DMatrix;
 
-use legume_numeric::matrix::common_io::read_lines_of_words_delim;
+use legume_numeric::matrix::common_io::{read_lines, unquote_field};
 use legume_numeric::matrix::traits::IoOps;
 
 /// Parsed cell annotations: maps each cell to an individual (and optionally a cell type).
@@ -45,9 +45,102 @@ pub struct CellTypeMembership {
     pub cell_type_names: Vec<Box<str>>,
 }
 
+/// The data rows of an annotation table (TSV, CSV, or whitespace-separated,
+/// plain or gzipped), unsplit, and the delimiter of their fields (`None`:
+/// runs of whitespace); see [`id_and_label`].
+///
+/// The header line names the delimiter for the whole file: tab when it holds
+/// a tab, else comma when it holds a comma; a header with neither leaves it
+/// to the rows, tab when one holds a tab, else runs of whitespace. A tab-
+/// or comma-separated field therefore keeps its spaces (`CD4 T cell`), and is
+/// trimmed and unquoted, while a comma inside a label of a
+/// whitespace-separated table (`B,naive`) is part of the label. Comment lines
+/// (`#`, `%`) and blank lines are skipped; the first remaining line is the
+/// header and is dropped.
+fn read_annotation_rows(path: &str) -> Result<(Vec<Box<str>>, Option<char>)> {
+    let mut lines: Vec<Box<str>> = read_lines(path)?
+        .into_iter()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with(['#', '%']))
+        .collect();
+    // A header of one column name holds no delimiter; tabs in the rows
+    // under it then tell (a comma there may be part of a label).
+    let delim = lines
+        .first()
+        .and_then(|header| ['\t', ','].into_iter().find(|&d| header.contains(d)))
+        .or_else(|| {
+            lines
+                .iter()
+                .skip(1)
+                .any(|line| line.contains('\t'))
+                .then_some('\t')
+        });
+    if !lines.is_empty() {
+        lines.remove(0);
+    }
+    Ok((lines, delim))
+}
+
+/// The cell id (field 0) and the label (field `label_idx`, 1 or later) of
+/// the row `line`, whose fields `delim` separates; `None` for a row too short
+/// to hold the label.
+fn id_and_label(line: &str, delim: Option<char>, label_idx: usize) -> Option<(&str, &str)> {
+    debug_assert!(label_idx > 0, "field 0 is the cell id");
+    match delim {
+        Some(d) => {
+            let mut fields = line.split(d).map(unquote_field);
+            Some((fields.next()?, fields.nth(label_idx - 1)?))
+        }
+        None => {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?, fields.nth(label_idx - 1)?))
+        }
+    }
+}
+
+/// Each row's cell id and its label in field `label_idx` (1 or later), in
+/// file order.
+/// A row too short to hold the label is skipped; so is a row whose cell id or
+/// label is empty. Both are counted in a warning, and a file that yields no
+/// row at all is an error: its rows do not follow the header's delimiter, or
+/// it has no such column.
+fn read_cell_labels(path: &str, label_idx: usize) -> Result<Vec<(Box<str>, Box<str>)>> {
+    let mut n_short = 0usize;
+    let mut n_empty = 0usize;
+    let mut out = Vec::new();
+    let (rows, delim) = read_annotation_rows(path)?;
+    for row in &rows {
+        let Some((cell_id, label)) = id_and_label(row, delim, label_idx) else {
+            n_short += 1;
+            continue;
+        };
+        if cell_id.is_empty() || label.is_empty() {
+            n_empty += 1;
+            continue;
+        }
+        out.push((cell_id.into(), label.into()));
+    }
+    let n_fields = label_idx + 1;
+    if out.is_empty() {
+        bail!(
+            "{path}: no row holds a cell id and a label in field {n_fields} \
+             ({n_short} rows with fewer than {n_fields} fields, {n_empty} rows \
+             with an empty cell id or label); the header line sets the delimiter"
+        );
+    }
+    if n_short > 0 || n_empty > 0 {
+        warn!(
+            "{path}: skipped {n_short} rows with fewer than {n_fields} fields \
+             and {n_empty} rows with an empty cell id or label"
+        );
+    }
+    Ok(out)
+}
+
 /// Read cell annotations from a delimited file (TSV, CSV, or space-separated).
 ///
-/// Supports gzip-compressed files (.gz) and multiple delimiters (tab, comma, space).
+/// Supports gzip-compressed files (.gz). The file is split on one delimiter
+/// (tab, else comma, else whitespace; see [`read_annotation_rows`]), so a
+/// field of a TSV or CSV may hold spaces.
 /// First line is treated as a header and skipped.
 ///
 /// Requires at least 2 columns: `cell_id individual_id`.
@@ -56,20 +149,11 @@ pub struct CellTypeMembership {
 pub fn read_cell_annotations(path: &str) -> Result<CellAnnotations> {
     info!("Reading cell annotations from {}", path);
 
-    let parsed = read_lines_of_words_delim(path, &['\t', ',', ' '], 0)?;
-
     let mut individual_to_idx: HashMap<Box<str>, usize> = Default::default();
     let mut individual_ids: Vec<Box<str>> = Vec::new();
     let mut cell_to_individual: HashMap<Box<str>, usize> = Default::default();
 
-    for words in &parsed.lines {
-        if words.len() < 2 {
-            continue;
-        }
-
-        let cell_id = words[0].clone();
-        let ind_id = words[1].clone();
-
+    for (cell_id, ind_id) in read_cell_labels(path, 1)? {
         let ind_idx = *individual_to_idx.entry(ind_id.clone()).or_insert_with(|| {
             let idx = individual_ids.len();
             individual_ids.push(ind_id);
@@ -129,7 +213,8 @@ pub fn infer_cell_annotations(column_names: &[Box<str>]) -> CellAnnotations {
 
 /// Build a one-hot membership matrix from hard cell-type annotations.
 ///
-/// Reads a delimited file with 3+ columns: `cell_id individual_id cell_type`.
+/// Reads a delimited file with 3+ columns: `cell_id individual_id cell_type`,
+/// split as [`read_cell_annotations`] splits it.
 /// The resulting matrix has one-hot rows aligned to the SC backend `column_names`.
 pub fn build_onehot_membership(
     path: &str,
@@ -137,20 +222,11 @@ pub fn build_onehot_membership(
 ) -> Result<CellTypeMembership> {
     info!("Building one-hot membership from {}", path);
 
-    let parsed = read_lines_of_words_delim(path, &['\t', ',', ' '], 0)?;
-
     let mut celltype_to_idx: HashMap<Box<str>, usize> = Default::default();
     let mut cell_type_names: Vec<Box<str>> = Vec::new();
     let mut cell_to_ct: HashMap<Box<str>, usize> = Default::default();
 
-    for words in &parsed.lines {
-        if words.len() < 3 {
-            continue;
-        }
-
-        let cell_id = words[0].clone();
-        let ct_name = words[2].clone();
-
+    for (cell_id, ct_name) in read_cell_labels(path, 2)? {
         let ct_idx = *celltype_to_idx.entry(ct_name.clone()).or_insert_with(|| {
             let idx = cell_type_names.len();
             cell_type_names.push(ct_name);
@@ -267,6 +343,192 @@ mod tests {
         assert_eq!(anno.individual_ids[ind_idx].as_ref(), "IND_A");
 
         Ok(())
+    }
+
+    fn write_table(dir: &tempfile::TempDir, name: &str, lines: &[&str]) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn individual_of<'a>(anno: &'a CellAnnotations, cell: &str) -> &'a str {
+        let &idx = anno.cell_to_individual.get(cell).unwrap();
+        anno.individual_ids[idx].as_ref()
+    }
+
+    #[test]
+    fn fields_of_a_tsv_or_csv_keep_their_spaces() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tsv = write_table(
+            &dir,
+            "cells.tsv",
+            &[
+                "cell_id\tindividual_id\tcell_type",
+                "cell_0\tdonor 1\tCD4 T cell",
+                "cell_1\tdonor 2\tCD4 T cell",
+                "cell_2\tdonor 2\tB cell, naive",
+            ],
+        );
+        let csv = write_table(
+            &dir,
+            "cells.csv",
+            &[
+                "cell_id, individual_id, cell_type",
+                "cell_0, donor 1, CD4 T cell",
+                "cell_1, \"donor 2\", CD4 T cell",
+                "cell_2, donor 2, B cell",
+            ],
+        );
+        let columns: Vec<Box<str>> = vec!["cell_0".into(), "cell_1".into(), "cell_2".into()];
+        for (path, b_cell) in [(&tsv, "B cell, naive"), (&csv, "B cell")] {
+            let anno = read_cell_annotations(path)?;
+            assert_eq!(
+                anno.individual_ids,
+                vec![Box::<str>::from("donor 1"), "donor 2".into()],
+                "{path}"
+            );
+            assert_eq!(individual_of(&anno, "cell_0"), "donor 1");
+            assert_eq!(individual_of(&anno, "cell_2"), "donor 2");
+
+            let membership = build_onehot_membership(path, &columns)?;
+            assert_eq!(
+                membership.cell_type_names,
+                vec![Box::<str>::from("CD4 T cell"), b_cell.into()],
+                "{path}"
+            );
+            assert_eq!(membership.matrix[(1, 0)], 1.0);
+            assert_eq!(membership.matrix[(2, 1)], 1.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn whitespace_tables_and_rows_with_an_empty_field() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Aligned with runs of spaces: no field is empty.
+        let spaced = write_table(
+            &dir,
+            "cells.txt",
+            &[
+                "cell  indiv  type",
+                "cell_0   IND_A  T",
+                "cell_1   IND_B  B",
+            ],
+        );
+        let anno = read_cell_annotations(&spaced)?;
+        assert_eq!(individual_of(&anno, "cell_0"), "IND_A");
+        assert_eq!(individual_of(&anno, "cell_1"), "IND_B");
+
+        // A row without a cell id or without an individual names no one.
+        let gapped = write_table(
+            &dir,
+            "gapped.tsv",
+            &[
+                "cell\tindiv",
+                "cell_0\tIND_A",
+                "cell_1\t",
+                "\tIND_B",
+                "",
+                "cell_2\tIND_A",
+            ],
+        );
+        let anno = read_cell_annotations(&gapped)?;
+        assert_eq!(anno.individual_ids, vec![Box::<str>::from("IND_A")]);
+        assert_eq!(anno.cell_to_individual.len(), 2);
+        Ok(())
+    }
+
+    /// A header with no tab or comma over tab-separated rows: the rows'
+    /// tabs separate, so a label keeps its spaces.
+    #[test]
+    fn rows_with_tabs_set_the_delimiter_a_header_does_not_name() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let columns: Vec<Box<str>> = vec!["cell_0".into(), "cell_1".into()];
+        let table = write_table(
+            &dir,
+            "cells.txt",
+            &[
+                "cell indiv type",
+                "cell_0\tIND_A\tCD4 T cell",
+                "cell_1\tIND_B\tB",
+            ],
+        );
+        let membership = build_onehot_membership(&table, &columns)?;
+        assert_eq!(
+            membership.cell_type_names,
+            vec![Box::<str>::from("CD4 T cell"), "B".into()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_header_line_sets_the_delimiter() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let columns: Vec<Box<str>> = vec!["cell_0".into(), "cell_1".into(), "cell_2".into()];
+
+        // Whitespace-separated: a comma is part of the label it sits in.
+        let spaced = write_table(
+            &dir,
+            "cells.txt",
+            &[
+                "cell indiv type",
+                "cell_0 IND_A T",
+                "cell_1 IND_B B,naive",
+                "cell_2 IND_B T",
+            ],
+        );
+        let anno = read_cell_annotations(&spaced)?;
+        assert_eq!(anno.cell_to_individual.len(), 3);
+        assert_eq!(individual_of(&anno, "cell_1"), "IND_B");
+        let membership = build_onehot_membership(&spaced, &columns)?;
+        assert_eq!(
+            membership.cell_type_names,
+            vec![Box::<str>::from("T"), "B,naive".into()]
+        );
+        assert_eq!(membership.matrix[(1, 1)], 1.0);
+        assert_eq!(membership.matrix[(2, 0)], 1.0);
+
+        let tsv = write_table(
+            &dir,
+            "cells.tsv",
+            &[
+                "cell\tindiv\ttype",
+                "cell_0\tIND_A\tT",
+                "cell_1\tIND_B\tB",
+                "cell_2\tIND_B\tT",
+            ],
+        );
+        let anno = read_cell_annotations(&tsv)?;
+        assert_eq!(anno.cell_to_individual.len(), 3);
+        assert_eq!(individual_of(&anno, "cell_0"), "IND_A");
+        assert_eq!(individual_of(&anno, "cell_2"), "IND_B");
+        assert_eq!(
+            build_onehot_membership(&tsv, &columns)?.cell_type_names,
+            vec![Box::<str>::from("T"), "B".into()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_table_where_no_row_parses_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // The rows do not use the header's delimiter: each is one field.
+        let mixed = write_table(
+            &dir,
+            "mixed.tsv",
+            &["cell\tindiv", "cell_0 IND_A", "cell_1 IND_B"],
+        );
+        let err = read_cell_annotations(&mixed).unwrap_err().to_string();
+        assert!(err.contains("2 rows with fewer than 2 fields"), "{err}");
+
+        // Two columns hold no cell type.
+        let two = write_table(&dir, "two.tsv", &["cell\tindiv", "cell_0\tIND_A"]);
+        assert!(read_cell_annotations(&two).is_ok());
+        let columns: Vec<Box<str>> = vec!["cell_0".into()];
+        assert!(build_onehot_membership(&two, &columns).is_err());
+
+        let header_only = write_table(&dir, "empty.tsv", &["cell\tindiv"]);
+        assert!(read_cell_annotations(&header_only).is_err());
     }
 
     #[test]

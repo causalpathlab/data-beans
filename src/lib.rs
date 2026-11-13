@@ -5,6 +5,7 @@ pub mod figure; // figures as SVG, written as PDF and PNG, shown as terminal ima
 pub mod hdf5_io; // HDF5/h5ad reading helpers
 #[cfg(feature = "tui")]
 pub mod interactive; // full-screen terminal views (ratatui): screens, histograms, pickers
+pub mod logging; // logger setup and progress bars (also data_beans::aux::logging)
 pub mod qc; // QC primitives: nnz cuts, histograms, streaming stat collectors (CLI + faba)
 pub mod qc_lib; // cell-axis QC (MAD outliers + near-empty floor); lib-only, senna/pinto
 pub mod qc_rules; // cell QC as rules one moves: edges, what each removes, flags

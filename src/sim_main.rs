@@ -80,12 +80,13 @@ enum Commands {
                       Reference mode (`--reference <h5/zarr>`): two-stage GLM,\n\
                       NB+copula sampling —\n\
                       stage 1:  log λ⁰ = log μ̂_g + √pve_topic·t + √pve_noise·ε\n\
-                      stage 2:  log λ  = log λ⁰ + √pve_batch·z_{g,b} + √(1−pve_batch)·w_g\n\
+                      stage 2:  log λ  = log λ⁰ + √pve_batch·z_{g,b}   (two or more batches)\n\
                       sample :  y ~ NB(λ, r̂_g)  via  u=Φ(z*),  F⁻¹_NB(u; λ, r̂)\n\
                       where t is z-scored log(β·θ) per cell. β is drawn as in synthetic mode,\n\
                       and ε is iid N(0, 1). z_{g,b} comes from the gene-gene copula factor,\n\
                       at rank `--batch-rank`, on axes chosen by `--batch-program`.\n\
-                      w_g iid N(0, 1) gives the batch-invariant per-gene shift.\n\
+                      z is centred across batches per gene. With one batch there is no shift:\n\
+                      the means are the reference's.\n\
                       \n\
                       `--depth` is reinterpreted as a multiplicative scale.\n\
                       Library size then matches the reference's mean. This follows the scDesign,\n\
@@ -160,7 +161,9 @@ enum Commands {
                       Ground truth is M[G,P].\n\
                       \n\
                       Reference mode uses `--reference-rna` or `--reference-atac`.\n\
-                      Each modality gets a two-stage GLM, with NB+copula PIT sampling.\n\
+                      Each modality with a reference gets a two-stage GLM,\n\
+                      with NB+copula PIT sampling.\n\
+                      A modality without one keeps its synthetic step.\n\
                       A normalized {topic, noise, batch} budget weights the log-rate;\n\
                       there is no cis term.\n\
                       Reference row counts override --n-genes and --n-peaks.\n\

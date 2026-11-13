@@ -48,13 +48,13 @@ fn slab(triplets: &[(u64, u64, f32)], col_lo: u64, col_hi: u64) -> (Vec<u64>, Ve
     (colptr, rows, vals)
 }
 
-fn stream_write(
-    path: &str,
+/// Stream `triplets` into `out` in column `bands`, then build its CSR half.
+fn stream_into(
+    out: &mut dyn SparseIo<IndexIter = Vec<usize>>,
     shape: Shape,
     bands: &[(u64, u64)],
     triplets: &[(u64, u64, f32)],
-) -> anyhow::Result<Box<dyn SparseIo<IndexIter = Vec<usize>>>> {
-    let mut out = create_sparse_streaming_empty(Some(path), Some(&SparseIoBackend::Zarr))?;
+) -> anyhow::Result<()> {
     out.begin_streaming_csc(shape)?;
     let mut nnz_offset = 0u64;
     for &(lo, hi) in bands {
@@ -63,7 +63,17 @@ fn stream_write(
         nnz_offset += vals.len() as u64;
     }
     out.finalize_streaming_csc()?;
-    out.build_csr_from_csc_streaming()?;
+    out.build_csr_from_csc_streaming()
+}
+
+fn stream_write(
+    path: &str,
+    shape: Shape,
+    bands: &[(u64, u64)],
+    triplets: &[(u64, u64, f32)],
+) -> anyhow::Result<Box<dyn SparseIo<IndexIter = Vec<usize>>>> {
+    let mut out = create_sparse_streaming_empty(Some(path), Some(&SparseIoBackend::Zarr))?;
+    stream_into(&mut *out, shape, bands, triplets)?;
     Ok(out)
 }
 
@@ -199,5 +209,41 @@ fn a_nonmonotone_colptr_is_refused() -> anyhow::Result<()> {
         refused.is_err(),
         "a decreasing colptr makes a column claim a negative span"
     );
+    Ok(())
+}
+
+/// Streaming a matrix into a handle that already holds one of the same shape
+/// writes the arrays again under the open handle. Chunks decoded by reads of
+/// the first matrix must not answer reads of the second.
+#[test]
+fn a_matrix_streamed_over_another_is_the_one_read_back() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("again.zarr");
+    let (first, shape) = reference();
+    let (nrow, ncol, _) = shape;
+    let bands = [(0, 2), (2, 5)];
+    let mut out = stream_write(path.to_str().expect("utf8"), shape, &bands, &first)?;
+
+    let all_columns: Vec<usize> = (0..ncol).collect();
+    let all_rows: Vec<usize> = (0..nrow).collect();
+    let (_, _, by_col) = out.read_triplets_by_columns(all_columns.clone())?;
+    assert_eq!(sorted(by_col), sorted(first.clone()));
+    let (_, _, by_row) = out.read_triplets_by_rows(all_rows.clone())?;
+    assert_eq!(sorted(by_row), sorted(first.clone()));
+
+    // the same sparsity pattern mirrored top to bottom, with other values
+    let mut second: Vec<(u64, u64, f32)> = first
+        .iter()
+        .map(|&(i, j, x)| (nrow as u64 - 1 - i, j, -10.0 * x))
+        .collect();
+    second.sort_by_key(|t| (t.1, t.0));
+    stream_into(&mut *out, shape, &bands, &second)?;
+
+    let (_, _, column) = out.read_triplets_by_single_column(0)?;
+    assert_eq!(column, [(1, 0, -20.0), (3, 0, -10.0)]);
+    let (_, _, by_col) = out.read_triplets_by_columns(all_columns)?;
+    assert_eq!(sorted(by_col), sorted(second.clone()));
+    let (_, _, by_row) = out.read_triplets_by_rows(all_rows)?;
+    assert_eq!(sorted(by_row), sorted(second));
     Ok(())
 }

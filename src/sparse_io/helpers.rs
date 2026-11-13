@@ -12,48 +12,6 @@ pub fn build_name2index_map(_names: &[Box<str>]) -> HashMap<Box<str>, usize> {
         .collect()
 }
 
-pub fn take_subset_indices_names(
-    new_indices: &[usize],
-    ntot: usize,
-    old_names: Vec<Box<str>>,
-) -> (HashMap<u64, u64>, Vec<Box<str>>) {
-    let mut old2new: HashMap<u64, u64> = Default::default();
-    let mut new2old = vec![];
-    debug_assert!(ntot == old_names.len());
-    let mut k = 0_u64;
-    for idx in new_indices.iter() {
-        if *idx < ntot {
-            old2new.insert(*idx as u64, k);
-            new2old.push(*idx);
-            k += 1;
-        }
-    }
-
-    let new_names = new2old
-        .iter()
-        .map(|&i| old_names[i].clone())
-        .collect::<Vec<Box<str>>>();
-
-    (old2new, new_names)
-}
-
-pub fn take_subset_indices_names_if_needed(
-    new_indices: Option<&Vec<usize>>,
-    ntot: Option<usize>,
-    old_names: Vec<Box<str>>,
-) -> (HashMap<u64, u64>, Vec<Box<str>>) {
-    let ntot = ntot.unwrap_or(old_names.len());
-    if let Some(new_indices) = new_indices {
-        take_subset_indices_names(new_indices, ntot, old_names)
-    } else {
-        let names = old_names;
-        let identity = (0..(ntot as u64))
-            .zip(0..(ntot as u64))
-            .collect::<HashMap<u64, u64>>();
-        (identity, names)
-    }
-}
-
 #[cfg(feature = "ndarray")]
 pub fn ndarray_to_triplets(array: &Array2<f32>) -> Vec<(u64, u64, f32)> {
     let eps = 1e-6;
@@ -96,8 +54,9 @@ pub fn remove_backend_path(path: &str) -> anyhow::Result<()> {
 /// Bytes reserved by live preloads in this process; see [`reserve_preload`].
 static RESERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Preloading costs 12 bytes per non-zero (a `u64` index and an `f32` value).
-const PRELOAD_BYTES_PER_NNZ: usize = 12;
+/// Preloading costs 12 bytes per non-zero (a `u64` index and an `f32` value);
+/// so does an entry of a transpose band.
+pub(crate) const PRELOAD_BYTES_PER_NNZ: usize = 12;
 
 /// A preload's share of the process-wide preload budget, given back when it
 /// is dropped. Keep it next to the preloaded arrays and drop it with them,
@@ -112,8 +71,9 @@ pub struct PreloadReservation {
 }
 
 impl PreloadReservation {
-    /// Bytes this reservation holds against the budget (0 under a
-    /// `LEGUME_PRELOAD_BUDGET_BYTES` override, which is per preload).
+    /// Bytes this reservation holds against the process-wide budget: 0 for
+    /// a preload admitted under a `LEGUME_PRELOAD_BUDGET_BYTES` override,
+    /// which is per preload and reserves nothing.
     #[allow(dead_code)] // library API; the bin has no caller
     pub fn bytes(&self) -> usize {
         self.bytes
@@ -158,16 +118,21 @@ pub fn preload_reserved_bytes() -> usize {
 /// `LEGUME_ZARR_CACHE_CAP` precedent for memory knobs.
 pub fn reserve_preload(nnz: usize, what: &str) -> Option<PreloadReservation> {
     let cost = nnz.saturating_mul(PRELOAD_BYTES_PER_NNZ);
-    if let Some(budget) = std::env::var("LEGUME_PRELOAD_BUDGET_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
+    if let Some(budget) = preload_budget_override() {
         return fits_or_warn(cost, budget, nnz, what).then_some(PreloadReservation {
             bytes: 0,
             counter: &RESERVED,
         });
     }
     reserve_against(&RESERVED, cost, auto_preload_budget_bytes(), nnz, what)
+}
+
+/// The per-preload budget `LEGUME_PRELOAD_BUDGET_BYTES` sets, when it is set
+/// to a number.
+fn preload_budget_override() -> Option<usize> {
+    std::env::var("LEGUME_PRELOAD_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
 }
 
 fn reserve_against(
@@ -187,6 +152,55 @@ fn reserve_against(
     } else {
         counter.fetch_sub(cost, Ordering::Relaxed);
         None
+    }
+}
+
+/// Bytes of a transpose band granted out of `room`: all of `wanted` when
+/// there is that much, what there is otherwise, and never less than
+/// [`SLAB_BUDGET_BYTES`] (or `wanted`, when smaller) so a transpose always
+/// makes progress.
+fn transpose_grant(wanted: usize, room: usize) -> usize {
+    wanted.min(room).max(wanted.min(SLAB_BUDGET_BYTES))
+}
+
+/// Reserve up to `wanted` bytes for the row band of a CSC → CSR transpose
+/// (see [`transpose_grant`]). The room is what the preload budget has left,
+/// and no more than half the memory available now: the budget was sized when
+/// the process first asked, and the process has allocated since. Returns
+/// the bytes granted and the reservation that holds them against the budget
+/// until it drops. Under a `LEGUME_PRELOAD_BUDGET_BYTES` override, which is
+/// per preload, the grant is cut from the override alone and nothing is
+/// reserved. The memory available is read once per call, and a grant shows
+/// there only once its band is allocated, so the half is a bound per caller,
+/// not across transposes that start together.
+pub(crate) fn reserve_transpose_band(wanted: usize) -> (usize, Option<PreloadReservation>) {
+    use std::sync::atomic::Ordering;
+    if let Some(budget) = preload_budget_override() {
+        return (transpose_grant(wanted, budget), None);
+    }
+    let budget = auto_preload_budget_bytes();
+    let free_now = available_memory_bytes().map_or(usize::MAX, |avail| avail / 2);
+    let mut reserved = RESERVED.load(Ordering::Relaxed);
+    loop {
+        let room = budget.saturating_sub(reserved).min(free_now);
+        let granted = transpose_grant(wanted, room);
+        match RESERVED.compare_exchange_weak(
+            reserved,
+            reserved.saturating_add(granted),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                return (
+                    granted,
+                    Some(PreloadReservation {
+                        bytes: granted,
+                        counter: &RESERVED,
+                    }),
+                )
+            }
+            Err(now) => reserved = now,
+        }
     }
 }
 
@@ -216,13 +230,18 @@ fn auto_preload_budget_bytes() -> usize {
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
         const FALLBACK_BYTES: usize = 8 << 30;
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        match usize::try_from(sys.available_memory()) {
-            Ok(avail) if avail > 0 => avail / 2,
-            _ => FALLBACK_BYTES,
-        }
+        available_memory_bytes().map_or(FALLBACK_BYTES, |avail| avail / 2)
     })
+}
+
+/// Memory available to the process right now; `None` when the system does
+/// not say.
+fn available_memory_bytes() -> Option<usize> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    usize::try_from(sys.available_memory())
+        .ok()
+        .filter(|&avail| avail > 0)
 }
 
 /// Whether loaders preload columns without being asked. On unless
@@ -266,6 +285,23 @@ mod preload_reservation_tests {
         assert_eq!(b.bytes(), 60);
         drop(b);
         assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_transpose_band_takes_the_room_there_is_but_never_under_a_slab() {
+        let slab = SLAB_BUDGET_BYTES;
+        // Room for all of it.
+        assert_eq!(transpose_grant(4 * slab, 8 * slab), 4 * slab);
+        // Less room than wanted: the room.
+        assert_eq!(transpose_grant(4 * slab, 2 * slab), 2 * slab);
+        // No room to speak of: still one slab, or all of a smaller want.
+        assert_eq!(transpose_grant(4 * slab, 0), slab);
+        assert_eq!(transpose_grant(slab / 2, 0), slab / 2);
+    }
+
+    #[test]
+    fn a_transpose_band_under_one_slab_is_granted_whole() {
+        assert_eq!(reserve_transpose_band(1024).0, 1024);
     }
 
     #[test]

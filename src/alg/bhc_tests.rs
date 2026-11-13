@@ -196,3 +196,59 @@ fn cached_merges_match_scoring_every_pair_afresh() {
         }
     }
 }
+
+/// With one non-empty cluster there is no merge; the sized cut still labels
+/// that cluster and leaves only the empty ones at -1.
+#[test]
+fn sized_cut_labels_a_lone_non_empty_cluster() {
+    let (k, m) = (5usize, 3usize);
+    let mut gene_sum = vec![0.0f64; k * m];
+    gene_sum[2 * m..3 * m].copy_from_slice(&[4.0, 1.0, 2.0]);
+    let size_sum = [0.0, 0.0, 7.0, 0.0, 0.0];
+    let effective_size = [0usize, 0, 7, 0, 0];
+    let merges = bhc_merge(
+        BhcInput {
+            k,
+            m,
+            gene_sum: &gene_sum,
+            size_sum: &size_sum,
+            effective_size: &effective_size,
+        },
+        1.0,
+    );
+    assert!(merges.is_empty());
+    assert_eq!(
+        bhc_cut_with_sizes(&merges, &effective_size, 0.0),
+        vec![-1, -1, 0, -1, -1]
+    );
+}
+
+/// With merges, the sized cut and the plain cut agree.
+#[test]
+fn sized_cut_matches_the_plain_cut_when_there_are_merges() {
+    let (k, m) = (4usize, 4usize);
+    let gene_sum = [
+        8.0, 1.0, 0.5, 0.5, // cluster 0
+        0.0, 0.0, 0.0, 0.0, // empty
+        8.5, 1.0, 0.5, 0.0, // like cluster 0
+        0.5, 0.5, 0.5, 8.0, // distinct
+    ];
+    let size_sum: Vec<f64> = gene_sum.chunks(m).map(|r| r.iter().sum()).collect();
+    let effective_size = [10usize, 0, 10, 10];
+    let merges = bhc_merge(
+        BhcInput {
+            k,
+            m,
+            gene_sum: &gene_sum,
+            size_sum: &size_sum,
+            effective_size: &effective_size,
+        },
+        1.0,
+    );
+    assert_eq!(merges.len(), 2);
+    for cutoff in [f64::NEG_INFINITY, 0.0, f64::INFINITY] {
+        let plain = bhc_cut(&merges, k, cutoff);
+        assert_eq!(bhc_cut_with_sizes(&merges, &effective_size, cutoff), plain);
+        assert_eq!(plain[1], -1);
+    }
+}

@@ -201,9 +201,9 @@ mod tests {
     use super::*;
     use crate::sparse_io::{create_sparse_from_triplets, SparseIoBackend};
 
-    /// The matched and neighbour reads go through `read_column_offset`.
+    /// The matched and neighbour reads go through `read_matched`.
     #[test]
-    fn a_single_column_read_divides_by_its_factor() {
+    fn a_matched_column_read_divides_by_its_factor() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.zarr");
         let t = [(0, 0, 4.0), (1, 1, 6.0), (0, 2, 9.0)];
@@ -219,10 +219,12 @@ mod tests {
         let mut data = SparseIoVec::new();
         data.push(Arc::from(b), None).unwrap();
         data.set_column_scales(Some(vec![2.0, 3.0, 9.0])).unwrap();
-        let (mut off, mut out) = (0, Vec::new());
-        for g in [2, 1] {
-            data.read_column_offset(g, &mut off, &mut out).unwrap();
-        }
+        let matched = data
+            .read_matched(vec![0, 0], vec![2, 1], vec![0.0, 0.0])
+            .unwrap();
+        assert_eq!(matched.shape, (2, 2));
+        let mut out = matched.triplets;
+        out.sort_by_key(|&(r, c, _)| (c, r));
         assert_eq!(out, [(0, 0, 1.0), (1, 1, 2.0)]);
     }
 }

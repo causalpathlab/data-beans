@@ -25,6 +25,19 @@ fn continuous_bins_cover_the_range() {
     }
 }
 
+/// The bins are made of finite values; a subset counted in them may hold
+/// values that are not finite, which take no bin.
+#[test]
+fn counted_values_that_are_not_finite_take_no_bin() {
+    for scale in [Scale::Log, Scale::Sqrt, Scale::Linear] {
+        let binned = Binned::new(&[0.0f32, 0.5, 3.2, 18.0], scale);
+        let clean = binned.count([0.5f32, 18.0].into_iter());
+        let odd = [f32::NEG_INFINITY, 0.5, f32::NAN, 18.0, f32::INFINITY];
+        assert_eq!(binned.count(odd.into_iter()), clean, "{scale:?}");
+        assert_eq!(clean.iter().sum::<usize>(), 2, "{scale:?}");
+    }
+}
+
 #[test]
 fn compact_labels() {
     assert_eq!(compact(0.0), "0");

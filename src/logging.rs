@@ -1,12 +1,12 @@
 //! Shared logger setup for the workspace.
 //!
-//! The progress-bar style and the single [`MULTI_PROGRESS`] now live in
-//! [`legume_numeric::matrix::progress`] — the lowest common dependency, so `data-beans`
-//! and friends can share them without a dependency cycle (this crate depends
-//! *on* `data-beans`, so the primitive can't live here). This module
-//! re-exports [`new_progress_bar`], [`new_spinner`], and [`MULTI_PROGRESS`] so
-//! every existing caller (`data_beans::aux::logging::new_progress_bar`, senna,
-//! graph-embedding-util) keeps working unchanged, and adds [`init_logger`],
+//! Reachable as `data_beans::logging` and, for callers that take it with the
+//! other helpers, as `data_beans::aux::logging`. The progress-bar style and
+//! the single [`MULTI_PROGRESS`] are defined in
+//! [`legume_numeric::matrix::progress`], the lowest common dependency of the
+//! workspace; this module re-exports [`new_progress_bar`], [`new_spinner`],
+//! and [`MULTI_PROGRESS`] from there, so every crate that draws a bar shares
+//! one set of them, and adds [`init_logger`],
 //! which wraps `env_logger` in `indicatif_log_bridge` so `log` output renders
 //! above the bars instead of corrupting them. With the `tui` feature the
 //! logger sits behind legume-tui's log gate, so a view's

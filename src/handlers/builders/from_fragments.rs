@@ -251,13 +251,12 @@ pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> 
     /////////////////////////////////////////////////
     // 3. Stream fragments and accumulate triplets //
     /////////////////////////////////////////////////
-    let mut triplet_map: HashMap<(u64, u64), f32> = Default::default();
     let mut n_total: u64 = 0;
     let mut n_skipped_bc: u64 = 0;
     let mut n_no_overlap: u64 = 0;
     let mut n_malformed: u64 = 0;
 
-    if args.preload_data {
+    let triplets = if args.preload_data {
         run_fragments_preload_parallel(
             args,
             use_peaks,
@@ -271,61 +270,41 @@ pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> 
             &mut bin_row_idx,
             &mut bin_display_chr,
             &mut row_names,
-            &mut triplet_map,
             &mut n_total,
             &mut n_skipped_bc,
             &mut n_no_overlap,
             &mut n_malformed,
-        )?;
+        )?
     } else {
         info!("Streaming fragments from {}", args.fragments);
-        let reader = open_fragments_reader(args.fragments.as_ref())?;
+        let mut reader = open_fragments_reader(args.fragments.as_ref())?;
         let prog_bar = streaming_fragments_progress();
 
-        for line in reader.lines() {
-            let line = line?;
-            // skip headers / blanks
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
+        let mut acc = TripletAccum::default();
+        // One buffer for every line.
+        let mut line: Vec<u8> = Vec::new();
+        // The chromosome being read (stripped key) and what it resolves to:
+        // its peaks, or its bins and display name. A fragments file is
+        // sorted, so these are looked up once per chromosome, not per line.
+        let mut cur_key: Option<Box<str>> = None;
+        let mut cur_peaks: Option<usize> = None;
+        let mut cur_bins: HashMap<i64, u64> = Default::default();
+        let mut cur_display: Box<str> = Box::from("");
 
-            let mut it = line.splitn(6, '\t');
-            let chr = match it.next() {
-                Some(c) if !c.is_empty() => c,
-                _ => {
-                    n_malformed += 1;
-                    continue;
-                }
-            };
-            let start: i64 = match it.next().and_then(|s| s.parse().ok()) {
-                Some(v) => v,
-                None => {
-                    n_malformed += 1;
-                    continue;
-                }
-            };
-            let end: i64 = match it.next().and_then(|s| s.parse().ok()) {
-                Some(v) => v,
-                None => {
-                    n_malformed += 1;
-                    continue;
-                }
-            };
-            let barcode = match it.next() {
-                Some(b) if !b.is_empty() => b,
-                _ => {
-                    n_malformed += 1;
-                    continue;
-                }
-            };
-            if end <= start {
-                n_malformed += 1;
-                continue;
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
             }
-            let cnt: f32 = if args.use_count {
-                it.next().and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0)
-            } else {
-                1.0
+            let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+            // headers and blanks are skipped
+            let (chr, start, end, barcode, cnt) = match parse_fragments_line(raw, args.use_count) {
+                Ok(Some(t)) => t,
+                Ok(None) => continue,
+                Err(()) => {
+                    n_malformed += 1;
+                    continue;
+                }
             };
 
             n_total += 1;
@@ -349,13 +328,27 @@ pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> 
 
             // resolve overlapping feature row(s) — match on the stripped chr key
             let ckey = chr_key(chr);
-            if start < 0 {
-                n_malformed += 1;
-                continue;
+            if cur_key.as_deref() != Some(ckey) {
+                acc.enter_chromosome(ckey);
+                cur_peaks = peak_chr_idx.get(ckey).copied();
+                if !use_peaks {
+                    // The bins of the chromosome left go back; one that
+                    // comes back later finds its rows again.
+                    if let Some(left) = cur_key.take() {
+                        bin_row_idx.insert(left, std::mem::take(&mut cur_bins));
+                    }
+                    cur_bins = bin_row_idx.remove(ckey).unwrap_or_default();
+                    // the first display string seen for the key wins
+                    cur_display = bin_display_chr
+                        .entry(ckey.into())
+                        .or_insert_with(|| chr.into())
+                        .clone();
+                }
+                cur_key = Some(ckey.into());
             }
             if use_peaks {
                 let mut hit = false;
-                if let Some(&chr_i) = peak_chr_idx.get(ckey) {
+                if let Some(chr_i) = cur_peaks {
                     let peaks = &peaks_by_chr[chr_i];
                     let max_w = peak_max_width[chr_i];
                     // peaks at idx < lower cannot overlap because their full
@@ -365,7 +358,7 @@ pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> 
                     let upper = peaks.partition_point(|p| p.0 < end);
                     for &(_, pe, ridx) in &peaks[lower..upper] {
                         if pe > start {
-                            *triplet_map.entry((ridx, col_idx)).or_insert(0.0) += cnt;
+                            acc.add(ridx, col_idx, cnt);
                             hit = true;
                         }
                     }
@@ -374,34 +367,27 @@ pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> 
                     n_no_overlap += 1;
                 }
             } else {
-                // bin mode: lookup-or-insert (stripped_chr, bin_idx) → row_idx
-                let chr_map = if bin_row_idx.contains_key(ckey) {
-                    bin_row_idx.get_mut(ckey).unwrap()
-                } else {
-                    bin_row_idx.insert(ckey.into(), Default::default());
-                    bin_display_chr.insert(ckey.into(), chr.into());
-                    bin_row_idx.get_mut(ckey).unwrap()
-                };
-                let display = bin_display_chr.get(ckey).map(|s| s.as_ref()).unwrap_or(chr);
+                // bin mode: lookup-or-insert bin_idx → row_idx
                 let first = start / bin_size;
                 let last = (end - 1) / bin_size;
                 for b in first..=last {
-                    let ridx = if let Some(&r) = chr_map.get(&b) {
+                    let ridx = if let Some(&r) = cur_bins.get(&b) {
                         r
                     } else {
                         let r = row_names.len() as u64;
                         let bs = b * bin_size;
                         let be = (b + 1) * bin_size;
-                        row_names.push(format!("{}:{}-{}", display, bs, be).into_boxed_str());
-                        chr_map.insert(b, r);
+                        row_names.push(format!("{}:{}-{}", cur_display, bs, be).into_boxed_str());
+                        cur_bins.insert(b, r);
                         r
                     };
-                    *triplet_map.entry((ridx, col_idx)).or_insert(0.0) += cnt;
+                    acc.add(ridx, col_idx, cnt);
                 }
             }
         }
         prog_bar.finish_with_message(format!("{} fragments", n_total));
-    }
+        acc.finish()
+    };
 
     info!(
         "Streamed {} fragments — {} cells, {} features, {} skipped (barcode), {} no peak overlap, {} malformed",
@@ -422,10 +408,6 @@ pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> 
         anyhow::bail!("no cells produced; check the barcode whitelist or input file");
     }
 
-    let triplets: Vec<(u64, u64, f32)> = triplet_map
-        .into_iter()
-        .map(|((r, c), v)| (r, c, v))
-        .collect();
     let nnz = triplets.len();
     info!("Built {} triplets in {} x {} matrix", nnz, nrows, ncols);
 
@@ -452,6 +434,65 @@ pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> 
     finalize_zarr_output(&backend_file, &effective_output)?;
     info!("done");
     Ok(())
+}
+
+/// The longest stretch one fragment may span, in bp. A fragment is a
+/// sequenced insert, kilobases at most; a line reaching further is a corrupt
+/// record, and would otherwise make a row of every bin under it.
+const MAX_FRAGMENT_SPAN: i64 = 1 << 30;
+
+/// The (row, column) sums of the serial path, held one chromosome at a
+/// time. A feature row belongs to one chromosome, so when the file moves to
+/// the next chromosome the sums of the one left are final: they move from
+/// the hash map to the triplet list, and the map stays as small as one
+/// chromosome's entries. That holds for a file grouped by chromosome, as
+/// fragments files are. Should a chromosome come back, every sum moves back
+/// into the map and stays there to the end, so each sum is still made in
+/// line order whatever the order of the file.
+#[derive(Default)]
+struct TripletAccum {
+    /// Sums of the chromosome being read; of every chromosome once one
+    /// came back.
+    open: rustc_hash::FxHashMap<(u64, u64), f32>,
+    /// Sums of the chromosomes left behind.
+    closed: Vec<(u64, u64, f32)>,
+    seen: rustc_hash::FxHashSet<Box<str>>,
+    /// Set once a chromosome came back: nothing is closed any more.
+    regrouped: bool,
+}
+
+impl TripletAccum {
+    /// The file moves to the chromosome keyed `ckey`.
+    fn enter_chromosome(&mut self, ckey: &str) {
+        if self.regrouped {
+            return;
+        }
+        if self.seen.contains(ckey) {
+            self.regrouped = true;
+            self.open.reserve(self.closed.len());
+            for (r, c, v) in std::mem::take(&mut self.closed) {
+                self.open.insert((r, c), v);
+            }
+        } else {
+            self.seen.insert(ckey.into());
+            self.close();
+        }
+    }
+
+    fn add(&mut self, row: u64, col: u64, value: f32) {
+        *self.open.entry((row, col)).or_insert(0.0) += value;
+    }
+
+    fn close(&mut self) {
+        self.closed
+            .extend(self.open.drain().map(|((r, c), v)| (r, c, v)));
+    }
+
+    /// Every sum, one triplet per (row, column).
+    fn finish(mut self) -> Vec<(u64, u64, f32)> {
+        self.close();
+        self.closed
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////
@@ -513,7 +554,11 @@ fn fragment_chunk_ranges(bytes: &[u8], n_chunks: usize) -> Vec<(usize, usize)> {
     cuts.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
-/// Parse a single fragments line (no trailing newline).
+/// Parse a single fragments line (no trailing newline): `Ok(None)` for a
+/// header or blank line, `Err` for a malformed one (a missing or unreadable
+/// field, a negative start, an end not past the start, or a span over
+/// [`MAX_FRAGMENT_SPAN`]). Both paths read lines with it, so they agree on
+/// which lines count.
 #[allow(clippy::type_complexity)]
 fn parse_fragments_line(
     line: &[u8],
@@ -551,7 +596,7 @@ fn parse_fragments_line(
         .map_err(|_| ())?
         .parse()
         .map_err(|_| ())?;
-    if end <= start || start < 0 {
+    if start < 0 || end <= start || end - start > MAX_FRAGMENT_SPAN {
         return Err(());
     }
     let cnt: f32 = if use_count {
@@ -585,13 +630,7 @@ fn process_fragments_chunk(
             Ok(Some(t)) => t,
             Ok(None) => continue,
             Err(()) => {
-                // empty/header lines were handled by the Ok(None) branch;
-                // anything else that fails parsing counts as malformed,
-                // but skip purely-empty bytes (a trailing \n leaves an
-                // empty slice in the iterator).
-                if !raw.is_empty() && raw != b"\r" {
-                    acc.n_malformed += 1;
-                }
+                acc.n_malformed += 1;
                 continue;
             }
         };
@@ -696,12 +735,11 @@ fn run_fragments_preload_parallel(
     bin_row_idx: &mut rustc_hash::FxHashMap<Box<str>, rustc_hash::FxHashMap<i64, u64>>,
     bin_display_chr: &mut rustc_hash::FxHashMap<Box<str>, Box<str>>,
     row_names: &mut Vec<Box<str>>,
-    triplet_map: &mut rustc_hash::FxHashMap<(u64, u64), f32>,
     n_total: &mut u64,
     n_skipped_bc: &mut u64,
     n_no_overlap: &mut u64,
     n_malformed: &mut u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(u64, u64, f32)>> {
     use crate::sparse_data_visitors::styled_progress_bar;
     use indicatif::ParallelProgressIterator;
     use rayon::prelude::*;
@@ -832,30 +870,41 @@ fn run_fragments_preload_parallel(
     /////////////////////////////
     // Merge: triplets + stats //
     /////////////////////////////
-    for (t, local) in locals.iter().enumerate() {
+    //
+    // Each chunk's sums go to one list under their global indices, chunk
+    // after chunk, and a chunk's map is freed as soon as it is copied. A
+    // (row, column) that several chunks saw is then summed in chunk order,
+    // which is line order.
+    let mut triplets: Vec<(u64, u64, f32)> =
+        Vec::with_capacity(locals.iter().map(|l| l.triplets.len()).sum());
+    for ((local, col_remap), row_remap) in locals.into_iter().zip(col_remaps).zip(row_remaps) {
         *n_total += local.n_total;
         *n_skipped_bc += local.n_skipped_bc;
         *n_no_overlap += local.n_no_overlap;
         *n_malformed += local.n_malformed;
 
-        let col_remap = &col_remaps[t];
-        let row_remap = &row_remaps[t];
-        for (&(r_or_local, c_or_local), &v) in local.triplets.iter() {
-            let global_col = if whitelist_only {
-                c_or_local
-            } else {
-                col_remap[c_or_local as usize]
-            };
-            let global_row = if use_peaks {
-                r_or_local
-            } else {
-                row_remap[r_or_local as usize]
-            };
-            *triplet_map.entry((global_row, global_col)).or_insert(0.0) += v;
-        }
+        triplets.extend(
+            local
+                .triplets
+                .into_iter()
+                .map(|((r_or_local, c_or_local), v)| {
+                    let global_col = if whitelist_only {
+                        c_or_local
+                    } else {
+                        col_remap[c_or_local as usize]
+                    };
+                    let global_row = if use_peaks {
+                        r_or_local
+                    } else {
+                        row_remap[r_or_local as usize]
+                    };
+                    (global_row, global_col, v)
+                }),
+        );
     }
+    crate::sparse_util::sum_duplicate_triplets(&mut triplets);
 
-    Ok(())
+    Ok(triplets)
 }
 
 /// Open a fragments-like text file with bgzip-safe gzip support.
@@ -1255,5 +1304,159 @@ mod tests {
             view: crate::handlers::explore::PlanArgs::batch(),
         };
         run_pair_and_compare(base, par);
+    }
+
+    fn build_args(
+        fragments: &std::path::Path,
+        output: &std::path::Path,
+        peaks: Option<&std::path::Path>,
+        bin_size: u64,
+        preload_data: bool,
+    ) -> FromFragmentsArgs {
+        FromFragmentsArgs {
+            fragments: fragments.to_str().unwrap().into(),
+            backend: SparseIoBackend::Zarr,
+            output: output.to_str().unwrap().into(),
+            zip: false,
+            peaks: peaks.map(|p| p.to_str().unwrap().into()),
+            bin_size,
+            barcodes: None,
+            use_count: true,
+            preload_data,
+            do_squeeze: false,
+            row_nnz_cutoff: 1,
+            column_nnz_cutoff: 1,
+            block_size: None,
+            view: crate::handlers::explore::PlanArgs::batch(),
+        }
+    }
+
+    /// A line with a negative start, or spanning more than a fragment can,
+    /// is malformed on both paths: its barcode makes no column and its span
+    /// no rows.
+    #[test]
+    fn from_fragments_malformed_coordinates_make_no_row_or_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let frags = tmp.path().join("frags.tsv");
+        std::fs::write(
+            &frags,
+            "chr1\t100\t200\tBC_A\n\
+             chr1\t-5\t120\tBC_Z\n\
+             chr1\t100\t9000000000000000000\tBC_Y\n\
+             chr1\t1100\t1200\tBC_B\n",
+        )
+        .unwrap();
+
+        let serial = build_args(&frags, &tmp.path().join("serial"), None, 1000, false);
+        run_build_from_fragments(&serial).unwrap();
+        let data =
+            open_sparse_matrix(&format!("{}.zarr", serial.output), &SparseIoBackend::Zarr).unwrap();
+        assert_eq!(
+            data.column_names().unwrap(),
+            ["BC_A", "BC_B"].map(Box::from)
+        );
+        assert_eq!(
+            data.row_names().unwrap(),
+            ["chr1:0-1000", "chr1:1000-2000"].map(Box::from)
+        );
+
+        let preload = build_args(&frags, &tmp.path().join("preload"), None, 1000, true);
+        run_pair_and_compare(serial, preload);
+    }
+
+    /// A file grouped by chromosome, as fragments files are, with the same
+    /// (bin, cell) hit many times and fractional counts (exact in f32): the serial path,
+    /// closing each chromosome as it is left, and the preload path agree,
+    /// and the sums are the ones the lines add up to.
+    #[test]
+    fn from_fragments_grouped_chromosomes_sum_alike_on_both_paths() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let frags = tmp.path().join("frags.tsv");
+        let peaks = tmp.path().join("peaks.bed");
+        let barcodes = ["BC_A", "BC_B", "BC_C", "BC_D"];
+        let mut expected = std::collections::HashMap::<(String, &str), f32>::new();
+        {
+            let mut f = std::fs::File::create(&frags).unwrap();
+            for chr in ["chr1", "chr2", "chrX"] {
+                for i in 0..1500usize {
+                    let s = (i as i64 % 40) * 250;
+                    let bc = barcodes[(i * 7) % barcodes.len()];
+                    let cnt = 0.25 + (i % 9) as f32 * 0.5;
+                    writeln!(f, "{chr}\t{s}\t{}\t{bc}\t{cnt}", s + 100).unwrap();
+                    let bin = s / 1000 * 1000;
+                    *expected
+                        .entry((format!("{chr}:{bin}-{}", bin + 1000), bc))
+                        .or_insert(0.0) += cnt;
+                }
+            }
+        }
+        std::fs::write(
+            &peaks,
+            "1\t0\t5000\n1\t5000\t10000\n2\t0\t10000\nX\t0\t10000\n",
+        )
+        .unwrap();
+
+        let serial = build_args(&frags, &tmp.path().join("bin_s"), None, 1000, false);
+        let preload = build_args(&frags, &tmp.path().join("bin_p"), None, 1000, true);
+        let out = format!("{}.zarr", serial.output);
+        run_pair_and_compare(serial, preload);
+
+        let data = open_sparse_matrix(&out, &SparseIoBackend::Zarr).unwrap();
+        let rows = data.row_names().unwrap();
+        let cols = data.column_names().unwrap();
+        let m = data
+            .read_columns_dmatrix((0..cols.len()).collect())
+            .unwrap();
+        assert_eq!(data.num_non_zeros(), Some(expected.len()));
+        for ((row, bc), want) in &expected {
+            let i = rows.iter().position(|r| r.as_ref() == row).unwrap();
+            let j = cols.iter().position(|c| c.as_ref() == *bc).unwrap();
+            assert_eq!(m[(i, j)], *want, "{row} {bc}");
+        }
+
+        run_pair_and_compare(
+            build_args(&frags, &tmp.path().join("peak_s"), Some(&peaks), 0, false),
+            build_args(&frags, &tmp.path().join("peak_p"), Some(&peaks), 0, true),
+        );
+    }
+
+    /// Closing chromosomes as they are left, or regrouping when one comes
+    /// back, gives every (row, column) the sum a single map would, added in
+    /// the same order.
+    #[test]
+    fn triplet_accum_sums_in_line_order_whatever_the_grouping() {
+        // (chromosome, row, column, value); rows 0-1 are on "1", 2-3 on "2".
+        let grouped = [
+            ("1", 0, 0, 0.1f32),
+            ("1", 0, 0, 0.7),
+            ("1", 1, 2, 1.3),
+            ("2", 2, 0, 0.2),
+            ("2", 2, 0, 0.9),
+            ("2", 3, 1, 2.0),
+        ];
+        let mut returning = grouped.to_vec();
+        returning.extend([("1", 0, 0, 0.3), ("1", 1, 1, 1.0), ("2", 2, 0, 0.6)]);
+
+        for lines in [&grouped[..], &returning[..]] {
+            let mut acc = TripletAccum::default();
+            let mut plain = rustc_hash::FxHashMap::<(u64, u64), f32>::default();
+            let mut cur = "";
+            for &(chr, r, c, v) in lines {
+                if chr != cur {
+                    acc.enter_chromosome(chr);
+                    cur = chr;
+                }
+                acc.add(r, c, v);
+                *plain.entry((r, c)).or_insert(0.0) += v;
+            }
+            let regrouped = acc.regrouped;
+            let mut got = acc.finish();
+            got.sort_by_key(|&(r, c, _)| (r, c));
+            let mut want: Vec<_> = plain.into_iter().map(|((r, c), v)| (r, c, v)).collect();
+            want.sort_by_key(|&(r, c, _)| (r, c));
+            assert_eq!(got, want);
+            assert_eq!(regrouped, lines.len() > grouped.len());
+        }
     }
 }

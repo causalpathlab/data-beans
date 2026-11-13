@@ -257,41 +257,64 @@ pub(super) fn collect_pb_sample_gene_sums(
     num_pb: usize,
 ) -> anyhow::Result<Vec<Vec<(usize, f32)>>> {
     use indicatif::ParallelProgressIterator;
+    let num_genes = data_vec.num_rows();
     let prog_bar = styled_progress_bar(group_to_cols.len() as u64, "groups (pb-sample gene sums)");
-    let gene_sum_maps: Vec<(usize, HashMap<usize, f32>)> = group_to_cols
+    // One dense gene accumulator per worker, reset through the list of genes
+    // a pb-sample touched, so each nonzero costs an indexed add.
+    let per_group: Vec<Vec<_>> = group_to_cols
         .par_iter()
         .progress_with(prog_bar.clone())
-        .flat_map(|cells| {
-            let yy = data_vec
-                .read_columns_csc(cells.iter().cloned())
-                .expect("read_columns_csc");
+        .map_init(
+            || (vec![0f32; num_genes], vec![false; num_genes], Vec::new()),
+            |(sums, seen, touched), cells| -> anyhow::Result<_> {
+                let yy = data_vec.read_columns_csc(cells.iter().cloned())?;
 
-            let mut per_pbsamp: HashMap<usize, HashMap<usize, f32>> = HashMap::default();
+                // A pb-sample lies within one group; the stable sort lines its
+                // cells up as one run, in group order.
+                let mut by_pbsamp: Vec<(usize, usize)> = cells
+                    .iter()
+                    .enumerate()
+                    .map(|(local_idx, &col)| (cell_to_pbsamp[col], local_idx))
+                    .filter(|&(pbsamp, _)| pbsamp != usize::MAX)
+                    .collect();
+                by_pbsamp.sort_by_key(|&(pbsamp, _)| pbsamp);
 
-            for (local_idx, y_j) in yy.col_iter().enumerate() {
-                let col = cells[local_idx];
-                let pbsamp = cell_to_pbsamp[col];
-                if pbsamp == usize::MAX {
-                    continue;
+                let mut out: Vec<(usize, Vec<(usize, f32)>)> = Vec::new();
+                for run in by_pbsamp.chunk_by(|a, b| a.0 == b.0) {
+                    for &(_, local_idx) in run {
+                        // Weighted to stay consistent with the weighted
+                        // `cell_counts` in the layout:
+                        // `collect_matched_stat_coarse` divides one by the
+                        // other, and the quotient has to remain the per-cell
+                        // rate.
+                        let w = data_vec.column_multiplicity(cells[local_idx]);
+                        let y_j = yy.col(local_idx);
+                        for (&gene, &val) in y_j.row_indices().iter().zip(y_j.values().iter()) {
+                            if !seen[gene] {
+                                seen[gene] = true;
+                                touched.push(gene);
+                            }
+                            sums[gene] += val * w;
+                        }
+                    }
+                    touched.sort_unstable();
+                    let sorted: Vec<(usize, f32)> = touched
+                        .drain(..)
+                        .map(|gene| {
+                            seen[gene] = false;
+                            (gene, std::mem::take(&mut sums[gene]))
+                        })
+                        .collect();
+                    out.push((run[0].0, sorted));
                 }
-                // Weighted to stay consistent with the weighted `cell_counts`
-                // in the layout: `collect_matched_stat_coarse` divides one by
-                // the other, and the quotient has to remain the per-cell rate.
-                let w = data_vec.column_multiplicity(col);
-                let gene_map = per_pbsamp.entry(pbsamp).or_default();
-                for (&gene, &val) in y_j.row_indices().iter().zip(y_j.values().iter()) {
-                    *gene_map.entry(gene).or_default() += val * w;
-                }
-            }
-
-            per_pbsamp.into_iter().collect::<Vec<_>>()
-        })
-        .collect();
+                Ok(out)
+            },
+        )
+        .collect::<anyhow::Result<_>>()?;
+    prog_bar.finish_and_clear();
 
     let mut gene_sums: Vec<Vec<(usize, f32)>> = vec![vec![]; num_pb];
-    for (pbsamp_idx, gene_map) in gene_sum_maps {
-        let mut sorted: Vec<(usize, f32)> = gene_map.into_iter().collect();
-        sorted.sort_unstable_by_key(|&(g, _)| g);
+    for (pbsamp_idx, sorted) in per_group.into_iter().flatten() {
         gene_sums[pbsamp_idx] = sorted;
     }
 
@@ -339,6 +362,54 @@ pub(super) fn build_pb_samples(
     })
 }
 
+/// How many distinct pb-samples each batch's cell index can return, in total
+/// and (when the layout is stratified) per stratum. A match search for `knn`
+/// pb-samples is complete once it holds `min(knn, count)` of them, so it need
+/// not exhaust a batch that has fewer than `knn` to offer.
+pub(crate) struct MatchablePbSamples {
+    per_batch: Vec<usize>,
+    per_batch_stratum: Option<Vec<HashMap<usize, usize>>>,
+}
+
+impl MatchablePbSamples {
+    pub(crate) fn new(layout: &PbSampleLayout, batch_knn_lookup: &[ColumnDict<usize>]) -> Self {
+        let strata = layout.pb_sample_to_stratum.as_deref();
+        let (per_batch, by_stratum): (Vec<usize>, Vec<HashMap<usize, usize>>) = batch_knn_lookup
+            .par_iter()
+            .map(|bknn| {
+                let mut pbsamps: Vec<usize> = bknn
+                    .names()
+                    .iter()
+                    .map(|&c| layout.cell_to_pbsamp[c])
+                    .filter(|&p| p != usize::MAX)
+                    .collect();
+                pbsamps.sort_unstable();
+                pbsamps.dedup();
+                let mut by_stratum: HashMap<usize, usize> = HashMap::default();
+                if let Some(st) = strata {
+                    for &p in &pbsamps {
+                        *by_stratum.entry(st[p]).or_default() += 1;
+                    }
+                }
+                (pbsamps.len(), by_stratum)
+            })
+            .unzip();
+        Self {
+            per_batch,
+            per_batch_stratum: strata.map(|_| by_stratum),
+        }
+    }
+
+    /// Distinct pb-samples batch `batch` holds for a query of `stratum`
+    /// (`None` = unstratified: all of them).
+    fn count(&self, batch: usize, stratum: Option<usize>) -> usize {
+        match (self.per_batch_stratum.as_ref(), stratum) {
+            (Some(by_stratum), Some(s)) => by_stratum[batch].get(&s).copied().unwrap_or(0),
+            _ => self.per_batch[batch],
+        }
+    }
+}
+
 /// Recover up to `knn` *distinct* pb-samples (closest, by min cell distance)
 /// from a single batch's cell-level HNSW for the given `query` centroid.
 ///
@@ -348,19 +419,27 @@ pub(super) fn build_pb_samples(
 /// nearest cells collapsed into fewer than `knn` pb-samples (small / sorting-
 /// biased batches) — starving the cross-batch δ estimate of matches.
 ///
-/// `own_pbsamp` and `usize::MAX` (unassigned) cells are skipped. Returned
-/// distance per pb-sample is the minimum over its collapsed cells.
+/// `available` is the number of distinct pb-samples in `bknn` the stratum
+/// filter lets through ([`MatchablePbSamples`]): the search is complete once
+/// it holds `min(knn, available)` of them, and has nothing to do when there
+/// are none. A count above the true number only defers the stop to exhaustion.
+///
+/// `own_pbsamp` and `usize::MAX` (unassigned) cells are skipped. `stratum` is
+/// the per-pb-sample stratum table with the query's own stratum; only
+/// pb-samples of that stratum are kept. Returned distance per pb-sample is the
+/// minimum over its collapsed cells.
 pub(crate) fn knn_distinct_pbsamples_in_batch(
     bknn: &ColumnDict<usize>,
     query: &[f32],
     knn: usize,
+    available: usize,
     cell_to_pbsamp: &[usize],
     own_pbsamp: usize,
-    pb_sample_to_stratum: Option<&[usize]>,
-    own_stratum: Option<usize>,
+    stratum: Option<(&[usize], usize)>,
 ) -> anyhow::Result<Vec<(usize, f32)>> {
     let n = bknn.num_points();
-    if n == 0 || knn == 0 {
+    let wanted = knn.min(available);
+    if n == 0 || wanted == 0 {
         return Ok(Vec::new());
     }
     // Start at the historical oversample, then grow ×4 per round. `search_by_
@@ -376,10 +455,8 @@ pub(crate) fn knn_distinct_pbsamples_in_batch(
             if other_pbsamp == usize::MAX || other_pbsamp == own_pbsamp {
                 continue;
             }
-            if let (Some(st), Some(own_s)) = (pb_sample_to_stratum, own_stratum) {
-                if st[other_pbsamp] != own_s {
-                    continue;
-                }
+            if stratum.is_some_and(|(st, own_s)| st[other_pbsamp] != own_s) {
+                continue;
             }
             best.entry(other_pbsamp)
                 .and_modify(|old| {
@@ -389,7 +466,7 @@ pub(crate) fn knn_distinct_pbsamples_in_batch(
                 })
                 .or_insert(d);
         }
-        if best.len() >= knn || query_k >= n {
+        if best.len() >= wanted || query_k >= n {
             break;
         }
         query_k = query_k.saturating_mul(4).min(n);
@@ -404,11 +481,12 @@ pub(crate) fn knn_distinct_pbsamples_in_batch(
 /// distinct pb-samples from **each** non-own batch (closest to `pbsamp`'s
 /// centroid), flattened across batches via [`knn_distinct_pbsamples_in_batch`].
 ///
-/// Shared per-pb-sample body for both [`per_batch_sc_neighbors`] (keeps
-/// distances) and `refine_multilevel::build_bbknn_neighbors` (ids only).
-pub(crate) fn bbknn_match_one_pbsamp(
+/// The per-pb-sample body of [`per_batch_sc_neighbors`]; `matchable` is the
+/// per-batch census of `batch_knn_lookup` that bounds each search.
+fn bbknn_match_one_pbsamp(
     layout: &PbSampleLayout,
     batch_knn_lookup: &[ColumnDict<usize>],
+    matchable: &MatchablePbSamples,
     knn: usize,
     pbsamp: usize,
     anchor_batches: Option<&[usize]>,
@@ -422,8 +500,11 @@ pub(crate) fn bbknn_match_one_pbsamp(
     // every anchor set).
     let pbsamp_batch = layout.pb_sample_to_batch[pbsamp];
     let centroid: Vec<f32> = layout.centroids.column(pbsamp).iter().copied().collect();
-    let pb_stratum = layout.pb_sample_to_stratum.as_deref();
-    let own_stratum = pb_stratum.map(|s| s[pbsamp]);
+    let stratum = layout
+        .pb_sample_to_stratum
+        .as_deref()
+        .map(|st| (st, st[pbsamp]));
+    let own_stratum = stratum.map(|(_, own_s)| own_s);
     let mut all_hits: Vec<(usize, f32)> = Vec::new();
     match anchor_batches {
         // Pooled matching: every non-own, non-bulk batch contributes
@@ -439,10 +520,10 @@ pub(crate) fn bbknn_match_one_pbsamp(
                     bknn,
                     &centroid,
                     knn,
+                    matchable.count(b, own_stratum),
                     &layout.cell_to_pbsamp,
                     pbsamp,
-                    pb_stratum,
-                    own_stratum,
+                    stratum,
                 )?;
                 all_hits.extend(per_batch);
             }
@@ -461,10 +542,10 @@ pub(crate) fn bbknn_match_one_pbsamp(
                     bknn,
                     &centroid,
                     knn,
+                    matchable.count(b, own_stratum),
                     &layout.cell_to_pbsamp,
                     usize::MAX, // self-match allowed
-                    pb_stratum,
-                    own_stratum,
+                    stratum,
                 )?;
                 all_hits.extend(per_batch);
             }
@@ -480,9 +561,12 @@ pub(crate) fn bbknn_match_one_pbsamp(
 /// [`knn_distinct_pbsamples_in_batch`], which grows each per-batch search until
 /// `knn` distinct pb-samples are recovered or the batch is exhausted.
 ///
+/// With `anchor_batches`, the sources are the anchor batches only, for every
+/// pb-sample (see [`bbknn_match_one_pbsamp`]).
+///
 /// Returns: `result[pbsamp] = Vec<(other_pbsamp, distance)>` flattened across all
 /// non-own batches.
-pub(super) fn per_batch_sc_neighbors(
+pub(crate) fn per_batch_sc_neighbors(
     layout: &PbSampleLayout,
     batch_knn_lookup: &[ColumnDict<usize>],
     knn: usize,
@@ -490,12 +574,22 @@ pub(super) fn per_batch_sc_neighbors(
 ) -> anyhow::Result<Vec<Vec<(usize, f32)>>> {
     use indicatif::ParallelProgressIterator;
     let num_pb = layout.cell_counts.len();
+    let matchable = MatchablePbSamples::new(layout, batch_knn_lookup);
 
     let prog_bar = styled_progress_bar(num_pb as u64, "pb-samples (BBKNN match)");
     let result = (0..num_pb)
         .into_par_iter()
         .progress_with(prog_bar.clone())
-        .map(|pbsamp| bbknn_match_one_pbsamp(layout, batch_knn_lookup, knn, pbsamp, anchor_batches))
+        .map(|pbsamp| {
+            bbknn_match_one_pbsamp(
+                layout,
+                batch_knn_lookup,
+                &matchable,
+                knn,
+                pbsamp,
+                anchor_batches,
+            )
+        })
         .collect();
     prog_bar.finish_and_clear();
     result

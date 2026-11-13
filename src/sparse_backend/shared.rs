@@ -1,7 +1,7 @@
 //! Storage-agnostic helpers shared by the `zarr` and `hdf5` sparse backends.
 //!
 //! These capture the *algorithmic* duplication between the two `SparseIo`
-//! impls (range coalescing and MTX header emission) without touching the
+//! impls (range coalescing and the MTX export) without touching the
 //! *structural* divergences (zarr's decoded-chunk caches and `Element` string
 //! storage vs hdf5's datasets and `VarLenUnicode`). Each backend supplies its
 //! own retrieval primitive via a closure or keeps its own dataset-write tail;
@@ -9,6 +9,7 @@
 //! but lives in `utilities::io_helpers::parse_name_file` since it is general
 //! I/O, not backend-specific.)
 
+use legume_numeric::matrix::common_io::open_buf_writer;
 use std::io::Write;
 
 /// Coalesce abutting/overlapping ranges in `tagged` (already sorted by
@@ -94,9 +95,14 @@ where
     Ok(ret)
 }
 
+/// Block size (in elements) for streaming the CSC value/row-index arrays when
+/// exporting to Matrix Market. ~1M elements ≈ 4 MiB f32 + 8 MiB u64 transient
+/// per block — large enough to amortize per-retrieve overhead, small enough to
+/// bound memory regardless of matrix size.
+pub(crate) const MTX_STREAM_BLOCK: u64 = 1 << 20;
+
 /// Write the MatrixMarket coordinate header: the format magic line followed by
-/// the `rows  cols  nnz` size line. The per-nonzero body stays per-backend
-/// (zarr block-streams the CSC arrays, hdf5 reads per column).
+/// the `rows  cols  nnz` size line.
 pub(crate) fn write_mtx_header<W: Write>(
     buf: &mut W,
     nrow: usize,
@@ -106,6 +112,95 @@ pub(crate) fn write_mtx_header<W: Write>(
     writeln!(buf, "%%MatrixMarket matrix coordinate real general")?;
     writeln!(buf, "{}\t{}\t{}", nrow, ncol, nnz)?;
     Ok(())
+}
+
+/// Write a CSC matrix of `shape` = `(nrow, ncol, nnz)` as a MatrixMarket
+/// coordinate file: the header, then one 1-based `row  col  value` line per
+/// stored entry.
+///
+/// The value/row-index arrays are streamed in sequential blocks of `block`
+/// elements (instead of two retrieves per column) and `indptr` is walked to
+/// map each stored nonzero back to its column. CSC values are laid out
+/// column-major in column order, so emitting them in storage order reproduces
+/// the same column-by-column output as a per-column scan; empty columns are
+/// skipped by advancing the column pointer.
+///
+/// `indptr` is audited against the shape before anything is written, so a
+/// short or non-monotone pointer array, or one that disagrees with the
+/// declared `nnz`, is an error rather than a file whose header and body
+/// differ. A stored row index outside `nrow` is an error too.
+///
+/// `retrieve(start, end)` follows the same contract as in
+/// [`coalesce_and_emit`]: `(data, indices)` buffers of length `end - start`,
+/// indexed base-0 at `start`.
+pub(crate) fn write_mtx<W, R, D, I>(
+    buf: &mut W,
+    shape: (usize, usize, usize),
+    indptr: &[u64],
+    block: u64,
+    mut retrieve: R,
+) -> anyhow::Result<()>
+where
+    W: Write,
+    R: FnMut(u64, u64) -> anyhow::Result<(D, I)>,
+    D: std::ops::Index<usize, Output = f32>,
+    I: std::ops::Index<usize, Output = u64>,
+{
+    let (nrow, ncol, nnz) = shape;
+    crate::sparse_io::index_audit::check_indptr("to_mtx_file", indptr, ncol, nnz)?;
+    write_mtx_header(buf, nrow, ncol, nnz)?;
+
+    let total_nnz = indptr[ncol];
+    let block = block.max(1);
+    let mut jj = 0usize; // column owning the running nnz position
+    let mut pos = 0u64;
+    while pos < total_nnz {
+        let end = (pos + block).min(total_nnz);
+        let (data_block, indices_block) = retrieve(pos, end)?;
+
+        for k in 0..(end - pos) as usize {
+            let global = pos + k as u64;
+            // advance to the column owning this nonzero (skips empties)
+            while indptr[jj + 1] <= global {
+                jj += 1;
+            }
+            let ii = indices_block[k];
+            if ii >= nrow as u64 {
+                return Err(crate::sparse_io::index_audit::inner_out_of_range(
+                    "to_mtx_file",
+                    global as usize,
+                    ii,
+                    nrow,
+                ));
+            }
+            // 1-based indices
+            writeln!(buf, "{}\t{}\t{}", ii + 1, jj + 1, data_block[k])?;
+        }
+        pos = end;
+    }
+    Ok(())
+}
+
+/// Create `mtx_file`, let `write` fill it and flush it. A file left
+/// incomplete by a failed `write` or flush is removed, so an export that
+/// returns an error leaves nothing a reader could take for the matrix.
+///
+/// `mtx_file` follows `open_buf_writer`: `stdout` and `stderr` name the
+/// standard streams, which are never removed.
+pub(crate) fn write_mtx_file<F>(mtx_file: &str, write: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut Box<dyn Write>) -> anyhow::Result<()>,
+{
+    let mut buf = open_buf_writer(mtx_file)?;
+    let written = write(&mut buf).and_then(|()| Ok(buf.flush()?));
+    // Only a regular file is a partial output to take away: a stream
+    // (`stdout`, a device, a pipe) holds nothing to remove.
+    if written.is_err() && std::fs::metadata(mtx_file).is_ok_and(|m| m.is_file()) {
+        // close the file before unlinking it
+        drop(buf);
+        let _ = std::fs::remove_file(mtx_file);
+    }
+    written
 }
 
 #[cfg(test)]

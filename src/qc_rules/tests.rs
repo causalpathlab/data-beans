@@ -224,3 +224,26 @@ fn a_mito_pattern_that_matched_nothing_leaves_no_mito_rule() {
     assert!(crate::figure::qc::figure(&rules, "no mito").contains("<svg"));
     assert_flags_decide_the_same(&rules);
 }
+
+#[test]
+fn a_fractional_floor_on_a_whole_number_metric_rounds_up() {
+    // At or above 153.2 genes is at or above 154: a cell with 153 fails.
+    let mut rules = CellRules::new(metrics(), config());
+    rules.set_value(Rule::Genes, 153.2);
+    assert_eq!(rules.config().min_cell_nnz, 154);
+    rules.set_value(Rule::GeneCells, 20.4);
+    assert_eq!(rules.config().feature_min_cells, 21);
+    rules.set_value(Rule::Genes, 153.0);
+    assert_eq!(rules.config().min_cell_nnz, 153);
+}
+
+#[test]
+fn a_gene_band_switched_to_a_value_still_fails_what_its_edge_did() {
+    let mut rules = CellRules::new(metrics(), config());
+    let edge = rules.edge(Rule::Genes).expect("a band");
+    rules.toggle_mode(Rule::Genes);
+    let floor = rules.config().min_cell_nnz;
+    assert!(floor as f32 >= edge, "floor {floor} under the edge {edge}");
+    let (genes, removed) = (rules.values(Rule::Genes), rules.removed(Rule::Genes));
+    assert!((0..genes.len()).all(|c| genes[c] >= edge || removed[c]));
+}

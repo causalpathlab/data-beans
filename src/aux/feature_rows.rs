@@ -364,8 +364,9 @@ pub fn intern_count_rows(feature_names: &[Box<str>], policy: UnparsedRowPolicy) 
             match policy {
                 UnparsedRowPolicy::Reject => row_to_gene.push(NO_GENE),
                 UnparsedRowPolicy::OwnGene => {
+                    // Kept out of `ids`, which pairs channel rows by gene
+                    // key: a stray row named like a gene stays on its own.
                     let g = gene_names.len() as u32;
-                    ids.insert(name.clone(), g);
                     gene_names.push(name.clone());
                     row_to_gene.push(g);
                 }

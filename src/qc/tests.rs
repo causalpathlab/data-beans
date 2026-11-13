@@ -199,3 +199,134 @@ fn printed_ranges_keep_three_significant_digits() {
     assert_eq!(fmt_sig(145.0), "145");
     assert_eq!(fmt_sig(1234.5), "1234");
 }
+
+#[test]
+fn printed_mean_holds_past_f32_sum_precision() {
+    // 2^24 + 1 is not an f32: a sum kept in f32 would stay at 2^24.
+    let vals: Vec<f32> = vec![16_777_216.0, 1.0, 1.0, 1.0, 1.0];
+    let mut out = Vec::new();
+    write_nnz_summary(&mut out, "Cell", "nnz", &vals, 0, None).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("Mean: 3355444.00"), "{text}");
+}
+
+#[test]
+fn log_histogram_with_no_cutoff_spans_the_values_alone() {
+    // Values within a factor of 1.5: with no cutoff the axis must not reach
+    // down to 0, which would crowd them into its last two bins.
+    let vals: Vec<f32> = (0..=1000).map(|i| 20_000.0 + 10.0 * i as f32).collect();
+    let hist = create_log_histogram(&vals, 0);
+    assert_eq!(hist.len(), PRINTED_BINS);
+    // A cutoff that is set still has its place on the axis.
+    let hist = create_log_histogram(&vals, 100);
+    assert!(hist.len() < 5 && hist[0].is_cutoff);
+}
+
+#[test]
+fn linear_ticks_of_a_range_with_no_span_end() {
+    assert_eq!(Axis::linear(0.0, 0.0).ticks(), vec![0.0]);
+    assert_eq!(Axis::linear(3.0, 3.0).ticks(), vec![3.0]);
+    assert!(Axis::linear(1.0, 0.0).ticks().is_empty());
+    assert!(Axis::linear(0.0, f64::INFINITY).ticks().is_empty());
+    assert!(Axis::linear(0.0, f64::NAN).ticks().is_empty());
+    assert!(Axis::linear(0.0, 5e-324).ticks().is_empty());
+    assert_eq!(
+        Axis::linear(0.0, 1.0).ticks(),
+        vec![0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    );
+}
+
+/// 40 rows by 150 columns, about a fifth filled, with empty rows and columns.
+fn sparse_fixture() -> Box<dyn SparseIo<IndexIter = Vec<usize>>> {
+    let (nrows, ncols) = (40u64, 150u64);
+    let mut triplets = vec![];
+    for c in 0..ncols {
+        for r in 0..nrows {
+            let h = (r * 7919 + c * 104_729 + r * c) % 97;
+            if h < 20 && r != 11 && c % 31 != 5 {
+                triplets.push((r, c, 0.5 + h as f32));
+            }
+        }
+    }
+    let shape = (nrows as usize, ncols as usize, triplets.len());
+    let mut data = create_sparse_from_triplets(&triplets, shape, None, None).unwrap();
+    let names =
+        |n: u64, p: &str| -> Vec<Box<str>> { (0..n).map(|i| format!("{p}{i}").into()).collect() };
+    data.register_row_names_vec(&names(nrows, "g"));
+    data.register_column_names_vec(&names(ncols, "c"));
+    data
+}
+
+#[test]
+fn one_pass_statistics_match_the_separate_passes() {
+    let data = sparse_fixture();
+    let block = Some(16);
+    let (col, row) = collect_column_row_stat(data.as_ref(), block).unwrap();
+    let (col_alone, row_alone) = (
+        collect_column_stat(data.as_ref(), block).unwrap(),
+        collect_row_stat(data.as_ref(), block).unwrap(),
+    );
+    assert!(col.sum().iter().any(|&s| s > 0.0));
+    assert_eq!(col.count_positives(), col_alone.count_positives());
+    assert_eq!(col.sum(), col_alone.sum());
+    assert_eq!(col.mean(), col_alone.mean());
+    assert_eq!(row.count_positives(), row_alone.count_positives());
+}
+
+/// A backend nothing was written to has no shape, so no counts to squeeze
+/// by: it is refused.
+#[test]
+fn squeeze_refuses_a_backend_without_a_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.zarr");
+    let data = create_sparse_streaming_empty(path.to_str(), Some(&SparseIoBackend::Zarr)).unwrap();
+    assert!(data.num_rows().is_none() || data.num_columns().is_none());
+    let cutoffs = SqueezeCutoffs { row: 1, column: 1 };
+    let err = squeeze_by_nnz(data.as_ref(), cutoffs, None, false).unwrap_err();
+    assert!(
+        err.to_string().contains("missing shape information"),
+        "{err}"
+    );
+}
+
+/// A row's sum runs across the column blocks, and a sum of non-integer
+/// values depends on how it is grouped: the grouping follows the blocks, not
+/// the threads that read them.
+#[test]
+fn row_statistics_do_not_depend_on_the_thread_count() -> anyhow::Result<()> {
+    let (nrows, ncols) = (8u64, 600u64);
+    let mut triplets = vec![];
+    for c in 0..ncols {
+        for r in 0..nrows {
+            if (r * 5 + c * 3) % 4 != 0 {
+                triplets.push((r, c, 0.1 + ((r * 131 + c * 17) % 97) as f32 * 0.37));
+            }
+        }
+    }
+    let shape = (nrows as usize, ncols as usize, triplets.len());
+    let data = create_sparse_from_triplets(&triplets, shape, None, None)?;
+
+    let bits = |x: Vec<f32>| -> Vec<u32> { x.iter().map(|v| v.to_bits()).collect() };
+    // Blocks of two columns: several leaves of the fold, merged.
+    let run = |threads: usize| -> anyhow::Result<_> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()?
+            .install(|| {
+                let alone = collect_row_stat(data.as_ref(), Some(2))?;
+                let (_, with_columns) = collect_column_row_stat(data.as_ref(), Some(2))?;
+                Ok((
+                    bits(alone.sum()),
+                    bits(alone.variance()),
+                    bits(with_columns.sum()),
+                    bits(with_columns.variance()),
+                ))
+            })
+    };
+    let one = run(1)?;
+    assert_eq!(one.0, one.2, "the two passes group a row's sum alike");
+    for threads in [3, 6] {
+        assert_eq!(run(threads)?, one, "{threads} threads");
+    }
+    Ok(())
+}

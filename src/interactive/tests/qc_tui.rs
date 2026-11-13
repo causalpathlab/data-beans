@@ -241,3 +241,80 @@ fn the_guardrail_is_said() {
     assert!(v.rules().verdicts().guarded);
     assert!(screen(&mut v, 150, 44).contains("QC keeps them all instead"));
 }
+
+/// An edge typed as `inf` or past what an f32 holds is refused: the rule
+/// stays where it was.
+#[test]
+fn a_typed_edge_that_is_not_finite_is_refused() {
+    for text in ["inf", "1e39", "NaN"] {
+        let mut v = QcView::new(rules(), "toy", Some("kept".into()), "toy.qc");
+        let before = v.rules().flags();
+        press(&mut v, KeyCode::Down);
+        press(&mut v, KeyCode::Char('e'));
+        for _ in 0..20 {
+            press(&mut v, KeyCode::Backspace);
+        }
+        for c in text.chars() {
+            press(&mut v, KeyCode::Char(c));
+        }
+        press(&mut v, KeyCode::Enter);
+        assert_eq!(v.rules().flags(), before, "{text}");
+        let s = screen(&mut v, 150, 44);
+        assert!(s.contains(&format!("not a number: {text}")), "{text}\n{s}");
+    }
+}
+
+/// A floor given as infinite (`--qc-min-counts inf`) is drawn at the end
+/// of its axis.
+#[test]
+fn an_infinite_edge_is_drawn_at_the_end_of_its_axis() {
+    let mut rules = rules();
+    rules.set_value(Rule::Counts, f32::INFINITY);
+    let mut v = QcView::new(rules, "toy", Some("kept".into()), "toy.qc");
+    let s = screen(&mut v, 150, 44);
+    assert!(s.contains("total counts × detected genes"), "{s}");
+    screen(&mut v, 60, 16);
+}
+
+/// The kept counts the rules panel and the session status give are those
+/// of the rules as they stand, after every change.
+#[test]
+fn the_kept_counts_follow_the_rules() {
+    let mut v = QcView::new(rules(), "toy", Some("kept".into()), "toy.qc");
+    let check = |v: &mut QcView| {
+        let (cells, genes) = (v.rules().kept_cells().len(), v.rules().kept_genes().len());
+        assert_eq!(
+            Screen::status(v),
+            Some(format!("qc toy: keeps {cells} of 600 cells"))
+        );
+        let s = screen(v, 150, 44);
+        assert!(s.contains(&format!("kept {cells} / 600 cells")), "{s}");
+        assert!(s.contains(&format!("{genes} / 200 genes")), "{s}");
+        cells
+    };
+    let start = check(&mut v);
+    assert_eq!(start, 528);
+    // The genes rule off, a wider band, a typed floor, the genes rule
+    // moved, reset.
+    press(&mut v, KeyCode::Char('o'));
+    let mut seen = vec![check(&mut v)];
+    press(&mut v, KeyCode::Down);
+    press(&mut v, KeyCode::Char('L'));
+    seen.push(check(&mut v));
+    press(&mut v, KeyCode::Char('e'));
+    for _ in 0..20 {
+        press(&mut v, KeyCode::Backspace);
+    }
+    for c in "2500".chars() {
+        press(&mut v, KeyCode::Char(c));
+    }
+    press(&mut v, KeyCode::Enter);
+    seen.push(check(&mut v));
+    press(&mut v, KeyCode::Up);
+    press(&mut v, KeyCode::Up);
+    press(&mut v, KeyCode::Right);
+    seen.push(check(&mut v));
+    assert!(seen[2] < start, "{seen:?}");
+    press(&mut v, KeyCode::Char('r'));
+    assert_eq!(check(&mut v), start);
+}

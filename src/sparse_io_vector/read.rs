@@ -30,6 +30,12 @@ fn remap_row(
 }
 
 impl SparseIoVec {
+    /// True when some row is observed by more than one backend, so a column
+    /// that several backends contribute to can receive two values at one row.
+    fn backends_share_rows(&self) -> bool {
+        self.row_count_by_global.iter().any(|&n| n > 1)
+    }
+
     /// The factor reads divide global column `glob` by: 1 when no scales
     /// are set, and IEEE division by 1 is exact, so such reads are the
     /// counts as stored.
@@ -41,37 +47,6 @@ impl SparseIoVec {
     ////////////////////
     // access columns //
     ////////////////////
-
-    /// Read a single column by global index and append offset triplets.
-    /// Under [`ColumnAlignment::Union`] one global column can be backed
-    /// by multiple `(didx, loc)` pairs — their triplets all land in the
-    /// same output column and `col_offset` advances by 1.
-    ///
-    /// `pub(super)` so the matched/neighbour read paths in `matched.rs` (a
-    /// sibling module) can reuse it.
-    pub(super) fn read_column_offset(
-        &self,
-        glob: usize,
-        col_offset: &mut usize,
-        triplets: &mut Vec<(u64, u64, f32)>,
-    ) -> anyhow::Result<()> {
-        let off = *col_offset as u64;
-        let g2c = self.global_to_compact_row.as_slice();
-        let scale = self.scale_of(glob);
-        for source in self.col_to_data[glob].iter() {
-            let didx = source.backend as usize;
-            let loc = source.local_col as usize;
-            let (_, _, loc_triplets) = self.data_vec[didx].read_triplets_by_single_column(loc)?;
-            let l2g = self.data_local_to_global_row[didx].as_slice();
-            for (i, _j, v) in loc_triplets {
-                if let Some(c) = g2c[l2g[i as usize]] {
-                    triplets.push((c as u64, off, v / scale));
-                }
-            }
-        }
-        *col_offset += 1;
-        Ok(())
-    }
 
     /// Stream every nonzero of the selected `cells` (global column
     /// indices) through `f(row, col, val)` **without** materializing the
@@ -85,6 +60,11 @@ impl SparseIoVec {
     /// not by the total nnz. Callers can therefore build a compact edge
     /// list (e.g. 12-byte triplets) directly and never pay for the wide
     /// intermediate. Returns the `(nrow, ncol)` dimensions.
+    ///
+    /// Each `(row, col)` is emitted at most once: where a row canonicalizer
+    /// folds several rows of one backend together, or several backends of a
+    /// [`ColumnAlignment::Union`] column observe the same row, the values are
+    /// summed first.
     pub fn for_each_triplet<I, F>(
         &self,
         cells: I,
@@ -102,6 +82,11 @@ impl SparseIoVec {
         let g2c = self.global_to_compact_row.as_slice();
         let scale: Vec<f32> = cells.iter().map(|&g| self.scale_of(g)).collect();
 
+        // Backends of one column can only collide on a row they both observe.
+        let union_shares_rows =
+            self.column_alignment == ColumnAlignment::Union && self.backends_share_rows();
+        let mut pending: Vec<(u64, u64, f32)> = Vec::new();
+
         for slab_start in (0..ncol).step_by(chunk) {
             let slab_end = (slab_start + chunk).min(ncol);
 
@@ -112,9 +97,13 @@ impl SparseIoVec {
             // backend that observed it); all those reads target the same
             // out_col.
             let mut backend_groups: HashMap<usize, Vec<(usize, usize)>> = HashMap::default();
+            // Per slab column: do several backends feed it rows they share?
+            let mut multi_source = vec![false; slab_end - slab_start];
             for (k, &glob) in cells[slab_start..slab_end].iter().enumerate() {
                 let out_col = slab_start + k;
-                for source in self.col_to_data[glob].iter() {
+                let sources = self.col_to_data[glob].as_slice();
+                multi_source[k] = union_shares_rows && sources.len() > 1;
+                for source in sources {
                     backend_groups
                         .entry(source.backend as usize)
                         .or_default()
@@ -128,30 +117,29 @@ impl SparseIoVec {
                     self.data_vec[didx].read_triplets_by_columns(local_cols)?;
 
                 let l2g = self.data_local_to_global_row[didx].as_slice();
-                if self.data_has_intra_row_merges[didx] {
-                    // Canonicalizer collapsed >=2 local rows in this dataset
-                    // to the same global. Sum into a HashMap so downstream
-                    // consumers don't see duplicate (row, col) entries. Every
-                    // entry for a given out_col lives in this slab, so
-                    // per-slab accumulation is exact.
-                    let mut acc: HashMap<(u64, u64), f32> = HashMap::default();
-                    for (i, j, v) in group_triplets {
-                        if let Some(c) = g2c[l2g[i as usize]] {
-                            let out_col = group[j as usize].1 as u64;
-                            *acc.entry((c as u64, out_col)).or_insert(0.0) += v;
-                        }
-                    }
-                    for ((r, c), v) in acc {
-                        f(r, c, v / scale[c as usize]);
-                    }
-                } else {
-                    for (i, j, v) in group_triplets {
-                        if let Some(c) = g2c[l2g[i as usize]] {
-                            let out_col = group[j as usize].1;
+                // A canonicalizer that collapsed >=2 local rows of this
+                // dataset to one global row repeats (row, col) within the
+                // backend; a multi-source column can repeat it across
+                // backends. Those entries wait in `pending` to be summed;
+                // every entry of an out_col lives in this slab, so per-slab
+                // accumulation is exact. The rest pass straight through.
+                let intra_merges = self.data_has_intra_row_merges[didx];
+                for (i, j, v) in group_triplets {
+                    if let Some(c) = g2c[l2g[i as usize]] {
+                        let out_col = group[j as usize].1;
+                        if intra_merges || multi_source[out_col - slab_start] {
+                            pending.push((c as u64, out_col as u64, v));
+                        } else {
                             f(c as u64, out_col as u64, v / scale[out_col]);
                         }
                     }
                 }
+            }
+
+            // Divided after the duplicates are summed: one factor per column.
+            crate::sparse_util::sum_duplicate_triplets(&mut pending);
+            for (r, c, v) in pending.drain(..) {
+                f(r, c, v / scale[c as usize]);
             }
         }
 
@@ -271,6 +259,13 @@ impl SparseIoVec {
                 // LRU cache). For a contiguous block of N cells this becomes
                 // ONE retrieval instead of N — the dominant win on cold reads
                 // from `.zarr.zip` over a slow disk.
+                // The indptr gives each column's size before any entry is
+                // read, so its bucket grows once.
+                for &(loc, out_col) in group {
+                    if let Some(nnz) = self.data_vec[didx].column_nnz(loc) {
+                        buckets[out_col].reserve(nnz as usize);
+                    }
+                }
                 let cols: Vec<usize> = group.iter().map(|&(loc, _)| loc).collect();
                 let (_, _, trip) = self.data_vec[didx].read_triplets_by_columns(cols)?;
                 for (i, jj, v) in trip {
@@ -358,6 +353,9 @@ impl SparseIoVec {
     /// all backends. Output column index is the SparseIoVec-global
     /// column (concatenation of backends in push order); output row
     /// index is the position in `rows`.
+    ///
+    /// Each `(row, col)` appears at most once, with the same sums
+    /// [`Self::for_each_triplet`] reports for it.
     #[allow(clippy::type_complexity)]
     pub fn rows_triplets<I>(
         &self,
@@ -373,11 +371,18 @@ impl SparseIoVec {
         let n_compact = self.cached_num_rows;
         let compact_to_global = self.compact_to_global_row.as_slice();
 
+        // Two backends can only land on one (row, col) when a Union column
+        // spans them and they observe the same row.
+        let mut has_duplicates =
+            self.column_alignment == ColumnAlignment::Union && self.backends_share_rows();
+
         let mut triplets: Vec<(u64, u64, f32)> = Vec::new();
         let mut local_to_out: Vec<usize> = Vec::with_capacity(rows_compact.len());
         for didx in 0..self.data_vec.len() {
-            let g2l = &self.data_global_to_local_row[didx];
+            let g2l = self.data_global_to_local_row[didx].as_slice();
 
+            // Every local row folded onto a requested row is read, each
+            // mapped to that row's output position.
             local_to_out.clear();
             let mut local_rows: Vec<usize> = Vec::with_capacity(rows_compact.len());
             for (out_row, &c) in rows_compact.iter().enumerate() {
@@ -385,7 +390,8 @@ impl SparseIoVec {
                     continue;
                 }
                 let g = compact_to_global[c];
-                if let Some(&l) = g2l.get(&g) {
+                let first = g2l.partition_point(|&(global, _)| global < g);
+                for &(_, l) in g2l[first..].iter().take_while(|&&(global, _)| global == g) {
                     local_rows.push(l);
                     local_to_out.push(out_row);
                 }
@@ -393,6 +399,7 @@ impl SparseIoVec {
             if local_rows.is_empty() {
                 continue;
             }
+            has_duplicates |= self.data_has_intra_row_merges[didx];
 
             let (_, _, group_triplets) = self.data_vec[didx].read_triplets_by_rows(local_rows)?;
             let cols_map = self
@@ -407,7 +414,17 @@ impl SparseIoVec {
                     continue;
                 }
                 let out_row = local_to_out[i as usize] as u64;
-                triplets.push((out_row, mapped as u64, v / self.scale_of(mapped)));
+                triplets.push((out_row, mapped as u64, v));
+            }
+        }
+
+        if has_duplicates {
+            crate::sparse_util::sum_duplicate_triplets(&mut triplets);
+        }
+        // Divided after the duplicates are summed: one factor per column.
+        if let Some(scales) = self.column_scales.as_ref() {
+            for t in triplets.iter_mut() {
+                t.2 /= scales[t.1 as usize];
             }
         }
 

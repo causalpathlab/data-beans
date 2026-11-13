@@ -34,24 +34,22 @@ pub(super) fn collect_matched_stat_visitor(
     let knn_batches = knn_params.knn_batches;
     let knn_cells = knn_params.knn_cells;
 
-    let (y0_matched, source_columns, euclidean_distances) = match knn_params.reference_indices {
-        Some(target_indices) => data_vec.read_matched_columns_csc(
-            cells.iter().cloned(),
-            target_indices,
-            knn_cells,
-            true,
-        )?,
-        None => {
-            let (mat, src, _matched, dist) = data_vec.read_neighbouring_columns_csc(
+    let (y0_matched, source_columns, matched_columns, euclidean_distances) =
+        match knn_params.reference_indices {
+            Some(target_indices) => data_vec.read_matched_columns_with_targets_csc(
+                cells.iter().cloned(),
+                target_indices,
+                knn_cells,
+                true,
+            )?,
+            None => data_vec.read_neighbouring_columns_csc(
                 cells.iter().cloned(),
                 knn_batches,
                 knn_cells,
                 true,
                 None,
-            )?;
-            (mat, src, dist)
-        }
-    };
+            )?,
+        };
 
     let y1_pos: HashMap<_, _> = cells
         .iter()
@@ -83,14 +81,16 @@ pub(super) fn collect_matched_stat_visitor(
     .normalize_exp_logits_columns();
 
     let y1_hat = &y0_matched * &ww;
-    let source_batches = data_vec.get_batch_membership(source_columns.iter().cloned());
+    let matched_batches = data_vec.get_batch_membership(matched_columns.iter().cloned());
 
     let mut stat = arc_stat.lock().expect("lock stat");
 
-    // Source mass per batch: each cell's weights sum to 1 over its matches.
+    // Source mass per batch: each cell's weights sum to 1 over its matches,
+    // and row `k` of `ww` is the `k`-th matched column, whose batch the
+    // counterfactual was drawn from.
     for w_j in ww.col_iter() {
         for (&k, &w) in w_j.row_indices().iter().zip(w_j.values().iter()) {
-            stat.matched_bs[(source_batches[k], sample)] += w;
+            stat.matched_bs[(matched_batches[k], sample)] += w;
         }
     }
 
@@ -259,39 +259,44 @@ fn optimize_block(
                                         // samples so private-clone mass cannot pull the batch fold.
                                         // `n_bs_d` is the matched-own mass that also votes in `pin_delta_scale`
                                         // (same basis as unstratified `frame_weights()` — own mass only).
-        let (obs_db_for_delta, own_plus_src_for_delta, n_bs_d) =
-            if stat.exclude_unmatched_from_delta {
-                let mut obs = stat.observed_sum_db.clone();
-                let mut n_bs_d = n_bs.clone();
-                for s in 0..num_samples {
-                    if w_bs.column(s).sum() > 0.0 {
-                        continue;
-                    }
-                    let size = stat.size_s[s];
-                    if size <= 0.0 {
-                        continue;
-                    }
-                    for b in 0..num_batches {
-                        let n = n_bs[(b, s)];
-                        if n <= 0.0 {
-                            continue;
-                        }
-                        let frac = n / size;
-                        for g in 0..num_genes {
-                            obs[(g, b)] -= stat.observed_sum_ds[(g, s)] * frac;
-                        }
-                        n_bs_d[(b, s)] = 0.0;
-                    }
+        let (obs_db_for_delta, own_plus_src_for_delta, n_bs_d) = if stat
+            .exclude_unmatched_from_delta
+        {
+            let mut obs = stat.observed_sum_db.clone();
+            let mut n_bs_d = n_bs.clone();
+            for s in 0..num_samples {
+                if w_bs.column(s).sum() > 0.0 {
+                    continue;
                 }
-                let own_plus = &n_bs_d + w_bs;
-                (obs, own_plus, n_bs_d)
-            } else {
-                (
-                    stat.observed_sum_db.clone(),
-                    own_plus_src.clone(),
-                    n_bs.clone(),
-                )
-            };
+                let size = stat.size_s[s];
+                if size <= 0.0 {
+                    continue;
+                }
+                for b in 0..num_batches {
+                    let n = n_bs[(b, s)];
+                    if n <= 0.0 {
+                        continue;
+                    }
+                    // The split of the sample's sum by cell mass is exact
+                    // for a single-batch sample only; the floor keeps a
+                    // batch's observed count from going negative where
+                    // the split charges it more than it holds.
+                    let frac = n / size;
+                    for g in 0..num_genes {
+                        obs[(g, b)] = (obs[(g, b)] - stat.observed_sum_ds[(g, s)] * frac).max(0.0);
+                    }
+                    n_bs_d[(b, s)] = 0.0;
+                }
+            }
+            let own_plus = &n_bs_d + w_bs;
+            (obs, own_plus, n_bs_d)
+        } else {
+            (
+                stat.observed_sum_db.clone(),
+                own_plus_src.clone(),
+                n_bs.clone(),
+            )
+        };
         let obs_plus_imp = &stat.observed_sum_ds + &stat.imputed_sum_ds;
         // Fraction of each (gene, sample)'s mass whose source measures the gene;
         // `None` = fully observed.
@@ -885,94 +890,186 @@ pub fn resample_and_optimize(
 pub(super) const DEFAULT_NUM_LEVELS: usize = 2;
 pub(super) const DEFAULT_COARSEST_SORT_DIM: usize = 7;
 
+/// pb-samples of each group, in pb-sample order: with these one worker owns
+/// one output column of a `[· × group]` plane.
+fn pbsamps_by_group(pbsamp_to_group: &[usize], num_groups: usize) -> Vec<Vec<usize>> {
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); num_groups];
+    for (pbsamp, &g) in pbsamp_to_group.iter().enumerate() {
+        out[g].push(pbsamp);
+    }
+    out
+}
+
+/// The observed side of the finest stat — `observed_sum_ds`, `size_s` and,
+/// with two or more batches, `observed_sum_db` and `n_bs` — from the pb-sample
+/// aggregates instead of another pass over the data: a finest group is a union
+/// of pb-samples, each within one batch, so its sums are sums of
+/// `gene_sums`. `gene_sums` must be `data_vec`'s
+/// ([`collect_pb_sample_gene_sums`], multiplicity-weighted like the sizes
+/// here). Adds to whatever the stat already holds.
+pub(super) fn collect_observed_stat_from_pb_samples(
+    data_vec: &SparseIoVec,
+    layout: &PbSampleLayout,
+    gene_sums: &[Vec<(usize, f32)>],
+    pbsamp_to_group: &[usize],
+    stat: &mut CollapsedStat,
+) -> anyhow::Result<()> {
+    let num_pb = layout.cell_counts.len();
+    let num_genes = stat.num_genes();
+    let num_groups = stat.num_samples();
+    let num_batches = stat.num_batches();
+    anyhow::ensure!(
+        gene_sums.len() == num_pb && pbsamp_to_group.len() == num_pb,
+        "{} gene sums and {} group labels for {num_pb} pb-samples",
+        gene_sums.len(),
+        pbsamp_to_group.len(),
+    );
+    let with_batches = num_batches >= 2;
+
+    // Sizes: one multiplicity per column, as the columns are assigned.
+    for (c, &pbsamp) in layout.cell_to_pbsamp.iter().enumerate() {
+        if pbsamp == usize::MAX {
+            continue;
+        }
+        let w = data_vec.column_multiplicity(c);
+        let g = pbsamp_to_group[pbsamp];
+        stat.size_s[g] += w;
+        if with_batches {
+            stat.n_bs[(layout.pb_sample_to_batch[pbsamp], g)] += w;
+        }
+    }
+    if num_genes == 0 {
+        return Ok(());
+    }
+
+    let add_gene_sums = |column: &mut [f32], pbsamps: &Vec<usize>| {
+        for &pbsamp in pbsamps {
+            for &(gene, val) in &gene_sums[pbsamp] {
+                column[gene] += val;
+            }
+        }
+    };
+    // nalgebra stores column-major, so a `num_genes` chunk is one column.
+    stat.observed_sum_ds
+        .as_mut_slice()
+        .par_chunks_mut(num_genes)
+        .zip(pbsamps_by_group(pbsamp_to_group, num_groups).par_iter())
+        .for_each(|(column, pbsamps)| add_gene_sums(column, pbsamps));
+    if with_batches {
+        stat.observed_sum_db
+            .as_mut_slice()
+            .par_chunks_mut(num_genes)
+            .zip(pbsamps_by_group(&layout.pb_sample_to_batch, num_batches).par_iter())
+            .for_each(|(column, pbsamps)| add_gene_sums(column, pbsamps));
+    }
+    Ok(())
+}
+
 /// Cross-batch matched-stat accumulation on top of the pb-sample
-/// layout. For each fine-group, fetches `knn` matched cells from each
-/// non-own batch via `batch_knn_lookup`, dedupes them through their
-/// pb-samples, and emits the counterfactual gene sums into
-/// `stat.imputed_sum_ds` and the per-batch source mass into `stat.matched_bs`.
+/// layout. `matches[pbsamp]` are the pb-samples matched to `pbsamp` with
+/// their distances ([`per_batch_sc_neighbors`] under the same
+/// `anchor_batches`); their distance-weighted mean profile is the
+/// counterfactual, emitted as gene sums into `stat.imputed_sum_ds` and as
+/// per-batch source mass into `stat.matched_bs`.
 pub(super) fn collect_matched_stat_coarse(
     layout: &PbSampleLayout,
     gene_sums: &[Vec<(usize, f32)>],
     pbsamp_to_group: &[usize],
-    batch_knn_lookup: &[ColumnDict<usize>],
-    knn: usize,
+    matches: &[Vec<(usize, f32)>],
     anchor_batches: Option<&[usize]>,
     stat: &mut CollapsedStat,
 ) -> anyhow::Result<()> {
     let num_pb = layout.cell_counts.len();
     debug_assert_eq!(pbsamp_to_group.len(), num_pb);
+    anyhow::ensure!(
+        matches.len() == num_pb,
+        "{} match lists for {num_pb} pb-samples",
+        matches.len(),
+    );
 
     // The batches that source the counterfactual are the batches that pin δ:
     // recorded here, where that mass is written, so no caller can forget.
     stat.anchor_batches = anchor_batches.map(<[usize]>::to_vec).unwrap_or_default();
-    let neighbors_per_sc = per_batch_sc_neighbors(layout, batch_knn_lookup, knn, anchor_batches)?;
 
-    use indicatif::ParallelProgressIterator;
+    let num_genes = stat.num_genes();
+    let num_batches = stat.num_batches();
+    if num_genes == 0 || num_batches == 0 {
+        return Ok(());
+    }
+    let group_to_pbsamps = pbsamps_by_group(pbsamp_to_group, stat.num_samples());
+
     let prog_bar = styled_progress_bar(num_pb as u64, "pb-samples (matched stats)");
-    let arc_stat = Arc::new(Mutex::new(stat));
 
-    (0..num_pb)
-        .into_par_iter()
-        .progress_with(prog_bar.clone())
-        .for_each(|pbsamp_idx| {
-            let pbsamp_group = pbsamp_to_group[pbsamp_idx];
-            let sc_count = layout.cell_counts[pbsamp_idx];
+    // One group's pb-samples write one column of each plane (column-major
+    // storage: a `num_genes` / `num_batches` chunk), so the workers share
+    // nothing. Each holds a dense counterfactual, cleared through the list of
+    // genes a pb-sample touched.
+    stat.imputed_sum_ds
+        .as_mut_slice()
+        .par_chunks_mut(num_genes)
+        .zip(stat.matched_bs.as_mut_slice().par_chunks_mut(num_batches))
+        .zip(group_to_pbsamps.par_iter())
+        .for_each_init(
+            || (vec![0f32; num_genes], Vec::<usize>::new()),
+            |(y_hat, touched), ((imputed_s, matched_s), pbsamps)| {
+                for &pbsamp_idx in pbsamps {
+                    let sc_count = layout.cell_counts[pbsamp_idx];
+                    let filtered = &matches[pbsamp_idx];
+                    if sc_count < 1.0 || filtered.is_empty() {
+                        continue;
+                    }
 
-            if sc_count < 1.0 {
-                return;
-            }
+                    // Softmax weights from negative distances
+                    let max_neg_d = filtered
+                        .iter()
+                        .map(|(_, d)| -d)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let mut weights: Vec<f32> = filtered
+                        .iter()
+                        .map(|(_, d)| (-d - max_neg_d).exp())
+                        .collect();
+                    let w_sum: f32 = weights.iter().sum();
+                    if w_sum > 0.0 {
+                        weights.iter_mut().for_each(|w| *w /= w_sum);
+                    }
 
-            let filtered = &neighbors_per_sc[pbsamp_idx];
-            if filtered.is_empty() {
-                return;
-            }
+                    // Counterfactual: weighted average of matched pb-samples'
+                    // per-cell gene expression
+                    // y_hat[g] = sum_k w[k] * gene_sums[k][g] / cell_counts[k]
+                    for ((matched_sc, _), &w) in filtered.iter().zip(weights.iter()) {
+                        let matched_count = layout.cell_counts[*matched_sc];
+                        if matched_count < 1.0 {
+                            continue;
+                        }
+                        let inv_count = 1.0 / matched_count;
+                        for &(gene, val) in &gene_sums[*matched_sc] {
+                            // A gene whose sum is still zero may be listed
+                            // again; its second visit below adds zero.
+                            if y_hat[gene] == 0.0 {
+                                touched.push(gene);
+                            }
+                            y_hat[gene] += w * val * inv_count;
+                        }
+                    }
 
-            // Softmax weights from negative distances
-            let max_neg_d = filtered
-                .iter()
-                .map(|(_, d)| -d)
-                .fold(f32::NEG_INFINITY, f32::max);
-            let mut weights: Vec<f32> = filtered
-                .iter()
-                .map(|(_, d)| (-d - max_neg_d).exp())
-                .collect();
-            let w_sum: f32 = weights.iter().sum();
-            if w_sum > 0.0 {
-                weights.iter_mut().for_each(|w| *w /= w_sum);
-            }
+                    // imputed_sum_ds[g, s] += cell_counts[pbsamp] * y_hat[g]
+                    for gene in touched.drain(..) {
+                        imputed_s[gene] += sc_count * std::mem::take(&mut y_hat[gene]);
+                    }
 
-            // Counterfactual: weighted average of matched pb-samples'
-            // per-cell gene expression
-            // y_hat[g] = sum_k w[k] * gene_sums[k][g] / cell_counts[k]
-            let mut y_hat: HashMap<usize, f32> = HashMap::default();
-            for ((matched_sc, _), &w) in filtered.iter().zip(weights.iter()) {
-                let matched_count = layout.cell_counts[*matched_sc];
-                if matched_count < 1.0 {
-                    continue;
+                    // Source mass per batch: this pb-sample's `sc_count` cells
+                    // split their unit weight over the matched pb-samples'
+                    // batches.
+                    for ((matched_sc, _), &w) in filtered.iter().zip(weights.iter()) {
+                        if layout.cell_counts[*matched_sc] < 1.0 {
+                            continue;
+                        }
+                        matched_s[layout.pb_sample_to_batch[*matched_sc]] += sc_count * w;
+                    }
                 }
-                let inv_count = 1.0 / matched_count;
-                for &(gene, val) in &gene_sums[*matched_sc] {
-                    *y_hat.entry(gene).or_default() += w * val * inv_count;
-                }
-            }
-
-            let mut stat = arc_stat.lock().expect("lock stat");
-
-            // Accumulate imputed_sum_ds[g, s] += cell_counts[pbsamp] * y_hat[g]
-            for (&gene, &y) in &y_hat {
-                stat.imputed_sum_ds[(gene, pbsamp_group)] += sc_count * y;
-            }
-
-            // Source mass per batch: this pb-sample's `sc_count` cells split their
-            // unit weight over the matched pb-samples' batches.
-            for ((matched_sc, _), &w) in filtered.iter().zip(weights.iter()) {
-                if layout.cell_counts[*matched_sc] < 1.0 {
-                    continue;
-                }
-                stat.matched_bs[(layout.pb_sample_to_batch[*matched_sc], pbsamp_group)] +=
-                    sc_count * w;
-            }
-        });
+                prog_bar.inc(pbsamps.len() as u64);
+            },
+        );
 
     prog_bar.finish_and_clear();
     Ok(())
