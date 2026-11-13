@@ -419,6 +419,22 @@ pub(crate) fn write_batch_truth(
     Ok(())
 }
 
+/// Each simulated cell's reference group ([`crate::sim::copula::GroupFit`]),
+/// one name per line.
+pub(crate) fn write_reference_groups(
+    fit: &crate::sim::copula::GlobalCopulaFit,
+    groups: &[usize],
+    path: &str,
+) -> anyhow::Result<()> {
+    let lines: Vec<Box<str>> = groups
+        .iter()
+        .map(|&k| fit.groups[k].name.clone().into_boxed_str())
+        .collect();
+    write_lines(&lines, path)?;
+    info!("reference group of each cell: {path}");
+    Ok(())
+}
+
 /// Build a sparse backend from column-remapped triplets and register
 /// row/column names. Shared by the single-file and holdout-split write
 /// paths of [`run_simulate`].
@@ -686,7 +702,11 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
     info!("opening reference: {}", reference_path);
     let sc = open_reference(reference_path)?;
 
-    let fit = fit_global_copula(&cmd_args.fit.global_args(&sc))?;
+    let fit = fit_global_copula(
+        &cmd_args
+            .fit
+            .global_args(&sc, crate::sim::copula::DEFAULT_GROUPS),
+    )?;
 
     let dd = fit.n_genes;
     let nn = cmd_args.cols;
@@ -774,7 +794,7 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
         batch_delta: &batch_delta,
         batch_membership: &batch_membership,
     };
-    let (triplets, _) = sample_reference_counts(
+    let sample = sample_reference_counts(
         &fit,
         depth_offset,
         &programs,
@@ -782,6 +802,7 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
         cmd_args.rseed,
         0x5a5a_5a5a,
     )?;
+    let triplets = sample.triplets;
 
     info!(
         "sampled {} cells producing {} nonzero triplets from the reference",
@@ -800,8 +821,10 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
     let ln_batch_file = format!("{}.ln_batch.parquet", output);
     let r_file = format!("{}.r.parquet", output);
     let hvg_file = format!("{}.hvg.gz", output);
+    let group_file = format!("{}.ref_group.gz", output);
 
     remove_all_files(&vec![
+        group_file.clone().into_boxed_str(),
         backend_file.clone(),
         mtx_file.clone().into_boxed_str(),
         dict_file.clone().into_boxed_str(),
@@ -828,6 +851,7 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
         &batch_memb_file,
         &ln_batch_file,
     )?;
+    write_reference_groups(&fit, &sample.groups, &group_file)?;
     theta_kn.transpose().to_parquet_with_names(
         &prop_file,
         (Some(&col_names), Some("cell")),

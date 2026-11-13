@@ -12,8 +12,11 @@
 //! y_{g,j}     = F⁻¹_g(Φ(z*_g); rates × m_{g,j})
 //! ```
 //!
-//! `F_g` is the gene's Poisson mixture ([`crate::sim::copula::mixture`]),
-//! its rates scaled by the cell's mean multiplier `m_{g,j}`.
+//! `F_g` is the gene's Poisson mixture ([`crate::sim::copula::mixture`])
+//! in the cell's reference group ([`crate::sim::copula::groups`]), its
+//! rates scaled by the cell's mean multiplier `m_{g,j}`. Each group keeps
+//! its own budget below: the topic and noise terms are scaled and centred
+//! within the group's dispersion and over its simulated cells.
 //!
 //! - Depth enters through the latent: one `z_s ~ N(0, 1)` per cell, and
 //!   each gene moves with it as much as it does in the reference (`ρ_gs`).
@@ -40,9 +43,10 @@
 //!   stays outside that budget; it is centred so the mean over batches is
 //!   the reference mean.
 
+use crate::sim::copula::groups::{group_sizes, members};
 use crate::sim::copula::marginals::phi;
 use crate::sim::copula::mixture::{PoissonMixture, Prepared};
-use crate::sim::copula::GlobalCopulaFit;
+use crate::sim::copula::{GlobalCopulaFit, GroupFit};
 use crate::sim::core::standardized_log_topic;
 use indicatif::ParallelProgressIterator;
 use log::info;
@@ -106,12 +110,43 @@ pub struct CellPrograms<'a> {
     pub batch_membership: &'a [usize],
 }
 
-/// How the sampler scaled the per-cell term: gene `g`'s log-mean term is
-/// `amp[g] · t_{g,j} − centre[g]`.
+/// How the sampler scaled the per-cell term within one cell group: gene
+/// `g`'s log-mean term is `amp[g] · t_{g,j} − centre[g]`.
 pub struct TermScaling {
     pub amp: Vec<f32>,
     pub centre: Vec<f32>,
 }
+
+impl TermScaling {
+    /// The cell-weighted mean over groups of each gene's amplitude and
+    /// centre, `groups` the simulated cells' groups.
+    pub fn pooled(per_group: &[TermScaling], groups: &[usize]) -> Self {
+        let dd = per_group.first().map_or(0, |s| s.amp.len());
+        let counts = group_sizes(groups, per_group.len());
+        let n = groups.len().max(1) as f32;
+        let (mut amp, mut centre) = (vec![0.0_f32; dd], vec![0.0_f32; dd]);
+        for (s, &c) in per_group.iter().zip(&counts) {
+            let w = c as f32 / n;
+            for g in 0..dd {
+                amp[g] += w * s.amp[g];
+                centre[g] += w * s.centre[g];
+            }
+        }
+        Self { amp, centre }
+    }
+}
+
+/// One simulated count matrix: its non-zero counts, each cell's reference
+/// group ([`GlobalCopulaFit::groups`]), and per group how the per-cell term
+/// was scaled.
+pub struct ReferenceSample {
+    pub triplets: Triplets,
+    pub groups: Vec<usize>,
+    pub scaling: Vec<TermScaling>,
+}
+
+/// Mixed into the seed of the cells' groups.
+const GROUP_STREAM: u64 = 0x6705_5eed_0000_0001;
 
 /// Triplets `(gene, cell, count)` of the non-zero simulated counts.
 pub type Triplets = Vec<(u64, u64, f32)>;
@@ -126,11 +161,13 @@ pub fn depth_log_offset(fit: &GlobalCopulaFit, depth: Option<usize>) -> f32 {
     }
 }
 
-/// Sample one count matrix from a reference fit, with how the per-cell term
-/// was scaled. `depth_offset` shifts every gene's log mean
-/// ([`depth_log_offset`]); `couple_depth` ties the genes to one depth
-/// coordinate per cell as in the reference, instead of giving every cell the
-/// same expected depth. Cell `j` uses the seed `rseed + seed_offset + j`.
+/// Sample one count matrix from a reference fit. Each cell is drawn from
+/// one of the fit's groups, in the reference's proportions, and every term
+/// is scaled and centred within its group. `depth_offset` shifts every
+/// gene's log mean ([`depth_log_offset`]); `couple_depth` ties the genes to
+/// one depth coordinate per cell as in the reference, instead of giving
+/// every cell the same expected depth. Cell `j` uses the seed
+/// `rseed + seed_offset + j`.
 pub fn sample_reference_counts(
     fit: &GlobalCopulaFit,
     depth_offset: f32,
@@ -138,7 +175,7 @@ pub fn sample_reference_counts(
     couple_depth: bool,
     rseed: u64,
     seed_offset: u64,
-) -> anyhow::Result<(Triplets, TermScaling)> {
+) -> anyhow::Result<ReferenceSample> {
     let dd = fit.n_genes;
     let nn = programs.batch_membership.len();
     if let CellTerm::Topics { theta_kn, .. } = &programs.term {
@@ -165,13 +202,21 @@ pub fn sample_reference_counts(
         );
     }
     let topic = |j: usize| programs.term.at(j);
-    let budget = DispersionBudget::new(fit, programs, nn, &topic);
+    let groups = fit.draw_groups(nn, rseed.wrapping_add(seed_offset) ^ GROUP_STREAM);
+    let group_cells = members(&groups, fit.groups.len());
+    let budgets: Vec<DispersionBudget> = fit
+        .groups
+        .iter()
+        .zip(&group_cells)
+        .map(|(group, cells)| DispersionBudget::new(fit, group, programs, cells, &topic))
+        .collect();
     info!(
-        "reference sampler: topic term capped by the reference dispersion for {} genes; \
-         {} of {} active genes over their variance; depth {}",
-        budget.n_capped,
-        budget.n_over,
-        fit.active_genes.len(),
+        "reference sampler: {} group(s); topic term capped by the reference dispersion for {} \
+         gene-groups; {} of {} active gene-groups over their variance; depth {}",
+        fit.groups.len(),
+        budgets.iter().map(|b| b.n_capped).sum::<usize>(),
+        budgets.iter().map(|b| b.n_over).sum::<usize>(),
+        fit.active_genes.len() * fit.groups.len(),
         if couple_depth {
             "coupled as in the reference"
         } else {
@@ -179,29 +224,38 @@ pub fn sample_reference_counts(
         }
     );
     let batch_centre = batch_centre(programs.batch_delta, programs.batch_membership, dd);
-    let with_topic = budget.topic_amp.iter().any(|&a| a > 0.0);
-    let with_noise = budget.noise_amp.iter().any(|&b| b > 0.0);
-    // A gene with no per-cell term has one multiplier per batch: one CDF
-    // table per batch, searched per draw. The others walk their mixture.
-    let fixed = |g: usize| budget.topic_amp[g] == 0.0 && budget.noise_amp[g] == 0.0;
-    let tables: Vec<Vec<Vec<f64>>> = programs
-        .batch_delta
+    let with_topic = budgets.iter().any(|b| b.topic_amp.iter().any(|&a| a > 0.0));
+    // A gene with no per-cell term in a group has one multiplier per batch:
+    // one CDF table per group and batch, searched per draw. The others walk
+    // their mixture.
+    let fixed = |b: &DispersionBudget, g: usize| b.topic_amp[g] == 0.0 && b.noise_amp[g] == 0.0;
+    let tables: Vec<Vec<Vec<Vec<f64>>>> = budgets
         .iter()
-        .map(|shift| {
-            let mut per_gene = vec![Vec::new(); dd];
-            let built: Vec<(usize, Vec<f64>)> = fit
-                .active_genes
-                .par_iter()
-                .filter(|&&g| fixed(g))
-                .map(|&g| {
-                    let m = (depth_offset + shift[g] - batch_centre[g]).exp() as f64;
-                    (g, budget.marginal[g].cdf_table(m))
+        .zip(&group_cells)
+        .map(|(budget, cells)| {
+            programs
+                .batch_delta
+                .iter()
+                .map(|shift| {
+                    let mut per_gene = vec![Vec::new(); dd];
+                    if cells.is_empty() {
+                        return per_gene;
+                    }
+                    let built: Vec<(usize, Vec<f64>)> = fit
+                        .active_genes
+                        .par_iter()
+                        .filter(|&&g| fixed(budget, g))
+                        .map(|&g| {
+                            let m = (depth_offset + shift[g] - batch_centre[g]).exp() as f64;
+                            (g, budget.marginal[g].cdf_table(m))
+                        })
+                        .collect();
+                    for (g, t) in built {
+                        per_gene[g] = t;
+                    }
+                    per_gene
                 })
-                .collect();
-            for (g, t) in built {
-                per_gene[g] = t;
-            }
-            per_gene
+                .collect()
         })
         .collect();
 
@@ -219,6 +273,9 @@ pub fn sample_reference_counts(
                 0.0
             };
             let t = with_topic.then(|| topic(j));
+            let k = groups[j];
+            let (budget, group) = (&budgets[k], &fit.groups[k]);
+            let with_noise = budget.with_noise;
             let b = programs.batch_membership[j];
             let shift = &programs.batch_delta[b];
             let z_hvg = fit.copula.sample(&mut rng);
@@ -237,11 +294,15 @@ pub fn sample_reference_counts(
                     Some(h) => z_hvg[h as usize],
                     None => normal.sample(&mut rng),
                 };
-                let rho = if couple_depth { fit.depth_rho[g] } else { 0.0 };
+                let rho = if couple_depth {
+                    group.depth_rho[g]
+                } else {
+                    0.0
+                };
                 let z = rho * z_depth + (1.0 - rho * rho).max(0.0).sqrt() * e;
                 let u = phi(z as f64).clamp(1e-7, 1.0 - 1e-7);
-                let x = if fixed(g) {
-                    tables[b][g].partition_point(|&f| f < u) as u32
+                let x = if fixed(budget, g) {
+                    tables[k][b][g].partition_point(|&f| f < u) as u32
                 } else {
                     let m = (ln_m as f64).exp();
                     if !m.is_finite() || m <= 0.0 {
@@ -257,11 +318,18 @@ pub fn sample_reference_counts(
         })
         .flatten()
         .collect();
-    let scaling = TermScaling {
-        amp: budget.topic_amp,
-        centre: budget.ln_m1,
-    };
-    Ok((triplets, scaling))
+    let scaling = budgets
+        .into_iter()
+        .map(|b| TermScaling {
+            amp: b.topic_amp,
+            centre: b.ln_m1,
+        })
+        .collect();
+    Ok(ReferenceSample {
+        triplets,
+        groups,
+        scaling,
+    })
 }
 
 /// `ln E_b[exp δ_{g,b}]` over the cells' batches: subtracting it keeps a
@@ -295,22 +363,42 @@ struct DispersionBudget {
     n_over: usize,
     topic_amp: Vec<f32>,
     noise_amp: Vec<f32>,
+    with_noise: bool,
     ln_m1: Vec<f32>,
     marginal: Vec<Prepared>,
 }
 
 impl DispersionBudget {
+    /// The budget of `group`'s genes over its simulated `cells`.
     fn new(
         fit: &GlobalCopulaFit,
+        group: &GroupFit,
         programs: &CellPrograms,
-        nn: usize,
+        cells: &[usize],
         topic: &(impl Fn(usize) -> DVector<f32> + Sync),
     ) -> Self {
+        let nn = cells.len();
+        if nn == 0 {
+            // No simulated cell is drawn from this group.
+            return Self {
+                n_capped: 0,
+                n_over: 0,
+                topic_amp: vec![0.0; fit.n_genes],
+                noise_amp: vec![0.0; fit.n_genes],
+                with_noise: false,
+                ln_m1: vec![0.0; fit.n_genes],
+                marginal: Vec::new(),
+            };
+        }
         let dd = fit.n_genes;
         let genes = &fit.active_genes;
         let alpha_topic = (programs.pve_topic.max(0.0) as f64).sqrt();
         let alpha_noise = (programs.pve_noise.max(0.0) as f64).sqrt();
-        let budget: Vec<f64> = fit.marginals.iter().map(|m| m.rate_cv2().ln_1p()).collect();
+        let budget: Vec<f64> = group
+            .marginals
+            .iter()
+            .map(|m| m.rate_cv2().ln_1p())
+            .collect();
 
         let mut topic_amp = vec![0.0_f32; dd];
         let mut ln_m1 = vec![0.0_f32; dd];
@@ -318,8 +406,8 @@ impl DispersionBudget {
         let mut n_capped = 0;
         if alpha_topic > 0.0 && nn > 0 {
             // Moments over the active genes, in their order.
-            let (mean_t, mean_t2) = first_two_moments(genes.len(), nn, |j, out| {
-                let t = topic(j);
+            let (mean_t, mean_t2) = first_two_moments(genes.len(), nn, |i, out| {
+                let t = topic(cells[i]);
                 for (o, &g) in out.iter_mut().zip(genes) {
                     *o = t[g] as f64;
                 }
@@ -333,8 +421,8 @@ impl DispersionBudget {
             }
             // `E[T]` and `E[T²]` of `T = exp(amp_g · t_g)` over `idx`.
             let exp_moments = |amp: &[f32], idx: &[usize]| {
-                first_two_moments(idx.len(), nn, |j, out| {
-                    let t = topic(j);
+                first_two_moments(idx.len(), nn, |i, out| {
+                    let t = topic(cells[i]);
                     for (o, &g) in out.iter_mut().zip(idx) {
                         *o = ((amp[g] * t[g]) as f64).exp();
                     }
@@ -398,16 +486,17 @@ impl DispersionBudget {
             .into_par_iter()
             .map(|g| {
                 if noise_amp[g] == 0.0 && spread[g] <= 1.0 {
-                    return (fit.marginals[g].clone(), true);
+                    return (group.marginals[g].clone(), true);
                 }
                 let b = noise_amp[g] as f64;
-                fit.marginals[g].leaving_room_for(spread[g] * (b * b).exp())
+                group.marginals[g].leaving_room_for(spread[g] * (b * b).exp())
             })
             .collect();
         let n_over = genes.iter().filter(|&&g| !left[g].1).count();
         Self {
             n_capped,
             n_over,
+            with_noise: noise_amp.iter().any(|&b| b > 0.0),
             topic_amp,
             noise_amp,
             ln_m1,

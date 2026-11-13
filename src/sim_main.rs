@@ -150,8 +150,10 @@ enum Commands {
                       both can be 1. `depth` is the **expected** library size. It is emergent,\n\
                       with no per-cell rescaling.\n\
                       \n\
-                      Reference mode (`--reference <h5/zarr>`): Poisson-mixture marginals + latent Gaussian copula.\n\
-                      Each gene keeps its reference count distribution F_g, a Poisson mixture:\n\
+                      Reference mode (`--reference <h5/zarr>`): Poisson-mixture marginals + latent Gaussian copula,\n\
+                      fitted per reference cell group (`--reference-groups`, k-means; or `--reference-labels`).\n\
+                      Each cell is drawn from one group in the reference's proportions, and each\n\
+                      gene keeps its count distribution F_g within the group, a Poisson mixture:\n\
                       \x20 log λ = log μ̂_g + a_g·t − ln M1_g + b_g·ε − b_g²/2 + δ_{g,b} − c_g\n\
                       \x20 z*_g  = ρ_gs·z_s + √(1−ρ_gs²)·e_g,   y = F⁻¹_g(Φ(z*_g); rates × λ/μ̂_g)\n\
                       t is z-scored log(β·θ) per cell, ε iid N(0, 1); a_g = √pve_topic and\n\

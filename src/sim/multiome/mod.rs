@@ -845,7 +845,9 @@ pub fn run_multiome(args: &MultiomeArgs) -> anyhow::Result<()> {
 }
 
 fn fit_modality_copula(sc: &SparseRef, args: &MultiomeArgs) -> anyhow::Result<GlobalCopulaFit> {
-    fit_global_copula(&args.fit.global_args(sc))
+    // Paired modalities share each cell's identity, which independent
+    // per-modality group draws would break: one population unless asked.
+    fit_global_copula(&args.fit.global_args(sc, 1))
 }
 
 /// Standardize a row to mean 0, unit variance (in place). Zero-variance rows
@@ -1159,8 +1161,8 @@ fn sample_with_reference(
         batch_delta: &batch_delta,
         batch_membership,
     };
-    let (triplets, _) =
-        sample_reference_counts(fit, depth_offset, &programs, couple_depth, rseed, 1)?;
+    let triplets =
+        sample_reference_counts(fit, depth_offset, &programs, couple_depth, rseed, 1)?.triplets;
 
     Ok((triplets, batch_delta))
 }
@@ -1434,7 +1436,18 @@ mod tests {
                 };
                 dd
             ],
-            depth_rho: vec![0.3; dd],
+            groups: vec![crate::sim::copula::GroupFit {
+                name: "all".into(),
+                share: 1.0,
+                marginals: vec![
+                    PoissonMixture {
+                        rates: vec![mu as f64 * 0.2, mu as f64 * 1.8],
+                        weights: vec![0.5, 0.5],
+                    };
+                    dd
+                ],
+                depth_rho: vec![0.3; dd],
+            }],
             active_genes: (0..dd).collect(),
             hvg_pos,
             copula: CopulaCovariance::random_low_rank(n_hvg, 3, rng),

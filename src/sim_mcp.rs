@@ -23,9 +23,10 @@ columns) in the backends data-beans reads.
 
 The usual loop:
 1. simulate_from_reference fits a real reference (.zarr.zip, .zarr or .h5) \
-and simulates cells from it: each gene keeps its reference count distribution, \
-cells vary in depth as the reference's do, and the copula genes keep their \
-latent correlation. Topics (`factors`, `pve_topic`) and batches (`batches`, \
+and simulates cells from it, group by group (`reference_groups` k-means \
+groups of its cells, in its proportions): each gene keeps its count \
+distribution within the group, cells vary in depth as the reference's do, and \
+the copula genes keep their latent correlation. Topics (`factors`, `pve_topic`) and batches (`batches`, \
 `pve_batch`) add known structure on top. It returns the written files and \
 the fidelity summary.
 2. fidelity reads a run's `{out}.fidelity.json`: library size, detected \
@@ -89,6 +90,7 @@ fn tools() -> Vec<ToolSpec> {
                     "pve_batch": number("Batch effect size (default 1; no effect with one batch)"),
                     "n_hvg": integer("Copula genes (default 2000)"),
                     "hvg_min_detection": number("Smallest share of reference cells a copula gene is detected in (default 0.005, at least 50 cells)"),
+                    "reference_groups": integer("Cell groups the reference is fitted in, each with its own count distributions (default 8; 1 is one population)"),
                     "fixed_depth": { "type": "boolean", "description": "Same expected depth for every cell (default false)" },
                     "seed": integer("Random seed (default 42)"),
                     "out": out,
@@ -107,6 +109,7 @@ fn tools() -> Vec<ToolSpec> {
                     "rows": integer("Genes in synthetic mode (required without a reference)"),
                     "cols": integer("Cells to simulate (default 1000)"),
                     "lineages": integer("Lineages from one root (default 3; 1 is a single linear branch)"),
+                    "reference_groups": integer("Reference cell groups crossed with the trajectory (default 1: the tree is the only structure)"),
                     "tree": { "type": "string", "description": "Parent of each branch after the root, e.g. \"0,0,1,1\"; overrides `lineages`" },
                     "dynamic_genes": number("Share of genes that change along the trajectory (default 0.2)"),
                     "pve_trajectory": number("Log-variance of a dynamic gene's curve, capped by its reference dispersion (default 1)"),
@@ -236,6 +239,7 @@ fn simulate_from_reference(args: &Value, cx: &Call) -> Result<Value> {
             ("pve_batch", "--pve-batch"),
             ("n_hvg", "--n-hvg"),
             ("hvg_min_detection", "--hvg-min-detection"),
+            ("reference_groups", "--reference-groups"),
             ("seed", "--rseed"),
         ],
         &mut argv,
@@ -264,6 +268,7 @@ fn simulate_trajectory(args: &Value, cx: &Call) -> Result<Value> {
             ("rows", "--rows"),
             ("cols", "--cols"),
             ("lineages", "--lineages"),
+            ("reference_groups", "--reference-groups"),
             ("dynamic_genes", "--dynamic-genes"),
             ("pve_trajectory", "--pve-trajectory"),
             ("pve_noise", "--pve-noise"),

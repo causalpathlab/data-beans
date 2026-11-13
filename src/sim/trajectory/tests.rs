@@ -285,6 +285,7 @@ fn reference_moments_stay_near_the_reference() -> anyhow::Result<()> {
         copula_rank: 10,
         regularization: 1e-3,
         hvg_min_detection: 0.005,
+        groups: crate::sim::copula::GroupSpec::Cluster(1),
     })?;
     let tree = LineageTree::star(3)?;
     let mut r = rng(5);
@@ -305,7 +306,8 @@ fn reference_moments_stay_near_the_reference() -> anyhow::Result<()> {
             batch_delta: &delta,
             batch_membership: &membership,
         };
-        let (trips, scaling) = sample_reference_counts(&fit, 0.0, &programs, true, 9, 0)?;
+        let mut sample = sample_reference_counts(&fit, 0.0, &programs, true, 9, 0)?;
+        let (trips, scaling) = (sample.triplets, sample.scaling.swap_remove(0));
         let mut s1 = vec![0.0_f64; dd];
         let mut s2 = vec![0.0_f64; dd];
         for &(g, _, x) in &trips {

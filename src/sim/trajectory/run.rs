@@ -11,7 +11,8 @@ use crate::sim::copula::sampler::{
 use crate::sim::copula::{fit_global_copula, GlobalCopulaFit, ReferenceFitArgs};
 use crate::sim::core::{library_scale, sample_lognormal_dictionary};
 use crate::sim::handlers::{
-    batch_covariance, build_and_write_backend, write_batch_truth, BatchProgram,
+    batch_covariance, build_and_write_backend, write_batch_truth, write_reference_groups,
+    BatchProgram,
 };
 use crate::sparse_io::*;
 use crate::zarr_io::apply_zip_flag;
@@ -370,7 +371,8 @@ pub fn run_trajectory(args: &TrajectoryArgs) -> anyhow::Result<()> {
         Some(reference) => {
             info!("opening reference: {reference}");
             let sc = open_reference(reference)?;
-            let fit = fit_global_copula(&args.fit.global_args(&sc))?;
+            // The tree is the cells' structure: one population unless asked.
+            let fit = fit_global_copula(&args.fit.global_args(&sc, 1))?;
             let structure = Structure::sample(args, fit.n_genes, Some(&fit), &mut rng)?;
             let term = |j: usize| structure.term(j);
             let programs = CellPrograms {
@@ -381,7 +383,7 @@ pub fn run_trajectory(args: &TrajectoryArgs) -> anyhow::Result<()> {
                 batch_delta: &structure.batch_delta,
                 batch_membership: &structure.batch_membership,
             };
-            let (triplets, scaling) = sample_reference_counts(
+            let sample = sample_reference_counts(
                 &fit,
                 depth_log_offset(&fit, args.depth),
                 &programs,
@@ -389,9 +391,14 @@ pub fn run_trajectory(args: &TrajectoryArgs) -> anyhow::Result<()> {
                 args.rseed,
                 0x7a7a_7a7a,
             )?;
-            let report = fit.write_fidelity_report(&triplets, args.cols, reference, &prefix)?;
+            let report =
+                fit.write_fidelity_report(&sample.triplets, args.cols, reference, &prefix)?;
             info!("fidelity report: {report}");
-            (structure, triplets, fit.gene_names.clone(), scaling)
+            write_reference_groups(&fit, &sample.groups, &format!("{prefix}.ref_group.gz"))?;
+            // Each group scales the curves within its own dispersion; the
+            // ground truth reports their cell-weighted mean.
+            let scaling = TermScaling::pooled(&sample.scaling, &sample.groups);
+            (structure, sample.triplets, fit.gene_names.clone(), scaling)
         }
     };
 
