@@ -287,6 +287,10 @@ pub struct ReferenceLatent {
     /// Latent correlation of the HVGs given the library coordinate:
     /// `(ρ_hk − ρ_hs ρ_ks) / √((1 − ρ_hs²)(1 − ρ_ks²))`, unit diagonal.
     pub hvg_residual: DMatrix<f64>,
+    /// Per HVG, `c_1` of its latent scores ([`LatentScores`]): the share of
+    /// the latent variance one count carries, which sets how much these
+    /// cells say about its correlations.
+    pub hvg_information: Vec<f64>,
 }
 
 impl ReferenceLatent {
@@ -353,6 +357,7 @@ impl ReferenceLatent {
             .iter()
             .map(|&g| scores[g].clone().expect("HVG scores were built"))
             .collect();
+        let hvg_information = hvg_scores.iter().map(|s| s.c[0]).collect();
         let m = centred_scores(mat, libs.len(), hvg, &hvg_scores, hist);
         let joint = pairwise_correlation(&m, &hvg_scores);
         let hvg_residual = DMatrix::from_fn(hvg.len(), hvg.len(), |i, k| {
@@ -366,6 +371,7 @@ impl ReferenceLatent {
         Self {
             depth_rho: depth_rho.iter().map(|&r| r as f32).collect(),
             hvg_residual,
+            hvg_information,
         }
     }
 }
