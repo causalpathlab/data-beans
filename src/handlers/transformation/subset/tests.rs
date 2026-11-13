@@ -5,6 +5,7 @@
 //! subcommand leaves a `.zarr.zip`. A pipeline that feeds one subcommand's
 //! output to the next then breaks on the path alone.
 
+use super::super::tests::input_in;
 use super::super::{ReorderRowsArgs, SubsetColumnsArgs, SubsetRowsArgs};
 use crate::handlers::cell_qc::CellQcArgs;
 use clap::Parser;
@@ -130,24 +131,6 @@ fn subset_into(out: &str) -> (tempfile::TempDir, Vec<String>) {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     (dir, left)
-}
-
-/// A 3 x 4 backend at `in.zarr` of `dir`, rows g0..g2 and columns c0..c3:
-/// 1 and 4 on g0 (c0, c3), 2 on g1 (c1), 3 on g2 (c2).
-fn input_in(dir: &std::path::Path) -> String {
-    use crate::sparse_io::create_sparse_from_triplets;
-    let input = dir.join("in.zarr").to_str().unwrap().to_string();
-    let triplets = [(0, 0, 1.0), (1, 1, 2.0), (2, 2, 3.0), (0, 3, 4.0)];
-    let mut data = create_sparse_from_triplets(
-        &triplets,
-        (3, 4, triplets.len()),
-        Some(&input),
-        Some(&crate::sparse_io::SparseIoBackend::Zarr),
-    )
-    .unwrap();
-    data.register_row_names_vec(&["g0".into(), "g1".into(), "g2".into()]);
-    data.register_column_names_vec(&["c0".into(), "c1".into(), "c2".into(), "c3".into()]);
-    input
 }
 
 /// The backend at `path`: its row names, and its rows' values.

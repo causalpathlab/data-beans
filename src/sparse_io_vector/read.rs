@@ -29,21 +29,6 @@ fn remap_row(
     })
 }
 
-/// Sort `triplets` by (column, row) and sum the values of the entries that
-/// share both, leaving one entry per coordinate. The sort is stable, so a
-/// coordinate's values are summed in the order they arrived, as the dense
-/// readers accumulate them: float sums depend on the order.
-fn sum_duplicate_coordinates(triplets: &mut Vec<(u64, u64, f32)>) {
-    triplets.sort_by_key(|&(r, c, _)| (c, r));
-    triplets.dedup_by(|next, kept| {
-        let same = next.0 == kept.0 && next.1 == kept.1;
-        if same {
-            kept.2 += next.2;
-        }
-        same
-    });
-}
-
 impl SparseIoVec {
     /// True when some row is observed by more than one backend, so a column
     /// that several backends contribute to can receive two values at one row.
@@ -152,7 +137,7 @@ impl SparseIoVec {
             }
 
             // Divided after the duplicates are summed: one factor per column.
-            sum_duplicate_coordinates(&mut pending);
+            crate::sparse_util::sum_duplicate_triplets(&mut pending);
             for (r, c, v) in pending.drain(..) {
                 f(r, c, v / scale[c as usize]);
             }
@@ -434,7 +419,7 @@ impl SparseIoVec {
         }
 
         if has_duplicates {
-            sum_duplicate_coordinates(&mut triplets);
+            crate::sparse_util::sum_duplicate_triplets(&mut triplets);
         }
         // Divided after the duplicates are summed: one factor per column.
         if let Some(scales) = self.column_scales.as_ref() {
@@ -486,32 +471,5 @@ impl SparseIoVec {
     {
         let ((nrow, ncol), triplets) = self.rows_triplets(rows)?;
         Tensor::from_nonzero_triplets(nrow, ncol, &triplets)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sum_duplicate_coordinates;
-
-    /// Three values on each coordinate whose sum depends on the order:
-    /// `(1e8 + 1) - 1e8` is 0 in `f32`, `(1e8 - 1e8) + 1` is 1. Enough
-    /// coordinates that a sort has to move entries past their equals.
-    #[test]
-    fn values_on_one_coordinate_are_summed_in_the_order_they_arrived() {
-        let n = 5_000u64;
-        let mut triplets: Vec<(u64, u64, f32)> = Vec::new();
-        for value in [1e8_f32, 1.0, -1e8] {
-            // Descending, so sorting reverses the coordinates.
-            triplets.extend((0..n).rev().map(|k| (k % 50, k / 50, value)));
-        }
-        sum_duplicate_coordinates(&mut triplets);
-        assert_eq!(triplets.len(), n as usize);
-        assert!(triplets
-            .windows(2)
-            .all(|w| (w[0].1, w[0].0) < (w[1].1, w[1].0)));
-        assert!(
-            triplets.iter().all(|&(_, _, x)| x == 0.0),
-            "summed out of arrival order"
-        );
     }
 }

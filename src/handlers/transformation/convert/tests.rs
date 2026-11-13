@@ -1,21 +1,13 @@
 //! `convert` writes the same matrix in another container or format, and
 //! never over the file it reads.
 
+use super::super::tests::input_in;
 use super::*;
 
-/// A 3 x 4 backend at `in.zarr` of `dir`, rows g0..g2 and columns c0..c3.
+/// The shared 3 x 4 input, with a producer in its metadata.
 fn fixture(dir: &std::path::Path) -> String {
-    let path = dir.join("in.zarr").to_str().unwrap().to_string();
-    let triplets = [(0, 0, 1.0), (1, 1, 2.0), (2, 2, 3.0), (0, 3, 4.0)];
-    let mut data = create_sparse_from_triplets(
-        &triplets,
-        (3, 4, triplets.len()),
-        Some(&path),
-        Some(&SparseIoBackend::Zarr),
-    )
-    .unwrap();
-    data.register_row_names_vec(&["g0".into(), "g1".into(), "g2".into()]);
-    data.register_column_names_vec(&["c0".into(), "c1".into(), "c2".into(), "c3".into()]);
+    let path = input_in(dir);
+    let mut data = open_sparse_matrix(&path, &SparseIoBackend::Zarr).unwrap();
     data.set_meta(meta::PRODUCER, "p1").unwrap();
     path
 }

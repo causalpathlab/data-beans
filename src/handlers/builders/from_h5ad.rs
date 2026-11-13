@@ -180,9 +180,7 @@ pub fn run_build_from_h5ad(args: &FromH5adArgs) -> anyhow::Result<()> {
     // AnnData stores (obs x var) = (cells x features), but data-beans
     // convention is (features x cells). We swap the pointer type to
     // transpose: CSR -> Column pointers, CSC -> Row pointers.
-    let declared = declared_shape(&x_group);
-    let n_obs = declared.map(|(n_obs, _)| n_obs);
-    let n_var = declared.map(|(_, n_var)| n_var);
+    let (n_obs, n_var) = declared_shape(&x_group).unzip();
     let pointer_type = sparse_pointer_type(
         &x_group,
         x_path,
@@ -522,23 +520,12 @@ fn write_sample_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::exporters::{vlu, write_str_attr};
     use hdf5::types::VarLenUnicode;
     use std::path::Path;
 
-    fn vlu(s: &str) -> VarLenUnicode {
-        s.parse().unwrap()
-    }
-
-    fn write_attr(loc: &hdf5::Location, name: &str, value: &str) {
-        loc.new_attr::<VarLenUnicode>()
-            .create(name)
-            .unwrap()
-            .write_scalar(&vlu(value))
-            .unwrap();
-    }
-
     fn write_strings(group: &hdf5::Group, name: &str, values: &[&str]) {
-        let values: Vec<VarLenUnicode> = values.iter().map(|v| vlu(v)).collect();
+        let values: Vec<VarLenUnicode> = values.iter().map(|v| vlu(v).unwrap()).collect();
         group
             .new_dataset::<VarLenUnicode>()
             .shape(values.len())
@@ -557,9 +544,9 @@ mod tests {
         columns: &[(&str, &[&str])],
     ) {
         let group = file.create_group(name).unwrap();
-        write_attr(&group, "_index", index.0);
+        write_str_attr(&group, "_index", index.0).unwrap();
         write_strings(&group, index.0, index.1);
-        let order: Vec<VarLenUnicode> = columns.iter().map(|(c, _)| vlu(c)).collect();
+        let order: Vec<VarLenUnicode> = columns.iter().map(|(c, _)| vlu(c).unwrap()).collect();
         group
             .new_attr::<VarLenUnicode>()
             .shape([order.len()])
@@ -584,7 +571,7 @@ mod tests {
     ) {
         let x = file.create_group("X").unwrap();
         if let Some((name, value)) = format {
-            write_attr(&x, name, value);
+            write_str_attr(&x, name, value).unwrap();
         }
         if let Some((name, value)) = shape {
             x.new_attr::<i64>()

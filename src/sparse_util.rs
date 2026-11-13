@@ -105,9 +105,48 @@ impl<'a> SparseTripletsTraits for ValuesIndicesPointers<'a> {
     }
 }
 
+/// Sort `triplets` by (column, row), the order the backend writer sorts by
+/// first, and sum the values of the entries that share both, leaving one
+/// entry per coordinate. The sort is stable, so a coordinate's values are
+/// summed in the order they arrived, as the dense readers accumulate them:
+/// float sums depend on the order.
+pub(crate) fn sum_duplicate_triplets(triplets: &mut Vec<(u64, u64, f32)>) {
+    use rayon::prelude::*;
+    triplets.par_sort_by_key(|&(r, c, _)| (c, r));
+    triplets.dedup_by(|later, kept| {
+        let same = (later.0, later.1) == (kept.0, kept.1);
+        if same {
+            kept.2 += later.2;
+        }
+        same
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three values on each coordinate whose sum depends on the order:
+    /// `(1e8 + 1) - 1e8` is 0 in `f32`, `(1e8 - 1e8) + 1` is 1. Enough
+    /// coordinates that a sort has to move entries past their equals.
+    #[test]
+    fn values_on_one_coordinate_are_summed_in_the_order_they_arrived() {
+        let n = 5_000u64;
+        let mut triplets: Vec<(u64, u64, f32)> = Vec::new();
+        for value in [1e8_f32, 1.0, -1e8] {
+            // Descending, so sorting reverses the coordinates.
+            triplets.extend((0..n).rev().map(|k| (k % 50, k / 50, value)));
+        }
+        sum_duplicate_triplets(&mut triplets);
+        assert_eq!(triplets.len(), n as usize);
+        assert!(triplets
+            .windows(2)
+            .all(|w| (w[0].1, w[0].0) < (w[1].1, w[1].0)));
+        assert!(
+            triplets.iter().all(|&(_, _, x)| x == 0.0),
+            "summed out of arrival order"
+        );
+    }
 
     /// The triplets a sequential walk of the compressed vectors gives.
     fn walk(

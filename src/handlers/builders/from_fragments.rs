@@ -495,21 +495,6 @@ impl TripletAccum {
     }
 }
 
-/// Sum the triplets that share a (row, column) into one, each sum taken in
-/// the order its terms stand in `triplets`. Leaves them sorted by column,
-/// then row, the order the backend writer sorts by first.
-fn sum_duplicate_triplets(triplets: &mut Vec<(u64, u64, f32)>) {
-    use rayon::prelude::*;
-    triplets.par_sort_by_key(|&(r, c, _)| (c, r));
-    triplets.dedup_by(|later, kept| {
-        let same = (later.0, later.1) == (kept.0, kept.1);
-        if same {
-            kept.2 += later.2;
-        }
-        same
-    });
-}
-
 ///////////////////////////////////////////////////////////////////////
 // Parallel fragments path: preload entire (decompressed) TSV into   //
 // memory, split at newline boundaries, parse + aggregate per-thread //
@@ -917,7 +902,7 @@ fn run_fragments_preload_parallel(
                 }),
         );
     }
-    sum_duplicate_triplets(&mut triplets);
+    crate::sparse_util::sum_duplicate_triplets(&mut triplets);
 
     Ok(triplets)
 }
@@ -1473,13 +1458,5 @@ mod tests {
             assert_eq!(got, want);
             assert_eq!(regrouped, lines.len() > grouped.len());
         }
-    }
-
-    #[test]
-    fn duplicate_triplets_are_summed_in_their_order() {
-        let (a, b, c) = (0.1f32, 0.7f32, 1e-8f32);
-        let mut t = vec![(1, 0, a), (0, 1, 2.0), (1, 0, b), (0, 0, 5.0), (1, 0, c)];
-        sum_duplicate_triplets(&mut t);
-        assert_eq!(t, [(0, 0, 5.0), (1, 0, (a + b) + c), (0, 1, 2.0)]);
     }
 }

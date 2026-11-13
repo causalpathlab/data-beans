@@ -356,13 +356,13 @@ fn load_aligned_metadata(
 //////////////////////
 
 /// Encode a Rust string as an HDF5 variable-length UTF-8 string.
-fn vlu(s: &str) -> anyhow::Result<VarLenUnicode> {
+pub(crate) fn vlu(s: &str) -> anyhow::Result<VarLenUnicode> {
     s.parse::<VarLenUnicode>()
         .map_err(|e| anyhow::anyhow!("cannot encode '{}' as an HDF5 string: {}", s, e))
 }
 
 /// Write a scalar UTF-8 string attribute onto a group or dataset.
-fn write_str_attr(loc: &hdf5::Location, name: &str, value: &str) -> anyhow::Result<()> {
+pub(crate) fn write_str_attr(loc: &hdf5::Location, name: &str, value: &str) -> anyhow::Result<()> {
     loc.new_attr::<VarLenUnicode>()
         .create(name)?
         .write_scalar(&vlu(value)?)?;
