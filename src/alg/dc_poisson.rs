@@ -592,11 +592,8 @@ impl NullLog {
 
     /// The moments for a block of mass `size` at each class rate.
     fn row(&self, size: f64, classes: &RateClasses, mean: &mut [f64], var: &mut [f64]) {
-        let ln_size = if size > 0.0 {
-            size.ln()
-        } else {
-            f64::NEG_INFINITY
-        };
+        // `ln 0 = −∞`: an empty block has rate zero everywhere.
+        let ln_size = size.ln();
         for (((m, v), &rate), &ln_rate) in mean
             .iter_mut()
             .zip(var.iter_mut())
@@ -633,11 +630,19 @@ struct RateClasses {
 
 impl RateClasses {
     /// Classes covering pooled rates from `min_entry / total` to
-    /// `max_pooled / total`, with an octave to spare on either side.
-    fn new(max_pooled: f64, min_entry: f64, total: f64) -> Self {
+    /// `max_pooled / rest_min`, with an octave to spare on either side.
+    ///
+    /// An entity's rates are taken without it, `(P_g − y_eg) / (T − s_e)`,
+    /// so the largest is bounded by `max_pooled` over the smallest
+    /// remainder `rest_min = T − max_e s_e`, which an entity holding much
+    /// of the mass pushes well above `max_pooled / T`.
+    fn new(max_pooled: f64, min_entry: f64, total: f64, rest_min: f64) -> Self {
         let ln2 = std::f64::consts::LN_2;
         let (top, len) = if total > 0.0 && max_pooled > 0.0 && min_entry.is_finite() {
-            let top = (max_pooled / total).ln() + ln2;
+            // A lone entity with mass has no rate but zero; any positive
+            // remainder will do then.
+            let rest_min = if rest_min > 0.0 { rest_min } else { total };
+            let top = (max_pooled / rest_min.min(total)).ln() + ln2;
             let bottom = (min_entry / total).ln() - ln2;
             let span = ((top - bottom) / CLASS_STEP).ceil() as usize;
             (top, (span + 2).clamp(3, MAX_CLASSES))
@@ -824,7 +829,11 @@ impl DcPoissonStats {
         }
         let total: f64 = pooled.iter().sum();
         let max_pooled = pooled.iter().copied().fold(0f64, f64::max);
-        let classes = RateClasses::new(max_pooled, min_entry, total);
+        let max_sf = profiles
+            .size_factor
+            .iter()
+            .fold(0f64, |a, &s| a.max(s as f64));
+        let classes = RateClasses::new(max_pooled, min_entry, total, total - max_sf);
         let jj = classes.len();
 
         // Each entity's counts on the rate grid, the pooled rate of a
@@ -1183,9 +1192,7 @@ pub fn sample_categorical_log_restricted(
     for &k in allowed {
         let lp = log_probs[k];
         if lp.is_finite() {
-            let u: f64 = rng.random_range(1e-12..1.0_f64);
-            let g = -(-u.ln()).ln();
-            let key = lp + g;
+            let key = gumbel_key(lp, rng);
             if key > best_key {
                 best_key = key;
                 best_idx = k;
@@ -1193,6 +1200,13 @@ pub fn sample_categorical_log_restricted(
         }
     }
     best_idx
+}
+
+/// `lp` plus a standard Gumbel draw: the key of a Gumbel-max draw.
+#[inline]
+fn gumbel_key(lp: f64, rng: &mut SmallRng) -> f64 {
+    let u: f64 = rng.random_range(1e-12..1.0_f64);
+    lp - (-u.ln()).ln()
 }
 
 /// Argmax over `allowed` indices.
@@ -1254,20 +1268,16 @@ fn sample_improving_log(
     rng: &mut SmallRng,
 ) -> usize {
     let cur_val = staying_score(log_probs, allowed, current);
-    let mut gumbel = |lp: f64| {
-        let u: f64 = rng.random_range(1e-12..1.0_f64);
-        lp - (-u.ln()).ln()
-    };
     let mut best_idx = current;
     let mut best_key = if cur_val.is_finite() {
-        gumbel(cur_val)
+        gumbel_key(cur_val, rng)
     } else {
         f64::NEG_INFINITY
     };
     for &k in allowed {
         let lp = log_probs[k];
         if k != current && lp.is_finite() && lp > cur_val {
-            let key = gumbel(lp);
+            let key = gumbel_key(lp, rng);
             if key > best_key {
                 best_key = key;
                 best_idx = k;
@@ -1503,28 +1513,25 @@ impl SizeLimits {
         let total = count.iter().sum::<usize>() as u128;
         let size_floor = millionths(params.size_floor);
         let size_cap = millionths(params.size_cap);
-        let floor = count
+        // `ceil(frac · base / occupied)` members, `base` a size times `occupied`.
+        let limit = |frac: u128, base: u128| (frac * base).div_ceil(UNIT * occupied) as usize;
+        let (floor, cap) = count
             .iter()
             .map(|&n0| {
-                if size_floor > 0 {
-                    let base = (n0 as u128 * occupied).min(total);
-                    ((size_floor * base).div_ceil(UNIT * occupied) as usize).max(1)
+                let n0 = n0 as u128 * occupied;
+                let floor = if size_floor > 0 {
+                    limit(size_floor, n0.min(total)).max(1)
                 } else {
                     0
-                }
-            })
-            .collect();
-        let cap = count
-            .iter()
-            .map(|&n0| {
-                if size_cap > 0 {
-                    let base = (n0 as u128 * occupied).max(total);
-                    (size_cap * base).div_ceil(UNIT * occupied) as usize
+                };
+                let cap = if size_cap > 0 {
+                    limit(size_cap, n0.max(total))
                 } else {
                     usize::MAX
-                }
+                };
+                (floor, cap)
             })
-            .collect();
+            .unzip();
         Self { floor, cap }
     }
 
@@ -1583,17 +1590,6 @@ impl SweepScratch {
     }
 }
 
-/// What became of a move handed to [`Mover::settle`].
-#[derive(PartialEq)]
-enum Settled {
-    /// Applied, alone or as one half of an exchange.
-    Moved,
-    /// Dropped: no gain left on the live statistics, or vetoed.
-    Stays,
-    /// Refused by the size limits and left waiting for a counterpart.
-    Waits,
-}
-
 /// Applies the moves of one sweep to the live statistics, one at a time.
 ///
 /// A move the size limits admit is applied if the guard accepts it. A move
@@ -1602,9 +1598,7 @@ enum Settled {
 /// member count. A block at its floor, as every small block is, can
 /// thereby still trade a member that does not fit for one that does.
 struct Mover<'a, G> {
-    profiles: &'a Profiles,
-    limits: &'a SizeLimits,
-    guard: &'a G,
+    env: &'a SweepEnv<'a, G>,
     stats: &'a mut DcPoissonStats,
     changed: &'a mut [bool],
     log_probs: &'a mut [f64],
@@ -1612,17 +1606,42 @@ struct Mover<'a, G> {
     counts: SweepCounts,
 }
 
-impl<G: MoveGuard> Mover<'_, G> {
+impl<'a, G: MoveGuard> Mover<'a, G> {
+    /// A mover for one sweep, with no move left waiting from an earlier one.
+    fn new(
+        env: &'a SweepEnv<'a, G>,
+        stats: &'a mut DcPoissonStats,
+        changed: &'a mut [bool],
+        log_probs: &'a mut [f64],
+        waiting: &'a mut HashMap<(usize, usize), VecDeque<u32>>,
+    ) -> Self {
+        waiting.clear();
+        Self {
+            env,
+            stats,
+            changed,
+            log_probs,
+            waiting,
+            counts: SweepCounts::default(),
+        }
+    }
+
     /// Does `e`, a member of `from`, score higher in `to` on the live
     /// statistics? A score that does not compare is no gain.
     fn gains(&mut self, e: usize, from: usize, to: usize) -> bool {
-        compute_log_probs_restricted(e, self.stats, self.profiles, &[from, to], self.log_probs);
-        self.log_probs[to].partial_cmp(&self.log_probs[from]) == Some(std::cmp::Ordering::Greater)
+        compute_log_probs_restricted(
+            e,
+            self.stats,
+            self.env.profiles,
+            &[from, to],
+            self.log_probs,
+        );
+        self.log_probs[to] > self.log_probs[from]
     }
 
     /// Ask the guard about moving `e` out of `from`.
     fn accepted(&mut self, e: usize, from: usize) -> bool {
-        let yes = self.guard.accept_move(e, from, &self.stats.membership);
+        let yes = self.env.guard.accept_move(e, from, &self.stats.membership);
         if !yes {
             self.counts.vetoed += 1;
         }
@@ -1630,7 +1649,7 @@ impl<G: MoveGuard> Mover<'_, G> {
     }
 
     fn apply(&mut self, e: usize, from: usize, to: usize) {
-        self.stats.delta_move(e, from, to, self.profiles);
+        self.stats.delta_move(e, from, to, self.env.profiles);
         self.changed[from] = true;
         self.changed[to] = true;
     }
@@ -1638,18 +1657,21 @@ impl<G: MoveGuard> Mover<'_, G> {
     /// Settle the move of `e` to block `to`. With `recheck`, the move was
     /// scored against statistics that have changed since, and is dropped
     /// unless it still gains.
-    fn settle(&mut self, e: usize, to: usize, recheck: bool) -> Settled {
+    ///
+    /// Returns whether the move was refused by the size limits and left
+    /// waiting for a counterpart; otherwise it was applied (alone or as one
+    /// half of an exchange), or dropped for want of gain or by the guard.
+    fn settle(&mut self, e: usize, to: usize, recheck: bool) -> bool {
         let from = self.stats.membership[e];
         if from == to || (recheck && !self.gains(e, from, to)) {
-            return Settled::Stays;
+            return false;
         }
-        if self.limits.admits(&self.stats.count, from, to) {
-            if !self.accepted(e, from) {
-                return Settled::Stays;
+        if self.env.limits.admits(&self.stats.count, from, to) {
+            if self.accepted(e, from) {
+                self.apply(e, from, to);
+                self.counts.moves += 1;
             }
-            self.apply(e, from, to);
-            self.counts.moves += 1;
-            return Settled::Moved;
+            return false;
         }
         // An exchange with a member of `to` that waits to come here: tried
         // with `e` moved, and undone unless the counterpart then gains and
@@ -1668,21 +1690,21 @@ impl<G: MoveGuard> Mover<'_, G> {
                     .entry((to, from))
                     .or_default()
                     .push_front(f as u32);
-                return Settled::Stays;
+                return false;
             }
-            self.stats.delta_move(e, from, to, self.profiles);
+            self.stats.delta_move(e, from, to, self.env.profiles);
             if self.gains(f, to, from) && self.accepted(f, to) {
                 self.apply(f, to, from);
                 self.counts.moves += 2;
-                return Settled::Moved;
+                return false;
             }
-            self.stats.delta_move(e, to, from, self.profiles);
+            self.stats.delta_move(e, to, from, self.env.profiles);
         }
         self.waiting
             .entry((from, to))
             .or_default()
             .push_back(e as u32);
-        Settled::Waits
+        true
     }
 }
 
@@ -1733,22 +1755,12 @@ fn apply_proposals<G: MoveGuard>(
     });
     changed.iter_mut().for_each(|c| *c = false);
     deferred.clear();
-    waiting.clear();
-    let mut mover = Mover {
-        profiles: env.profiles,
-        limits: env.limits,
-        guard: env.guard,
-        stats,
-        changed,
-        log_probs,
-        waiting,
-        counts: SweepCounts::default(),
-    };
+    let mut mover = Mover::new(env, stats, changed, log_probs, waiting);
     for &e in movers.iter() {
         let (e, to) = (e as usize, proposals[e as usize]);
         let from = mover.stats.membership[e];
         let recheck = mover.changed[from] || mover.changed[to];
-        if mover.settle(e, to, recheck) == Settled::Waits {
+        if mover.settle(e, to, recheck) {
             deferred.push(e as u32);
         }
     }
@@ -1779,17 +1791,13 @@ where
     F: FnMut(&[f64], &[usize], usize) -> usize,
     I: IntoIterator<Item = usize>,
 {
-    scratch.waiting.clear();
-    let mut mover = Mover {
-        profiles: env.profiles,
-        limits: env.limits,
-        guard: env.guard,
+    let mut mover = Mover::new(
+        env,
         stats,
-        changed: &mut scratch.changed,
-        log_probs: &mut scratch.log_probs,
-        waiting: &mut scratch.waiting,
-        counts: SweepCounts::default(),
-    };
+        &mut scratch.changed,
+        &mut scratch.log_probs,
+        &mut scratch.waiting,
+    );
     for e in order {
         let cand = &env.candidates[e];
         if cand.len() < 2 {

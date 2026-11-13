@@ -1707,3 +1707,34 @@ fn strata_keep_a_type_alike_across_batches_of_unequal_composition() {
         "against the pool the composition is taken for a factor: {raw} -> {pooled}"
     );
 }
+
+/// An entity's rates are taken without it, so one that holds most of the
+/// mass sees the others' rates at up to `max_pooled / (T − s_e)`, well above
+/// `max_pooled / T`. The top rate class has to cover them, or they are
+/// clamped into it and read at a lower rate than they have.
+#[test]
+fn leave_one_out_rates_fall_inside_the_rate_classes() {
+    // Entity 0 holds most of the mass, little of it on feature 0, the
+    // largest pooled feature: without entity 0, feature 0 has rate 700/700,
+    // where 2 · max_pooled / T is 1402/1901.
+    let gene_sums = vec![
+        vec![(0usize, 1.0f32), (1, 600.0), (2, 600.0)],
+        vec![(0, 350.0)],
+        vec![(0, 350.0)],
+    ];
+    let profiles = make_profiles(&gene_sums, 3);
+    let stats = DcPoissonStats::from_profiles(&profiles, 2, &[0, 1, 1]);
+    let pooled = [701.0f64, 600.0, 600.0];
+    let total = 1901.0f64;
+    for (e, row) in gene_sums.iter().enumerate() {
+        let rest = total - profiles.size_factor[e] as f64;
+        for &(g, v) in row {
+            let rate = (pooled[g] - v as f64) / rest;
+            assert!(
+                rate.ln() <= stats.classes.top + 1e-12,
+                "entity {e} feature {g}: rate {rate} above the top class {}",
+                stats.classes.top.exp()
+            );
+        }
+    }
+}
