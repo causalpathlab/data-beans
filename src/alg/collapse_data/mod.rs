@@ -44,6 +44,8 @@ pub(crate) use pb_samples::per_batch_sc_neighbors;
 mod reassign_cells;
 pub use reassign_cells::ReassignCellsParams;
 mod pb_tree;
+// The simulator's per-group reference fit reads column subsets with it.
+#[cfg(feature = "sim")]
 pub(crate) use pb_tree::select_columns;
 pub use pb_tree::{BelowEdge, ContrastGene, PbTree, PbTreeParams, RootRecord, SplitRecord};
 mod refine;
