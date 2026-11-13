@@ -311,3 +311,50 @@ fn the_halves_partition_the_cells_and_keep_their_values() -> anyhow::Result<()> 
     assert_eq!(seen, all, "the halves tile the cells exactly once");
     Ok(())
 }
+
+/// The test half of `-o cv` is `cv.test.zarr`. An input of that name is
+/// refused before the train half, which comes first, is written.
+#[test]
+fn an_input_named_like_a_later_half_is_refused_before_any_half_is_written() -> anyhow::Result<()> {
+    use crate::sparse_io::*;
+    let dir = tempfile::tempdir()?;
+    let input = dir.path().join("cv.test.zarr");
+    let triplets: Vec<(u64, u64, f32)> = (0..8).map(|c| (c % 3, c, 1.0 + c as f32)).collect();
+    {
+        let mut data = create_sparse_from_triplets(
+            &triplets,
+            (3, 8, triplets.len()),
+            input.to_str(),
+            Some(&SparseIoBackend::Zarr),
+        )?;
+        let rows: Vec<Box<str>> = (0..3).map(|r| format!("g{r}").into()).collect();
+        let cols: Vec<Box<str>> = (0..8).map(|c| format!("cell{c}").into()).collect();
+        data.register_row_names_vec(&rows);
+        data.register_column_names_vec(&cols);
+    }
+
+    let err = run_split(&SplitArgs {
+        data_file: input.to_str().expect("utf8").into(),
+        test_frac: Some(0.25),
+        folds: None,
+        coord: None,
+        coord_columns: None,
+        grid: 8,
+        groups: None,
+        seed: 7,
+        backend: SparseIoBackend::Zarr,
+        output: dir.path().join("cv").to_str().expect("utf8").into(),
+        zip: false,
+        view: crate::handlers::explore::PlanArgs::batch(),
+    })
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("is the input"), "{err:#}");
+
+    let left: Vec<String> = std::fs::read_dir(dir.path())?
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["cv.test.zarr"], "a half was left on disk");
+    let kept = open_sparse_matrix(input.to_str().expect("utf8"), &SparseIoBackend::Zarr)?;
+    assert_eq!(kept.num_non_zeros(), Some(8));
+    Ok(())
+}

@@ -304,10 +304,10 @@ impl SparseMtxData {
     }
 
     /// Forget everything held in memory about the store's contents: the
-    /// decoded-chunk caches, the shape attributes and the streaming cursor.
-    /// For when the store behind this handle has been replaced; chunks
-    /// decoded from the old arrays would otherwise be served against the new
-    /// index pointers.
+    /// decoded-chunk caches, the preloaded columns and rows, the shape
+    /// attributes and the streaming cursor. For when the store behind this
+    /// handle has been replaced; chunks or preloaded arrays read from the old
+    /// store would otherwise be served against the new index pointers.
     fn forget_store_contents(&mut self) {
         for key in [
             KEY_BY_COLUMN_DATA,
@@ -317,6 +317,8 @@ impl SparseMtxData {
         ] {
             self.forget_array_chunks(key);
         }
+        self.clean_preloaded_columns();
+        self.clean_preloaded_rows();
         self.shape = MtxShape::default();
         self.streamed_nnz = 0;
     }
@@ -840,8 +842,6 @@ impl SparseIo for SparseMtxData {
         self.by_row_indptr = vec![];
         // Nothing read from the removed store describes the new one.
         self.forget_store_contents();
-        self.clean_preloaded_columns();
-        self.clean_preloaded_rows();
 
         Ok(())
     }

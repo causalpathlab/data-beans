@@ -23,6 +23,7 @@ use clap::ValueEnum;
 use indicatif::ParallelProgressIterator;
 use legume_numeric::matrix::mtx_io::*;
 use legume_numeric::matrix::traits::*;
+use legume_numeric::matrix::utils::byte_budget_intervals;
 use log::info;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
@@ -55,10 +56,6 @@ pub enum CsKey {
 /// streamed out as CSC or CSR. Bounds the staging buffers; the triplets
 /// themselves are the only full-size structure alive at that point.
 const SLAB_NNZ: usize = 1 << 20;
-
-/// Bytes one entry occupies in a transpose band: a `u64` column index and an
-/// `f32` value.
-const TRANSPOSE_BYTES_PER_NNZ: usize = 12;
 
 /// End of the slab that starts at triplet `start` of a vector sorted on the
 /// major axis `major` (column for CSC, row for CSR): at least `slab_nnz`
@@ -162,9 +159,131 @@ where
     std::fs::rename(&temp_path, &final_path)?;
     crate::zarr_io::leave_stage(&temp_path);
     data.reopen_backend()?;
-    data.clean_preloaded_columns();
-    data.clean_preloaded_rows();
     info!("registered new data to {}", data.get_backend_file_name());
+    Ok(())
+}
+
+/// [`SparseIo::build_csr_from_csc_streaming`] with an explicit cap of `band_bytes` on the entries one row band
+/// holds in memory (12 B each; a single row larger than the cap is still
+/// one band). Every scatter pass re-reads the whole CSC, so the cap
+/// trades memory against passes; the result does not depend on it.
+pub(crate) fn build_csr_from_csc_banded<S>(data: &mut S, band_bytes: usize) -> anyhow::Result<()>
+where
+    S: SparseIo + ?Sized,
+{
+    let nrow = data
+        .num_rows()
+        .ok_or_else(|| anyhow::anyhow!("nrow not set before build_csr_from_csc_streaming"))?;
+    let ncol = data
+        .num_columns()
+        .ok_or_else(|| anyhow::anyhow!("ncol not set before build_csr_from_csc_streaming"))?;
+    let nnz = data
+        .num_non_zeros()
+        .ok_or_else(|| anyhow::anyhow!("nnz not set before build_csr_from_csc_streaming"))?;
+
+    if nnz == 0 {
+        data.cs_create(CsKey::CsrData, 0)?;
+        data.cs_create(CsKey::CsrIndices, 0)?;
+        data.cs_create(CsKey::CsrIndptr, nrow + 1)?;
+        let zeros = vec![0u64; nrow + 1];
+        data.cs_write_u64(CsKey::CsrIndptr, 0, &zeros)?;
+        data.read_row_indptr()?;
+        return Ok(());
+    }
+
+    const COL_BLOCK: usize = 1024;
+    let n_col_blocks = ncol.div_ceil(COL_BLOCK);
+    let bar1 = styled_progress_bar(n_col_blocks as u64, "transpose count");
+    let mut row_counts = vec![0u64; nrow];
+    let mut col_lo = 0usize;
+    while col_lo < ncol {
+        let col_hi = (col_lo + COL_BLOCK).min(ncol);
+        let cols: S::IndexIter = (col_lo..col_hi).collect();
+        let (_, _, triplets) = data.read_triplets_by_columns(cols)?;
+        for t in &triplets {
+            let slot = row_counts.get_mut(t.0 as usize).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "build_csr_from_csc_streaming: row index {} (0x{:016x}) outside \
+                     the {nrow}-row matrix",
+                    t.0,
+                    t.0
+                )
+            })?;
+            *slot += 1;
+        }
+        col_lo = col_hi;
+        bar1.inc(1);
+    }
+    bar1.finish_and_clear();
+
+    let mut rowptr = vec![0u64; nrow + 1];
+    let mut acc = 0u64;
+    for i in 0..nrow {
+        rowptr[i] = acc;
+        acc += row_counts[i];
+    }
+    rowptr[nrow] = acc;
+    anyhow::ensure!(
+        acc == nnz as u64,
+        "build_csr_from_csc_streaming: counted {acc} entries in the CSC arrays, \
+         but {nnz} are declared"
+    );
+
+    data.cs_create(CsKey::CsrData, nnz)?;
+    data.cs_create(CsKey::CsrIndices, nnz)?;
+    data.cs_create(CsKey::CsrIndptr, nrow + 1)?;
+    data.cs_write_u64(CsKey::CsrIndptr, 0, &rowptr)?;
+
+    // Row bands cut where the cumulative nnz reaches the cap, so a band
+    // of dense rows holds no more than a band of sparse ones. A band of
+    // empty rows has nothing to scatter.
+    let bands: Vec<(usize, usize)> =
+        byte_budget_intervals(&row_counts, band_bytes, PRELOAD_BYTES_PER_NNZ)
+            .into_iter()
+            .filter(|&(lo, hi)| rowptr[hi] > rowptr[lo])
+            .collect();
+
+    let bar2 = styled_progress_bar(bands.len() as u64, "transpose scatter");
+    for (band_lo, band_hi) in bands {
+        let band_nnz_start = rowptr[band_lo];
+        let band_nnz = (rowptr[band_hi] - band_nnz_start) as usize;
+
+        let mut out_indices = vec![0u64; band_nnz];
+        let mut out_values = vec![0f32; band_nnz];
+        let mut cursor = vec![0u64; band_hi - band_lo];
+
+        let mut col_lo = 0usize;
+        while col_lo < ncol {
+            let col_hi = (col_lo + COL_BLOCK).min(ncol);
+            let cols: S::IndexIter = (col_lo..col_hi).collect();
+            let (_, _, triplets) = data.read_triplets_by_columns(cols)?;
+            for &(row_i, col_j_local, x) in &triplets {
+                let row_i_us = row_i as usize;
+                if row_i_us >= band_lo && row_i_us < band_hi {
+                    let band_idx = row_i_us - band_lo;
+                    // col_j_local is already the global column index because
+                    // read_triplets_by_columns returns columns in the passed order
+                    // (0..batch for standalone call). We passed col_lo..col_hi,
+                    // which returns local indices 0..(col_hi - col_lo) — so add col_lo.
+                    let col_j_global = col_j_local + col_lo as u64;
+                    let offset_in_band =
+                        (rowptr[band_lo + band_idx] - band_nnz_start) + cursor[band_idx];
+                    out_indices[offset_in_band as usize] = col_j_global;
+                    out_values[offset_in_band as usize] = x;
+                    cursor[band_idx] += 1;
+                }
+            }
+            col_lo = col_hi;
+        }
+
+        data.cs_write_u64(CsKey::CsrIndices, band_nnz_start, &out_indices)?;
+        data.cs_write_f32(CsKey::CsrData, band_nnz_start, &out_values)?;
+
+        bar2.inc(1);
+    }
+    bar2.finish_and_clear();
+
+    data.read_row_indptr()?;
     Ok(())
 }
 
@@ -580,12 +699,16 @@ pub trait SparseIo: Sync + Send {
         let new_col_names = take_names(columns, self.column_names()?, "column")?;
         let new_row_names = take_names(rows, self.row_names()?, "row")?;
 
-        let old_cols: Vec<usize> = match columns {
-            Some(cols) => cols.clone(),
-            None => (0..ncol_data).collect(),
+        let every_column: Vec<usize>;
+        let old_cols: &[usize] = match columns {
+            Some(cols) => cols,
+            None => {
+                every_column = (0..ncol_data).collect();
+                &every_column
+            }
         };
         replace_backend_content(self, "subset_tmp", |data, out| {
-            stream_csc_selection(data, &old_cols, row_map.as_ref(), out)?;
+            stream_csc_selection(data, old_cols, row_map.as_ref(), out)?;
             out.register_row_names_vec(&new_row_names);
             out.register_column_names_vec(&new_col_names);
             Ok(())
@@ -611,11 +734,7 @@ pub trait SparseIo: Sync + Send {
             .num_rows()
             .ok_or_else(|| anyhow::anyhow!("missing shape information"))?;
 
-        // A row past the names has none, so no listed name places it.
-        let old_names = self.row_names()?;
-        let named = old_names.len().min(nrow_data);
-        let mut row_map = RowMap::by_names(&old_names[..named], row_names_order)?;
-        row_map.to.resize(nrow_data, None);
+        let row_map = RowMap::by_names(&self.row_names()?, row_names_order, nrow_data)?;
 
         let new_col_names = self.column_names()?;
         let old_cols: Vec<usize> = (0..ncol).collect();
@@ -1054,137 +1173,10 @@ pub trait SparseIo: Sync + Send {
         let wanted = self
             .num_non_zeros()
             .unwrap_or(0)
-            .saturating_mul(TRANSPOSE_BYTES_PER_NNZ);
-        let band = reserve_transpose_band(wanted);
-        self.build_csr_from_csc_banded(band.bytes())
-    }
-
-    /// [`build_csr_from_csc_streaming`](Self::build_csr_from_csc_streaming)
-    /// with an explicit cap of `band_bytes` on the entries one row band
-    /// holds in memory (12 B each; a single row larger than the cap is still
-    /// one band). Every scatter pass re-reads the whole CSC, so the cap
-    /// trades memory against passes; the result does not depend on it.
-    fn build_csr_from_csc_banded(&mut self, band_bytes: usize) -> anyhow::Result<()> {
-        let nrow = self
-            .num_rows()
-            .ok_or_else(|| anyhow::anyhow!("nrow not set before build_csr_from_csc_streaming"))?;
-        let ncol = self
-            .num_columns()
-            .ok_or_else(|| anyhow::anyhow!("ncol not set before build_csr_from_csc_streaming"))?;
-        let nnz = self
-            .num_non_zeros()
-            .ok_or_else(|| anyhow::anyhow!("nnz not set before build_csr_from_csc_streaming"))?;
-
-        if nnz == 0 {
-            self.cs_create(CsKey::CsrData, 0)?;
-            self.cs_create(CsKey::CsrIndices, 0)?;
-            self.cs_create(CsKey::CsrIndptr, nrow + 1)?;
-            let zeros = vec![0u64; nrow + 1];
-            self.cs_write_u64(CsKey::CsrIndptr, 0, &zeros)?;
-            self.read_row_indptr()?;
-            return Ok(());
-        }
-
-        const COL_BLOCK: usize = 1024;
-        let n_col_blocks = ncol.div_ceil(COL_BLOCK);
-        let bar1 = styled_progress_bar(n_col_blocks as u64, "transpose count");
-        let mut row_counts = vec![0u64; nrow];
-        let mut col_lo = 0usize;
-        while col_lo < ncol {
-            let col_hi = (col_lo + COL_BLOCK).min(ncol);
-            let cols: Self::IndexIter = (col_lo..col_hi).collect();
-            let (_, _, triplets) = self.read_triplets_by_columns(cols)?;
-            for t in &triplets {
-                let slot = row_counts.get_mut(t.0 as usize).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "build_csr_from_csc_streaming: row index {} (0x{:016x}) outside \
-                         the {nrow}-row matrix",
-                        t.0,
-                        t.0
-                    )
-                })?;
-                *slot += 1;
-            }
-            col_lo = col_hi;
-            bar1.inc(1);
-        }
-        bar1.finish_and_clear();
-
-        let mut rowptr = vec![0u64; nrow + 1];
-        let mut acc = 0u64;
-        for i in 0..nrow {
-            rowptr[i] = acc;
-            acc += row_counts[i];
-        }
-        rowptr[nrow] = acc;
-        anyhow::ensure!(
-            acc == nnz as u64,
-            "build_csr_from_csc_streaming: counted {acc} entries in the CSC arrays, \
-             but {nnz} are declared"
-        );
-
-        self.cs_create(CsKey::CsrData, nnz)?;
-        self.cs_create(CsKey::CsrIndices, nnz)?;
-        self.cs_create(CsKey::CsrIndptr, nrow + 1)?;
-        self.cs_write_u64(CsKey::CsrIndptr, 0, &rowptr)?;
-
-        // Row bands cut where the cumulative nnz reaches the cap, so a band
-        // of dense rows holds no more than a band of sparse ones.
-        let band_nnz_cap = (band_bytes / TRANSPOSE_BYTES_PER_NNZ).max(1) as u64;
-        let mut bands: Vec<(usize, usize)> = Vec::new();
-        let mut band_lo = 0usize;
-        while band_lo < nrow {
-            let fits =
-                rowptr[band_lo + 1..].partition_point(|&end| end - rowptr[band_lo] <= band_nnz_cap);
-            let band_hi = band_lo + fits.max(1);
-            if rowptr[band_hi] > rowptr[band_lo] {
-                bands.push((band_lo, band_hi));
-            }
-            band_lo = band_hi;
-        }
-
-        let bar2 = styled_progress_bar(bands.len() as u64, "transpose scatter");
-        for (band_lo, band_hi) in bands {
-            let band_nnz_start = rowptr[band_lo];
-            let band_nnz = (rowptr[band_hi] - band_nnz_start) as usize;
-
-            let mut out_indices = vec![0u64; band_nnz];
-            let mut out_values = vec![0f32; band_nnz];
-            let mut cursor = vec![0u64; band_hi - band_lo];
-
-            let mut col_lo = 0usize;
-            while col_lo < ncol {
-                let col_hi = (col_lo + COL_BLOCK).min(ncol);
-                let cols: Self::IndexIter = (col_lo..col_hi).collect();
-                let (_, _, triplets) = self.read_triplets_by_columns(cols)?;
-                for &(row_i, col_j_local, x) in &triplets {
-                    let row_i_us = row_i as usize;
-                    if row_i_us >= band_lo && row_i_us < band_hi {
-                        let band_idx = row_i_us - band_lo;
-                        // col_j_local is already the global column index because
-                        // read_triplets_by_columns returns columns in the passed order
-                        // (0..batch for standalone call). We passed col_lo..col_hi,
-                        // which returns local indices 0..(col_hi - col_lo) — so add col_lo.
-                        let col_j_global = col_j_local + col_lo as u64;
-                        let offset_in_band =
-                            (rowptr[band_lo + band_idx] - band_nnz_start) + cursor[band_idx];
-                        out_indices[offset_in_band as usize] = col_j_global;
-                        out_values[offset_in_band as usize] = x;
-                        cursor[band_idx] += 1;
-                    }
-                }
-                col_lo = col_hi;
-            }
-
-            self.cs_write_u64(CsKey::CsrIndices, band_nnz_start, &out_indices)?;
-            self.cs_write_f32(CsKey::CsrData, band_nnz_start, &out_values)?;
-
-            bar2.inc(1);
-        }
-        bar2.finish_and_clear();
-
-        self.read_row_indptr()?;
-        Ok(())
+            .saturating_mul(PRELOAD_BYTES_PER_NNZ);
+        // The reservation is held until the transpose is done.
+        let (band_bytes, _reservation) = reserve_transpose_band(wanted);
+        build_csr_from_csc_banded(self, band_bytes)
     }
 
     /// preload row index pointers

@@ -49,15 +49,21 @@ impl RowMap {
         })
     }
 
-    /// The map that puts the rows named `old_names` in the order of `order`:
-    /// output row `i` is the input row named `order[i]`, empty when no input
-    /// row has that name; an input row whose name `order` does not list is
-    /// dropped.
+    /// The map that puts the `nrow_full` rows named `old_names` in the order
+    /// of `order`: output row `i` is the input row named `order[i]`, empty
+    /// when no input row has that name; an input row whose name `order` does
+    /// not list is dropped. Row `r` is named `old_names[r]`: a row past the
+    /// names has none, so nothing places it, and a name past the rows names
+    /// no row.
     ///
     /// # Errors
     /// If `order` lists a name twice (its second position would stay empty),
     /// or two input rows carry one listed name (they would share a position).
-    pub fn by_names(old_names: &[Box<str>], order: &[Box<str>]) -> anyhow::Result<Self> {
+    pub fn by_names(
+        old_names: &[Box<str>],
+        order: &[Box<str>],
+        nrow_full: usize,
+    ) -> anyhow::Result<Self> {
         let place = crate::sparse_io::build_name2index_map(order);
         if place.len() != order.len() {
             // The map keeps the last position of a repeated name.
@@ -73,7 +79,8 @@ impl RowMap {
         }
         // `claimed[new]` is the input row that took the output position.
         let mut claimed: Vec<Option<usize>> = vec![None; order.len()];
-        let to = old_names
+        let named = old_names.len().min(nrow_full);
+        let mut to = old_names[..named]
             .iter()
             .enumerate()
             .map(|(old, name)| {
@@ -89,6 +96,7 @@ impl RowMap {
                 Ok(Some(new as u64))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        to.resize(nrow_full, None);
         Ok(Self {
             to,
             nrow: order.len(),
@@ -117,19 +125,15 @@ impl RowMap {
     }
 }
 
-/// Number of surviving entries when every column of `src` is kept, read off
-/// the resident row index without touching the data. `None` when that index
-/// is absent or does not describe `nrow` rows.
-fn nnz_of_kept_rows<S>(src: &S, rows: &RowMap) -> Option<u64>
-where
-    S: SparseIo + ?Sized,
-{
-    let indptr = src.row_indptr();
-    if indptr.len() != rows.to.len() + 1 {
+/// Number of entries in the rows `to` keeps (those it maps to `Some`), read
+/// off the row index `indptr` without touching the data: the survivors when
+/// every column is kept. `None` when the index is absent or does not
+/// describe the rows of `to`.
+pub(crate) fn nnz_of_kept_rows(indptr: &[u64], to: &[Option<u64>]) -> Option<u64> {
+    if indptr.len() != to.len() + 1 {
         return None;
     }
-    rows.to
-        .iter()
+    to.iter()
         .zip(indptr.windows(2))
         .filter(|(kept, _)| kept.is_some())
         .try_fold(0u64, |acc, (_, w)| Some(acc + w[1].checked_sub(w[0])?))
@@ -269,20 +273,24 @@ where
     // The writer needs the exact total up front. Without a row filter it is
     // the stored total. With one, and every column kept, the resident row
     // index gives it for free. Otherwise one counting pass.
-    let every_column_once =
-        old_cols.len() == ncol_src && distinct_within(old_cols, ncol_src, "column").is_ok();
+    //
+    // Slabs are read a window at a time, one to a thread, here and by the
+    // writer, so each is cut at a thread's share of the slab budget. A slab
+    // reads every stored entry of its columns, whatever the row map then
+    // drops, so the stored counts are what bound it.
+    let share = slab_budget / rayon::current_num_threads().max(1);
+    let slabs = byte_budget_intervals(&stored_nnz, share, TRIPLET_BYTES);
     let nnz: u64 = match rows {
         None => stored_nnz.iter().sum(),
-        Some(remap) => match every_column_once
-            .then(|| nnz_of_kept_rows(src, remap))
-            .flatten()
-        {
-            Some(total) => total,
-            None => {
-                // Blocks are read all at once, one to a thread, so each takes
-                // a thread's share of the slab budget.
-                let share = slab_budget / rayon::current_num_threads().max(1);
-                byte_budget_intervals(&stored_nnz, share, TRIPLET_BYTES)
+        Some(remap) => {
+            let every_column_once =
+                old_cols.len() == ncol_src && distinct_within(old_cols, ncol_src, "column").is_ok();
+            match every_column_once
+                .then(|| nnz_of_kept_rows(src.row_indptr(), &remap.to))
+                .flatten()
+            {
+                Some(total) => total,
+                None => slabs
                     .par_iter()
                     .map(|&(lb, ub)| -> anyhow::Result<u64> {
                         let (_, _, triplets) = src
@@ -292,18 +300,84 @@ where
                             .filter(|(r, _, _)| remap.to[*r as usize].is_some())
                             .count() as u64)
                     })
-                    .sum::<anyhow::Result<u64>>()?
+                    .sum::<anyhow::Result<u64>>()?,
             }
-        },
+        }
     };
 
     Ok(SelectionPlan {
         nrow: rows.map_or(nrow_src, |r| r.nrow),
         nnz,
-        // A slab reads every stored entry of its columns, whatever the row
-        // map then drops, so the stored counts are what bound it.
-        slabs: byte_budget_intervals(&stored_nnz, slab_budget, TRIPLET_BYTES),
+        slabs,
     })
+}
+
+/// Append the columns `cols` of `src`, cut into `slabs` (`[lb, ub)`
+/// positions in `cols` that tile it in order), to the column index `out` is
+/// streaming: position `p` of `cols` becomes column `col_offset + p`, and
+/// the first entry lands at `nnz_offset`. With `rows`, each row is
+/// renumbered by `rows[old]` and an entry whose row maps to `None` is
+/// dropped. Returns the number of entries written.
+///
+/// The slabs go through a window at a time: as many as there are threads are
+/// read at once and laid out, then appended as one stretch. A caller that
+/// bounds what is resident cuts each slab at a thread's share of its budget.
+///
+/// # Errors
+/// If a block read fails. Nothing is skipped: the output's nnz is declared
+/// up front, so a block left out would leave a gap of fill values behind.
+pub(crate) fn append_csc_slabs<S, O>(
+    src: &S,
+    cols: &[usize],
+    rows: Option<&[Option<u64>]>,
+    slabs: &[(usize, usize)],
+    out: &mut O,
+    col_offset: u64,
+    nnz_offset: u64,
+) -> anyhow::Result<u64>
+where
+    S: SparseIo + Sync + ?Sized,
+    O: SparseIo + ?Sized,
+{
+    let threads = rayon::current_num_threads().max(1);
+    let mut written = 0u64;
+    for window in slabs.chunks(threads) {
+        // One block read per slab, never a read per column: a single-column
+        // read pays the cached-subset machinery per call, which dominates at
+        // hundreds of thousands of columns. The block read numbers its
+        // columns from the block's first, rows ascending within each; a row
+        // map that reorders is sorted for within each column.
+        let built = window
+            .par_iter()
+            .map(|&(lb, ub)| -> anyhow::Result<_> {
+                let (_, _, triplets) =
+                    src.read_triplets_by_columns(cols[lb..ub].iter().copied().collect())?;
+                Ok(csc_slab(triplets, ub - lb, rows))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // The window as one slab: each colptr rebased by the entries of the
+        // slabs before it.
+        let window_nnz: usize = built.iter().map(|(_, _, values)| values.len()).sum();
+        let mut colptr: Vec<u64> = Vec::with_capacity(window[window.len() - 1].1 - window[0].0);
+        let mut row_indices: Vec<u64> = Vec::with_capacity(window_nnz);
+        let mut values: Vec<f32> = Vec::with_capacity(window_nnz);
+        for (slab_colptr, slab_rows, slab_values) in built {
+            let before = values.len() as u64;
+            colptr.extend(slab_colptr.iter().map(|&at| at + before));
+            row_indices.extend(slab_rows);
+            values.extend(slab_values);
+        }
+        out.append_csc_slab(
+            col_offset + window[0].0 as u64,
+            nnz_offset + written,
+            &colptr,
+            &row_indices,
+            &values,
+        )?;
+        written += window_nnz as u64;
+    }
+    Ok(written)
 }
 
 /// Write the selection `plan` was made for as the whole content of `out`, an
@@ -324,20 +398,8 @@ where
     let shape = (plan.nrow, old_cols.len(), plan.nnz as usize);
     out.begin_streaming_csc(shape)?;
 
-    let mut nnz_offset = 0u64;
-    for &(lb, ub) in &plan.slabs {
-        // One block read per slab, never a read per column: a single-column
-        // read pays the cached-subset machinery per call, which dominates at
-        // hundreds of thousands of columns. The block read numbers its
-        // columns from the block's first, rows ascending within each; a row
-        // map that reorders is sorted for within each column.
-        let (_, _, triplets) =
-            src.read_triplets_by_columns(old_cols[lb..ub].iter().copied().collect())?;
-        let (colptr, row_indices, values) =
-            csc_slab(triplets, ub - lb, rows.map(|r| r.to.as_slice()));
-        out.append_csc_slab(lb as u64, nnz_offset, &colptr, &row_indices, &values)?;
-        nnz_offset += values.len() as u64;
-    }
+    let to = rows.map(|r| r.to.as_slice());
+    append_csc_slabs(src, old_cols, to, &plan.slabs, out, 0, 0)?;
 
     out.finalize_streaming_csc()?;
     out.build_csr_from_csc_streaming()?;

@@ -58,15 +58,7 @@ fn build(
 
 /// `(row, column, value)` of the nonzeros of `raw`, column-major.
 fn dense_triplets(raw: &Array2<f32>) -> Vec<(u64, u64, f32)> {
-    let mut ret = Vec::new();
-    for j in 0..raw.ncols() {
-        for i in 0..raw.nrows() {
-            if raw[(i, j)] != 0.0 {
-                ret.push((i as u64, j as u64, raw[(i, j)]));
-            }
-        }
-    }
-    ret
+    sorted(ndarray_to_triplets(raw))
 }
 
 /// Stream `raw` into `data` as one column band, then build its CSR half.
@@ -306,6 +298,40 @@ fn an_initialized_backend_keeps_nothing_of_the_old_matrix() -> anyhow::Result<()
         next[(1, 1)] = -3.0;
         stream(&mut *data, &next)?;
         assert_reads(&*data, &next, &format!("{ext}, same handle"));
+    }
+    Ok(())
+}
+
+/// `reopen_backend` opens the file at the handle's path again. Columns and
+/// rows preloaded from the file that was there before describe the old
+/// matrix; the handle serves the new one.
+#[test]
+fn a_reopened_backend_serves_the_new_store_not_the_old_preload() -> anyhow::Result<()> {
+    for (backend, ext) in backends() {
+        let dir = tempfile::tempdir()?;
+        let raw = reference();
+        let (mut data, path) = build(&raw, &dir, &backend, ext)?;
+        data.preload_columns()?;
+        data.preload_rows()?;
+        assert!(data.csc_column_arrays().is_some(), "{ext}: preloaded");
+        assert_reads(&*data, &raw, &format!("{ext}, before"));
+
+        let mut next = Array2::<f32>::zeros((3, 2));
+        next[(2, 0)] = -1.0;
+        next[(0, 1)] = -2.0;
+        next[(1, 1)] = -3.0;
+        let other = dir.path().join(format!("y.{ext}"));
+        drop(create_sparse_from_ndarray(
+            &next,
+            other.to_str(),
+            Some(&backend),
+        )?);
+        data.remove_backend_file()?;
+        std::fs::rename(&other, &path)?;
+
+        data.reopen_backend()?;
+        assert!(data.csc_column_arrays().is_none(), "{ext}: preload dropped");
+        assert_reads(&*data, &next, &format!("{ext}, reopened"));
     }
     Ok(())
 }

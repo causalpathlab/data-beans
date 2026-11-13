@@ -1,4 +1,4 @@
-use crate::column_subset::csc_slab;
+use crate::column_subset::{append_csc_slabs, csc_slab, nnz_of_kept_rows};
 use crate::handlers::transformation::{ensure_output_is_no_input, squeeze_in_place};
 use crate::hdf5_io::*;
 use crate::sparse_data_visitors::styled_progress_bar;
@@ -396,17 +396,12 @@ fn merge_backend_within(
                 continue; // these are the common rows, in order
             }
             // The rows kept hold this many entries: the row index says.
-            anyhow::ensure!(
-                indptr.len() == rows.len() + 1,
-                "{} has no by-row index to count its common rows' entries",
-                h.path
-            );
-            h.nnz = map
-                .iter()
-                .enumerate()
-                .filter(|(_, m)| m.is_some())
-                .map(|(r, _)| indptr[r + 1] - indptr[r])
-                .sum();
+            h.nnz = nnz_of_kept_rows(indptr, &map).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has no by-row index to count its common rows' entries",
+                    h.path
+                )
+            })?;
             h.row_map = Some(map);
         }
     }
@@ -432,8 +427,7 @@ fn merge_backend_within(
     // Each batch goes through in slabs of columns, as many read at once as
     // there are threads and appended in order. The threads share one slab
     // budget, so what is resident does not grow with the batch.
-    let threads = rayon::current_num_threads().max(1);
-    let slab_share = slab_budget / threads;
+    let slab_share = slab_budget / rayon::current_num_threads().max(1);
     let prog_bar = styled_progress_bar(num_batches as u64, "batches");
     let mut nnz_offset: u64 = 0;
     for h in &batches {
@@ -451,32 +445,16 @@ fn merge_backend_within(
                 byte_budget_intervals(&column_nnz, slab_share, TRIPLET_BYTES)
             }
         };
-        let row_map = h.row_map.as_deref();
-        let mut written: u64 = 0;
-        for window in slabs.chunks(threads) {
-            // A block read returns its columns in order, numbered from the
-            // block's first, rows ascending; a row map that reorders is
-            // sorted for within each column. A failed read stops the merge:
-            // the output's nnz is declared up front, so a block left out
-            // would leave a gap of fill values behind.
-            let built = window
-                .par_iter()
-                .map(|&(lb, ub)| -> anyhow::Result<_> {
-                    let (_, _, triplets) = src.read_triplets_by_columns((lb..ub).collect())?;
-                    Ok(csc_slab(triplets, ub - lb, row_map))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            for (&(lb, _), (local_colptr, row_indices, values)) in window.iter().zip(&built) {
-                out.append_csc_slab(
-                    h.col_offset + lb as u64,
-                    nnz_offset + written,
-                    local_colptr,
-                    row_indices,
-                    values,
-                )?;
-                written += values.len() as u64;
-            }
-        }
+        let every_column: Vec<usize> = (0..h.ncol).collect();
+        let written = append_csc_slabs(
+            &*src,
+            &every_column,
+            h.row_map.as_deref(),
+            &slabs,
+            &mut *out,
+            h.col_offset,
+            nnz_offset,
+        )?;
         anyhow::ensure!(
             written == h.nnz,
             "{} holds {written} entries in the rows kept, where its index says {}",

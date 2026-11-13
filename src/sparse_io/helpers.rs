@@ -54,8 +54,9 @@ pub fn remove_backend_path(path: &str) -> anyhow::Result<()> {
 /// Bytes reserved by live preloads in this process; see [`reserve_preload`].
 static RESERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Preloading costs 12 bytes per non-zero (a `u64` index and an `f32` value).
-const PRELOAD_BYTES_PER_NNZ: usize = 12;
+/// Preloading costs 12 bytes per non-zero (a `u64` index and an `f32` value);
+/// so does an entry of a transpose band.
+pub(crate) const PRELOAD_BYTES_PER_NNZ: usize = 12;
 
 /// A preload's share of the process-wide preload budget, given back when it
 /// is dropped. Keep it next to the preloaded arrays and drop it with them,
@@ -70,8 +71,9 @@ pub struct PreloadReservation {
 }
 
 impl PreloadReservation {
-    /// Bytes this reservation holds against the budget (0 under a
-    /// `LEGUME_PRELOAD_BUDGET_BYTES` override, which is per preload).
+    /// Bytes this reservation holds against the process-wide budget: 0 for
+    /// a preload admitted under a `LEGUME_PRELOAD_BUDGET_BYTES` override,
+    /// which is per preload and reserves nothing.
     #[allow(dead_code)] // library API; the bin has no caller
     pub fn bytes(&self) -> usize {
         self.bytes
@@ -116,16 +118,21 @@ pub fn preload_reserved_bytes() -> usize {
 /// `LEGUME_ZARR_CACHE_CAP` precedent for memory knobs.
 pub fn reserve_preload(nnz: usize, what: &str) -> Option<PreloadReservation> {
     let cost = nnz.saturating_mul(PRELOAD_BYTES_PER_NNZ);
-    if let Some(budget) = std::env::var("LEGUME_PRELOAD_BUDGET_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
+    if let Some(budget) = preload_budget_override() {
         return fits_or_warn(cost, budget, nnz, what).then_some(PreloadReservation {
             bytes: 0,
             counter: &RESERVED,
         });
     }
     reserve_against(&RESERVED, cost, auto_preload_budget_bytes(), nnz, what)
+}
+
+/// The per-preload budget `LEGUME_PRELOAD_BUDGET_BYTES` sets, when it is set
+/// to a number.
+fn preload_budget_override() -> Option<usize> {
+    std::env::var("LEGUME_PRELOAD_BUDGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
 }
 
 fn reserve_against(
@@ -159,26 +166,17 @@ fn transpose_grant(wanted: usize, room: usize) -> usize {
 /// Reserve up to `wanted` bytes for the row band of a CSC → CSR transpose
 /// (see [`transpose_grant`]). The room is what the preload budget has left,
 /// and no more than half the memory available now: the budget was sized when
-/// the process first asked, and the process has allocated since. The grant
-/// is [`PreloadReservation::bytes`], given back when the guard drops. The
-/// memory available is read once per call, and a grant shows there only once
-/// its band is allocated, so the half is a bound per caller, not across
-/// transposes that start together.
-pub(crate) fn reserve_transpose_band(wanted: usize) -> PreloadReservation {
+/// the process first asked, and the process has allocated since. Returns
+/// the bytes granted and the reservation that holds them against the budget
+/// until it drops. Under a `LEGUME_PRELOAD_BUDGET_BYTES` override, which is
+/// per preload, the grant is cut from the override alone and nothing is
+/// reserved. The memory available is read once per call, and a grant shows
+/// there only once its band is allocated, so the half is a bound per caller,
+/// not across transposes that start together.
+pub(crate) fn reserve_transpose_band(wanted: usize) -> (usize, Option<PreloadReservation>) {
     use std::sync::atomic::Ordering;
-    if let Some(budget) = std::env::var("LEGUME_PRELOAD_BUDGET_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        // The override is per preload, so the grant is kept off the shared
-        // counter and no other preload sees it.
-        static UNSHARED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let bytes = transpose_grant(wanted, budget);
-        UNSHARED.fetch_add(bytes, Ordering::Relaxed);
-        return PreloadReservation {
-            bytes,
-            counter: &UNSHARED,
-        };
+    if let Some(budget) = preload_budget_override() {
+        return (transpose_grant(wanted, budget), None);
     }
     let budget = auto_preload_budget_bytes();
     let free_now = available_memory_bytes().map_or(usize::MAX, |avail| avail / 2);
@@ -193,10 +191,13 @@ pub(crate) fn reserve_transpose_band(wanted: usize) -> PreloadReservation {
             Ordering::Relaxed,
         ) {
             Ok(_) => {
-                return PreloadReservation {
-                    bytes: granted,
-                    counter: &RESERVED,
-                }
+                return (
+                    granted,
+                    Some(PreloadReservation {
+                        bytes: granted,
+                        counter: &RESERVED,
+                    }),
+                )
             }
             Err(now) => reserved = now,
         }
@@ -300,7 +301,7 @@ mod preload_reservation_tests {
 
     #[test]
     fn a_transpose_band_under_one_slab_is_granted_whole() {
-        assert_eq!(reserve_transpose_band(1024).bytes(), 1024);
+        assert_eq!(reserve_transpose_band(1024).0, 1024);
     }
 
     #[test]

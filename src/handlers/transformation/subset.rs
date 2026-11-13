@@ -23,10 +23,18 @@ type Source = dyn SparseIo<IndexIter = Vec<usize>>;
 
 /// The rows `selection` of `data`, in that order: where each row goes, and
 /// the names of those kept. The selection must name something, each row
-/// once and within those there are.
-fn rows_kept(data: &Source, selection: &[usize]) -> anyhow::Result<(RowMap, Vec<Box<str>>)> {
+/// once and within those there are. `names` are the data's row names when
+/// the caller has read them already.
+fn rows_kept(
+    data: &Source,
+    names: Option<Vec<Box<str>>>,
+    selection: &[usize],
+) -> anyhow::Result<(RowMap, Vec<Box<str>>)> {
     anyhow::ensure!(!selection.is_empty(), "subset: empty row selection");
-    let names = data.row_names()?;
+    let names = match names {
+        Some(names) => names,
+        None => data.row_names()?,
+    };
     let map = RowMap::keeping(selection, names.len())?;
     let kept = selection.iter().map(|&r| names[r].clone()).collect();
     Ok((map, kept))
@@ -36,6 +44,8 @@ fn rows_kept(data: &Source, selection: &[usize]) -> anyhow::Result<(RowMap, Vec<
 /// `None`), in that order, into the backend `output` names, with the rows
 /// `rows` maps and names when given. The input is only read; the output is
 /// a fresh backend of the input's format, unless its name gives another.
+/// `all_column_names` are the data's column names when the caller has read
+/// them already.
 ///
 /// `zip` is applied here, the same way every `from-*` builder applies it, so a
 /// bare `-o out` lands on `out.zarr.zip` whichever subcommand produced it.
@@ -48,11 +58,15 @@ fn write_subset(
     input: &str,
     data: &Source,
     columns: Option<&[usize]>,
+    all_column_names: Option<Vec<Box<str>>>,
     rows: Option<(RowMap, Vec<Box<str>>)>,
     output: &str,
     zip: bool,
 ) -> anyhow::Result<(Box<str>, Box<str>)> {
-    let all_names = data.column_names()?;
+    let all_names = match all_column_names {
+        Some(names) => names,
+        None => data.column_names()?,
+    };
     let every_column: Vec<usize>;
     let columns = match columns {
         Some(columns) => {
@@ -145,6 +159,8 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
         let original_ncol = data.num_columns().unwrap_or(0);
         info!("original data: {} columns", original_ncol);
 
+        // The data's column names, once a branch has read them.
+        let mut names_read: Option<Vec<Box<str>>> = None;
         let selected_columns = if let Some(idx) = columns_indices {
             info!("using {} column indices directly", idx.len());
             idx
@@ -196,6 +212,7 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
                 .collect();
 
             info!("subsetting to {} columns", idx.len());
+            names_read = Some(data_col_names);
             idx
         } else {
             return Err(anyhow::anyhow!(
@@ -207,6 +224,7 @@ pub fn subset_columns(args: &SubsetColumnsArgs) -> anyhow::Result<()> {
             &args.data_file,
             data.as_ref(),
             Some(&selected_columns),
+            names_read,
             None,
             &args.output,
             zip,
@@ -273,6 +291,8 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
         let original_nrow = data.num_rows().unwrap_or(0);
         info!("original data: {} rows", original_nrow);
 
+        // The data's row names, once a branch has read them.
+        let mut names_read: Option<Vec<Box<str>>> = None;
         let selected_rows = if let Some(idx) = row_indices {
             info!("using {} row indices directly", idx.len());
             idx
@@ -320,6 +340,7 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
                 .collect();
 
             info!("subsetting to {} rows", idx.len());
+            names_read = Some(data_row_names);
             idx
         } else {
             return Err(anyhow::anyhow!(
@@ -327,10 +348,11 @@ pub fn subset_rows(args: &SubsetRowsArgs) -> anyhow::Result<()> {
             ));
         };
 
-        let rows = rows_kept(data.as_ref(), &selected_rows)?;
+        let rows = rows_kept(data.as_ref(), names_read, &selected_rows)?;
         let (effective_output, output_file) = write_subset(
             &args.data_file,
             data.as_ref(),
+            None,
             None,
             Some(rows),
             &args.output,
@@ -388,12 +410,13 @@ pub fn subset(args: &SubsetArgs) -> anyhow::Result<()> {
                 .map_or(data.num_columns().unwrap_or(0), |c| c.len())
         );
         let rows = rows
-            .map(|rows| rows_kept(data.as_ref(), &rows))
+            .map(|rows| rows_kept(data.as_ref(), None, &rows))
             .transpose()?;
         let (effective_output, output_file) = write_subset(
             &args.data_file,
             data.as_ref(),
             columns.as_deref(),
+            None,
             rows,
             &args.output,
             zip,
@@ -431,7 +454,10 @@ pub fn reorder_rows(args: &ReorderRowsArgs) -> anyhow::Result<()> {
 
     // Each row of the data goes where the file names it; a row it does not
     // name is dropped, and a name the data lacks is an empty row.
-    let rows = RowMap::by_names(&data.row_names()?, &row_names_order).with_context(|| {
+    let nrow = data
+        .num_rows()
+        .ok_or_else(|| anyhow::anyhow!("{} has no `nrow`", args.data_file))?;
+    let rows = RowMap::by_names(&data.row_names()?, &row_names_order, nrow).with_context(|| {
         format!(
             "{} cannot take the order of {}",
             args.data_file, args.row_file
@@ -441,6 +467,7 @@ pub fn reorder_rows(args: &ReorderRowsArgs) -> anyhow::Result<()> {
     let (effective_output, output_file) = write_subset(
         &args.data_file,
         data.as_ref(),
+        None,
         None,
         Some((rows, row_names_order)),
         &args.output,

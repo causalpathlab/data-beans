@@ -295,6 +295,16 @@ impl SparseMtxData {
             row_preload: None,
         })
     }
+
+    /// Forget everything held in memory about the file's contents: the
+    /// preloaded columns and rows and the streaming cursor. For when the
+    /// file behind this handle has been replaced; arrays preloaded from the
+    /// old file would otherwise be served against the new index pointers.
+    fn forget_file_contents(&mut self) {
+        self.clean_preloaded_columns();
+        self.clean_preloaded_rows();
+        self.streamed_nnz = 0;
+    }
 }
 
 impl SparseIo for SparseMtxData {
@@ -309,9 +319,7 @@ impl SparseIo for SparseMtxData {
         self.by_column_indptr = vec![];
         self.by_row_indptr = vec![];
         // Nothing read from the removed file describes the new one.
-        self.streamed_nnz = 0;
-        self.clean_preloaded_columns();
-        self.clean_preloaded_rows();
+        self.forget_file_contents();
 
         Ok(())
     }
@@ -374,7 +382,7 @@ impl SparseIo for SparseMtxData {
         // The open handle points at the deleted inode after the swap; reopen on
         // the path and refresh the resident indptrs.
         self.backend = hdf5::File::open_rw(&self.file_name)?.into();
-        self.streamed_nnz = 0;
+        self.forget_file_contents();
         self.read_column_indptr()?;
         self.read_row_indptr()?;
         Ok(())

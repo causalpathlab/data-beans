@@ -256,6 +256,19 @@ fn write_splits(
     let n_columns = column_names.len();
     let row_names = data.row_names()?;
     let names = (row_names.as_slice(), column_names);
+    // Every half is checked before the first is written: an input named
+    // like a later half would otherwise be refused with the earlier halves
+    // already on disk.
+    for fold in 0..splits.len() {
+        for half in ["train", "test"] {
+            super::ensure_output_is_no_input(
+                &[&args.data_file],
+                &half_name(args, choice, fold, half),
+                args.backend.clone(),
+                args.zip,
+            )?;
+        }
+    }
     for (fold, (train_columns, test_columns)) in splits.iter().enumerate() {
         anyhow::ensure!(
             train_columns.len() + test_columns.len() == n_columns,
@@ -444,7 +457,8 @@ fn column_groups_from_table(
     Ok(column_groups)
 }
 
-/// Write one half as a new backend, streamed.
+/// Write one half as a new backend, streamed. The caller has checked that
+/// `output` is not the input.
 ///
 /// The selected columns' exact nnz comes off the resident indptr and the
 /// survivors flow through the validated streaming writer in byte-budgeted
@@ -464,7 +478,7 @@ fn write_half(
         .collect();
 
     let (effective_output, backend_out, file_out) =
-        super::prepare_output_beside(&args.data_file, output, args.backend.clone(), args.zip)?;
+        super::prepare_output(output, args.backend.clone(), args.zip)?;
     info!("Streaming {} columns to {output}", selected_columns.len());
     let (n_rows, n_cols, nnz) = crate::column_subset::stream_column_selection(
         data,

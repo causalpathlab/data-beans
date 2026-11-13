@@ -48,13 +48,13 @@ fn the_row_index_counts_the_entries_of_the_rows_kept() {
 
     // Rows 0 and 3 hold 10, 50 and 40, 70.
     let rows = RowMap::keeping(&[3, 0], 4).unwrap();
-    assert_eq!(nnz_of_kept_rows(data.as_ref(), &rows), Some(4));
+    assert_eq!(nnz_of_kept_rows(data.row_indptr(), &rows.to), Some(4));
     let every_row = RowMap::keeping(&[0, 1, 2, 3], 4).unwrap();
-    assert_eq!(nnz_of_kept_rows(data.as_ref(), &every_row), Some(7));
+    assert_eq!(nnz_of_kept_rows(data.row_indptr(), &every_row.to), Some(7));
 
     // An index that does not describe the map's rows says nothing.
     let other_rows = RowMap::keeping(&[0, 1], 3).unwrap();
-    assert_eq!(nnz_of_kept_rows(data.as_ref(), &other_rows), None);
+    assert_eq!(nnz_of_kept_rows(data.row_indptr(), &other_rows.to), None);
 }
 
 #[test]
@@ -147,15 +147,23 @@ fn rows_are_placed_by_name_and_ambiguous_names_refused() {
     let names = |xs: &[&str]| -> Vec<Box<str>> { xs.iter().map(|&x| x.into()).collect() };
     let old = names(&["a", "b", "c", "b"]);
 
-    let map = RowMap::by_names(&old, &names(&["c", "x", "a"])).unwrap();
+    let map = RowMap::by_names(&old, &names(&["c", "x", "a"]), 4).unwrap();
     assert_eq!(map.to, [Some(2), None, Some(0), None]);
     assert_eq!(map.nrow, 3);
 
-    let err = RowMap::by_names(&old, &names(&["a", "c", "a"]))
+    // A row past the names is dropped; a name past the rows names no row,
+    // so the second `b` is no clash.
+    let map = RowMap::by_names(&old, &names(&["c", "a"]), 6).unwrap();
+    assert_eq!(map.to, [Some(1), None, Some(0), None, None, None]);
+    let map = RowMap::by_names(&old, &names(&["b", "c"]), 2).unwrap();
+    assert_eq!(map.to, [None, Some(0)]);
+    assert_eq!(map.nrow, 2);
+
+    let err = RowMap::by_names(&old, &names(&["a", "c", "a"]), 4)
         .err()
         .expect("a listed twice");
     assert!(err.to_string().contains("lists `a` twice"), "{err}");
-    let err = RowMap::by_names(&old, &names(&["b", "a"]))
+    let err = RowMap::by_names(&old, &names(&["b", "a"]), 4)
         .err()
         .expect("two rows named b");
     assert!(
