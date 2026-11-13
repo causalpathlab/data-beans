@@ -31,7 +31,7 @@ pub use sample::{sample_nested_topic_proportions, sample_poisson_from_logits};
 use crate::sim::copula::gaussian::CopulaCovariance;
 use crate::sim::copula::reference::{open_reference, SparseRef};
 use crate::sim::copula::sampler::{
-    depth_log_offset, sample_reference_counts, CellPrograms, Triplets,
+    depth_log_offset, sample_reference_counts, CellPrograms, CellTerm, Triplets,
 };
 use crate::sim::copula::{fit_global_copula, GlobalCopulaFit, ReferenceFitArgs};
 use crate::sim::handlers::BatchProgram;
@@ -1149,14 +1149,18 @@ fn sample_with_reference(
     let batch_delta = batch_cov.sample_batch_shifts(bb, alpha_batch, &mut rng);
 
     let programs = CellPrograms {
-        dict_dk: &eff_dk,
-        theta_kn,
+        term: CellTerm::Topics {
+            dict_dk: &eff_dk,
+            theta_kn,
+        },
         pve_topic: pi_topic,
+        cap_spread: false,
         pve_noise: pi_noise,
         batch_delta: &batch_delta,
         batch_membership,
     };
-    let triplets = sample_reference_counts(fit, depth_offset, &programs, couple_depth, rseed, 1)?;
+    let (triplets, _) =
+        sample_reference_counts(fit, depth_offset, &programs, couple_depth, rseed, 1)?;
 
     Ok((triplets, batch_delta))
 }

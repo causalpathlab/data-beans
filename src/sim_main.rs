@@ -7,6 +7,9 @@ use data_beans::sim::handlers::{
     RunSimulateMultimodalArgs,
 };
 use data_beans::sim::multiome::{fidelity_report_paths, run_multiome, MultiomeArgs};
+use data_beans::sim::trajectory::run::{
+    fidelity_report_path as trajectory_report_path, run_trajectory, TrajectoryArgs,
+};
 
 #[cfg(feature = "mcp")]
 mod sim_mcp;
@@ -35,6 +38,13 @@ fn main() -> anyhow::Result<()> {
         Commands::Topic(args) => {
             run_simulate(args)?;
             (fidelity_report_path(args).into_iter().collect(), args.view)
+        }
+        Commands::Trajectory(args) => {
+            run_trajectory(args)?;
+            (
+                trajectory_report_path(args).into_iter().collect(),
+                args.view,
+            )
         }
         Commands::Bulk(args) => {
             generate_convoluted_data(args)?;
@@ -103,7 +113,8 @@ struct ViewArgs {
     version,
     about = "Synthetic single-cell-like data generators for the data-beans ecosystem.",
     long_about = "data-beans-sim simulates sparse count matrices. Available structure:\n\
-                  factor-model, CNV, multimodal, and topic-conditioned bulk-deconvolution.\n\
+                  factor-model, lineage trajectory, CNV, multimodal, and topic-conditioned\n\
+                  bulk-deconvolution.\n\
                   \n\
                   Outputs use the same zarr/h5 backend formats `data-beans` reads.\n\
                   Simulated and real datasets therefore share one toolchain."
@@ -162,6 +173,33 @@ enum Commands {
                       See data-beans-sim/docs/topic.md for the full derivation."
     )]
     Topic(RunSimulateArgs),
+
+    #[command(
+        about = "Lineage tree / pseudotime trajectory (with optional reference-conditioned sampling)",
+        long_about = "Cells sit on the branches of a lineage tree (`--lineages k`: a root that\n\
+                      splits into k; or `--tree` parents), each at a pseudotime t ∈ [0, 1]\n\
+                      in its branch. A share of genes (`--dynamic-genes`) follows a smooth\n\
+                      random curve f_g(branch, t), continuous at branch points:\n\
+                      \x20 f_g(b, t) = f_g(parent(b), 1) + Σ_k c_{g,b,k}·sin((k−½)πt)/((k−½)π)\n\
+                      a smoothed Brownian motion down the tree (`--basis` terms per branch),\n\
+                      standardised over the cells to f̃_g. Per cell j and gene g:\n\
+                      \x20 log λ = log μ_g + √pve_traj·f̃_g(b_j,t_j) − c_g + √pve_noise·ε − pve_noise/2\n\
+                      \x20         + √pve_batch·z_{g,B(j)} − c_{g,batch}\n\
+                      with every c centring its term so the gene's mean stays μ_g.\n\
+                      \n\
+                      Synthetic mode: μ_g = (depth/G)·β_g, log-normal β, y ~ Poisson(λ).\n\
+                      Reference mode (`--reference`): the sampler of `topic --reference`, with\n\
+                      the trajectory in place of topics. Each gene keeps its reference Poisson\n\
+                      mixture, depth coupling and latent copula; trajectory and noise are capped\n\
+                      by its extra-Poisson log-variance. It writes `{output}.fidelity.json`.\n\
+                      \n\
+                      Ground truth: `{output}.cells.parquet` (branch, pseudotime, tree time,\n\
+                      batch, lineage membership), `{output}.tree.tsv`, `{output}.genes.parquet`\n\
+                      (dynamic, amplitude, centre, curve coefficients) and\n\
+                      `{output}.curves.parquet` (each gene's log-mean term on a pseudotime grid).\n\
+                      This follows scDesign3's pseudotime mode, Splatter's paths and PROSSTT."
+    )]
+    Trajectory(TrajectoryArgs),
 
     #[command(
         about = "Bulk (convoluted) data matrix from real SC reference (experimental)",
@@ -270,7 +308,8 @@ enum Commands {
     #[command(
         about = "Draw a reference-mode simulation against its reference (terminal view)",
         long_about = "Open the fidelity view of a reference-mode simulation.\n\
-                      `topic --reference` and `multiome --reference-*` write a report,\n\
+                      `topic --reference`, `trajectory --reference` and `multiome --reference-*`\n\
+                      write a report,\n\
                       `{output}.fidelity.json` (`{out}.{rna,atac}.fidelity.json` for multiome).\n\
                       The view shows a summary table, library-size and detected-gene histograms,\n\
                       per-gene mean, variance and zero fraction against the reference,\n\

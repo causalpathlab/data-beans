@@ -1,6 +1,8 @@
 use crate::hdf5_io::*;
 use crate::sim::copula::reference::open_reference;
-use crate::sim::copula::sampler::{depth_log_offset, sample_reference_counts, CellPrograms};
+use crate::sim::copula::sampler::{
+    depth_log_offset, sample_reference_counts, CellPrograms, CellTerm,
+};
 use crate::sim::copula::{fit_global_copula, ReferenceFitArgs};
 use crate::sim::core as simulate;
 use crate::sim::multimodal as simulate_multimodal;
@@ -373,10 +375,54 @@ pub struct RunSimulateMultimodalArgs {
     pub zip: bool,
 }
 
+/// The batch-program covariance of the per-batch log shifts: rank 0 gives
+/// iid shifts per gene (Splatter-style); a positive rank a low-rank factor
+/// plus an iid residual, random or the reference copula's top factors.
+pub(crate) fn batch_covariance(
+    dd: usize,
+    rank: usize,
+    program: BatchProgram,
+    fit: Option<&crate::sim::copula::GlobalCopulaFit>,
+    rng: &mut impl rand::Rng,
+) -> anyhow::Result<CopulaCovariance> {
+    Ok(match (rank, program, fit) {
+        (0, ..) | (_, BatchProgram::Random, _) => CopulaCovariance::random_low_rank(dd, rank, rng),
+        (_, BatchProgram::Empirical, Some(fit)) => {
+            fit.copula.truncate_rank(rank).embed(&fit.hvg_indices, dd)?
+        }
+        (_, BatchProgram::Empirical, None) => {
+            anyhow::bail!("--batch-program empirical needs a --reference")
+        }
+    })
+}
+
+/// Each cell's batch, one per line, and the per-batch log shifts already
+/// scaled by `√π_batch`, gene × batch, as `topic` writes them.
+pub(crate) fn write_batch_truth(
+    membership: &[usize],
+    delta: &[nalgebra::DVector<f32>],
+    row_names: &[Box<str>],
+    batch_file: &str,
+    ln_batch_file: &str,
+) -> anyhow::Result<()> {
+    let lines: Vec<Box<str>> = membership
+        .iter()
+        .map(|b| b.to_string().into_boxed_str())
+        .collect();
+    write_lines(&lines, batch_file)?;
+    let mut ln_delta_db = DMatrix::<f32>::zeros(row_names.len(), delta.len());
+    for (b, col) in delta.iter().enumerate() {
+        ln_delta_db.set_column(b, col);
+    }
+    ln_delta_db.to_parquet_with_names(ln_batch_file, (Some(row_names), Some("feature")), None)?;
+    info!("batch membership: {batch_file}; log shifts: {ln_batch_file}");
+    Ok(())
+}
+
 /// Build a sparse backend from column-remapped triplets and register
 /// row/column names. Shared by the single-file and holdout-split write
 /// paths of [`run_simulate`].
-fn build_and_write_backend(
+pub(crate) fn build_and_write_backend(
     triplets: &[(u64, u64, f32)],
     row_names: &[Box<str>],
     col_names: &[Box<str>],
@@ -666,19 +712,13 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
 
     // Stage-2 batch covariance. rank=0 → all-isotropic (Splatter-style);
     // rank>0 → low-rank factor + iid residual.
-    let batch_cov: CopulaCovariance = if cmd_args.batch_rank == 0 {
-        CopulaCovariance::random_low_rank(dd, 0, &mut rng)
-    } else {
-        match cmd_args.batch_program {
-            BatchProgram::Empirical => fit
-                .copula
-                .truncate_rank(cmd_args.batch_rank)
-                .embed(&fit.hvg_indices, dd)?,
-            BatchProgram::Random => {
-                CopulaCovariance::random_low_rank(dd, cmd_args.batch_rank, &mut rng)
-            }
-        }
-    };
+    let batch_cov = batch_covariance(
+        dd,
+        cmd_args.batch_rank,
+        cmd_args.batch_program,
+        Some(&fit),
+        &mut rng,
+    )?;
     info!(
         "stage-2 batch program: rank={} ({:?}), {} batches",
         batch_cov.rank(),
@@ -724,14 +764,17 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
     let theta_kn = crate::sim::core::sample_theta_kn(kk, nn, pve_topic, &mut rng)?;
 
     let programs = CellPrograms {
-        dict_dk: &beta_dk,
-        theta_kn: &theta_kn,
+        term: CellTerm::Topics {
+            dict_dk: &beta_dk,
+            theta_kn: &theta_kn,
+        },
         pve_topic,
+        cap_spread: false,
         pve_noise,
         batch_delta: &batch_delta,
         batch_membership: &batch_membership,
     };
-    let triplets = sample_reference_counts(
+    let (triplets, _) = sample_reference_counts(
         &fit,
         depth_offset,
         &programs,
@@ -778,19 +821,13 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
         })
         .collect();
 
-    let batch_lines: Vec<Box<str>> = batch_membership
-        .iter()
-        .map(|b: &usize| b.to_string().into_boxed_str())
-        .collect();
-    write_lines(&batch_lines, &batch_memb_file)?;
-    info!("batch membership: {}", batch_memb_file);
-
-    // batch_delta is already α_batch-scaled. Stack into D × B for parquet.
-    let mut ln_delta_db = DMatrix::<f32>::zeros(dd, bb);
-    for (b, col) in batch_delta.iter().enumerate() {
-        ln_delta_db.set_column(b, col);
-    }
-    ln_delta_db.to_parquet_with_names(&ln_batch_file, (Some(&row_names), Some("feature")), None)?;
+    write_batch_truth(
+        &batch_membership,
+        &batch_delta,
+        &row_names,
+        &batch_memb_file,
+        &ln_batch_file,
+    )?;
     theta_kn.transpose().to_parquet_with_names(
         &prop_file,
         (Some(&col_names), Some("cell")),

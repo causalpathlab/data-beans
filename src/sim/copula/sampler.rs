@@ -18,7 +18,8 @@
 //! - Depth enters through the latent: one `z_s ~ N(0, 1)` per cell, and
 //!   each gene moves with it as much as it does in the reference (`ρ_gs`).
 //! - `t_{g,j}` is the z-scored log topic loading
-//!   ([`crate::sim::core::standardized_log_topic`]); `M1_g` is the mean of
+//!   ([`crate::sim::core::standardized_log_topic`]), or any other per-cell
+//!   term ([`CellTerm`], e.g. a trajectory's curves); `M1_g` is the mean of
 //!   `exp(a_g · t_{g,j})` over the simulated cells, so no term raises a
 //!   gene's mean.
 //! - The mixture already holds all of the gene's extra-Poisson variation,
@@ -27,7 +28,8 @@
 //!   keeps the dictionary's effects, `a_g = √pve_topic`, unless its
 //!   log-variance `a_g² · Var_j t_{g,j}` would exceed `L_g`; then `a_g`
 //!   shrinks to fit it exactly. The noise term takes `b_g = √pve_noise`,
-//!   capped by what the topic term left. The mixture keeps the rest: its
+//!   capped by what the topic term left, `L_g − ln spread_g` (below). The
+//!   mixture keeps the rest: its
 //!   rates are tempered (`λ^γ`, rescaled to the same mean) until
 //!   `(1 + cv²(γ)) · spread_g = 1 + cv_g²`, with `spread_g = E[T²]/E[T]²` of
 //!   the realised multipliers. Every gene keeps the reference's variance; a
@@ -53,23 +55,62 @@ use rayon::prelude::*;
 /// order, so the moments do not depend on the thread count.
 const MOMENT_BLOCK: usize = 256;
 
+/// Bisection steps of the spread cap ([`CellPrograms::cap_spread`]): the
+/// amplitude to within `2⁻²⁰` of its log-variance cap.
+const SPREAD_STEPS: usize = 20;
+
 /// `Var_j t_{g,j}` below which a gene has no topic term.
 const MIN_TOPIC_VARIANCE: f64 = 1e-8;
 
+/// The per-cell log-mean term `t_{·,j}` that [`CellPrograms`] scales by
+/// `√pve_topic`, capped per gene by its reference dispersion.
+pub enum CellTerm<'a> {
+    /// z-scored `log(β·θ_j)` ([`standardized_log_topic`]) from gene × topic
+    /// loadings (`β`, or `γ ⊙ β` in the multiome) and topic × cell
+    /// proportions `θ`.
+    Topics {
+        dict_dk: &'a DMatrix<f32>,
+        theta_kn: &'a DMatrix<f32>,
+    },
+    /// Any per-cell gene vector, e.g. a trajectory's curves at each cell's
+    /// branch and pseudotime ([`crate::sim::trajectory`]).
+    PerCell(&'a (dyn Fn(usize) -> DVector<f32> + Sync)),
+}
+
+impl CellTerm<'_> {
+    fn at(&self, j: usize) -> DVector<f32> {
+        match self {
+            Self::Topics { dict_dk, theta_kn } => {
+                standardized_log_topic(&(*dict_dk * theta_kn.column(j)))
+            }
+            Self::PerCell(term) => term(j),
+        }
+    }
+}
+
 /// Per-cell programs on top of the reference baseline.
 pub struct CellPrograms<'a> {
-    /// Gene × topic loadings (`β`, or `γ ⊙ β` in the multiome).
-    pub dict_dk: &'a DMatrix<f32>,
-    /// Topic × cell proportions `θ`.
-    pub theta_kn: &'a DMatrix<f32>,
-    /// Log-variance of the topic term (`√pve_topic` scales the z-scored
-    /// topic loading), capped per gene by its reference dispersion.
+    pub term: CellTerm<'a>,
+    /// Log-variance of the per-cell term (`√pve_topic` scales it), capped
+    /// per gene by its reference dispersion.
     pub pve_topic: f32,
+    /// Also cap the per-cell term so its multiplier `T = exp(a_g · t)`
+    /// spreads no more than the gene's reference rates, `E[T²]/E[T]² ≤
+    /// 1 + cv_g²`. The log-variance cap alone bounds that only for a
+    /// log-normal `T`; a skewed term then overshoots the reference variance.
+    pub cap_spread: bool,
     /// Log-variance of the iid noise term, capped by what the topic term left.
     pub pve_noise: f32,
     /// Per-batch log shift of every gene, already scaled.
     pub batch_delta: &'a [DVector<f32>],
     pub batch_membership: &'a [usize],
+}
+
+/// How the sampler scaled the per-cell term: gene `g`'s log-mean term is
+/// `amp[g] · t_{g,j} − centre[g]`.
+pub struct TermScaling {
+    pub amp: Vec<f32>,
+    pub centre: Vec<f32>,
 }
 
 /// Triplets `(gene, cell, count)` of the non-zero simulated counts.
@@ -85,11 +126,11 @@ pub fn depth_log_offset(fit: &GlobalCopulaFit, depth: Option<usize>) -> f32 {
     }
 }
 
-/// Sample one count matrix from a reference fit. `depth_offset` shifts every
-/// gene's log mean ([`depth_log_offset`]); `couple_depth` ties the genes to
-/// one depth coordinate per cell as in the reference, instead of giving
-/// every cell the same expected depth. Cell `j` uses the seed
-/// `rseed + seed_offset + j`.
+/// Sample one count matrix from a reference fit, with how the per-cell term
+/// was scaled. `depth_offset` shifts every gene's log mean
+/// ([`depth_log_offset`]); `couple_depth` ties the genes to one depth
+/// coordinate per cell as in the reference, instead of giving every cell the
+/// same expected depth. Cell `j` uses the seed `rseed + seed_offset + j`.
 pub fn sample_reference_counts(
     fit: &GlobalCopulaFit,
     depth_offset: f32,
@@ -97,21 +138,17 @@ pub fn sample_reference_counts(
     couple_depth: bool,
     rseed: u64,
     seed_offset: u64,
-) -> anyhow::Result<Triplets> {
+) -> anyhow::Result<(Triplets, TermScaling)> {
     let dd = fit.n_genes;
     let nn = programs.batch_membership.len();
-    anyhow::ensure!(
-        programs.dict_dk.nrows() == dd,
-        "reference sampler: {} dictionary rows for {} genes",
-        programs.dict_dk.nrows(),
-        dd
-    );
-    anyhow::ensure!(
-        programs.theta_kn.ncols() == nn,
-        "reference sampler: {} cells of topic proportions for {} cells",
-        programs.theta_kn.ncols(),
-        nn
-    );
+    if let CellTerm::Topics { theta_kn, .. } = &programs.term {
+        anyhow::ensure!(
+            theta_kn.ncols() == nn,
+            "reference sampler: {} cells of topic proportions for {} cells",
+            theta_kn.ncols(),
+            nn
+        );
+    }
     anyhow::ensure!(
         programs
             .batch_membership
@@ -120,9 +157,14 @@ pub fn sample_reference_counts(
         "reference sampler: a cell's batch has no shift"
     );
 
-    let topic = |j: usize| -> DVector<f32> {
-        standardized_log_topic(&(programs.dict_dk * programs.theta_kn.column(j)))
-    };
+    if nn > 0 {
+        let len = programs.term.at(0).len();
+        anyhow::ensure!(
+            len == dd,
+            "reference sampler: a per-cell term of {len} genes for {dd} genes"
+        );
+    }
+    let topic = |j: usize| programs.term.at(j);
     let budget = DispersionBudget::new(fit, programs, nn, &topic);
     info!(
         "reference sampler: topic term capped by the reference dispersion for {} genes; \
@@ -215,12 +257,16 @@ pub fn sample_reference_counts(
         })
         .flatten()
         .collect();
-    Ok(triplets)
+    let scaling = TermScaling {
+        amp: budget.topic_amp,
+        centre: budget.ln_m1,
+    };
+    Ok((triplets, scaling))
 }
 
 /// `ln E_b[exp δ_{g,b}]` over the cells' batches: subtracting it keeps a
 /// gene's mean over all cells at the reference mean.
-fn batch_centre(delta: &[DVector<f32>], membership: &[usize], dd: usize) -> Vec<f32> {
+pub(crate) fn batch_centre(delta: &[DVector<f32>], membership: &[usize], dd: usize) -> Vec<f32> {
     if membership.is_empty() || delta.is_empty() {
         return vec![0.0; dd];
     }
@@ -267,7 +313,6 @@ impl DispersionBudget {
         let budget: Vec<f64> = fit.marginals.iter().map(|m| m.rate_cv2().ln_1p()).collect();
 
         let mut topic_amp = vec![0.0_f32; dd];
-        let mut used = vec![0.0_f64; dd];
         let mut ln_m1 = vec![0.0_f32; dd];
         let mut spread = vec![1.0_f64; dd];
         let mut n_capped = 0;
@@ -284,21 +329,59 @@ impl DispersionBudget {
                 if v <= MIN_TOPIC_VARIANCE {
                     continue;
                 }
-                let a = if alpha_topic * alpha_topic * v > budget[g] {
-                    n_capped += 1;
-                    (budget[g] / v).sqrt()
-                } else {
-                    alpha_topic
-                };
-                topic_amp[g] = a as f32;
-                used[g] = a * a * v;
+                topic_amp[g] = alpha_topic.min((budget[g] / v).sqrt()) as f32;
             }
-            let (m1, m2) = first_two_moments(genes.len(), nn, |j, out| {
-                let t = topic(j);
-                for (o, &g) in out.iter_mut().zip(genes) {
-                    *o = ((topic_amp[g] * t[g]) as f64).exp();
+            // `E[T]` and `E[T²]` of `T = exp(amp_g · t_g)` over `idx`.
+            let exp_moments = |amp: &[f32], idx: &[usize]| {
+                first_two_moments(idx.len(), nn, |j, out| {
+                    let t = topic(j);
+                    for (o, &g) in out.iter_mut().zip(idx) {
+                        *o = ((amp[g] * t[g]) as f64).exp();
+                    }
+                })
+            };
+            let (mut m1, mut m2) = exp_moments(&topic_amp, genes);
+            if programs.cap_spread {
+                // The spread grows with the amplitude from 1 at 0: bisect
+                // each gene over it, all genes in one pass per step.
+                let fits = |g: usize, a: f64, b: f64| {
+                    b / (a * a).max(f64::MIN_POSITIVE) <= budget[g].exp()
+                };
+                let over: Vec<usize> = genes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &g)| (!fits(g, m1[i], m2[i])).then_some(g))
+                    .collect();
+                if !over.is_empty() {
+                    let mut lo = vec![0.0_f32; dd];
+                    let mut hi = topic_amp.clone();
+                    let mut trial = topic_amp.clone();
+                    for _ in 0..SPREAD_STEPS {
+                        for &g in &over {
+                            trial[g] = 0.5 * (lo[g] + hi[g]);
+                        }
+                        let (a, b) = exp_moments(&trial, &over);
+                        for (i, &g) in over.iter().enumerate() {
+                            if fits(g, a[i], b[i]) {
+                                lo[g] = trial[g];
+                            } else {
+                                hi[g] = trial[g];
+                            }
+                        }
+                    }
+                    for &g in &over {
+                        topic_amp[g] = lo[g];
+                    }
+                    (m1, m2) = exp_moments(&topic_amp, genes);
                 }
-            });
+            }
+            n_capped = genes
+                .iter()
+                .filter(|&&g| {
+                    let a = topic_amp[g] as f64;
+                    a > 0.0 && a < alpha_topic * (1.0 - 1e-6)
+                })
+                .count();
             for (i, &g) in genes.iter().enumerate() {
                 ln_m1[g] = m1[i].max(f64::MIN_POSITIVE).ln() as f32;
                 spread[g] = m2[i] / (m1[i] * m1[i]).max(f64::MIN_POSITIVE);
@@ -306,7 +389,10 @@ impl DispersionBudget {
         }
         let mut noise_amp = vec![0.0_f32; dd];
         for &g in genes {
-            noise_amp[g] = alpha_noise.min((budget[g] - used[g]).max(0.0).sqrt()) as f32;
+            // What the topic term left: its multiplier's log spread, which
+            // exceeds its log-variance when the term is skewed.
+            let left = budget[g] - spread[g].ln();
+            noise_amp[g] = alpha_noise.min(left.max(0.0).sqrt()) as f32;
         }
         let left: Vec<(PoissonMixture, bool)> = (0..dd)
             .into_par_iter()
@@ -333,7 +419,7 @@ impl DispersionBudget {
 /// Per entry, the mean over cells of `x` and `x²`, with `fill(j, out)`
 /// writing cell `j`'s `n` values; summed in fixed blocks so the result does
 /// not depend on the thread schedule.
-fn first_two_moments(
+pub(crate) fn first_two_moments(
     n: usize,
     nn: usize,
     fill: impl Fn(usize, &mut [f64]) + Sync,

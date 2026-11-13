@@ -5,3 +5,4 @@ pub mod faba;
 pub mod handlers;
 pub mod multimodal;
 pub mod multiome;
+pub mod trajectory;
