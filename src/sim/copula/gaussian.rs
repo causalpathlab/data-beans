@@ -5,13 +5,16 @@
 //! [`CopulaCovariance::from_correlation`] fits `F` to a latent correlation
 //! matrix (see [`crate::sim::copula::latent`]) by iterated principal-axis
 //! factoring: the diagonal of the correlation matrix is replaced by the
-//! rows' communalities `‖F[h,:]‖²`, the leading positive eigenpairs give the
+//! rows' communalities `‖F[h,:]‖²`, the leading positive eigenpairs (a top-r
+//! symmetric eigensolver, `legume_numeric`'s `SymmetricTopEigen`) give the
 //! next `F`, and each row's residual `1 − ‖F[h,:]‖²` goes to `ridge_sd`.
 //! The off-diagonal correlations are what the factor fits; each gene keeps
 //! the variance the shared factors do not explain as its own, instead of
 //! being stretched into pure shared variance. The dense `G × G` matrix is
 //! only formed for the copula's genes (the HVGs); sampling uses `F` alone.
 
+use anyhow::Context;
+use legume_numeric::matrix::traits::{SymmetricTopEigen, TopEigenArgs};
 use nalgebra::{DMatrix, DVector};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
@@ -58,6 +61,30 @@ impl CopulaCovariance {
             g,
             corr.ncols()
         );
+        Self::principal_axes(corr, rank, regularization, |reduced, r, warm| {
+            let eig = reduced
+                .top_eigen_with(r, &TopEigenArgs::default(), warm)
+                .context("copula factor fit: top eigenpairs")?;
+            Ok((eig.values, eig.vectors, eig.converged))
+        })
+    }
+
+    /// Iterated principal-axis factoring of `corr` with `eigen` giving the
+    /// `r` largest algebraic eigenpairs of a matrix (descending, warm-started
+    /// from the last vectors) and whether they converged. Shared by
+    /// [`Self::from_correlation`] and the test that checks it against a full
+    /// eigendecomposition.
+    fn principal_axes(
+        corr: &DMatrix<f64>,
+        rank: usize,
+        regularization: f32,
+        mut eigen: impl FnMut(
+            &DMatrix<f64>,
+            usize,
+            Option<&DMatrix<f64>>,
+        ) -> anyhow::Result<(DVector<f64>, DMatrix<f64>, bool)>,
+    ) -> anyhow::Result<Self> {
+        let g = corr.nrows();
         let max_communality = 1.0 - (regularization as f64).clamp(0.0, 1.0);
         let r_eff = rank.min(g);
         // Start from each row's largest off-diagonal |ρ|: the matrix need
@@ -72,36 +99,45 @@ impl CopulaCovariance {
             })
             .collect();
         let mut factor = DMatrix::<f64>::zeros(g, 0);
-        for _ in 0..PAF_ITERATIONS {
-            if r_eff == 0 {
-                break;
-            }
+        let mut converged = true;
+        if r_eff > 0 {
+            // Each refit only moves the diagonal: one copy, its diagonal
+            // rewritten per refit, and the last eigenvectors a close start.
             let mut reduced = corr.clone();
-            for (h, &c) in communality.iter().enumerate() {
-                reduced[(h, h)] = c;
-            }
-            let eig = reduced.symmetric_eigen();
-            let mut order: Vec<usize> = (0..g).filter(|&i| eig.eigenvalues[i] > 0.0).collect();
-            order.sort_by(|&i, &j| eig.eigenvalues[j].total_cmp(&eig.eigenvalues[i]));
-            order.truncate(r_eff);
-            factor = DMatrix::from_fn(g, order.len(), |h, k| {
-                eig.eigenvectors[(h, order[k])] * eig.eigenvalues[order[k]].sqrt()
-            });
-            let mut change = 0.0_f64;
-            for (h, c) in communality.iter_mut().enumerate() {
-                let norm_sq = factor.row(h).norm_squared();
-                if norm_sq > max_communality {
-                    factor
-                        .row_mut(h)
-                        .scale_mut((max_communality / norm_sq).sqrt());
+            let mut warm: Option<DMatrix<f64>> = None;
+            for _ in 0..PAF_ITERATIONS {
+                for (h, &c) in communality.iter().enumerate() {
+                    reduced[(h, h)] = c;
                 }
-                let next = norm_sq.min(max_communality);
-                change = change.max((next - *c).abs());
-                *c = next;
+                // Only the positive eigenpairs become factors: the reduced
+                // matrix need not be positive semi-definite.
+                let (values, vectors, ok) = eigen(&reduced, r_eff, warm.as_ref())?;
+                converged = ok;
+                let kept = values.iter().take_while(|&&v| v > 0.0).count();
+                factor = DMatrix::from_fn(g, kept, |h, k| vectors[(h, k)] * values[k].sqrt());
+                warm = Some(vectors);
+                let mut change = 0.0_f64;
+                for (h, c) in communality.iter_mut().enumerate() {
+                    let norm_sq = factor.row(h).norm_squared();
+                    if norm_sq > max_communality {
+                        factor
+                            .row_mut(h)
+                            .scale_mut((max_communality / norm_sq).sqrt());
+                    }
+                    let next = norm_sq.min(max_communality);
+                    change = change.max((next - *c).abs());
+                    *c = next;
+                }
+                if change < PAF_TOLERANCE {
+                    break;
+                }
             }
-            if change < PAF_TOLERANCE {
-                break;
-            }
+        }
+        if !converged {
+            log::warn!(
+                "copula factor fit: the last top-{r_eff} eigensolve stopped before converging; \
+                 the factor is approximate"
+            );
         }
         let ridge_sd = DVector::from_fn(g, |h, _| {
             ((1.0 - factor.row(h).norm_squared()).max(0.0).sqrt()) as f32
@@ -384,6 +420,46 @@ mod tests {
                 .rank(),
             0
         );
+    }
+
+    /// The top-r path keeps the same factor a full eigendecomposition gives,
+    /// on a reduced matrix with large negative eigenvalues: only the
+    /// leading positive eigenpairs become factors.
+    #[test]
+    fn top_eigenpairs_match_the_dense_fit_on_an_indefinite_matrix() {
+        let g = 40;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(23);
+        let normal = Normal::new(0.0_f64, 1.0).unwrap();
+        // Two positive spikes, and a negative block larger in magnitude.
+        let a = DMatrix::from_fn(g, 2, |_, _| normal.sample(&mut rng) * 0.15);
+        let b = DMatrix::from_fn(g, 3, |_, _| normal.sample(&mut rng) * 0.2);
+        let mut corr = &a * a.transpose() - &b * b.transpose();
+        for h in 0..g {
+            corr[(h, h)] = 1.0;
+        }
+        let cov = CopulaCovariance::from_correlation(&corr, 4, 1e-3).unwrap();
+
+        // The same principal-axis fit with a full eigendecomposition, as
+        // before the top-r solver. g = 40 against rank 4 plus the default
+        // oversample of 10 keeps the top-r solver on its iterative path
+        // (it solves densely once twice the block reaches g).
+        let dense = CopulaCovariance::principal_axes(&corr, 4, 1e-3, |m, r, _| {
+            let eig = m.clone().symmetric_eigen();
+            let mut order: Vec<usize> = (0..m.nrows()).collect();
+            order.sort_by(|&i, &j| eig.eigenvalues[j].total_cmp(&eig.eigenvalues[i]));
+            order.truncate(r);
+            let values = DVector::from_fn(order.len(), |k, _| eig.eigenvalues[order[k]]);
+            let vectors = DMatrix::from_fn(m.nrows(), order.len(), |h, k| {
+                eig.eigenvectors[(h, order[k])]
+            });
+            Ok((values, vectors, true))
+        })
+        .unwrap();
+        let want = (&dense.factor * dense.factor.transpose()).map(|x| x as f64);
+        let got = (&cov.factor * cov.factor.transpose()).map(|x| x as f64);
+        assert_eq!(cov.rank(), dense.rank());
+        let worst = (&got - &want).abs().max();
+        assert!(worst < 1e-4, "top-r and dense factors differ by {worst}");
     }
 
     /// One shared factor between rows 0 and 1 comes back as one column,
