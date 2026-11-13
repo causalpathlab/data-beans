@@ -1,11 +1,10 @@
 //! Reference loading, per-gene stats, HVG selection, and PIT z-build for the
 //! global copula structure used by `run_simulate --reference`.
 
-use crate::sim::copula::marginals::NbFit;
 use crate::sparse_io::*;
 use legume_numeric::matrix::common_io::file_ext;
 use legume_numeric::matrix::sparse_stat::SparseRunningStatistics;
-use nalgebra::DMatrix;
+use nalgebra_sparse::CscMatrix;
 
 /// Boxed dyn handle to whatever sparse backend the reference lives in.
 pub type SparseRef = Box<dyn SparseIo<IndexIter = Vec<usize>>>;
@@ -37,26 +36,20 @@ pub struct GeneStats {
 }
 
 /// Per-gene mean / variance / nnz over a cell subset via
-/// `legume_numeric::matrix::sparse_stat::SparseRunningStatistics` (one CSC pass).
+/// `legume_numeric::matrix::sparse_stat::SparseRunningStatistics` (one CSC
+/// pass), with each cell's library size. The CSC itself is returned too:
+/// the latent fit reads the same counts again.
 pub fn per_gene_stats(
     sc: &SparseRef,
     cells: &[usize],
     n_genes: usize,
-) -> anyhow::Result<Vec<GeneStats>> {
-    if cells.is_empty() {
-        return Ok(vec![
-            GeneStats {
-                mu: 0.0,
-                var: 0.0,
-                nnz: 0,
-            };
-            n_genes
-        ]);
-    }
+) -> anyhow::Result<(Vec<GeneStats>, Vec<f64>, CscMatrix<f32>)> {
     let mat = sc.read_columns_csc(cells.to_vec())?;
     let mut acc = SparseRunningStatistics::<f64>::new(n_genes);
+    let mut libs = Vec::with_capacity(cells.len());
     for col in mat.col_iter() {
         let vals_f64: Vec<f64> = col.values().iter().map(|&v| v as f64).collect();
+        libs.push(vals_f64.iter().sum());
         acc.add_sparse_column(col.row_indices(), &vals_f64);
     }
     // Pad implicit-zero columns so the mean/variance denominators reflect
@@ -64,47 +57,40 @@ pub fn per_gene_stats(
     for _ in mat.ncols()..cells.len() {
         acc.add_sparse_column(&[], &[]);
     }
+    libs.resize(cells.len(), 0.0);
     let (npos, _sum, mean, std) = acc.to_vecs();
-    Ok((0..n_genes)
+    let stats = (0..n_genes)
         .map(|g| GeneStats {
             mu: mean[g],
             var: std[g] * std[g],
             nnz: npos[g] as usize,
         })
-        .collect())
-}
-
-/// Combined per-gene stats + NB MoM fits — produces both from a single CSC
-/// pass. The copula fit needs both, and reading the CSC twice was the
-/// dominant cost on large references.
-pub fn per_gene_stats_and_marginals(
-    sc: &SparseRef,
-    cells: &[usize],
-    n_genes: usize,
-    r_floor: f32,
-) -> anyhow::Result<(Vec<GeneStats>, Vec<NbFit>)> {
-    let stats = per_gene_stats(sc, cells, n_genes)?;
-    let marginals = stats
-        .iter()
-        .map(|s| nb_fit_from_stats(s, r_floor))
         .collect();
-    Ok((stats, marginals))
+    Ok((stats, libs, mat))
 }
 
-fn nb_fit_from_stats(s: &GeneStats, r_floor: f32) -> NbFit {
-    let mu = s.mu as f32;
-    let var = s.var as f32;
-    if mu <= 0.0 || var <= mu {
-        return NbFit {
-            mu,
-            r: f32::INFINITY,
-        };
+/// Library-size coordinate of each cell: `Φ⁻¹` of its mid-rank, ties
+/// averaged, so it is standard normal across cells by construction.
+pub fn library_coordinate(libs: &[f64]) -> Vec<f64> {
+    let n = libs.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&i, &j| libs[i].total_cmp(&libs[j]));
+    let mut z = vec![0.0_f64; n];
+    let mut start = 0;
+    while start < n {
+        let mut end = start + 1;
+        while end < n && libs[order[end]] == libs[order[start]] {
+            end += 1;
+        }
+        // Mid-rank of the tie block, on (0, 1).
+        let u = (start + end) as f64 / (2.0 * n as f64);
+        let zu = crate::sim::copula::marginals::inv_phi(u);
+        for &c in &order[start..end] {
+            z[c] = zu;
+        }
+        start = end;
     }
-    let r = (mu * mu) / (var - mu);
-    NbFit {
-        mu,
-        r: r.max(r_floor),
-    }
+    z
 }
 
 /// Select up to `n_hvg` highly variable genes via the workspace's NB
@@ -113,61 +99,50 @@ fn nb_fit_from_stats(s: &GeneStats, r_floor: f32) -> NbFit {
 /// the trend — the same `φ(μ)` fit that the rest of the workspace uses for
 /// Fisher-info gene weighting and DC-Poisson clustering, so the copula sim
 /// is consistent with how HVGs are picked in cocoa / pinto / senna.
-pub fn select_hvg(stats: &[GeneStats], n_hvg: usize) -> Vec<usize> {
+///
+/// Only genes detected (non-zero) in at least `min_detection` of the
+/// `n_cells` reference cells are eligible: the excess-dispersion score
+/// otherwise favours genes seen in a handful of cells, whose correlations
+/// the reference cannot estimate.
+pub fn select_hvg(
+    stats: &[GeneStats],
+    n_cells: usize,
+    n_hvg: usize,
+    min_detection: f32,
+) -> Vec<usize> {
+    let floor = ((min_detection.max(0.0) as f64 * n_cells as f64).ceil() as usize)
+        .max(HVG_MIN_CELLS.min(n_cells));
     let means: Vec<f32> = stats.iter().map(|s| s.mu as f32).collect();
     let vars: Vec<f32> = stats.iter().map(|s| s.var as f32).collect();
-    crate::alg::hvg::select_hvg_by_stats(&means, &vars, n_hvg)
+    let trend = crate::alg::nb_dispersion::DispersionTrend::fit(&means, &vars);
+    let mut ranked: Vec<(usize, f32)> = (0..stats.len())
+        .filter(|&g| stats[g].nnz >= floor.max(1))
+        .map(|g| (g, log_excess_dispersion(&trend, means[g], vars[g])))
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut hvg: Vec<usize> = ranked.into_iter().take(n_hvg).map(|(g, _)| g).collect();
+    hvg.sort_unstable();
+    hvg
 }
 
-/// Build the (|hvg| × |cells|) PIT-then-`Φ⁻¹` Z matrix used to fit the
-/// gene-gene Gaussian copula on the reference.
-pub fn build_z_matrix(
-    sc: &SparseRef,
-    cells: &[usize],
-    hvg: &[usize],
-    fits: &[NbFit],
-) -> anyhow::Result<DMatrix<f32>> {
-    use crate::sim::copula::marginals::{inv_phi, nb_cdf_table, pit_continuity};
-    let n_hvg = hvg.len();
-    let n = cells.len();
-    let mat = sc.read_rows_csc(hvg.to_vec())?;
-    // mat: (|hvg| × |all_cells|). We need only the columns in `cells`.
-    let col_off = mat.col_offsets();
-    let row_idx = mat.row_indices();
-    let vals = mat.values();
-    // Pre-build CDF tables per HVG gene; cap k at the max observed value for that gene.
-    let mut max_val: Vec<u32> = vec![0; n_hvg];
-    for k in 0..vals.len() {
-        let h = row_idx[k];
-        let v = vals[k] as u32;
-        if v > max_val[h] {
-            max_val[h] = v;
-        }
+/// Fewest reference cells an HVG may be detected in, whatever the share.
+pub const HVG_MIN_CELLS: usize = 50;
+
+/// `ln(φ̂ / φ(μ))`: a gene's dispersion relative to the trend at its mean.
+/// The difference `φ̂ − φ(μ)` would rank genes seen in a handful of cells
+/// first, whose `φ̂` is huge only because their mean is tiny.
+fn log_excess_dispersion(
+    trend: &crate::alg::nb_dispersion::DispersionTrend,
+    mu: f32,
+    var: f32,
+) -> f32 {
+    if mu.is_nan() || mu <= 0.0 || !var.is_finite() {
+        return f32::NEG_INFINITY;
     }
-    let cdf_tables: Vec<Vec<f64>> = (0..n_hvg)
-        .map(|h| {
-            let fit = fits[hvg[h]];
-            nb_cdf_table(fit, (max_val[h] as usize).max(1))
-        })
-        .collect();
-    // U for value=0 is the same for all zero cells of a given gene; precompute.
-    let u_zero: Vec<f64> = cdf_tables.iter().map(|t| pit_continuity(t, 0)).collect();
-    let z_zero: Vec<f32> = u_zero.iter().map(|&u| inv_phi(u) as f32).collect();
-    let mut z = DMatrix::<f32>::zeros(n_hvg, n);
-    for (col_out, &cell) in cells.iter().enumerate() {
-        // Initialize the column to the zero-value Z for each gene.
-        for h in 0..n_hvg {
-            z[(h, col_out)] = z_zero[h];
-        }
-        // Then overwrite the nonzero entries from the CSC slice for this cell.
-        let s = col_off[cell];
-        let e = col_off[cell + 1];
-        for k in s..e {
-            let h = row_idx[k];
-            let v = vals[k] as u32;
-            let u = pit_continuity(&cdf_tables[h], v);
-            z[(h, col_out)] = inv_phi(u) as f32;
-        }
+    let phi_hat = (var - mu) / (mu * mu);
+    let phi_trend = trend.phi_at(mu);
+    if phi_hat <= 0.0 || phi_trend.is_nan() || phi_trend <= 0.0 {
+        return f32::NEG_INFINITY;
     }
-    Ok(z)
+    (phi_hat / phi_trend).ln()
 }

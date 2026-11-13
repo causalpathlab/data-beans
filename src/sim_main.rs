@@ -3,9 +3,13 @@ use clap::{Parser, Subcommand};
 use data_beans::sim::deconv::{generate_convoluted_data, SimConvArgs};
 use data_beans::sim::faba::{run_faba, FabaArgs};
 use data_beans::sim::handlers::{
-    run_simulate, run_simulate_multimodal, RunSimulateArgs, RunSimulateMultimodalArgs,
+    fidelity_report_path, run_simulate, run_simulate_multimodal, RunSimulateArgs,
+    RunSimulateMultimodalArgs,
 };
-use data_beans::sim::multiome::{run_multiome, MultiomeArgs};
+use data_beans::sim::multiome::{fidelity_report_paths, run_multiome, MultiomeArgs};
+
+#[cfg(feature = "mcp")]
+mod sim_mcp;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -26,14 +30,77 @@ fn main() -> anyhow::Result<()> {
     }
 
     match &cli.commands {
-        Commands::Topic(args) => run_simulate(args)?,
+        Commands::Topic(args) => {
+            run_simulate(args)?;
+            let report = fidelity_report_path(args);
+            if let Some(path) = report.as_deref() {
+                eprintln!("fidelity report: {path} (open with `data-beans-sim view {path}`)");
+            }
+            if args.view {
+                view_all(report.as_slice(), false)?;
+            }
+        }
         Commands::Bulk(args) => generate_convoluted_data(args)?,
         Commands::Multimodal(args) => run_simulate_multimodal(args)?,
-        Commands::Multiome(args) => run_multiome(args)?,
+        Commands::Multiome(args) => {
+            run_multiome(args)?;
+            let reports = fidelity_report_paths(args);
+            for path in &reports {
+                eprintln!("fidelity report: {path} (open with `data-beans-sim view {path}`)");
+            }
+            if args.view {
+                view_all(&reports, false)?;
+            }
+        }
         Commands::Faba(args) => run_faba(args)?,
+        Commands::View(args) => view_all(std::slice::from_ref(&args.report), true)?,
+        #[cfg(feature = "mcp")]
+        Commands::Mcp => sim_mcp::run_mcp()?,
     }
 
     Ok(())
+}
+
+/// Open the fidelity view of each report in turn (`q` moves on). Without a
+/// terminal it fails when the view is what was asked for (`view`), and only
+/// says so after a simulation (`--view`), whose outputs are written.
+#[cfg(feature = "tui")]
+fn view_all(reports: &[String], required: bool) -> anyhow::Result<()> {
+    if reports.is_empty() {
+        eprintln!("no fidelity report to view: --view draws reference-mode runs only");
+        return Ok(());
+    }
+    if !data_beans::interactive::tui_available() {
+        let line =
+            format!("the fidelity view needs a terminal; the reports are written: {reports:?}");
+        anyhow::ensure!(!required, "{line}");
+        eprintln!("{line}");
+        return Ok(());
+    }
+    for path in reports {
+        data_beans::interactive::sim_tui::view_fidelity(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "tui"))]
+fn view_all(reports: &[String], required: bool) -> anyhow::Result<()> {
+    if reports.is_empty() {
+        return Ok(());
+    }
+    if !required {
+        eprintln!("data-beans-sim was built without the `tui` feature; the reports are written: {reports:?}");
+        return Ok(());
+    }
+    anyhow::bail!(
+        "data-beans-sim was built without the `tui` feature; the reports are written: {reports:?}"
+    )
+}
+
+#[derive(clap::Args, Debug)]
+struct ViewArgs {
+    #[arg(help = "Fidelity report of a reference-mode run, `{output}.fidelity.json`")]
+    report: String,
 }
 
 #[derive(Parser, Debug)]
@@ -77,20 +144,25 @@ enum Commands {
                       both can be 1. `depth` is the **expected** library size. It is emergent,\n\
                       with no per-cell rescaling.\n\
                       \n\
-                      Reference mode (`--reference <h5/zarr>`): two-stage GLM,\n\
-                      NB+copula sampling —\n\
-                      stage 1:  log λ⁰ = log μ̂_g + √pve_topic·t + √pve_noise·ε\n\
-                      stage 2:  log λ  = log λ⁰ + √pve_batch·z_{g,b}   (two or more batches)\n\
-                      sample :  y ~ NB(λ, r̂_g)  via  u=Φ(z*),  F⁻¹_NB(u; λ, r̂)\n\
-                      where t is z-scored log(β·θ) per cell. β is drawn as in synthetic mode,\n\
-                      and ε is iid N(0, 1). z_{g,b} comes from the gene-gene copula factor,\n\
-                      at rank `--batch-rank`, on axes chosen by `--batch-program`.\n\
-                      z is centred across batches per gene. With one batch there is no shift:\n\
-                      the means are the reference's.\n\
+                      Reference mode (`--reference <h5/zarr>`): NB + Gaussian copula sampling.\n\
+                      Each gene keeps its reference count distribution F_g, a Poisson mixture:\n\
+                      \x20 log λ = log μ̂_g + a_g·t − ln M1_g + b_g·ε − b_g²/2 + δ_{g,b} − c_g\n\
+                      \x20 z*_g  = ρ_gs·z_s + √(1−ρ_gs²)·e_g,   y = F⁻¹_g(Φ(z*_g); rates × λ/μ̂_g)\n\
+                      t is z-scored log(β·θ) per cell, ε iid N(0, 1); a_g = √pve_topic and\n\
+                      b_g = √pve_noise, both capped so their log-variance stays within the gene's\n\
+                      extra-Poisson log-variance; F_g is tempered to leave them room, and M1_g\n\
+                      and c_g centre the means.\n\
+                      z_s is one depth coordinate per cell, and ρ_gs each gene's latent coupling\n\
+                      to library size in the reference. e is the HVGs' latent correlation beyond\n\
+                      depth (iid off the HVGs), estimated on the reference's empirical counts.\n\
+                      δ_{g,b} comes from the gene-gene copula factor at rank `--batch-rank`,\n\
+                      on axes chosen by `--batch-program`, centred across batches per gene.\n\
+                      With one batch there is no shift: the means are the reference's.\n\
                       \n\
-                      `--depth` is reinterpreted as a multiplicative scale.\n\
-                      Library size then matches the reference's mean. This follows the scDesign,\n\
-                      scDesign2 and scDesign3 lineage.\n\
+                      `--depth` rescales every μ̂_g so the mean library size is `depth`; unset,\n\
+                      it is the reference's. This follows the scDesign, scDesign2 and scDesign3\n\
+                      lineage. The run writes `{output}.fidelity.json`; `--view` or\n\
+                      `data-beans-sim view` draws it against the reference.\n\
                       \n\
                       See data-beans-sim/docs/topic.md for the full derivation."
     )]
@@ -199,4 +271,28 @@ enum Commands {
                       See data-beans-sim/docs/faba.md for the full derivation."
     )]
     Faba(FabaArgs),
+
+    #[command(
+        about = "Draw a reference-mode simulation against its reference (terminal view)",
+        long_about = "Open the fidelity view of a reference-mode simulation.\n\
+                      `topic --reference` and `multiome --reference-*` write a report,\n\
+                      `{output}.fidelity.json` (`{out}.{rna,atac}.fidelity.json` for multiome).\n\
+                      The view shows a summary table, library-size and detected-gene histograms,\n\
+                      per-gene mean, variance and zero fraction against the reference,\n\
+                      and the gene-gene correlation of the densest copula genes.\n\
+                      ←/→ or Tab switch panels, 1-7 jump, y changes the histogram scale, q quits."
+    )]
+    View(ViewArgs),
+
+    #[cfg(feature = "mcp")]
+    #[command(
+        about = "Serve the simulators and their fidelity diagnosis as MCP tools over stdio",
+        long_about = "Serve the simulators as Model Context Protocol tools over stdio, for an agent\n\
+                      (`claude mcp add data-beans-sim -- data-beans-sim mcp`).\n\
+                      simulate_from_reference fits a reference and simulates from it, returning\n\
+                      the fidelity summary; fidelity reads a run's report, with the genes and\n\
+                      pairs furthest from the reference; simulate runs any simulator with its\n\
+                      command-line options; command_help lists them."
+    )]
+    Mcp,
 }
