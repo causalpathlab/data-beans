@@ -11,7 +11,6 @@ use crate::qc::*;
 use crate::sparse_io::*;
 use crate::sparse_io_vector::*;
 
-use legume_numeric::matrix::common_io::basename;
 use legume_numeric::matrix::traits::RunningStatOps;
 use log::info;
 use std::sync::Arc;
@@ -80,7 +79,6 @@ pub fn off_screen<T>(
 /// Open `files` as one matrix. Several files keep their column names
 /// distinct by appending each file's name.
 pub fn open_data(files: &[Box<str>], preload: bool) -> anyhow::Result<SparseIoVec> {
-    let attach_data_name = files.len() > 1;
     let mut data = SparseIoVec::new();
     for file in files {
         let (backend, path) = resolve_backend_file(file, None)?;
@@ -89,7 +87,7 @@ pub fn open_data(files: &[Box<str>], preload: bool) -> anyhow::Result<SparseIoVe
             info!("Preloading data from {} ...", path);
             this.preload_columns()?;
         }
-        let data_name = attach_data_name.then(|| basename(&path)).transpose()?;
+        let data_name = data_name_of(&path, files.len())?;
         data.push(Arc::from(this), data_name)?;
     }
     Ok(data)

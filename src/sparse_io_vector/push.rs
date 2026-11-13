@@ -145,14 +145,10 @@ impl SparseIoVec {
                             local_col,
                         }]
                     }));
-                let data_tag = match data_name.as_deref() {
-                    Some(x) => COLUMN_SEP.to_string() + x,
-                    None => String::new(),
-                };
                 self.column_names_with_data_tag.extend(
                     raw_col_names
                         .iter()
-                        .map(|x| (x.to_string() + data_tag.as_str()).into_boxed_str()),
+                        .map(|x| tag_column_name(x, data_name.as_deref())),
                 );
                 self.offset += ncol_data;
                 local_to_glob

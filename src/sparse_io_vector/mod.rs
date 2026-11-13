@@ -24,6 +24,36 @@ mod push;
 mod read;
 pub mod scales;
 
+/// The `data_name` [`SparseIoVec::push`] takes for a backend read from
+/// `file`, one of `n_files` stacked side by side
+/// ([`ColumnAlignment::Disjoint`]): the file's stem (`a/pbmc.zarr.zip` →
+/// `pbmc`) when there are several, so cells sharing a barcode across files
+/// stay apart, and none for a single file. `read_data_on_shared_rows` and
+/// the CLI's readers name cells by this rule.
+pub fn data_name_of(file: &str, n_files: usize) -> anyhow::Result<Option<Box<str>>> {
+    (n_files > 1)
+        .then(|| legume_numeric::matrix::common_io::basename(file))
+        .transpose()
+}
+
+/// The name a cell `name` of `file` goes by once `n_files` files are stacked
+/// side by side: `name@{stem}` for several files ([`data_name_of`]), `name`
+/// for one.
+pub fn stacked_column_name(name: &str, file: &str, n_files: usize) -> anyhow::Result<Box<str>> {
+    Ok(tag_column_name(
+        name,
+        data_name_of(file, n_files)?.as_deref(),
+    ))
+}
+
+/// `name`, with `@{data_name}` when there is one.
+fn tag_column_name(name: &str, data_name: Option<&str>) -> Box<str> {
+    match data_name {
+        Some(tag) => format!("{name}{COLUMN_SEP}{tag}").into_boxed_str(),
+        None => name.into(),
+    }
+}
+
 /// Where a single global cell's nonzeros come from in one of the
 /// underlying [`SparseIo`] backends. Under
 /// [`ColumnAlignment::Disjoint`] each global column has exactly one

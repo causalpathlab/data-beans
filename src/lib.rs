@@ -1,8 +1,10 @@
 pub mod column_subset; // stream a column/row selection into a new backend
 pub mod convert; // data format conversion (h5/zarr → backend)
+pub mod export; // backend → 10x mtx / h5ad, for scanpy and Seurat
 #[cfg(feature = "figure")]
 pub mod figure; // figures as SVG, written as PDF and PNG, shown as terminal images
 pub mod hdf5_io; // HDF5/h5ad reading helpers
+pub mod import; // 10x mtx / h5ad / 10x h5 → backend
 #[cfg(feature = "tui")]
 pub mod interactive; // full-screen terminal views (ratatui): screens, histograms, pickers
 pub mod logging; // logger setup and progress bars (also data_beans::aux::logging)

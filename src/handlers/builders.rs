@@ -7,25 +7,14 @@ use legume_numeric::matrix::traits::RunningStatOps;
 #[path = "import_preview.rs"]
 mod import;
 
-#[cfg(feature = "hdf5")]
-mod from_10x_matrix;
-#[cfg(feature = "hdf5")]
-mod from_10x_molecule;
+// The `from-*` commands `data_beans::import` builds live in `imports`.
 mod from_fragments;
-#[cfg(feature = "hdf5")]
-mod from_h5ad;
-mod from_mtx;
 mod from_zarr;
+mod imports;
 
-#[cfg(feature = "hdf5")]
-pub use from_10x_matrix::*;
-#[cfg(feature = "hdf5")]
-pub use from_10x_molecule::*;
 pub use from_fragments::*;
-#[cfg(feature = "hdf5")]
-pub use from_h5ad::*;
-pub use from_mtx::*;
 pub use from_zarr::*;
+pub use imports::*;
 
 ////////////////////////////////////////////////////////////////////
 // Shared helpers used across all build-from-* subcommands.       //
@@ -33,42 +22,71 @@ pub use from_zarr::*;
 // that are reused by more than one of them stay here.            //
 ////////////////////////////////////////////////////////////////////
 
-pub(super) fn log_feature_type_histogram(label: &str, row_types: &[Box<str>]) {
-    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for t in row_types {
-        *counts.entry(t.as_ref()).or_insert(0) += 1;
-    }
-    info!("Feature types in {}: {:?}", label, counts);
-}
-
 /// What `--do-squeeze` asks of a build.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Squeeze {
     pub(super) on: bool,
-    pub(super) rows: usize,
-    pub(super) columns: usize,
-    pub(super) block_size: Option<usize>,
+    /// The cutoffs, kept while `on` is off so the preview can turn it on.
+    pub(super) cut: crate::import::Squeeze,
 }
 
 impl Squeeze {
-    fn apply(self, backend_file: &str) -> anyhow::Result<()> {
-        if self.on {
-            crate::handlers::transformation::squeeze_in_place(
-                backend_file,
-                self.rows,
-                self.columns,
-                self.block_size,
-            )?;
-        }
-        Ok(())
+    /// `--do-squeeze`, `--row-nnz-cutoff`, `--column-nnz-cutoff`,
+    /// `--block-size`.
+    pub(super) fn new(on: bool, rows: usize, columns: usize, block_size: Option<usize>) -> Self {
+        let cut = crate::import::Squeeze {
+            rows,
+            columns,
+            block_size,
+        };
+        Self { on, cut }
     }
+
+    /// The library's squeeze, when on.
+    fn cut(self) -> Option<crate::import::Squeeze> {
+        self.on.then_some(self.cut)
+    }
+
+    fn apply(self, backend_file: &str) -> anyhow::Result<()> {
+        match self.cut() {
+            Some(cut) => cut.apply(backend_file),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Build with `whole`, the library's import squeezed as asked and put in
+/// place, or, on a terminal, `stage` it and keep it after the import
+/// preview ([`keep_import`]).
+pub(super) fn run_import<O>(
+    command: &str,
+    session: Option<&legume_tui::Session>,
+    opts: &O,
+    out: crate::import::Output,
+    squeeze: Squeeze,
+    whole: fn(&O, &crate::import::Output) -> anyhow::Result<Box<str>>,
+    stage: fn(&O, &crate::import::Output) -> anyhow::Result<crate::import::Staged>,
+) -> anyhow::Result<()> {
+    if session.is_none() {
+        let squeeze = squeeze.cut();
+        whole(opts, &crate::import::Output { squeeze, ..out })?;
+    } else {
+        let staged = stage(opts, &out)?;
+        if keep_import(command, session, squeeze, staged.working())? {
+            staged.finish()?;
+        } else {
+            staged.discard()?;
+        }
+    }
+    Ok(())
 }
 
 /// The end of a build, before the output is finalized: squeezed as asked,
 /// or, with a `session` (on a terminal), the import preview first: the
 /// rows' and columns' non-zeros as histograms against the squeeze cutoffs,
-/// each a setting. Enter keeps the build (squeezed when on); `q` deletes
-/// it. Whether to go on and finalize.
+/// each a setting. Enter keeps the build (squeezed when on); `q`
+/// discards it. Whether to keep it: false for the caller to delete it
+/// ([`crate::import::remove_build`]).
 pub(super) fn keep_import(
     command: &str,
     session: Option<&legume_tui::Session>,
@@ -83,26 +101,17 @@ pub(super) fn keep_import(
     let (rows, columns) = off_screen(Some(&mut tui), || nnz_by_axis(backend_file))?;
     let Some(s) = import::preview(&mut tui, command, backend_file, &rows, &columns, squeeze)?
     else {
-        info!("{command}: discarded; deleting {backend_file}");
-        open_backend(backend_file)?.remove_backend_file()?;
-        crate::zarr_io::leave_stage(backend_file);
+        info!("{command}: discarded");
         return Ok(false);
     };
     off_screen(Some(&mut tui), || s.apply(backend_file))?;
     Ok(true)
 }
 
-type Backend = Box<dyn crate::sparse_io::SparseIo<IndexIter = Vec<usize>>>;
-
-fn open_backend(file: &str) -> anyhow::Result<Backend> {
-    let (backend, file) = crate::hdf5_io::resolve_backend_file(file, None)?;
-    crate::sparse_io::open_sparse_matrix(&file, &backend)
-}
-
 /// Non-zeros per row and per column of the backend at `file`: off its
 /// indexes, else counted in a pass.
 fn nnz_by_axis(file: &str) -> anyhow::Result<(Vec<usize>, Vec<usize>)> {
-    let data = open_backend(file)?;
+    let data = crate::sparse_io::open_sparse_matrix_by_path(file)?;
     let counts = |p: &[u64], n: usize| -> Option<Vec<usize>> {
         (p.len() == n + 1).then(|| p.windows(2).map(|w| (w[1] - w[0]) as usize).collect())
     };
