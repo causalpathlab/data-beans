@@ -1,26 +1,28 @@
 use crate::hdf5_io::*;
-use crate::sim::copula::marginals::{nb_inverse_cdf, nb_table_cap, phi, NbFit};
 use crate::sim::copula::reference::open_reference;
-use crate::sim::copula::{fit_global_copula, GlobalCopulaArgs};
+use crate::sim::copula::sampler::{depth_log_offset, sample_reference_counts, CellPrograms};
+use crate::sim::copula::{fit_global_copula, ReferenceFitArgs};
 use crate::sim::core as simulate;
 use crate::sim::multimodal as simulate_multimodal;
 use crate::sparse_io::*;
 use crate::zarr_io::{apply_zip_flag, finalize_zarr_output};
 
 use clap::{Args, ValueEnum};
-use indicatif::ParallelProgressIterator;
 use legume_numeric::matrix::common_io::*;
 use legume_numeric::matrix::mtx_io;
 use legume_numeric::matrix::traits::*;
 use log::info;
-use nalgebra::{DMatrix, DVector};
+use nalgebra::DMatrix;
 use rand::SeedableRng;
-use rand_distr::{Distribution, Normal};
+use rand_distr::Distribution;
 use rayon::prelude::*;
 
-use crate::sim::core::{inject_housekeeping, sample_lognormal_dictionary, standardized_log_topic};
+use crate::sim::core::{inject_housekeeping, sample_lognormal_dictionary};
 
 use crate::sim::copula::gaussian::CopulaCovariance;
+
+/// Expected library size in synthetic mode when `--depth` is not given.
+const DEFAULT_DEPTH: usize = 1000;
 
 /// How the batch-program covariance `F_batch` is constructed.
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -56,62 +58,27 @@ pub struct RunSimulateArgs {
         long_help = "Real single-cell reference: `.h5`, `.zarr` or `.zarr.zip`. When set,\n\
                      the GLM pipeline is unchanged.\n\
                      Only the final count generation step differs.\n\
-                     It swaps `Poisson(λ)` for a copula-coupled NB draw.\n\
-                     That draw uses the per-gene dispersion `r̂_g`,\n\
-                     and a global Σ̂ fitted from this reference."
+                     It swaps `Poisson(λ)` for a copula-coupled draw from each gene's\n\
+                     reference count distribution (a Poisson mixture, its rates scaled to λ),\n\
+                     coupled to a per-cell depth and by a global Σ̂ fitted from this reference."
     )]
     pub reference: Option<Box<str>>,
 
-    #[arg(
-        long,
-        default_value_t = 2000,
-        help = "HVG count for the gene-gene copula",
-        long_help = "HVG count for the gene-gene copula.\n\
-                     Genes outside the HVG set are sampled independently, from `NB(λ_{g,j},\n\
-                     r̂_g)`. This is used only with `--reference`."
-    )]
-    pub n_hvg: usize,
+    #[command(flatten)]
+    pub fit: ReferenceFitArgs,
 
     #[arg(
         long,
-        default_value_t = 100,
-        help = "Maximum rank of the low-rank Σ̂ factor F = U·diag(σ)/√N",
-        long_help = "Maximum rank of the low-rank `Σ̂` factor `F = U·diag(σ)/√N`.\n\
-                     The effective rank is `min(rank, n_hvg, n_reference_cells)`.\n\
-                     This is used only with `--reference`."
-    )]
-    pub copula_rank: usize,
-
-    #[arg(
-        long,
-        default_value_t = 1e-3,
-        help = "Per-gene isotropic ridge variance added at sample time on top of Σ̂",
-        long_help = "Per-gene isotropic ridge variance. It is added at sample time,\n\
-                     on top of `Σ̂`. This is used only with `--reference`."
-    )]
-    pub regularization: f32,
-
-    #[arg(
-        long,
-        default_value_t = 1e-2,
-        help = "Lower bound on the NB size parameter r̂_g",
-        long_help = "Lower bound on the NB size parameter `r̂_g`. It tames runaway dispersion.\n\
-                     MoM can yield a near-zero `r` for noisy genes.\n\
-                     This is used only with `--reference`."
-    )]
-    pub r_floor: f32,
-
-    #[arg(
-        long,
-        default_value_t = 1000,
-        help = "Expected library size E[Σ_g Y(g,j)] per cell",
+        help = "Expected library size E[Σ_g Y(g,j)] per cell [synthetic default: 1000]",
         long_help = "Expected library size E[Σ_g Y(g,j)] per cell. It is emergent;\n\
                      nothing is rescaled per cell.\n\
                      In synthetic mode it enters as λ_scale = depth/G, or depth·K with\n\
                      `--hierarchical-depth`, whose dictionary sums to 1 over all genes and topics.\n\
-                     In reference mode it scales the per-gene mean μ̂_g."
+                     It defaults to 1000 there.\n\
+                     In reference mode it scales every per-gene mean μ̂_g so the mean library\n\
+                     size is `depth`; unset keeps the reference's."
     )]
-    pub depth: usize,
+    pub depth: Option<usize>,
 
     #[arg(
         short,
@@ -138,7 +105,11 @@ pub struct RunSimulateArgs {
                      \n\
                      π_topic = 0 gives no topic structure.\n\
                      π_topic = 1 gives pure topic structure.\n\
-                     It is independent of pve_batch; both can be 1."
+                     It is independent of pve_batch; both can be 1.\n\
+                     \n\
+                     In reference mode √π_topic scales the z-scored log topic loading of each\n\
+                     cell, centred per gene, and capped so it never takes more log-variance\n\
+                     than the gene's extra-Poisson log-variance in the reference."
     )]
     pub pve_topic: f32,
 
@@ -167,14 +138,15 @@ pub struct RunSimulateArgs {
         default_value_t = 0.0,
         help = "PVE-style magnitude for the per-cell residual log-mean noise term",
         long_help = "PVE-style magnitude for the per-cell residual noise term.\n\
-                     It applies to the log-mean,\n\
-                     in stage 1 of the reference-mode two-stage simulator.\n\
+                     It applies to the log-mean, in reference mode.\n\
                      \n\
-                     Above 0 it adds `√pve_noise · ε_{g,j}`.\n\
+                     Above 0 it adds `√pve_noise · ε_{g,j}`, centred so the mean stays.\n\
                      `ε ~ N(0,1)` is iid per gene per cell.\n\
                      The term sits on top of the topic perturbation, and applies before batch.\n\
+                     Together they never take more log-variance than the gene's reference\n\
+                     extra-Poisson log-variance; the gene's count distribution keeps the rest.\n\
                      \n\
-                     The default of 0 keeps stage 1 driven by topics and the reference baseline alone."
+                     The default of 0 leaves topics and the reference alone."
     )]
     pub pve_noise: f32,
 
@@ -252,6 +224,17 @@ pub struct RunSimulateArgs {
 
     #[arg(long, default_value_t = false, help = "Save output in MTX format")]
     pub save_mtx: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Open the fidelity view when done (reference mode)",
+        long_help = "Open the fidelity view when done, in reference mode.\n\
+                     It draws the simulation against its reference from `{output}.fidelity.json`:\n\
+                     library size, detected genes, gene moments and gene-gene correlation.\n\
+                     `data-beans-sim view {output}.fidelity.json` opens it again later."
+    )]
+    pub view: bool,
 
     #[arg(
         long,
@@ -427,9 +410,10 @@ fn build_and_write_backend(
 /// `pve_topic`, and log δ decomposed into batch-specific + batch-invariant
 /// by `pve_batch`. Library size is emergent.
 ///
-/// With `--reference`: same β / θ / δ structure, but counts are sampled
-/// via NB(λ, r̂_g) coupled across HVGs by the reference-fitted gene-gene
-/// copula Σ̂. Per-gene baseline becomes log μ̂_g (replacing log(depth/G)).
+/// With `--reference`: same β / θ / δ structure, but counts are drawn from
+/// each gene's reference count distribution, coupled to depth and across
+/// HVGs by the reference-fitted copula. Per-gene baseline becomes log μ̂_g
+/// (replacing log(depth/G)).
 pub fn run_simulate(cmd_args: &RunSimulateArgs) -> anyhow::Result<()> {
     if cmd_args.reference.is_some() && cmd_args.rows.is_some() {
         anyhow::bail!(
@@ -475,7 +459,7 @@ pub fn run_simulate(cmd_args: &RunSimulateArgs) -> anyhow::Result<()> {
     let sim_args = simulate::SimArgs {
         rows,
         cols: cmd_args.cols,
-        depth: cmd_args.depth,
+        depth: cmd_args.depth.unwrap_or(DEFAULT_DEPTH),
         factors: cmd_args.factors,
         batches: cmd_args.batches,
         beta_scale: cmd_args.beta_scale,
@@ -607,25 +591,36 @@ pub fn run_simulate(cmd_args: &RunSimulateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reference-conditioned variant of [`run_simulate`]. Two-stage
-/// architecture:
+/// Where `topic --reference` writes its fidelity report,
+/// `{output}.fidelity.json`; `None` without a reference.
+pub fn fidelity_report_path(cmd_args: &RunSimulateArgs) -> Option<String> {
+    cmd_args.reference.as_ref()?;
+    let effective_output = apply_zip_flag(&cmd_args.output, cmd_args.zip, &cmd_args.backend);
+    Some(crate::sim::copula::fidelity::report_path(
+        strip_backend_suffix(&effective_output),
+    ))
+}
+
+/// Reference-conditioned variant of [`run_simulate`]. Each gene keeps the
+/// reference count distribution, a Poisson mixture; on top of it:
 ///
-/// **Stage 1 (clean cell, topic-only):**
-/// `log λ⁰_{g,j} = log μ̂_g + √pve_topic · t_{g,j} + √pve_noise · ε_{g,j}`
-/// where `t = log(β·θ)` z-scored across genes per cell (unit log-variance
-/// per cell) and `ε ~ N(0, 1)` iid per gene per cell.
+/// - **topics and noise** move a gene between cells within its reference
+///   dispersion: `√pve_topic` scales the z-scored topic loading and
+///   `√pve_noise` an iid term, both mean-centred and capped so their
+///   log-variance never exceeds the gene's extra-Poisson log-variance; the
+///   mixture keeps the rest;
+/// - **batches** shift the log mean by `√pve_batch · δ_{g, b(j)}`, where
+///   `δ_{:,b} ~ N(0, F_b · F_bᵀ + diag(1 − ‖F_b‖²))`, centred so a gene's mean
+///   over all cells stays the reference's. `F_b`'s rank is `--batch-rank`;
+///   `--batch-program` picks `random` (a fresh low-rank factor) or
+///   `empirical` (the top factors of the reference's HVG copula);
+/// - **depth and co-expression** come from the latent: each cell draws a
+///   depth coordinate that every gene follows as it follows library size in
+///   the reference, and the HVGs share the reference's latent correlation
+///   beyond depth.
 ///
-/// **Stage 2 (batch perturbation, post-hoc):**
-/// `log λ_{g,j} = log λ⁰_{g,j} + √pve_batch · δ_{g, b(j)}`
-/// where `δ_{:,b} ~ N(0, F_b · F_bᵀ + diag(1 − ‖F_b‖²))` has unit per-gene
-/// variance by construction. `F_b`'s rank is `--batch-rank`; its construction
-/// is controlled by `--batch-program` (`random` = fresh low-rank factor,
-/// `empirical` = top PCs of the reference's fitted gene-gene copula `Σ̂`).
-///
-/// Counts are sampled via a unified copula PIT pipeline:
-/// `u = Φ(z*)`, `y = F⁻¹_NB(u; λ, r̂_g)`, with `z*` drawn from the gene-gene
-/// copula for HVGs and iid `N(0, 1)` for non-HVGs. No per-cell depth
-/// renormalization — library size emerges from `μ̂_g · exp(stage-1 + stage-2)`.
+/// Counts are `y = F⁻¹_g(Φ(z*))` with the mixture's rates scaled to `λ`; see
+/// [`crate::sim::copula::sampler`].
 fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()> {
     if cmd_args.holdout_topics.is_some() {
         log::warn!("--holdout-topics is ignored in reference mode (synthetic mode only)");
@@ -645,14 +640,7 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
     info!("opening reference: {}", reference_path);
     let sc = open_reference(reference_path)?;
 
-    let global_args = GlobalCopulaArgs {
-        sc: &sc,
-        n_hvg: cmd_args.n_hvg,
-        copula_rank: cmd_args.copula_rank,
-        regularization: cmd_args.regularization,
-        r_floor: cmd_args.r_floor,
-    };
-    let fit = fit_global_copula(&global_args)?;
+    let fit = fit_global_copula(&cmd_args.fit.global_args(&sc))?;
 
     let dd = fit.n_genes;
     let nn = cmd_args.cols;
@@ -665,31 +653,16 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
     let pve_topic = cmd_args.pve_topic.clamp(0.0, 1.0);
     let pve_batch = cmd_args.pve_batch.clamp(0.0, 1.0);
     let pve_noise = cmd_args.pve_noise.clamp(0.0, 1.0);
-    let alpha_topic = pve_topic.sqrt();
     let alpha_batch = pve_batch.sqrt();
-    let alpha_noise = pve_noise.sqrt();
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(cmd_args.rseed);
 
     let runif = rand_distr::Uniform::new(0, bb).expect("unif [0 .. bb)");
     let batch_membership: Vec<usize> = (0..nn).map(|_| runif.sample(&mut rng)).collect();
 
-    // Stage-1 baseline: log μ̂_g rescaled so the reference's mean library size
-    // matches `--depth`. log_mu_hat[g] = log μ̂_g + log(depth / Σ_g μ̂_g).
-    let lib_ref: f32 = fit.mu_hat.iter().sum::<f32>().max(1e-30);
-    let depth_log_offset = ((cmd_args.depth as f32).max(1.0) / lib_ref).ln();
-    let log_mu_hat: DVector<f32> = DVector::from_iterator(
-        dd,
-        fit.mu_hat
-            .iter()
-            .map(|&m| m.max(1e-30).ln() + depth_log_offset),
-    );
-    info!(
-        "stage-1 baseline: μ̂ rescaled by depth/lib_ref = {}/{:.0} = {:.4}",
-        cmd_args.depth,
-        lib_ref,
-        (cmd_args.depth as f32) / lib_ref
-    );
+    // Every gene's mean shifted so the mean library size is `--depth`.
+    let depth_offset = depth_log_offset(&fit, cmd_args.depth);
+    info!("gene means scaled by {:.4} for --depth", depth_offset.exp());
 
     // Stage-2 batch covariance. rank=0 → all-isotropic (Splatter-style);
     // rank>0 → low-rank factor + iid residual.
@@ -750,65 +723,25 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
 
     let theta_kn = crate::sim::core::sample_theta_kn(kk, nn, pve_topic, &mut rng)?;
 
-    let triplets: Vec<(u64, u64, f32)> = (0..nn)
-        .into_par_iter()
-        .progress_count(nn as u64)
-        .map(|j| -> Vec<(u64, u64, f32)> {
-            let mut local_rng = rand::rngs::StdRng::seed_from_u64(
-                cmd_args
-                    .rseed
-                    .wrapping_add(0x5a5a_5a5a)
-                    .wrapping_add(j as u64),
-            );
-            let normal = Normal::new(0.0_f32, 1.0_f32).unwrap();
-
-            // Stage 1: t = z-scored log(β·θ); ε iid per gene.
-            let t_z = standardized_log_topic(&(&beta_dk * theta_kn.column(j)));
-
-            let b = batch_membership[j];
-            let mut log_lambda = log_mu_hat.clone();
-            for g in 0..dd {
-                let topic_term = alpha_topic * t_z[g];
-                let noise_term = if alpha_noise > 0.0 {
-                    alpha_noise * normal.sample(&mut local_rng)
-                } else {
-                    0.0
-                };
-                log_lambda[g] += topic_term + noise_term + batch_delta[b][g];
-            }
-
-            // Unified PIT sampling: u = Φ(z*), y = F⁻¹_NB(u; λ, r̂).
-            // z* from gene-gene copula for HVGs, iid N(0,1) for non-HVGs.
-            // Iterate only active genes (μ̂ ≥ threshold); undetectable genes
-            // can't produce a nonzero count even at maximum perturbation.
-            let z_hvg = fit.copula.sample(&mut local_rng);
-            let mut counts: Vec<(u64, u64, f32)> = Vec::with_capacity(fit.active_genes.len() / 8);
-            for &g in &fit.active_genes {
-                let mu_g = log_lambda[g].exp();
-                if !mu_g.is_finite() || mu_g <= 0.0 {
-                    continue;
-                }
-                let nb = NbFit {
-                    mu: mu_g,
-                    r: fit.r_hat[g],
-                };
-                let z_g = match fit.hvg_pos[g] {
-                    Some(h) => z_hvg[h as usize],
-                    None => normal.sample(&mut local_rng),
-                };
-                let u = phi(z_g as f64).clamp(1e-7, 1.0 - 1e-7);
-                let x = nb_inverse_cdf(u, nb, nb_table_cap(nb));
-                if x > 0 {
-                    counts.push((g as u64, j as u64, x as f32));
-                }
-            }
-            counts
-        })
-        .flatten()
-        .collect();
+    let programs = CellPrograms {
+        dict_dk: &beta_dk,
+        theta_kn: &theta_kn,
+        pve_topic,
+        pve_noise,
+        batch_delta: &batch_delta,
+        batch_membership: &batch_membership,
+    };
+    let triplets = sample_reference_counts(
+        &fit,
+        depth_offset,
+        &programs,
+        !cmd_args.fit.fixed_depth,
+        cmd_args.rseed,
+        0x5a5a_5a5a,
+    )?;
 
     info!(
-        "sampled {} cells producing {} nonzero triplets via two-stage NB+copula",
+        "sampled {} cells producing {} nonzero triplets from the reference",
         nn,
         triplets.len()
     );
@@ -875,16 +808,8 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
         info!("hierarchy node probabilities: {}", hierarchy_file);
     }
 
-    // Poisson collapses (`r = ∞`) are encoded as a large finite sentinel
-    // so parquet readers don't choke on infinity.
-    let mut r_col = DMatrix::<f32>::zeros(dd, 1);
-    for g in 0..dd {
-        let r = fit.r_hat[g];
-        r_col[(g, 0)] = if r.is_finite() { r } else { 1e9 };
-    }
-    let r_label = ["r_hat".to_string().into_boxed_str()];
-    r_col.to_parquet_with_names(&r_file, (Some(&row_names), Some("feature")), Some(&r_label))?;
-    info!("per-gene NB dispersion r̂: {}", r_file);
+    fit.write_effective_nb_size(&r_file, &row_names)?;
+    info!("per-gene NB size of the same variance: {}", r_file);
 
     let hvg_lines: Vec<Box<str>> = fit
         .hvg_indices
@@ -893,6 +818,9 @@ fn run_simulate_with_reference(cmd_args: &RunSimulateArgs) -> anyhow::Result<()>
         .collect();
     write_lines(&hvg_lines, &hvg_file)?;
     info!("HVGs used by copula: {}", hvg_file);
+
+    let fidelity_file = fit.write_fidelity_report(&triplets, nn, reference_path, &output)?;
+    info!("fidelity report: {}", fidelity_file);
 
     let mut triplets = triplets;
     if cmd_args.save_mtx {

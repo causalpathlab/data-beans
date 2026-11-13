@@ -12,6 +12,8 @@
 //!   hierarchy): filter, mark, write, copy.
 //! - [`plan_tui`]: what a command is about to write, with its settings on
 //!   keys: Enter writes, `q` does not.
+//! - `sim_tui` (feature `sim`): a reference-mode simulation against its
+//!   reference, from its fidelity report.
 //! - [`stat_tui`]: table-and-histogram explorer over plain name and value
 //!   columns, optionally marking entries and handing them back.
 //!
@@ -26,6 +28,8 @@
 pub mod list_tui;
 pub mod plan_tui;
 pub mod qc_tui;
+#[cfg(feature = "sim")]
+pub mod sim_tui;
 pub mod stat_tui;
 pub mod ui;
 

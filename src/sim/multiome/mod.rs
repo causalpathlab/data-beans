@@ -15,8 +15,8 @@
 //! specificity propagates through its peaks; unlinked genes are noise. Counts are
 //! `Poisson(depth_j · softmax(·))`; peak-gene ground truth is `M[G,P]`.
 //!
-//! With `--reference-rna`/`--reference-atac`: per-modality two-stage GLM + NB+copula
-//! sampling (`fit_global_copula`, no cross-modality copula); the `{topic, noise, batch}`
+//! With `--reference-rna`/`--reference-atac`: per-modality Poisson-mixture marginals
+//! with a latent copula (`fit_global_copula`, no cross-modality copula); the `{topic, noise, batch}`
 //! budget (normalized, no cis) weights the log-rate. A modality without a reference
 //! keeps its synthetic step, so one reference alone is enough.
 //!
@@ -29,32 +29,34 @@ mod sample;
 pub use sample::{sample_nested_topic_proportions, sample_poisson_from_logits};
 
 use crate::sim::copula::gaussian::CopulaCovariance;
-use crate::sim::copula::marginals::{nb_inverse_cdf, nb_table_cap, phi, NbFit};
 use crate::sim::copula::reference::{open_reference, SparseRef};
-use crate::sim::copula::{fit_global_copula, GlobalCopulaArgs, GlobalCopulaFit};
-use crate::sim::core::standardized_log_topic;
+use crate::sim::copula::sampler::{
+    depth_log_offset, sample_reference_counts, CellPrograms, Triplets,
+};
+use crate::sim::copula::{fit_global_copula, GlobalCopulaFit, ReferenceFitArgs};
 use crate::sim::handlers::BatchProgram;
 
 use crate::sparse_io::{create_sparse_from_triplets_owned, SparseIoBackend};
 use crate::zarr_io::{apply_zip_flag, finalize_zarr_output};
 use clap::Args;
-use indicatif::ParallelProgressIterator;
 use legume_numeric::matrix::common_io::{mkdir_parent, open_buf_writer, write_lines};
 use legume_numeric::matrix::traits::*;
 use log::info;
 use nalgebra::{DMatrix, DVector};
 use rand::prelude::*;
-use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
+use rand_distr::Distribution;
 use std::io::Write;
 
 use sample::Mat;
 
-type Triplets = Vec<(u64, u64, f32)>;
-
 const N_CHROMOSOMES: usize = 22;
 const PEAK_BIN_WIDTH: usize = 500;
 const PEAK_GAP: usize = 500;
+
+/// Expected library sizes in synthetic mode when `--depth-rna` /
+/// `--depth-atac` are not given.
+const DEFAULT_DEPTH_RNA: usize = 5000;
+const DEFAULT_DEPTH_ATAC: usize = 2000;
 
 /// Simulated gene TSS (chr + position). Local mirror of
 /// `genomic_data::coordinates::GeneTss` to avoid pulling in that crate.
@@ -138,24 +140,22 @@ pub struct MultiomeArgs {
 
     #[arg(
         long,
-        default_value_t = 5000,
-        help = "Expected RNA library size per cell",
+        help = "Expected RNA library size per cell [synthetic default: 5000]",
         long_help = "Expected RNA library size per cell.\n\
                      \n\
-                     In synthetic mode it is the per-cell depth multiplier ρ_j.\n\
+                     In synthetic mode it is the per-cell depth multiplier ρ_j, 5000 by default.\n\
                      `--cell-sd-log-depth-rna` adds log-normal noise.\n\
                      \n\
-                     In reference mode it rescales the per-gene mean μ̂_g.\n\
-                     Simulated cells then average this library size."
+                     In reference mode it rescales the per-gene mean μ̂_g, so simulated\n\
+                     cells average this library size; unset keeps the reference's."
     )]
-    pub depth_rna: usize,
+    pub depth_rna: Option<usize>,
 
     #[arg(
         long,
-        default_value_t = 2000,
-        help = "Expected ATAC library size per cell. Symmetric to --depth-rna."
+        help = "Expected ATAC library size per cell [synthetic default: 2000]. Symmetric to --depth-rna."
     )]
-    pub depth_atac: usize,
+    pub depth_atac: Option<usize>,
 
     #[arg(
         long,
@@ -262,8 +262,8 @@ pub struct MultiomeArgs {
         long,
         help = "Real single-cell ATAC reference (.h5, .zarr, .zarr.zip)",
         long_help = "Real single-cell ATAC reference (`.h5`, `.zarr`, `.zarr.zip`). When set,\n\
-                     the ATAC sampler switches to two-stage GLM + NB+copula PIT:\n\
-                     per-peak `r̂` plus a global Σ̂ from the reference.\n\
+                     the ATAC sampler draws from each peak's reference count distribution,\n\
+                     coupled by depth and a latent copula fitted to the reference.\n\
                      The reference's row count overrides `--n-peaks`."
     )]
     pub reference_atac: Option<Box<str>>,
@@ -276,37 +276,18 @@ pub struct MultiomeArgs {
     )]
     pub reference_rna: Option<Box<str>>,
 
-    #[arg(
-        long,
-        default_value_t = 2000,
-        help = "HVG / HVP count for each modality's gene-gene (peak-peak) copula",
-        long_help = "HVG / HVP count for each modality's gene-gene (peak-peak) copula.\n\
-                     Features outside the HV set are sampled independently from `NB(λ, r̂)`."
-    )]
-    pub n_hvg: usize,
+    #[command(flatten)]
+    pub fit: ReferenceFitArgs,
 
     #[arg(
         long,
-        default_value_t = 100,
-        help = "Maximum rank of the per-modality low-rank Σ̂ factor"
+        default_value_t = false,
+        help = "Open the fidelity view of each referenced modality when done",
+        long_help = "Open the fidelity view of each modality with a reference when done.\n\
+                     It reads `{out}.{rna,atac}.fidelity.json`;\n\
+                     `data-beans-sim view FILE` opens one again later."
     )]
-    pub copula_rank: usize,
-
-    #[arg(
-        long,
-        default_value_t = 1e-3,
-        help = "Per-feature isotropic ridge variance added at sample time on top of Σ̂"
-    )]
-    pub regularization: f32,
-
-    #[arg(
-        long,
-        default_value_t = 1e-2,
-        help = "Lower bound on the NB size parameter r̂",
-        long_help = "Lower bound on the NB size parameter `r̂`.\n\
-                     Tames runaway dispersion when MoM yields a near-zero `r` for noisy features."
-    )]
-    pub r_floor: f32,
+    pub view: bool,
 
     #[arg(
         long,
@@ -665,26 +646,25 @@ pub fn run_multiome(args: &MultiomeArgs) -> anyhow::Result<()> {
     // ATAC counts //
     /////////////////
     let (atac_triplets, atac_batch_delta) = if let Some(fit) = atac_fit.as_ref() {
-        let (trips, batch_delta) = sample_with_reference(
-            &beta_atac,
-            &theta_coarse_atac,
-            None,
-            fit,
-            &batch_membership_atac,
-            bb,
-            args.pve_topic,
-            args.pve_noise,
-            args.pve_batch,
-            args.batch_rank,
-            args.batch_program,
-            Some(args.depth_atac),
-            args.rseed.wrapping_add(0x4154_4143), // "ATAC"
-            "ATAC",
-        )?;
+        let modality = Modality {
+            dict_dk: &beta_atac,
+            theta_kn: &theta_coarse_atac,
+            gamma_dk: None,
+            batch_membership: &batch_membership_atac,
+            depth_target: args.depth_atac,
+            rseed: args.rseed.wrapping_add(0x4154_4143), // "ATAC"
+            label: "ATAC",
+        };
+        let (trips, batch_delta) =
+            sample_with_reference(&modality, fit, &ReferenceSettings::new(args, bb))?;
         (trips, Some(batch_delta))
     } else {
-        let rho =
-            sample::sample_cell_depths(nn, args.depth_atac, args.cell_sd_log_depth_atac, &mut rng);
+        let rho = sample::sample_cell_depths(
+            nn,
+            args.depth_atac.unwrap_or(DEFAULT_DEPTH_ATAC),
+            args.cell_sd_log_depth_atac,
+            &mut rng,
+        );
         info!(
             "sampling ATAC counts: {} peaks × {} cells (two-step)",
             p, nn
@@ -694,37 +674,42 @@ pub fn run_multiome(args: &MultiomeArgs) -> anyhow::Result<()> {
         (trips, None)
     };
     info!("ATAC: {} non-zeros", atac_triplets.len());
+    if let (Some(fit), Some(path)) = (atac_fit.as_ref(), args.reference_atac.as_ref()) {
+        write_fidelity_report(fit, &atac_triplets, nn, path, &args.out, "atac")?;
+    }
 
     ////////////////
     // RNA counts //
     ////////////////
     let (rna_triplets, rna_batch_delta) = if let Some(fit) = rna_fit.as_ref() {
-        let (trips, batch_delta) = sample_with_reference(
-            &w_gk,
-            &theta_full_rna,
-            gamma_gk.as_ref(),
-            fit,
-            &batch_membership_rna,
-            bb,
-            args.pve_topic,
-            args.pve_noise,
-            args.pve_batch,
-            args.batch_rank,
-            args.batch_program,
-            Some(args.depth_rna),
-            args.rseed.wrapping_add(0x524e_4100), // "RNA\0"
-            "RNA",
-        )?;
+        let modality = Modality {
+            dict_dk: &w_gk,
+            theta_kn: &theta_full_rna,
+            gamma_dk: gamma_gk.as_ref(),
+            batch_membership: &batch_membership_rna,
+            depth_target: args.depth_rna,
+            rseed: args.rseed.wrapping_add(0x524e_4100), // "RNA\0"
+            label: "RNA",
+        };
+        let (trips, batch_delta) =
+            sample_with_reference(&modality, fit, &ReferenceSettings::new(args, bb))?;
         (trips, Some(batch_delta))
     } else {
-        let tau =
-            sample::sample_cell_depths(nn, args.depth_rna, args.cell_sd_log_depth_rna, &mut rng);
+        let tau = sample::sample_cell_depths(
+            nn,
+            args.depth_rna.unwrap_or(DEFAULT_DEPTH_RNA),
+            args.cell_sd_log_depth_rna,
+            &mut rng,
+        );
         info!("sampling RNA counts: {} genes × {} cells (two-step)", g, nn);
         let logits = gene_logits.as_ref().expect("synthetic gene logits");
         let trips = sample::sample_poisson_from_logits(logits, &tau, rng.next_u64());
         (trips, None)
     };
     info!("RNA: {} non-zeros", rna_triplets.len());
+    if let (Some(fit), Some(path)) = (rna_fit.as_ref(), args.reference_rna.as_ref()) {
+        write_fidelity_report(fit, &rna_triplets, nn, path, &args.out, "rna")?;
+    }
 
     ////////////////////////////
     // Persist sparse outputs //
@@ -860,14 +845,7 @@ pub fn run_multiome(args: &MultiomeArgs) -> anyhow::Result<()> {
 }
 
 fn fit_modality_copula(sc: &SparseRef, args: &MultiomeArgs) -> anyhow::Result<GlobalCopulaFit> {
-    let global_args = GlobalCopulaArgs {
-        sc,
-        n_hvg: args.n_hvg,
-        copula_rank: args.copula_rank,
-        regularization: args.regularization,
-        r_floor: args.r_floor,
-    };
-    fit_global_copula(&global_args)
+    fit_global_copula(&args.fit.global_args(sc))
 }
 
 /// Standardize a row to mean 0, unit variance (in place). Zero-variance rows
@@ -1038,7 +1016,46 @@ fn build_gene_logits(
     logits
 }
 
-/// Two-stage GLM + NB+copula PIT sampler for one modality.
+/// One modality's inputs to [`sample_with_reference`].
+#[derive(Clone, Copy)]
+struct Modality<'a> {
+    dict_dk: &'a Mat,
+    theta_kn: &'a Mat,
+    gamma_dk: Option<&'a Mat>,
+    batch_membership: &'a [usize],
+    depth_target: Option<usize>,
+    rseed: u64,
+    label: &'a str,
+}
+
+/// The reference-mode settings both modalities share.
+#[derive(Clone, Copy)]
+struct ReferenceSettings {
+    bb: usize,
+    pve_topic: f32,
+    pve_noise: f32,
+    pve_batch: f32,
+    batch_rank: usize,
+    batch_program: BatchProgram,
+    couple_depth: bool,
+}
+
+impl ReferenceSettings {
+    fn new(args: &MultiomeArgs, bb: usize) -> Self {
+        Self {
+            bb,
+            pve_topic: args.pve_topic,
+            pve_noise: args.pve_noise,
+            pve_batch: args.pve_batch,
+            batch_rank: args.batch_rank,
+            batch_program: args.batch_program,
+            couple_depth: !args.fit.fixed_depth,
+        }
+    }
+}
+
+/// Reference-mode sampler for one modality: the shared reference sampler
+/// with this modality's dictionary, batch program and depth.
 ///
 /// `dict_dk` is the modality's dictionary (β_atac for ATAC, W for RNA), and
 /// `theta_kn` is the topic proportions matrix paired with it (θ_coarse for
@@ -1047,25 +1064,30 @@ fn build_gene_logits(
 /// applied to `dict_dk` before computing the stage-1 baseline.
 ///
 /// Returns triplets and the per-batch δ (for parquet export).
-#[allow(clippy::too_many_arguments)]
 fn sample_with_reference(
-    dict_dk: &Mat,
-    theta_kn: &Mat,
-    gamma_dk: Option<&Mat>,
+    modality: &Modality,
     fit: &GlobalCopulaFit,
-    batch_membership: &[usize],
-    bb: usize,
-    pve_topic: f32,
-    pve_noise: f32,
-    pve_batch: f32,
-    batch_rank: usize,
-    batch_program: BatchProgram,
-    depth_target: Option<usize>,
-    rseed: u64,
-    label: &str,
+    settings: &ReferenceSettings,
 ) -> anyhow::Result<(Triplets, Vec<DVector<f32>>)> {
+    let Modality {
+        dict_dk,
+        theta_kn,
+        gamma_dk,
+        batch_membership,
+        depth_target,
+        rseed,
+        label,
+    } = *modality;
+    let ReferenceSettings {
+        bb,
+        pve_topic,
+        pve_noise,
+        pve_batch,
+        batch_rank,
+        batch_program,
+        couple_depth,
+    } = *settings;
     let dd = fit.n_genes;
-    let nn = batch_membership.len();
     if dict_dk.nrows() != dd {
         anyhow::bail!(
             "{}: dictionary rows ({}) != reference features ({})",
@@ -1083,8 +1105,6 @@ fn sample_with_reference(
     let bbt = if bb > 1 { pve_batch.max(0.0) } else { 0.0 };
     let bsum = (bt + bn + bbt).max(1e-12);
     let (pi_topic, pi_noise, pi_batch) = (bt / bsum, bn / bsum, bbt / bsum);
-    let alpha_topic = pi_topic.sqrt();
-    let alpha_noise = pi_noise.sqrt();
     let alpha_batch = pi_batch.sqrt();
 
     // Effective dictionary (γ ⊙ β).
@@ -1093,26 +1113,12 @@ fn sample_with_reference(
         None => std::borrow::Cow::Borrowed(dict_dk),
     };
 
-    // Stage-1 baseline `log μ̂_g`, optionally rescaled so the reference's
-    // mean library size matches `depth_target` (mirrors topic ref mode).
-    let lib_ref: f32 = fit.mu_hat.iter().sum::<f32>().max(1e-30);
-    let depth_log_offset = match depth_target {
-        Some(d) if d > 0 => ((d as f32).max(1.0) / lib_ref).ln(),
-        _ => 0.0,
-    };
-    let log_mu_hat: DVector<f32> = DVector::from_iterator(
-        dd,
-        fit.mu_hat
-            .iter()
-            .map(|&m| m.max(1e-30).ln() + depth_log_offset),
-    );
-    if depth_log_offset != 0.0 {
+    // Every feature's mean shifted so the mean library size is `depth_target`.
+    let depth_offset = depth_log_offset(fit, depth_target);
+    if depth_offset != 0.0 {
         info!(
-            "{}: μ̂ rescaled by depth/lib_ref = {:?}/{:.0} = {:.4}",
-            label,
-            depth_target,
-            lib_ref,
-            depth_log_offset.exp(),
+            "{label}: means scaled by {:.4} for the depth",
+            depth_offset.exp()
         );
     }
 
@@ -1142,57 +1148,46 @@ fn sample_with_reference(
     // feature baseline, so nothing batch-invariant is added.
     let batch_delta = batch_cov.sample_batch_shifts(bb, alpha_batch, &mut rng);
 
-    let triplets: Vec<(u64, u64, f32)> = (0..nn)
-        .into_par_iter()
-        .progress_count(nn as u64)
-        .map(|j| -> Vec<(u64, u64, f32)> {
-            let mut local_rng = StdRng::seed_from_u64(rseed.wrapping_add(j as u64).wrapping_add(1));
-            let normal = Normal::new(0.0_f32, 1.0_f32).unwrap();
-
-            // Stage 1: t = z-scored log(eff · θ_col). Features with an
-            // all-zero dictionary row (genes without a causal peak) have no
-            // topic term.
-            let t_z = standardized_log_topic(&(&*eff_dk * theta_kn.column(j)));
-
-            let b = batch_membership[j];
-            let mut log_lambda = log_mu_hat.clone();
-            for g in 0..dd {
-                let topic_term = alpha_topic * t_z[g];
-                let noise_term = if alpha_noise > 0.0 {
-                    alpha_noise * normal.sample(&mut local_rng)
-                } else {
-                    0.0
-                };
-                log_lambda[g] += topic_term + noise_term + batch_delta[b][g];
-            }
-
-            let z_hvg = fit.copula.sample(&mut local_rng);
-            let mut counts: Vec<(u64, u64, f32)> = Vec::with_capacity(fit.active_genes.len() / 8);
-            for &gidx in &fit.active_genes {
-                let mu_g = log_lambda[gidx].exp();
-                if !mu_g.is_finite() || mu_g <= 0.0 {
-                    continue;
-                }
-                let nb = NbFit {
-                    mu: mu_g,
-                    r: fit.r_hat[gidx],
-                };
-                let z_g = match fit.hvg_pos[gidx] {
-                    Some(h) => z_hvg[h as usize],
-                    None => normal.sample(&mut local_rng),
-                };
-                let u = phi(z_g as f64).clamp(1e-7, 1.0 - 1e-7);
-                let x = nb_inverse_cdf(u, nb, nb_table_cap(nb));
-                if x > 0 {
-                    counts.push((gidx as u64, j as u64, x as f32));
-                }
-            }
-            counts
-        })
-        .flatten()
-        .collect();
+    let programs = CellPrograms {
+        dict_dk: &eff_dk,
+        theta_kn,
+        pve_topic: pi_topic,
+        pve_noise: pi_noise,
+        batch_delta: &batch_delta,
+        batch_membership,
+    };
+    let triplets = sample_reference_counts(fit, depth_offset, &programs, couple_depth, rseed, 1)?;
 
     Ok((triplets, batch_delta))
+}
+
+/// The fidelity reports a multiome run with `args` writes, RNA first.
+pub fn fidelity_report_paths(args: &MultiomeArgs) -> Vec<String> {
+    [("rna", &args.reference_rna), ("atac", &args.reference_atac)]
+        .into_iter()
+        .filter(|(_, reference)| reference.is_some())
+        .map(|(modality, _)| fidelity_report_path(&args.out, modality))
+        .collect()
+}
+
+fn fidelity_report_path(out_prefix: &str, modality: &str) -> String {
+    crate::sim::copula::fidelity::report_path(&format!("{out_prefix}.{modality}"))
+}
+
+/// `{out}.{modality}.fidelity.json`: the modality's simulation against its
+/// reference.
+fn write_fidelity_report(
+    fit: &GlobalCopulaFit,
+    triplets: &[(u64, u64, f32)],
+    n_cells: usize,
+    reference: &str,
+    out_prefix: &str,
+    modality: &str,
+) -> anyhow::Result<()> {
+    let prefix = format!("{out_prefix}.{modality}");
+    let file = fit.write_fidelity_report(triplets, n_cells, reference, &prefix)?;
+    info!("wrote {} fidelity report: {}", modality, file);
+    Ok(())
 }
 
 fn write_reference_extras(
@@ -1217,20 +1212,12 @@ fn write_reference_extras(
     )?;
     info!("wrote {} batch delta: {}", modality, ln_batch_file);
 
-    // Poisson collapses (`r = ∞`) encoded as a large finite sentinel.
     let r_file = format!("{}.{}.r.parquet", out_prefix, modality);
-    let mut r_col = DMatrix::<f32>::zeros(dd, 1);
-    for g in 0..dd {
-        let r = fit.r_hat[g];
-        r_col[(g, 0)] = if r.is_finite() { r } else { 1e9 };
-    }
-    let r_label = ["r_hat".to_string().into_boxed_str()];
-    r_col.to_parquet_with_names(
-        &r_file,
-        (Some(feature_names), Some("feature")),
-        Some(&r_label),
-    )?;
-    info!("wrote {} per-feature NB dispersion r̂: {}", modality, r_file);
+    fit.write_effective_nb_size(&r_file, feature_names)?;
+    info!(
+        "wrote {} per-feature NB size of the same variance: {}",
+        modality, r_file
+    );
 
     let hvg_file = format!("{}.{}.hvg.gz", out_prefix, modality);
     let hvg_lines: Vec<Box<str>> = fit
@@ -1327,7 +1314,9 @@ fn write_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::copula::mixture::PoissonMixture;
     use clap::Parser;
+    use rand_distr::Normal;
 
     /// The budget is normalized to Σπ = 1, so a feature with all components
     /// present has log-rate variance ≈ σ² regardless of how the weights split
@@ -1421,7 +1410,8 @@ mod tests {
     }
 
     /// A hand-built reference fit: `dd` features, the first `n_hvg` odd ones
-    /// in the copula, Poisson marginals with mean `mu`.
+    /// in the copula, two-atom Poisson mixtures with mean `mu`, coupled to
+    /// depth at 0.3.
     fn toy_fit(dd: usize, n_hvg: usize, mu: f32, rng: &mut StdRng) -> GlobalCopulaFit {
         let hvg_indices: Vec<usize> = (0..n_hvg).map(|h| 2 * h + 1).collect();
         let mut hvg_pos = vec![None; dd];
@@ -1433,10 +1423,19 @@ mod tests {
             n_genes: dd,
             hvg_indices,
             mu_hat: vec![mu; dd],
-            r_hat: vec![f32::INFINITY; dd],
+            marginals: vec![
+                PoissonMixture {
+                    rates: vec![mu as f64 * 0.2, mu as f64 * 1.8],
+                    weights: vec![0.5, 0.5],
+                };
+                dd
+            ],
+            depth_rho: vec![0.3; dd],
             active_genes: (0..dd).collect(),
             hvg_pos,
             copula: CopulaCovariance::random_low_rank(n_hvg, 3, rng),
+            profile: Default::default(),
+            correlation_genes: Vec::new(),
         }
     }
 
@@ -1452,20 +1451,25 @@ mod tests {
         let memb: Vec<usize> = (0..nn).map(|j| j % bb).collect();
 
         let (trips, delta) = sample_with_reference(
-            &dict,
-            &theta,
-            None,
+            &Modality {
+                dict_dk: &dict,
+                theta_kn: &theta,
+                gamma_dk: None,
+                batch_membership: &memb,
+                depth_target: None,
+                rseed: 5,
+                label: "test",
+            },
             &fit,
-            &memb,
-            bb,
-            1.0,
-            0.0,
-            1.0,
-            2,
-            BatchProgram::Empirical,
-            None,
-            5,
-            "test",
+            &ReferenceSettings {
+                bb,
+                pve_topic: 1.0,
+                pve_noise: 0.0,
+                pve_batch: 1.0,
+                batch_rank: 2,
+                batch_program: BatchProgram::Empirical,
+                couple_depth: true,
+            },
         )?;
         assert_eq!(delta.len(), bb);
         assert!(delta.iter().all(|d| d.len() == dd));
@@ -1497,20 +1501,25 @@ mod tests {
         let memb = vec![0usize; nn];
 
         let (trips, _) = sample_with_reference(
-            &dict,
-            &theta,
-            None,
+            &Modality {
+                dict_dk: &dict,
+                theta_kn: &theta,
+                gamma_dk: None,
+                batch_membership: &memb,
+                depth_target: None,
+                rseed: 9,
+                label: "test",
+            },
             &fit,
-            &memb,
-            1,
-            1.0,
-            0.0,
-            0.0,
-            0,
-            BatchProgram::Random,
-            None,
-            9,
-            "test",
+            &ReferenceSettings {
+                bb: 1,
+                pve_topic: 1.0,
+                pve_noise: 0.0,
+                pve_batch: 0.0,
+                batch_rank: 0,
+                batch_program: BatchProgram::Random,
+                couple_depth: true,
+            },
         )?;
         let mut sums = DMatrix::<f64>::zeros(dd, 2);
         for &(f, j, v) in &trips {

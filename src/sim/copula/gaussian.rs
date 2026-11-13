@@ -1,48 +1,34 @@
-//! Low-rank Gaussian copula covariance: fit a rank-`r` factor `F = U·diag(σ)/√N`
-//! directly from the per-cell z-score matrix `Z` via RSVD, then **per-row
-//! rescale** so the sampled `z*[h] = F[h,:]·η + ridge_sd[h]·ε` has unit
-//! marginal variance.
+//! Low-rank Gaussian copula: a rank-`r` factor `F` plus a per-row residual
+//! `ridge_sd`, so that `z*[h] = F[h,:]·η + ridge_sd[h]·ε` is standard normal
+//! for every row and `corr(z*[h], z*[k]) = F[h,:]·F[k,:]`.
 //!
-//! Without the per-row rescale, fitting `Σ̂ = (1/N)·Z·Zᵀ + λI` gives a
-//! covariance, not a correlation. PIT-Z scores from discrete NB marginals are
-//! **sub-unit-variance** (especially for sparse genes where the zero mass
-//! piles around `Φ⁻¹(0.5·P(X=0))`), so `Σ̂[h,h] ≪ 1`, sampled `z*[h]` lives
-//! near 0, and `Φ(z*[h])` never crosses `F(0)` for high-zero-mass marginals
-//! → inverse-CDF returns 0 every time. A Gaussian copula needs the *latent*
-//! variable to be standard normal per gene; the off-diagonals of the original
-//! covariance carry the dependence structure, but the diagonal must be 1.
-//!
-//! Concretely: after `F = U·diag(σ)/√N` and ridge `λ`, the per-row variance
-//! is `v_h = ‖F[h,:]‖² + λ`. We divide row `h` of `F` by `√v_h` and store a
-//! per-row `ridge_sd[h] = √λ / √v_h`, so:
-//!   - **diag** of `F'·F'ᵀ + diag(ridge_sd²)` is exactly 1,
-//!   - **off-diag** correlations are `F[h,:]·F[k,:] / √(v_h·v_k)`, the
-//!     standard covariance-to-correlation rescale,
-//!   - degenerate rows (`v_h ≈ 0`, only possible when `λ = 0`) collapse to
-//!     `z*[h] = 0`, falling back to median NB sampling.
-//!
-//! By construction this:
-//!  - **never forms the `G × G` covariance** (memory is `G·r`, not `G²`),
-//!  - **honors the empirical rank** — for `N < G` the empirical Σ̂ is rank ≤ N
-//!    anyway, so a low-rank factor captures the real structure instead of
-//!    padding it with regularization noise,
-//!  - keeps the per-row ridge as **isotropic noise that fills directions
-//!    outside the top-r subspace**, mirroring the previous Cholesky
-//!    regularization but rescaled to maintain unit marginal variance.
+//! [`CopulaCovariance::from_correlation`] fits `F` to a latent correlation
+//! matrix (see [`crate::sim::copula::latent`]) by iterated principal-axis
+//! factoring: the diagonal of the correlation matrix is replaced by the
+//! rows' communalities `‖F[h,:]‖²`, the leading positive eigenpairs give the
+//! next `F`, and each row's residual `1 − ‖F[h,:]‖²` goes to `ridge_sd`.
+//! The off-diagonal correlations are what the factor fits; each gene keeps
+//! the variance the shared factors do not explain as its own, instead of
+//! being stretched into pure shared variance. The dense `G × G` matrix is
+//! only formed for the copula's genes (the HVGs); sampling uses `F` alone.
 
-use legume_numeric::matrix::traits::RandomizedAlgs;
 use nalgebra::{DMatrix, DVector};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
 
+/// Principal-axis refits of [`CopulaCovariance::from_correlation`] at most.
+const PAF_ITERATIONS: usize = 3;
+
+/// Largest change of a communality at which the refits stop early.
+const PAF_TOLERANCE: f64 = 1e-3;
+
 #[derive(Debug, Clone)]
 pub struct CopulaCovariance {
-    /// Per-row-rescaled factor: `F'[h, k] = (U[h, k]·σ_k/√N) / √(‖F[h,:]‖²+λ)`.
-    /// Shape `(g, rank)`. After the rescale, `‖F'[h,:]‖² + ridge_sd[h]² = 1`,
-    /// so sampled `z*[h]` is unit-variance — the latent of a *correlation*
-    /// copula, not a covariance.
+    /// Factor loadings, shape `(g, rank)`, columns in decreasing order of
+    /// the variance they carry. `‖F[h,:]‖² + ridge_sd[h]² = 1`, so sampled
+    /// `z*[h]` is unit-variance — the latent of a *correlation* copula.
     pub factor: DMatrix<f32>,
-    /// Per-row ridge SD: `ridge_sd[h] = √λ / √(‖F[h,:]‖² + λ)`. Length `g`.
+    /// Per-row residual SD `√(1 − ‖F[h,:]‖²)`. Length `g`.
     pub ridge_sd: DVector<f32>,
 }
 
@@ -55,47 +41,75 @@ impl CopulaCovariance {
         self.factor.ncols()
     }
 
-    /// Fit by running RSVD on `Z` (genes × cells), forming `F = U·diag(σ)/√N`,
-    /// then **per-row rescaling** so each row has unit total variance under
-    /// `Var(z*[h]) = ‖F[h,:]‖² + ridge_sd[h]²`. `rank` caps the factor rank;
-    /// effective rank is `min(rank, g, n)`.
-    pub fn fit(z: &DMatrix<f32>, rank: usize, regularization: f32) -> anyhow::Result<Self> {
-        let g = z.nrows();
-        let n = z.ncols();
-        if n < 2 {
-            anyhow::bail!("need ≥2 cells to fit a copula covariance");
-        }
-        let r_eff = rank.max(1).min(g).min(n);
-        let (u, sigmas, _vt) = z.rsvd(r_eff)?;
-        let actual_rank = u.ncols().min(sigmas.len());
-        let scale = 1.0 / (n as f32).sqrt();
-        let mut factor = if u.ncols() > actual_rank {
-            u.columns(0, actual_rank).into_owned()
-        } else {
-            u
-        };
-        for k in 0..actual_rank {
-            let w = sigmas[k] * scale;
-            factor.column_mut(k).scale_mut(w);
-        }
-        // Per-row rescale to unit marginal variance (correlation copula).
-        // v_h = ‖F[h,:]‖² + λ; F'[h,:] = F[h,:]/√v_h; ridge_sd[h] = √λ/√v_h.
-        let lambda = regularization.max(0.0);
-        let mut ridge_sd = DVector::<f32>::zeros(g);
-        for h in 0..g {
-            let row_norm_sq: f32 = (0..actual_rank).map(|k| factor[(h, k)].powi(2)).sum();
-            let v_h = row_norm_sq + lambda;
-            if v_h > 1e-12 {
-                let inv_sd = 1.0 / v_h.sqrt();
-                for k in 0..actual_rank {
-                    factor[(h, k)] *= inv_sd;
-                }
-                ridge_sd[h] = lambda.sqrt() * inv_sd;
+    /// Fit a rank-`rank` factor to the correlation matrix `corr` by iterated
+    /// principal-axis factoring. Every row keeps at least `regularization`
+    /// of its variance as its own residual, so no gene is a pure copy of the
+    /// shared factors. Only positive eigenvalues become factors; with none
+    /// (or `rank = 0`) every row is an independent standard normal.
+    pub fn from_correlation(
+        corr: &DMatrix<f64>,
+        rank: usize,
+        regularization: f32,
+    ) -> anyhow::Result<Self> {
+        let g = corr.nrows();
+        anyhow::ensure!(
+            corr.ncols() == g,
+            "copula correlation must be square, got {} × {}",
+            g,
+            corr.ncols()
+        );
+        let max_communality = 1.0 - (regularization as f64).clamp(0.0, 1.0);
+        let r_eff = rank.min(g);
+        // Start from each row's largest off-diagonal |ρ|: the matrix need
+        // not be positive semi-definite, so 1 would overstate the shared part.
+        let mut communality: Vec<f64> = (0..g)
+            .map(|h| {
+                (0..g)
+                    .filter(|&k| k != h)
+                    .map(|k| corr[(h, k)].abs())
+                    .fold(0.0_f64, f64::max)
+                    .min(max_communality)
+            })
+            .collect();
+        let mut factor = DMatrix::<f64>::zeros(g, 0);
+        for _ in 0..PAF_ITERATIONS {
+            if r_eff == 0 {
+                break;
             }
-            // else: degenerate row (F[h,:]=0 ∧ λ=0) → leave factor row at 0
-            // and ridge_sd[h]=0 → z*[h]=0 → median NB fallback.
+            let mut reduced = corr.clone();
+            for (h, &c) in communality.iter().enumerate() {
+                reduced[(h, h)] = c;
+            }
+            let eig = reduced.symmetric_eigen();
+            let mut order: Vec<usize> = (0..g).filter(|&i| eig.eigenvalues[i] > 0.0).collect();
+            order.sort_by(|&i, &j| eig.eigenvalues[j].total_cmp(&eig.eigenvalues[i]));
+            order.truncate(r_eff);
+            factor = DMatrix::from_fn(g, order.len(), |h, k| {
+                eig.eigenvectors[(h, order[k])] * eig.eigenvalues[order[k]].sqrt()
+            });
+            let mut change = 0.0_f64;
+            for (h, c) in communality.iter_mut().enumerate() {
+                let norm_sq = factor.row(h).norm_squared();
+                if norm_sq > max_communality {
+                    factor
+                        .row_mut(h)
+                        .scale_mut((max_communality / norm_sq).sqrt());
+                }
+                let next = norm_sq.min(max_communality);
+                change = change.max((next - *c).abs());
+                *c = next;
+            }
+            if change < PAF_TOLERANCE {
+                break;
+            }
         }
-        Ok(Self { factor, ridge_sd })
+        let ridge_sd = DVector::from_fn(g, |h, _| {
+            ((1.0 - factor.row(h).norm_squared()).max(0.0).sqrt()) as f32
+        });
+        Ok(Self {
+            factor: factor.map(|x| x as f32),
+            ridge_sd,
+        })
     }
 
     /// Per-batch log shifts of the reference means: one draw `z_b` per
@@ -223,6 +237,17 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
 
+    /// Pearson correlation of the rows of `z`.
+    fn pearson(z: &DMatrix<f32>) -> DMatrix<f64> {
+        let z = z.map(|x| x as f64);
+        let n = z.ncols() as f64;
+        let centred = DMatrix::from_fn(z.nrows(), z.ncols(), |h, c| z[(h, c)] - z.row(h).mean());
+        let cov = &centred * centred.transpose() / n;
+        DMatrix::from_fn(cov.nrows(), cov.ncols(), |i, j| {
+            cov[(i, j)] / (cov[(i, i)] * cov[(j, j)]).sqrt()
+        })
+    }
+
     /// Embedding keeps the subset's rows where the index map puts them and
     /// gives every other feature an independent unit-variance draw.
     #[test]
@@ -231,7 +256,9 @@ mod tests {
         let normal = Normal::new(0.0_f32, 1.0_f32).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(5);
         let z = DMatrix::from_fn(h, n, |_, _| normal.sample(&mut rng));
-        let sub = CopulaCovariance::fit(&z, 4, 1e-3).unwrap().truncate_rank(2);
+        let sub = CopulaCovariance::from_correlation(&pearson(&z), 4, 1e-3)
+            .unwrap()
+            .truncate_rank(2);
         let indices = [12usize, 0, 7, 3, 14, 9];
 
         let full = sub.embed(&indices, dim).unwrap();
@@ -277,26 +304,26 @@ mod tests {
         assert!(cov.sample_batch_shifts(0, 1.0, &mut rng).is_empty());
     }
 
+    /// Independent rows stay (nearly) independent: the factors fit only
+    /// the sampling noise of the off-diagonals, and every row keeps unit
+    /// variance.
     #[test]
-    fn identity_recovery_full_rank() {
+    fn independent_rows_stay_independent() {
         let g = 5;
         let n = 5000;
         let normal = Normal::new(0.0_f32, 1.0_f32).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let z = DMatrix::from_fn(g, n, |_, _| normal.sample(&mut rng));
-        // Full-rank fit (rank = g) reproduces the empirical Σ̂.
-        let cov = CopulaCovariance::fit(&z, g, 0.0).unwrap();
+        let cov = CopulaCovariance::from_correlation(&pearson(&z), g, 0.0).unwrap();
         let recovered = &cov.factor * cov.factor.transpose();
         for i in 0..g {
-            for j in 0..g {
-                let expected = if i == j { 1.0 } else { 0.0 };
+            let var = recovered[(i, i)] + cov.ridge_sd[i] * cov.ridge_sd[i];
+            assert!((var - 1.0).abs() < 1e-4, "Var(z*[{i}]) = {var}");
+            for j in (0..g).filter(|&j| j != i) {
                 assert!(
-                    (recovered[(i, j)] - expected).abs() < 0.1,
-                    "Σ[{},{}]={} expected {}",
-                    i,
-                    j,
-                    recovered[(i, j)],
-                    expected
+                    recovered[(i, j)].abs() < 0.1,
+                    "Σ[{i},{j}]={}",
+                    recovered[(i, j)]
                 );
             }
         }
@@ -320,17 +347,21 @@ mod tests {
             z.set_column(j, &(&l * eta));
         }
 
-        let cov = CopulaCovariance::fit(&z, g, 0.0).unwrap();
+        let cov = CopulaCovariance::from_correlation(&pearson(&z), g, 0.0).unwrap();
         let recovered = &cov.factor * cov.factor.transpose();
         assert!(
             (recovered[(0, 1)] - 0.7).abs() < 0.05,
             "off-diag={}",
             recovered[(0, 1)]
         );
+        // The shared part of row 0 is about the correlation it shares; the
+        // rest is its own residual.
+        let total = recovered[(0, 0)] + cov.ridge_sd[0] * cov.ridge_sd[0];
+        assert!((total - 1.0).abs() < 1e-4, "Var(z*[0]) = {total}");
         assert!(
-            (recovered[(0, 0)] - 1.0).abs() < 0.05,
-            "diag[0,0]={}",
-            recovered[(0, 0)]
+            recovered[(2, 2)] < 0.1,
+            "row 2 shares {}",
+            recovered[(2, 2)]
         );
     }
 
@@ -341,53 +372,60 @@ mod tests {
         let normal = Normal::new(0.0_f32, 1.0_f32).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let z = DMatrix::from_fn(g, n, |_, _| normal.sample(&mut rng));
-        // Request rank=200 but expect it capped at min(g, n) = 50.
-        let cov = CopulaCovariance::fit(&z, 200, 1e-3).unwrap();
+        // Request rank=200 but expect it capped at g = 50.
+        let cov = CopulaCovariance::from_correlation(&pearson(&z), 200, 1e-3).unwrap();
         assert!(cov.rank() <= g);
         assert_eq!(cov.dim(), g);
         let s = cov.sample(&mut rng);
         assert_eq!(s.len(), g);
+        assert_eq!(
+            CopulaCovariance::from_correlation(&pearson(&z), 0, 1e-3)
+                .unwrap()
+                .rank(),
+            0
+        );
     }
 
+    /// One shared factor between rows 0 and 1 comes back as one column,
+    /// rows 2 and 3 load on nothing, and the regularization caps how much
+    /// of a row the factor may take.
     #[test]
     fn rank_one_recovery() {
-        // Σ = v vᵀ with v = (1, 1, 0, 0)ᵀ. A rank-1 fit should return a
-        // factor proportional to v (up to sign), and the recovered Σ̂[0, 1]
-        // should land near 1.
-        let g = 4;
-        let n = 8000;
-        let v = DVector::<f32>::from_vec(vec![1.0, 1.0, 0.0, 0.0]);
-        let normal = Normal::new(0.0_f32, 1.0_f32).unwrap();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
-        let mut z = DMatrix::<f32>::zeros(g, n);
-        for k in 0..n {
-            let eta: f32 = normal.sample(&mut rng);
-            z.set_column(k, &(eta * &v));
-        }
-        let cov = CopulaCovariance::fit(&z, 1, 0.0).unwrap();
+        let mut corr = DMatrix::<f64>::identity(4, 4);
+        corr[(0, 1)] = 0.8;
+        corr[(1, 0)] = 0.8;
+        let cov = CopulaCovariance::from_correlation(&corr, 1, 0.0).unwrap();
         let recovered = &cov.factor * cov.factor.transpose();
         assert!(
-            (recovered[(0, 0)] - 1.0).abs() < 0.1,
-            "Σ̂[0,0]={}",
-            recovered[(0, 0)]
-        );
-        assert!(
-            (recovered[(0, 1)] - 1.0).abs() < 0.1,
+            (recovered[(0, 1)] - 0.8).abs() < 0.02,
             "Σ̂[0,1]={}",
             recovered[(0, 1)]
         );
         assert!(
-            recovered[(2, 2)].abs() < 0.05,
-            "Σ̂[2,2]={} (should be ~0)",
+            (recovered[(0, 0)] - 0.8).abs() < 0.02,
+            "Σ̂[0,0]={}",
+            recovered[(0, 0)]
+        );
+        assert!(
+            recovered[(2, 2)].abs() < 1e-6,
+            "Σ̂[2,2]={}",
             recovered[(2, 2)]
         );
+        assert!((cov.ridge_sd[2] - 1.0).abs() < 1e-6);
+
+        corr[(0, 1)] = 0.99;
+        corr[(1, 0)] = 0.99;
+        let capped = CopulaCovariance::from_correlation(&corr, 1, 0.1).unwrap();
+        for h in 0..2 {
+            let shared = capped.factor.row(h).norm_squared();
+            assert!(shared <= 0.9 + 1e-5, "row {h} shares {shared}");
+        }
     }
 
-    /// Sub-unit-variance input (mimics PIT-Z from sparse discrete NB) — the
-    /// per-row rescale in `fit` must drag every marginal back to Var≈1.
-    /// Without the rescale this test would catch the original bug:
-    /// HVG-like rows produce `z*` with Var ≪ 1 → `Φ(z*) ≈ 0.5` → inverse-CDF
-    /// always returns 0.
+    /// Sub-unit-variance input (like PIT z-scores of sparse counts): the
+    /// fit works on correlations, so every sampled marginal has Var≈1
+    /// whatever the scale of the rows it came from. Var ≪ 1 would give
+    /// `Φ(z*) ≈ 0.5` and an inverse CDF that always returns 0.
     #[test]
     fn unit_marginal_variance_on_subunit_input() {
         let g = 30;
@@ -406,7 +444,7 @@ mod tests {
                 z[(h, j)] = normal.sample(&mut rng);
             }
         }
-        let cov = CopulaCovariance::fit(&z, 5, 1e-3).unwrap();
+        let cov = CopulaCovariance::from_correlation(&pearson(&z), 5, 1e-3).unwrap();
 
         // Empirically estimate Var(z*[h]) over many draws.
         let n_samples = 20_000;
@@ -452,7 +490,7 @@ mod tests {
             z[(2, j)] = 0.5 * normal.sample(&mut rng);
             z[(3, j)] = 1.5 * normal.sample(&mut rng);
         }
-        let cov = CopulaCovariance::fit(&z, 4, 1e-4).unwrap();
+        let cov = CopulaCovariance::from_correlation(&pearson(&z), 4, 1e-4).unwrap();
 
         // Empirical corr from samples.
         let n_samples = 30_000;
@@ -506,7 +544,7 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(2027);
         let normal = Normal::new(0.0_f32, 1.0_f32).unwrap();
         let z = DMatrix::from_fn(g, n, |_, _| normal.sample(&mut rng));
-        let full = CopulaCovariance::fit(&z, 10, 1e-3).unwrap();
+        let full = CopulaCovariance::from_correlation(&pearson(&z), 10, 1e-3).unwrap();
         for new_rank in [0usize, 1, 3, 7] {
             let truncated = full.truncate_rank(new_rank);
             assert_eq!(truncated.dim(), g);
