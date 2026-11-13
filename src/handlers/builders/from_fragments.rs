@@ -422,14 +422,14 @@ pub fn run_build_from_fragments(args: &FromFragmentsArgs) -> anyhow::Result<()> 
     out.register_row_names_vec(&row_names);
     out.register_column_names_vec(&col_names);
 
-    let squeeze = Squeeze {
-        on: args.do_squeeze,
-        rows: args.row_nnz_cutoff,
-        columns: args.column_nnz_cutoff,
-        block_size: args.block_size,
-    };
+    let squeeze = Squeeze::new(
+        args.do_squeeze,
+        args.row_nnz_cutoff,
+        args.column_nnz_cutoff,
+        args.block_size,
+    );
     if !keep_import("from-fragments", session.as_ref(), squeeze, &backend_file)? {
-        return Ok(());
+        return crate::import::remove_build(&backend_file);
     }
     finalize_zarr_output(&backend_file, &effective_output)?;
     info!("done");

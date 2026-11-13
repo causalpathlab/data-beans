@@ -1,10 +1,7 @@
 use crate::handlers::merging::same_file;
-use crate::hdf5_io::resolve_backend_file;
-use crate::qc::{squeeze_by_nnz, SqueezeCutoffs};
-use crate::sparse_io::{open_sparse_matrix, SparseIoBackend};
+use crate::sparse_io::SparseIoBackend;
 use crate::zarr_io::{output_target, prepare_output};
 use clap::Args;
-use log::info;
 
 mod convert;
 mod group_table;
@@ -233,33 +230,7 @@ pub(crate) fn prepare_output_beside(
     prepare_output(output, backend, zip)
 }
 
-/// Cut, in place, the rows and columns of the backend at `backend_file`
-/// with fewer than `row` and `column` non-zeros: the `--squeeze` of the
-/// commands that build or derive a backend. The path is one the caller
-/// resolved and finalizes itself, so nothing is zipped here.
-pub fn squeeze_in_place(
-    backend_file: &str,
-    row: usize,
-    column: usize,
-    block_size: Option<usize>,
-) -> anyhow::Result<()> {
-    info!("Squeeze the backend data {backend_file}");
-    let (backend, file) = resolve_backend_file(backend_file, None)?;
-    let data = open_sparse_matrix(&file, &backend)?;
-    squeeze_by_nnz(
-        data.as_ref(),
-        SqueezeCutoffs { row, column },
-        block_size,
-        true,
-    )?;
-    let data = open_sparse_matrix(&file, &backend)?;
-    info!(
-        "after squeeze -- data: {} rows x {} columns",
-        data.num_rows().unwrap_or_default(),
-        data.num_columns().unwrap_or_default()
-    );
-    Ok(())
-}
+pub use crate::qc::squeeze_in_place;
 
 #[cfg(test)]
 mod tests;

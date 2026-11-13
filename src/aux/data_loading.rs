@@ -3,8 +3,9 @@ use std::sync::Arc;
 use log::{debug, info, warn};
 
 use crate::convert::try_open_or_convert;
-use crate::sparse_io_vector::SparseIoVec;
-use legume_numeric::matrix::common_io::{self, basename, read_lines};
+use crate::sparse_io::COLUMN_SEP;
+use crate::sparse_io_vector::{data_name_of, SparseIoVec};
+use legume_numeric::matrix::common_io::{self, read_lines};
 use rustc_hash::FxHashSet;
 
 use crate::aux::feature_names::FeatureNameKind;
@@ -113,9 +114,6 @@ pub struct SparseDataWithBatch {
 /// 2. Embedded `@`-separated batch info in column names (e.g., `barcode@donor`)
 /// 3. File name as batch label (one batch per input file)
 pub fn read_data_on_shared_rows(args: ReadSharedRowsArgs) -> anyhow::Result<SparseDataWithBatch> {
-    // to avoid duplicate barcodes in the column names
-    let attach_data_name = args.data_files.len() > 1;
-
     // Open every backend first (preserving order). For LocusOverlap we
     // need to peek all row names before installing the canonicalizer.
     type OpenedBackend = Box<dyn crate::sparse_io::SparseIo<IndexIter = Vec<usize>>>;
@@ -129,14 +127,12 @@ pub fn read_data_on_shared_rows(args: ReadSharedRowsArgs) -> anyhow::Result<Spar
         opened.push((data_file.clone(), data));
     }
 
-    // `Disjoint` keeps today's @<basename>-suffix semantics; `Union`
-    // glues cells by raw barcode (no suffix). Affects `SparseIoVec::push`
-    // *and* the batch-resolution branch below — per-file batch labels
-    // become ambiguous under Union (one cell can be in two files) so we
-    // require either a single unified batch file or per-cell embedded
-    // tags that agree across backends.
-    let attach_data_name = attach_data_name && args.column_alignment == ColumnAlignment::Disjoint;
-
+    // `Disjoint` names a cell `barcode@<basename>` when several files are
+    // read ([`data_name_of`]); `Union` glues cells by raw barcode (no
+    // suffix). Affects `SparseIoVec::push` *and* the batch-resolution
+    // branch below — per-file batch labels become ambiguous under Union
+    // (one cell can be in two files) so we require either a single unified
+    // batch file or per-cell embedded tags that agree across backends.
     let mut data_vec = SparseIoVec::new()
         .with_row_alignment(args.row_alignment)
         .expect("with_row_alignment on empty SparseIoVec")
@@ -282,8 +278,13 @@ pub fn read_data_on_shared_rows(args: ReadSharedRowsArgs) -> anyhow::Result<Spar
         if kind_was_auto { " (auto)" } else { "" },
         opened.len(),
     );
+    let n_files = opened.len();
     for (file_idx, (data_file, data)) in opened.into_iter().enumerate() {
-        let data_name = attach_data_name.then(|| basename(&data_file)).transpose()?;
+        // Under Union cells glue by raw barcode: no file name.
+        let data_name = match args.column_alignment {
+            ColumnAlignment::Disjoint => data_name_of(&data_file, n_files)?,
+            ColumnAlignment::Union => None,
+        };
         // Per-file barcode sample tag (Union only; ignored under Disjoint).
         let barcode_suffix: Option<&str> = args
             .per_file_barcode_suffix
@@ -318,12 +319,9 @@ pub fn read_data_on_shared_rows(args: ReadSharedRowsArgs) -> anyhow::Result<Spar
     // check batch membership
     let n_cells = data_vec.num_columns();
     let mut batch_membership: Vec<Box<str>> = match args.column_alignment {
-        ColumnAlignment::Disjoint => resolve_batch_disjoint(
-            &args.data_files,
-            &data_vec,
-            args.batch_files.as_deref(),
-            attach_data_name,
-        )?,
+        ColumnAlignment::Disjoint => {
+            resolve_batch_disjoint(&args.data_files, &data_vec, args.batch_files.as_deref())?
+        }
         ColumnAlignment::Union => {
             resolve_batch_union(&data_vec, args.batch_files.as_deref(), n_cells)?
         }
@@ -550,7 +548,6 @@ fn resolve_batch_disjoint(
     data_files: &[Box<str>],
     data_vec: &SparseIoVec,
     batch_files: Option<&[Box<str>]>,
-    attach_data_name: bool,
 ) -> anyhow::Result<Vec<Box<str>>> {
     let mut batch_membership: Vec<Box<str>> = Vec::with_capacity(data_vec.num_columns());
 
@@ -586,8 +583,8 @@ fn resolve_batch_disjoint(
             let col_end = col_start + ncols;
             let file_columns = &column_names[col_start..col_end];
 
-            let appended_suffix =
-                attach_data_name.then(|| format!("@{}", file_base).into_boxed_str());
+            let appended_suffix = data_name_of(&data_file, data_files.len())?
+                .map(|name| format!("{COLUMN_SEP}{name}").into_boxed_str());
             let (tags, used_embedded) = infer_batch_from_columns(
                 file_columns,
                 file_base.as_ref(),

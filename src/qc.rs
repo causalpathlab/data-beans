@@ -801,5 +801,33 @@ pub fn write_nnz_summary(
     Ok(())
 }
 
+/// Cut, in place, the rows and columns of the backend at `backend_file`
+/// with fewer than `row` and `column` non-zeros: the `--squeeze` of the
+/// commands that build or derive a backend. The path is one the caller
+/// resolved and finalizes itself, so nothing is zipped here.
+pub fn squeeze_in_place(
+    backend_file: &str,
+    row: usize,
+    column: usize,
+    block_size: Option<usize>,
+) -> anyhow::Result<()> {
+    log::info!("Squeeze the backend data {backend_file}");
+    let (backend, file) = crate::hdf5_io::resolve_backend_file(backend_file, None)?;
+    let data = crate::sparse_io::open_sparse_matrix(&file, &backend)?;
+    squeeze_by_nnz(
+        data.as_ref(),
+        SqueezeCutoffs { row, column },
+        block_size,
+        true,
+    )?;
+    let data = crate::sparse_io::open_sparse_matrix(&file, &backend)?;
+    log::info!(
+        "after squeeze -- data: {} rows x {} columns",
+        data.num_rows().unwrap_or_default(),
+        data.num_columns().unwrap_or_default()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

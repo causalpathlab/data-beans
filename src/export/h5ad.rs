@@ -1,7 +1,6 @@
 use crate::hdf5_io::*;
 use crate::sparse_io::*;
 
-use clap::Args;
 use hdf5::types::{H5Type, VarLenUnicode};
 use legume_numeric::matrix::common_io::read_lines;
 use log::info;
@@ -17,69 +16,51 @@ const DONOR_COLUMN: &str = "donor_id";
 /// Upper bound on the chunk length (elements) for the `X` datasets.
 const MAX_CHUNK_ELEMS: usize = 1 << 20;
 
-#[derive(Args, Debug)]
-pub struct ToH5adArgs {
-    /// backend data file to export (`.zarr`, `.zarr.zip`, or `.h5`)
-    pub data_file: Box<str>,
-
-    #[arg(
-        short,
-        long,
-        help = "Output `.h5ad` file (default: <input stem>.h5ad)",
-        long_help = "Output AnnData h5ad path.\n\
-                     `.h5ad` is appended when the name lacks that suffix.\n\
-                     It defaults to the input file's stem, plus `.h5ad`."
-    )]
-    pub output: Option<Box<str>>,
-
-    #[arg(
-        long,
-        help = "Cell-metadata TSV to attach as `obs` columns",
-        long_help = "Optional TSV whose first column is the cell key; gzip is fine.\n\
-                     Keys match against the backend column names.\n\
-                     A cell named `barcode@donor` also matches the row keyed `barcode`\n\
-                     whose `donor_id` column is `donor`, or else the row keyed `barcode`.\n\
-                     \n\
-                     Remaining columns become `obs` columns. Unmatched cells get `NA`,\n\
-                     as do cells whose key is listed on rows that differ.\n\
-                     \n\
-                     Pair this with the `*.cell_metadata.tsv.gz` that `from-h5ad` wrote,\n\
-                     to round-trip cell annotations."
-    )]
+/// The metadata [`to_h5ad`] attaches.
+#[derive(Clone, Debug, Default)]
+pub struct H5adExport {
+    /// Cell-metadata TSV (gzip is fine) whose first column is the cell key,
+    /// matched against the column names; the other columns become `obs`
+    /// columns. A cell named `barcode@donor` also matches the row keyed
+    /// `barcode` whose `donor_id` column is `donor`, or else the row keyed
+    /// `barcode`. Unmatched cells get `NA`, as do cells whose key is listed
+    /// on rows that differ. The `*.cell_metadata.tsv.gz` that
+    /// [`crate::import::from_h5ad`] writes round-trips this way.
     pub obs: Option<Box<str>>,
-
-    #[arg(
-        long,
-        help = "Feature-metadata TSV to attach as `var` columns",
-        long_help = "Optional TSV whose first column is the feature key; gzip is fine.\n\
-                     Keys match against the backend row names.\n\
-                     Remaining columns become `var` columns. Unmatched features get `NA`,\n\
-                     as do features whose key is listed on rows that differ."
-    )]
+    /// Feature-metadata TSV whose first column is the feature key, matched
+    /// against the row names; the other columns become `var` columns, `NA`
+    /// where unmatched or ambiguous.
     pub var: Option<Box<str>>,
 }
 
-/// Export a data-beans backend to an AnnData `.h5ad` file readable by
-/// scanpy / anndata. This is the inverse of `from-h5ad`.
+/// Where `to-h5ad` writes for the backend `data_file`: `output`, given one,
+/// with `.h5ad` appended when it lacks it, else `data_file`'s stem plus
+/// `.h5ad` (`sim.zarr.zip` → `sim.h5ad`).
+pub fn h5ad_path(data_file: &str, output: Option<&str>) -> String {
+    match output {
+        Some(o) if o.ends_with(".h5ad") => o.to_string(),
+        Some(o) => format!("{}.h5ad", o),
+        None => format!("{}.h5ad", strip_backend_suffix(data_file)),
+    }
+}
+
+/// Export `data` to the AnnData `.h5ad` file `output`, readable by scanpy /
+/// anndata. This is the inverse of [`crate::import::from_h5ad`].
 ///
 /// data-beans stores the matrix `M` as (features x cells) with `/by_column`
 /// holding the CSC of `M` (column pointers over cells, row indices over
 /// features). AnnData's `X` is (cells x features) = `Mᵀ`, stored as CSR.
 /// Because CSR(`Mᵀ`) is byte-for-byte identical to CSC(`M`), the `/by_column`
 /// arrays copy straight into `X` as a `csr_matrix` of shape `[n_cells,
-/// n_features]` — no re-sort, exactly undoing the transpose `from-h5ad` did.
-pub fn run_export_to_h5ad(args: &ToH5adArgs) -> anyhow::Result<()> {
-    let (backend, data_file) = resolve_backend_file(&args.data_file, None)?;
-
-    let output = match &args.output {
-        Some(o) if o.ends_with(".h5ad") => o.to_string(),
-        Some(o) => format!("{}.h5ad", o),
-        None => format!("{}.h5ad", strip_backend_suffix(&data_file)),
-    };
-
-    info!("Exporting {} -> {}", data_file, output);
-
-    let mut data = open_sparse_matrix(&data_file, &backend)?;
+/// n_features]` — no re-sort, exactly undoing the transpose `from_h5ad` did.
+/// `data` is preloaded by column for it (and stays so), and the whole CSC
+/// has to fit the preload budget.
+pub fn to_h5ad(
+    data: &mut dyn SparseIo<IndexIter = Vec<usize>>,
+    output: &str,
+    opts: &H5adExport,
+) -> anyhow::Result<()> {
+    info!("Exporting to {}", output);
 
     let nrow = data
         .num_rows()
@@ -120,7 +101,7 @@ pub fn run_export_to_h5ad(args: &ToH5adArgs) -> anyhow::Result<()> {
     debug_assert_eq!(indptr.len(), ncol + 1);
     debug_assert_eq!(indices.len(), values.len());
 
-    let file = hdf5::File::create(&output)?;
+    let file = hdf5::File::create(output)?;
 
     // Root: mark as an AnnData container.
     write_str_attr(&file, "encoding-type", "anndata")?;
@@ -130,8 +111,8 @@ pub fn run_export_to_h5ad(args: &ToH5adArgs) -> anyhow::Result<()> {
     write_csr_x(&file, ncol, nrow, indptr, indices, values)?;
 
     // obs (cells) and var (features) dataframes.
-    write_dataframe(&file, "obs", &col_names, args.obs.as_deref(), true)?;
-    write_dataframe(&file, "var", &row_names, args.var.as_deref(), false)?;
+    write_dataframe(&file, "obs", &col_names, opts.obs.as_deref(), true)?;
+    write_dataframe(&file, "var", &row_names, opts.var.as_deref(), false)?;
 
     file.flush()?;
     info!(
@@ -235,6 +216,10 @@ fn write_dataframe(
     Ok(())
 }
 
+/// Metadata column names, and each column's entries in the order of the
+/// names they were aligned onto.
+type AlignedMetadata = (Vec<Box<str>>, Vec<Vec<Box<str>>>);
+
 /// Parse a metadata TSV and align its rows onto `names`.
 ///
 /// The first TSV column is the join key; the rest become columns (a literal
@@ -249,12 +234,11 @@ fn write_dataframe(
 /// they say the same in every kept column; once they differ it names no
 /// single row, matches nothing, and the entry is left `"NA"`, with a
 /// warning.
-#[allow(clippy::type_complexity)]
 fn load_aligned_metadata(
     path: &str,
     names: &[Box<str>],
     barcode_fallback: bool,
-) -> anyhow::Result<(Vec<Box<str>>, Vec<Vec<Box<str>>>)> {
+) -> anyhow::Result<AlignedMetadata> {
     let lines = read_lines(path)?;
     if lines.is_empty() {
         log::warn!("metadata file {} is empty; no columns attached", path);

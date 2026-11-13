@@ -61,8 +61,8 @@ fn plan_of(file: &str, rows: &[usize], columns: &[usize], squeeze: Squeeze) -> P
     let entries: usize = columns.iter().sum();
     let mut notes = vec![
         format!("{file}: {} entries", entries),
-        format!("rows    {}", spark(rows, cut(squeeze.rows))),
-        format!("columns {}", spark(columns, cut(squeeze.columns))),
+        format!("rows    {}", spark(rows, cut(squeeze.cut.rows))),
+        format!("columns {}", spark(columns, cut(squeeze.cut.columns))),
     ];
     if squeeze.on {
         notes.push(
@@ -74,8 +74,8 @@ fn plan_of(file: &str, rows: &[usize], columns: &[usize], squeeze: Squeeze) -> P
             .map(String::from)
             .to_vec(),
         rows: vec![
-            axis("rows", rows, squeeze.rows),
-            axis("columns", columns, squeeze.columns),
+            axis("rows", rows, squeeze.cut.rows),
+            axis("columns", columns, squeeze.cut.columns),
         ],
         notes,
         blocked: None,
@@ -92,12 +92,12 @@ fn cutoff(s: &Setting, what: &str) -> anyhow::Result<usize> {
 }
 
 fn squeeze_of(s: &[Setting], base: Squeeze) -> anyhow::Result<Squeeze> {
-    Ok(Squeeze {
-        on: s[0].flag(),
-        rows: cutoff(&s[1], "the row cutoff (r)")?,
-        columns: cutoff(&s[2], "the column cutoff (c)")?,
-        ..base
-    })
+    Ok(Squeeze::new(
+        s[0].flag(),
+        cutoff(&s[1], "the row cutoff (r)")?,
+        cutoff(&s[2], "the column cutoff (c)")?,
+        base.cut.block_size,
+    ))
 }
 
 /// Show what the build at `file` holds; the squeeze to keep it with, or
@@ -112,8 +112,8 @@ pub(super) fn preview(
 ) -> anyhow::Result<Option<Squeeze>> {
     let controls = vec![
         Control::flag('s', "squeeze", squeeze.on),
-        Control::number('r', "row cutoff", Some(squeeze.rows as f64)),
-        Control::number('c', "column cutoff", Some(squeeze.columns as f64)),
+        Control::number('r', "row cutoff", Some(squeeze.cut.rows as f64)),
+        Control::number('c', "column cutoff", Some(squeeze.cut.columns as f64)),
     ];
     let planner: Planner =
         Box::new(move |s: &[Setting]| Ok(plan_of(file, rows, columns, squeeze_of(s, squeeze)?)));
@@ -130,12 +130,7 @@ mod tests {
     use super::*;
 
     fn squeeze(on: bool, rows: usize, columns: usize) -> Squeeze {
-        Squeeze {
-            on,
-            rows,
-            columns,
-            block_size: None,
-        }
+        Squeeze::new(on, rows, columns, None)
     }
 
     #[test]
@@ -172,7 +167,7 @@ mod tests {
         let base = squeeze(false, 1, 1);
         let n = |v: Option<f64>| Setting::Number(v);
         let s = squeeze_of(&[Setting::Flag(true), n(Some(10.0)), n(None)], base).unwrap();
-        assert_eq!((s.on, s.rows, s.columns), (true, 10, 0));
+        assert_eq!((s.on, s.cut.rows, s.cut.columns), (true, 10, 0));
         assert!(squeeze_of(&[Setting::Flag(true), n(Some(1.5)), n(None)], base).is_err());
     }
 }

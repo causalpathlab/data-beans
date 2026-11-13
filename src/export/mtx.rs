@@ -1,8 +1,6 @@
-use crate::hdf5_io::*;
 use crate::sparse_io::*;
 use crate::utilities::name_matching::split_id_name;
 
-use clap::Args;
 use legume_numeric::matrix::common_io::{mkdir, open_buf_writer, write_lines};
 use log::{info, warn};
 use std::io::Write;
@@ -11,49 +9,42 @@ use std::io::Write;
 /// block of triplets regardless of matrix size).
 const COL_BLOCK: usize = 512;
 
-#[derive(Args, Debug)]
-pub struct ToMtxArgs {
-    /// backend data file to export (`.zarr`, `.zarr.zip`, or `.h5`)
-    pub data_file: Box<str>,
-
-    #[arg(
-        short,
-        long,
-        help = "Output directory for the 10x-style triplet",
-        long_help = "Output directory. The 10x Cell Ranger MEX triplet is written inside it:\n\
-                     matrix.mtx.gz, features.tsv.gz and barcodes.tsv.gz.\n\
-                     `scanpy.read_10x_mtx(dir)` and Seurat `Read10X(dir)` load it.\n\
-                     The directory is created if missing."
-    )]
-    pub output: Box<str>,
-
-    /// keep the triplet uncompressed (`matrix.mtx` / `features.tsv` /
-    /// `barcodes.tsv`) instead of the default gzipped Cell Ranger v3 layout
-    #[arg(long = "no-gzip", default_value_t = true, action = clap::ArgAction::SetFalse)]
+/// How [`to_mtx`] writes the triplet.
+#[derive(Clone, Debug)]
+pub struct MtxExport {
+    /// Gzip the three files (`matrix.mtx.gz`, ...), the Cell Ranger v3
+    /// layout; else plain `matrix.mtx`, `features.tsv`, `barcodes.tsv`.
     pub gzip: bool,
-
-    #[arg(
-        long,
-        default_value = "Gene Expression",
-        help = "feature_type written to column 3 of features.tsv",
-        long_help = "Value written to the third column of features.tsv.\n\
-                     That column is feature_type, and every feature gets this value.\n\
-                     10x uses 'Gene Expression', 'Antibody Capture' or 'Peaks'.\n\
-                     `from-mtx` reads it back for --select-row-type filtering."
-    )]
+    /// Written as every feature's `feature_type`, the third column of
+    /// `features.tsv`: 10x uses `Gene Expression`, `Antibody Capture` or
+    /// `Peaks`.
     pub feature_type: Box<str>,
 }
 
-/// Export a data-beans backend to a 10x Genomics MEX (MatrixMarket) triplet
-/// readable by scanpy / Seurat. This is the inverse of `from-mtx`.
+impl Default for MtxExport {
+    /// Gzipped, every feature `Gene Expression`: what `to-mtx` writes.
+    fn default() -> Self {
+        Self {
+            gzip: true,
+            feature_type: "Gene Expression".into(),
+        }
+    }
+}
+
+/// Export `data` to a 10x Genomics MEX (MatrixMarket) triplet in the
+/// directory `out_dir`, created if missing, readable by scanpy / Seurat.
+/// This is the inverse of [`crate::import::from_mtx`]; the directory is
+/// returned.
 ///
 /// data-beans already stores the matrix as (features x cells), which is 10x's
 /// orientation (features are rows, barcodes are columns), so no transpose is
-/// needed — unlike `to-h5ad`.
-pub fn run_export_to_mtx(args: &ToMtxArgs) -> anyhow::Result<()> {
-    let (backend, data_file) = resolve_backend_file(&args.data_file, None)?;
-    let data = open_sparse_matrix(&data_file, &backend)?;
-
+/// needed — unlike `to_h5ad`. A feature named `id_name` is split back into
+/// its id and name columns.
+pub fn to_mtx(
+    data: &dyn SparseIo<IndexIter = Vec<usize>>,
+    out_dir: &str,
+    opts: &MtxExport,
+) -> anyhow::Result<Box<str>> {
     let nrow = data
         .num_rows()
         .ok_or_else(|| anyhow::anyhow!("backend has no `nrow`"))?;
@@ -73,16 +64,16 @@ pub fn run_export_to_mtx(args: &ToMtxArgs) -> anyhow::Result<()> {
         anyhow::bail!("column name count {} != ncol {}", col_names.len(), ncol);
     }
 
-    let dir = args.output.trim_end_matches('/');
+    let dir = out_dir.trim_end_matches('/');
     mkdir(dir)?;
-    let suffix = if args.gzip { ".gz" } else { "" };
+    let suffix = if opts.gzip { ".gz" } else { "" };
     let mtx_path = format!("{}/matrix.mtx{}", dir, suffix);
     let features_path = format!("{}/features.tsv{}", dir, suffix);
     let barcodes_path = format!("{}/barcodes.tsv{}", dir, suffix);
 
     info!(
-        "Exporting {} -> {}/ ({} features x {} barcodes, {} non-zeros)",
-        data_file, dir, nrow, ncol, nnz
+        "Exporting to {}/ ({} features x {} barcodes, {} non-zeros)",
+        dir, nrow, ncol, nnz
     );
 
     // features.tsv: 10x 3-column layout (id, name, feature_type). Recover the
@@ -91,7 +82,7 @@ pub fn run_export_to_mtx(args: &ToMtxArgs) -> anyhow::Result<()> {
         .iter()
         .map(|composite| {
             let (id, name) = split_id_name(composite);
-            format!("{}\t{}\t{}", id, name, args.feature_type).into_boxed_str()
+            format!("{}\t{}\t{}", id, name, opts.feature_type).into_boxed_str()
         })
         .collect();
     write_lines(&feature_lines, &features_path)?;
@@ -102,11 +93,11 @@ pub fn run_export_to_mtx(args: &ToMtxArgs) -> anyhow::Result<()> {
     info!("wrote {}", barcodes_path);
 
     // matrix.mtx: stream the CSC columns as 1-based (feature, barcode, count).
-    write_mtx_10x(data.as_ref(), &mtx_path, nrow, ncol, nnz)?;
+    write_mtx_10x(data, &mtx_path, nrow, ncol, nnz)?;
     info!("wrote {}", mtx_path);
 
     info!("done: {}/", dir);
-    Ok(())
+    Ok(dir.into())
 }
 
 /// Write a Cell Ranger v3 style `matrix.mtx[.gz]`: a MatrixMarket coordinate

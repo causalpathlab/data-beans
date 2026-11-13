@@ -1,108 +1,73 @@
-use super::{keep_import, log_feature_type_histogram, Squeeze};
-use crate::hdf5_io::*;
+use super::{log_feature_type_histogram, Output, Staged};
 use crate::sparse_io::*;
 use crate::utilities::name_matching::{
     colon_peak_names, id_name, make_names_unique, RowTypeFilter,
 };
-use crate::zarr_io::*;
 
-use clap::Args;
 use legume_numeric::matrix::common_io::*;
 use log::info;
 
-#[derive(Args, Debug)]
-pub struct FromMtxArgs {
-    /// matrix market-formatted data file (`.mtx.gz` or `.mtx`)
+/// A MatrixMarket matrix and its name files, as [`from_mtx`] reads them.
+#[derive(Clone, Debug)]
+pub struct MtxImport {
+    /// The matrix, `.mtx.gz` or `.mtx`: features as rows, cells as columns.
     pub mtx: Box<str>,
-
-    /// row/feature name file (name per each line; `.tsv.gz` or `.tsv`).
-    /// For 10x `features.tsv[.gz]` the columns are `id`, `name`, `feature_type`;
-    /// the third column, when present, is used for `--select-row-type` /
-    /// `--remove-row-type` / `--hto-row-type` filtering.
-    #[arg(short, long)]
+    /// Feature names, one per line (`.tsv.gz` or `.tsv`). For 10x
+    /// `features.tsv[.gz]` the columns are `id`, `name`, `feature_type`; the
+    /// third, when present, is what the row-type filters read. A BED-shaped
+    /// peaks file names its rows `chr:start-end`. `None` numbers them.
     pub row: Option<Box<str>>,
-
-    /// column/cell/barcode file (name per each line; `.tsv.gz` or `.tsv`)
-    #[arg(short, long)]
+    /// Cell barcodes, one per line; `None` numbers them.
     pub col: Option<Box<str>>,
-
-    /// backend for the output file
-    #[arg(long, value_enum, default_value = "zarr")]
-    pub backend: SparseIoBackend,
-
-    /// output file header: {output}.zarr.zip by default; pass --no-zip to keep a {output}.zarr directory
-    #[arg(short, long)]
-    pub output: Box<str>,
-
-    /// keep a `.zarr` directory instead of producing a `.zarr.zip` archive
-    #[arg(long = "no-zip", default_value_t = true, action = clap::ArgAction::SetFalse)]
-    pub zip: bool,
-
-    /// maximum number of columns to read from the row/feature name file
-    /// (columns are joined with '_'); e.g. 2 reads "ENSG…<tab>SYMBOL"
-    #[arg(long, default_value_t = 2)]
+    /// How many columns of `row` name a feature: 2 joins id and name as
+    /// `id_name`, 1 keeps the id.
     pub row_name_columns: usize,
-
-    /// Comma-separated patterns; row is kept if its feature_type (column 3
-    /// of `--row`) contains ANY of them (case-insensitive). Default
-    /// `Gene Expression,Peaks` covers both 10x scRNA and 10x ATAC.
-    /// Set to empty to keep everything.
-    #[arg(long, default_value = "Gene Expression,Peaks")]
+    /// Comma-separated patterns; a row is kept if its feature_type contains
+    /// any of them (case-insensitive). Empty keeps every row.
     pub select_row_type: Box<str>,
-
-    /// Drop rows whose feature_type contains this string. Applied after
-    /// `--select-row-type`.
-    #[arg(long, default_value = "")]
+    /// Comma-separated patterns; a row whose feature_type contains one goes,
+    /// after `select_row_type`.
     pub remove_row_type: Box<str>,
-
-    /// Feature type used as HTO/multiplexing tags (e.g. `Antibody Capture`).
-    /// When set, each cell is assigned a batch label `barcode@{id}_{name}`
-    /// based on the HTO row with the highest count. HTO rows are then
-    /// removed from the final backend and cells with zero HTO signal are
-    /// dropped.
-    #[arg(long, default_value = "")]
+    /// The feature type of HTO (multiplexing) tags, such as `Antibody
+    /// Capture`. When set, each cell is named `barcode@{id}_{name}` for the
+    /// HTO row with its highest count, written to
+    /// `{stem}.barcode_to_hto.tsv.gz`; HTO rows then go, and so do cells
+    /// without any HTO count. Empty turns this off.
     pub hto_row_type: Box<str>,
-
-    /// squeeze
-    #[arg(long, default_value_t = false)]
-    pub do_squeeze: bool,
-
-    /// minimum number of non-zero cutoff for rows
-    #[arg(long, default_value_t = 1)]
-    pub row_nnz_cutoff: usize,
-
-    /// minimum number of non-zero cutoff for columns
-    #[arg(long, default_value_t = 1)]
-    pub column_nnz_cutoff: usize,
-
-    /// Cells per rayon job for the post-build squeeze pass.
-    /// Omit for auto-scaling by feature count.
-    #[arg(long)]
-    pub block_size: Option<usize>,
-
-    #[command(flatten)]
-    pub view: crate::handlers::explore::PlanArgs,
 }
-pub fn run_build_from_mtx(args: &FromMtxArgs) -> anyhow::Result<()> {
-    // The session first: hosted, the build runs there.
-    let session = args.view.session("from-mtx")?;
+
+impl MtxImport {
+    /// `mtx` with the CLI's defaults: rows numbered, 10x scRNA and ATAC
+    /// rows kept (`Gene Expression,Peaks`), no HTO.
+    pub fn new(mtx: &str) -> Self {
+        Self {
+            mtx: mtx.into(),
+            row: None,
+            col: None,
+            row_name_columns: 2,
+            select_row_type: "Gene Expression,Peaks".into(),
+            remove_row_type: "".into(),
+            hto_row_type: "".into(),
+        }
+    }
+}
+
+/// Build the backend `out` names from the matrix `mtx`; the path written.
+pub fn from_mtx(mtx: &MtxImport, out: &Output) -> anyhow::Result<Box<str>> {
+    stage_mtx(mtx, out)?.finish()
+}
+
+/// [`from_mtx`] short of squeezing and putting the backend in place.
+pub fn stage_mtx(args: &MtxImport, out: &Output) -> anyhow::Result<Staged> {
     let mtx_file = args.mtx.as_ref();
     let row_file = args.row.as_ref();
     let col_file = args.col.as_ref();
 
-    let effective_output = apply_zip_flag(&args.output, args.zip, &args.backend);
-    let (backend, backend_file) =
-        resolve_backend_file(&effective_output, Some(args.backend.clone()))?;
+    let (staged, backend) = out.stage()?;
+    let backend_file = staged.working();
+    let effective_output = &staged.effective;
 
-    if std::path::Path::new(backend_file.as_ref()).exists() {
-        info!(
-            "This existing backend file '{}' will be deleted",
-            backend_file
-        );
-        remove_file(&backend_file)?;
-    }
-
-    let mut data = create_sparse_from_mtx_file(mtx_file, Some(&backend_file), Some(&backend))?;
+    let mut data = create_sparse_from_mtx_file(mtx_file, Some(backend_file), Some(&backend))?;
 
     // Row names + (optional) ids + feature types — parsed together from the
     // features.tsv file so we can support the 10x 3-column layout.
@@ -221,7 +186,7 @@ pub fn run_build_from_mtx(args: &FromMtxArgs) -> anyhow::Result<()> {
 
                 let mut col_names = data.column_names()?;
 
-                let output_stem = crate::hdf5_io::strip_backend_suffix(&effective_output);
+                let output_stem = crate::hdf5_io::strip_backend_suffix(effective_output);
                 let hto_file = format!("{}.barcode_to_hto.tsv.gz", output_stem);
                 {
                     use std::io::Write;
@@ -270,19 +235,8 @@ pub fn run_build_from_mtx(args: &FromMtxArgs) -> anyhow::Result<()> {
         }
     }
 
-    let squeeze = Squeeze {
-        on: args.do_squeeze,
-        rows: args.row_nnz_cutoff,
-        columns: args.column_nnz_cutoff,
-        block_size: args.block_size,
-    };
-    if !keep_import("from-mtx", session.as_ref(), squeeze, &backend_file)? {
-        return Ok(());
-    }
-
-    finalize_zarr_output(&backend_file, &effective_output)?;
-    info!("done");
-    Ok(())
+    drop(data);
+    Ok(staged)
 }
 
 struct MtxFeatureRows {

@@ -3,8 +3,10 @@ mod column_subset;
 // the open-or-convert fallback.
 #[allow(dead_code)]
 mod convert;
+mod export;
 mod handlers;
 mod hdf5_io;
+mod import;
 #[cfg(feature = "mcp")]
 mod mcp;
 // The interactive views live in the library (feature "tui") so downstream
