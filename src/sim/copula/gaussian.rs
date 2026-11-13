@@ -5,13 +5,15 @@
 //! [`CopulaCovariance::from_correlation`] fits `F` to a latent correlation
 //! matrix (see [`crate::sim::copula::latent`]) by iterated principal-axis
 //! factoring: the diagonal of the correlation matrix is replaced by the
-//! rows' communalities `‖F[h,:]‖²`, the leading positive eigenpairs give the
+//! rows' communalities `‖F[h,:]‖²`, the leading positive eigenpairs (a top-r
+//! symmetric eigensolver, `legume_numeric`'s `SymmetricTopEigen`) give the
 //! next `F`, and each row's residual `1 − ‖F[h,:]‖²` goes to `ridge_sd`.
 //! The off-diagonal correlations are what the factor fits; each gene keeps
 //! the variance the shared factors do not explain as its own, instead of
 //! being stretched into pure shared variance. The dense `G × G` matrix is
 //! only formed for the copula's genes (the HVGs); sampling uses `F` alone.
 
+use legume_numeric::matrix::traits::{SymmetricTopEigen, TopEigenArgs};
 use nalgebra::{DMatrix, DVector};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
@@ -72,6 +74,9 @@ impl CopulaCovariance {
             })
             .collect();
         let mut factor = DMatrix::<f64>::zeros(g, 0);
+        // Each refit only moves the diagonal, so the last eigenvectors are a
+        // close start for the next.
+        let mut warm: Option<DMatrix<f64>> = None;
         for _ in 0..PAF_ITERATIONS {
             if r_eff == 0 {
                 break;
@@ -80,13 +85,13 @@ impl CopulaCovariance {
             for (h, &c) in communality.iter().enumerate() {
                 reduced[(h, h)] = c;
             }
-            let eig = reduced.symmetric_eigen();
-            let mut order: Vec<usize> = (0..g).filter(|&i| eig.eigenvalues[i] > 0.0).collect();
-            order.sort_by(|&i, &j| eig.eigenvalues[j].total_cmp(&eig.eigenvalues[i]));
-            order.truncate(r_eff);
-            factor = DMatrix::from_fn(g, order.len(), |h, k| {
-                eig.eigenvectors[(h, order[k])] * eig.eigenvalues[order[k]].sqrt()
-            });
+            // The `r_eff` largest algebraic eigenpairs, descending; the
+            // reduced matrix need not be positive semi-definite, so only the
+            // positive ones become factors.
+            let eig = reduced.top_eigen_with(r_eff, &TopEigenArgs::default(), warm.as_ref())?;
+            let kept = eig.values.iter().take_while(|&&v| v > 0.0).count();
+            factor = DMatrix::from_fn(g, kept, |h, k| eig.vectors[(h, k)] * eig.values[k].sqrt());
+            warm = Some(eig.vectors);
             let mut change = 0.0_f64;
             for (h, c) in communality.iter_mut().enumerate() {
                 let norm_sq = factor.row(h).norm_squared();
