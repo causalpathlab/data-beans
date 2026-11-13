@@ -185,9 +185,16 @@ pub fn collect_row_stat(
 }
 
 /// Column blocks folded into one accumulator at a leaf of
-/// [`fold_in_fixed_order`] by the streaming passes: a pass over many blocks
-/// allocates one accumulator per 64 of them, not one per block.
-pub(crate) const BLOCKS_PER_LEAF: usize = 64;
+/// [`fold_in_fixed_order`] by a streaming pass over `n_blocks` of them. A
+/// leaf is folded on one thread and allocates one accumulator the size of
+/// the feature axis, so the pass is cut into at most a few hundred leaves:
+/// each block is its own leaf, and its own task, up to that many blocks,
+/// and a longer pass shares an accumulator among neighbouring blocks. The
+/// leaf depends on the number of blocks alone, as the fold's order must.
+pub(crate) fn blocks_per_leaf(n_blocks: usize) -> usize {
+    const LEAVES: usize = 256;
+    n_blocks.div_ceil(LEAVES).max(1)
+}
 
 /// Fold `items` into one accumulator over a fixed binary tree: a run of at
 /// most `leaf` items is folded in order into a fresh accumulator; a longer
@@ -257,7 +264,7 @@ where
     let prog_bar = styled_progress_bar(jobs.len() as u64, "blocks");
     fold_in_fixed_order(
         &jobs,
-        BLOCKS_PER_LEAF,
+        blocks_per_leaf(jobs.len()),
         &init,
         &|acc, &(lb, ub)| {
             let csc = data.read_columns_csc((lb..ub).collect())?;

@@ -8,7 +8,7 @@
 //! invariants in one place and gives every caller a labelled progress
 //! bar with consistent styling.
 
-use crate::qc::{fold_in_fixed_order, BLOCKS_PER_LEAF};
+use crate::qc::{blocks_per_leaf, fold_in_fixed_order};
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::sparse_stat::SparseRunningStatistics;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
@@ -34,7 +34,7 @@ pub fn streaming_sparse_running_stats(
 
     let stats = fold_in_fixed_order(
         &jobs,
-        BLOCKS_PER_LEAF,
+        blocks_per_leaf(jobs.len()),
         &|| SparseRunningStatistics::<f32>::new(n_features),
         &|acc, &(lb, ub)| {
             let chunk = data_vec.read_columns_csc(lb..ub)?;
@@ -118,7 +118,7 @@ pub fn streaming_sparse_running_stats_folded(
 
     let (row_stats, folded_stats, ..) = fold_in_fixed_order(
         &jobs,
-        BLOCKS_PER_LEAF,
+        blocks_per_leaf(jobs.len()),
         &|| -> Acc {
             (
                 SparseRunningStatistics::<f32>::new(n_features),

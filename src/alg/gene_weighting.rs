@@ -14,7 +14,7 @@
 use crate::alg::feature_coarsening::FeatureCoarsening;
 use crate::alg::nb_dispersion::DispersionTrend;
 use crate::alg::sparse_streaming::streaming_sparse_running_stats;
-use crate::qc::{fold_in_fixed_order, BLOCKS_PER_LEAF};
+use crate::qc::{blocks_per_leaf, fold_in_fixed_order};
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::sparse_stat::SparseRunningStatistics;
 use legume_numeric::matrix::traits::{IoOps, RunningStatOps};
@@ -137,7 +137,7 @@ pub fn compute_nb_fisher_weights_coarsened(
 
     let stats = fold_in_fixed_order(
         &jobs,
-        BLOCKS_PER_LEAF,
+        blocks_per_leaf(jobs.len()),
         &|| SparseRunningStatistics::<f32>::new(n_features_coarse),
         &|acc, &(lb, ub)| {
             let chunk = data_vec.read_columns_csc(lb..ub)?;
