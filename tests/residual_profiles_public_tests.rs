@@ -2,6 +2,8 @@
 //! can take the profiles the feature partition clusters in and group them
 //! its own way.
 
+#![cfg(feature = "alg")]
+
 use data_beans::alg::feature_coarsening::{informative_features, residual_profiles};
 use nalgebra::DMatrix;
 
