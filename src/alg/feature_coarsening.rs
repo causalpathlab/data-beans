@@ -288,8 +288,15 @@ pub fn informative_features(counts: &DMatrix<f32>, sizes: &[f32]) -> Vec<bool> {
 
 /// Unit-length Pearson residual profiles `(n − E)/√E` of the `rows` of
 /// `counts`, clipped to `±√S`, sketched to [`SKETCH_DIM`] when wider than
-/// [`MAX_PROFILE_DIM`].
-fn residual_profiles(
+/// [`MAX_PROFILE_DIM`]: one row per entry of `rows`, in that order.
+///
+/// This is the space [`coarsen_features`] and [`partition_features`] group
+/// the informative features in ([`informative_features`] picks them). It is
+/// public so a caller can group the same profiles another way, for example
+/// by cutting their nearest-neighbour graph, and stay consistent with the
+/// k-means partition here. `sizes` are the pseudobulk sizes the expected
+/// counts `E_gs = T_g·n_s/N` are taken against; `seed` keys the sketch.
+pub fn residual_profiles(
     counts: &DMatrix<f32>,
     sizes: &[f32],
     rows: &[usize],
