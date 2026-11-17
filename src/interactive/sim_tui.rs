@@ -20,8 +20,7 @@ use ratatui::widgets::{Axis, Cell, Chart, Dataset, GraphType, Paragraph, Row, Ta
 use ratatui::Frame;
 
 use super::ui::{
-    compact, header, help_line, panel, run_screen, title_bar, Binned, HistPlot, Scale, Screen,
-    ACCENTED, DIM, HIGHLIGHT,
+    compact, header, help_line, panel, run_screen, title_bar, Binned, HistPlot, Scale, Screen, LOOK,
 };
 use crate::sim::copula::fidelity::{FidelityReport, StatKind};
 
@@ -201,9 +200,9 @@ impl FidelityView {
             .iter()
             .map(|row| {
                 Row::new(vec![
-                    Cell::from(Span::styled(row.label, DIM)),
+                    Cell::from(Span::styled(row.label, LOOK.hint)),
                     Cell::from(row.reference.clone()),
-                    Cell::from(Span::styled(row.simulated.clone(), ACCENTED)),
+                    Cell::from(Span::styled(row.simulated.clone(), LOOK.accent)),
                 ])
             })
             .collect();
@@ -217,24 +216,24 @@ impl FidelityView {
         )
         .header(Row::new(vec![
             Cell::from(""),
-            Cell::from(Span::styled("reference", HIGHLIGHT)),
-            Cell::from(Span::styled("simulated", HIGHLIGHT)),
+            Cell::from(Span::styled("reference", LOOK.highlight())),
+            Cell::from(Span::styled("simulated", LOOK.highlight())),
         ]))
-        .block(panel(" summary ".to_string(), true));
+        .block(panel(" summary ".to_string(), true, &LOOK));
         frame.render_widget(table, area);
     }
 
     fn render_overlay(&self, frame: &mut Frame, area: Rect, overlay: &Overlay, what: &str) {
-        let block = panel(format!(" {what} per cell · share of cells "), true);
+        let block = panel(format!(" {what} per cell · share of cells "), true, &LOOK);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let [legend, plot] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).areas(inner);
         frame.render_widget(
             Line::from(vec![
-                Span::styled("█ simulated", ACCENTED),
+                Span::styled("█ simulated", LOOK.accent),
                 Span::raw("   "),
-                Span::styled("█ reference (behind)", DIM),
+                Span::styled("█ reference (behind)", LOOK.hint),
             ]),
             legend,
         );
@@ -247,7 +246,7 @@ impl FidelityView {
             bins: overlay.hist.bins,
             kmin: overlay.hist.kmin,
             counts: &overlay.reference,
-            style: &|_| ACCENTED,
+            style: &|_| LOOK.accent,
             subset: Some(&overlay.simulated),
             y_scale: self.y_scale,
             y_max: Some(y_max),
@@ -255,6 +254,7 @@ impl FidelityView {
             marks: Vec::new(),
             x_label: None,
             tick_every: None,
+            look: LOOK,
         }
         .render(frame.buffer_mut(), plot);
     }
@@ -264,30 +264,31 @@ impl FidelityView {
         let axis = |name: &'static str| {
             let mid = 0.5 * (scatter.lo + scatter.hi);
             Axis::default()
-                .title(Span::styled(name, DIM))
+                .title(Span::styled(name, LOOK.hint))
                 .bounds([scatter.lo, scatter.hi])
                 .labels([
                     scatter.label(scatter.lo),
                     scatter.label(mid),
                     scatter.label(scatter.hi),
                 ])
-                .style(DIM)
+                .style(LOOK.hint)
         };
         let chart = Chart::new(vec![
             Dataset::default()
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(DIM)
+                .style(LOOK.hint)
                 .data(&identity),
             Dataset::default()
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Scatter)
-                .style(ACCENTED)
+                .style(LOOK.accent)
                 .data(&scatter.points),
         ])
         .block(panel(
             format!(" {what} · simulated against reference "),
             true,
+            &LOOK,
         ))
         .x_axis(axis("reference"))
         .y_axis(axis("simulated"));
@@ -300,7 +301,7 @@ impl FidelityView {
             pairs.push(("y", "y scale"));
         }
         pairs.push(("q", "quit"));
-        help_line(&pairs)
+        help_line(&pairs, &LOOK)
     }
 }
 
@@ -313,12 +314,22 @@ impl Screen for FidelityView {
             Constraint::Length(1),
         ])
         .areas(frame.area());
-        title_bar(frame, top, header("sim", &self.title, "fidelity"), &[]);
+        title_bar(
+            frame,
+            top,
+            header("sim", &self.title, "fidelity", &LOOK),
+            &[],
+            &LOOK,
+        );
         let tab_line: Vec<Span> = PANELS
             .iter()
             .enumerate()
             .flat_map(|(i, name)| {
-                let style = if i == self.tab { HIGHLIGHT } else { DIM };
+                let style = if i == self.tab {
+                    LOOK.highlight()
+                } else {
+                    LOOK.hint
+                };
                 [
                     Span::styled(format!(" {} {name} ", i + 1), style),
                     Span::raw(" "),

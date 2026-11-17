@@ -23,7 +23,7 @@ use regex::{Regex, RegexBuilder};
 
 use super::ui::{
     header, help_line, input_line, median, panel, run_screen, title_bar, Binned, HistPlot, Scale,
-    Screen, Tui, ACCENTED, DIM, HIGHLIGHT, PLAIN,
+    Screen, Tui, LOOK,
 };
 use crate::figure::stat::{draw_stat, figure as stat_figure, StatData};
 use crate::figure::term::PlotImage;
@@ -724,7 +724,7 @@ impl<'a> StatExplorer<'a> {
             } else {
                 line
             };
-            Cell::from(line).style(if sorted { HIGHLIGHT } else { DIM })
+            Cell::from(line).style(if sorted { LOOK.highlight() } else { LOOK.hint })
         };
         let mut header_cells = vec![head(None, "  name")];
         header_cells.extend((0..4).map(|s| head(Some(s), STATS[s])));
@@ -735,7 +735,7 @@ impl<'a> StatExplorer<'a> {
         (self.cursor, self.offset) = scroll(self.cursor, self.offset, height);
         let rows = self.view.iter().skip(self.offset).take(height).map(|&i| {
             let name = Line::from(vec![
-                Span::styled(if self.marked[i] { "● " } else { "  " }, ACCENTED),
+                Span::styled(if self.marked[i] { "● " } else { "  " }, LOOK.accent),
                 Span::raw(self.names[i].to_string()),
             ]);
             let mut cells = vec![Cell::from(name)];
@@ -745,7 +745,7 @@ impl<'a> StatExplorer<'a> {
                 if !self.by_name && self.stat == s {
                     cell
                 } else {
-                    cell.style(DIM)
+                    cell.style(LOOK.hint)
                 }
             }));
             Row::new(cells)
@@ -774,9 +774,9 @@ impl<'a> StatExplorer<'a> {
         ];
         let table = Table::new(rows, widths)
             .header(Row::new(header_cells))
-            .row_highlight_style(PLAIN.add_modifier(Modifier::REVERSED))
-            .highlight_symbol(Line::from("▶").style(ACCENTED))
-            .block(panel(title, false));
+            .row_highlight_style(LOOK.page.add_modifier(Modifier::REVERSED))
+            .highlight_symbol(Line::from("▶").style(LOOK.accent))
+            .block(panel(title, false, &LOOK));
         // The table sees only the visible slice, so select relative to it.
         let mut state = TableState::default()
             .with_selected((!self.view.is_empty()).then(|| self.cursor - self.offset));
@@ -785,7 +785,7 @@ impl<'a> StatExplorer<'a> {
 
     fn render_hist(&mut self, frame: &mut Frame, area: Rect) {
         let stat = STATS[self.stat];
-        let block = panel(format!(" {stat} "), false);
+        let block = panel(format!(" {stat} "), false, &LOOK);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let [summary, plot] =
@@ -793,7 +793,7 @@ impl<'a> StatExplorer<'a> {
 
         let n = self.sorted.len();
         let fmt = |v: f32| fmt_stat(v, DECIMALS);
-        let dim = |t: &str| Span::styled(t.to_string(), DIM);
+        let dim = |t: &str| Span::styled(t.to_string(), LOOK.hint);
         let mut lines = vec![Line::from(vec![
             dim("min "),
             Span::raw(fmt(self.sorted.first().copied().unwrap_or(0.0))),
@@ -806,7 +806,7 @@ impl<'a> StatExplorer<'a> {
         if let Some(i) = selected {
             let v = self.values[self.stat][i];
             let mut line = vec![
-                Span::styled(format!("▲ {}", self.names[i]), HIGHLIGHT),
+                Span::styled(format!("▲ {}", self.names[i]), LOOK.highlight()),
                 dim(&format!(" {stat} ")),
                 Span::raw(fmt(v)),
             ];
@@ -852,7 +852,7 @@ impl<'a> StatExplorer<'a> {
             bins,
             kmin: self.hist.kmin,
             counts: &self.hist.counts,
-            style: &|_| PLAIN,
+            style: &|_| LOOK.page,
             subset: self.shown.as_deref(),
             y_scale: self.y_scale,
             y_max: None,
@@ -863,6 +863,7 @@ impl<'a> StatExplorer<'a> {
             marks: Vec::new(),
             x_label: None,
             tick_every: None,
+            look: LOOK,
         }
         .render(frame.buffer_mut(), plot);
     }
@@ -879,7 +880,7 @@ impl<'a> StatExplorer<'a> {
             view.names.len(),
             side.other().name()
         );
-        let block = panel(title, true);
+        let block = panel(title, true, &LOOK);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -899,7 +900,7 @@ impl<'a> StatExplorer<'a> {
         (view.cursor, view.offset) = scroll(view.cursor, view.offset, height);
         let shown_cols: Vec<usize> = (view.hscroll..view.labels.len()).take(fit).collect();
 
-        let mut header_cells = vec![Cell::from(side.other().name()).style(DIM)];
+        let mut header_cells = vec![Cell::from(side.other().name()).style(LOOK.hint)];
         header_cells.extend(shown_cols.iter().map(|&c| {
             let arrow = match view.sort {
                 Some((s, true)) if s == c => " ▼",
@@ -909,9 +910,9 @@ impl<'a> StatExplorer<'a> {
             let label = format!("{}{arrow}", view.labels[c]);
             let cell = Cell::from(Line::from(label).right_aligned());
             if c == view.col {
-                cell.style(HIGHLIGHT)
+                cell.style(LOOK.highlight())
             } else {
-                cell.style(DIM)
+                cell.style(LOOK.hint)
             }
         }));
         let rows = view.order.iter().skip(view.offset).take(height).map(|&r| {
@@ -920,7 +921,7 @@ impl<'a> StatExplorer<'a> {
                 let v = view.columns[c][r];
                 let cell = Cell::from(Line::from(fmt_stat(v, DECIMALS)).right_aligned());
                 if v == 0.0 {
-                    cell.style(DIM)
+                    cell.style(LOOK.hint)
                 } else {
                     cell
                 }
@@ -931,7 +932,7 @@ impl<'a> StatExplorer<'a> {
         widths.extend(shown_cols.iter().map(|_| Constraint::Length(value_width)));
         let table = Table::new(rows, widths)
             .header(Row::new(header_cells))
-            .row_highlight_style(PLAIN.add_modifier(Modifier::REVERSED));
+            .row_highlight_style(LOOK.page.add_modifier(Modifier::REVERSED));
         let mut state = TableState::default()
             .with_selected((!view.order.is_empty()).then(|| view.cursor - view.offset));
         frame.render_stateful_widget(table, inner, &mut state);
@@ -939,24 +940,34 @@ impl<'a> StatExplorer<'a> {
 
     fn help(&self) -> Line<'static> {
         let mut line = match &self.mode {
-            Mode::Typing(Input::Filter, text) => {
-                input_line("filter /", text, &[("Enter", "keep"), ("Esc", "clear")])
-            }
+            Mode::Typing(Input::Filter, text) => input_line(
+                "filter /",
+                text,
+                &[("Enter", "keep"), ("Esc", "clear")],
+                &LOOK,
+            ),
             Mode::Typing(Input::SaveFigure, text) => input_line(
                 "save the figure as (.pdf + .png): ",
                 text,
                 &[("Enter", "save"), ("Esc", "back")],
+                &LOOK,
             ),
-            Mode::Typing(_, text) => {
-                input_line("save to ", text, &[("Enter", "write"), ("Esc", "back")])
-            }
-            Mode::Values => help_line(&[
-                ("↑/↓", "move"),
-                ("←/→", "column"),
-                ("s", "sort"),
-                ("w", "save tsv"),
-                ("Esc", "back"),
-            ]),
+            Mode::Typing(_, text) => input_line(
+                "save to ",
+                text,
+                &[("Enter", "write"), ("Esc", "back")],
+                &LOOK,
+            ),
+            Mode::Values => help_line(
+                &[
+                    ("↑/↓", "move"),
+                    ("←/→", "column"),
+                    ("s", "sort"),
+                    ("w", "save tsv"),
+                    ("Esc", "back"),
+                ],
+                &LOOK,
+            ),
             Mode::Browse => {
                 let other = self.side.other().name();
                 let lazy = format!("{other} (computed on first use)");
@@ -998,11 +1009,11 @@ impl<'a> StatExplorer<'a> {
                     keys.push(("Enter", &finish));
                 }
                 keys.push(("q", "quit"));
-                help_line(&keys)
+                help_line(&keys, &LOOK)
             }
         };
         if let Some(status) = &self.status {
-            line.spans.push(Span::styled(status.clone(), ACCENTED));
+            line.spans.push(Span::styled(status.clone(), LOOK.accent));
         }
         line
     }
@@ -1011,6 +1022,11 @@ impl<'a> StatExplorer<'a> {
 impl Screen for StatExplorer<'_> {
     fn done(&self) -> bool {
         self.quit
+    }
+
+    /// A resized figure is drawn at its new size once the resize settles.
+    fn tick(&mut self) -> bool {
+        self.picker.is_some() && self.plot.is_stale()
     }
 
     fn interrupt(&mut self) {
@@ -1115,8 +1131,9 @@ impl Screen for StatExplorer<'_> {
         title_bar(
             frame,
             top,
-            header(badge, &self.title, &extra),
+            header(badge, &self.title, &extra, &LOOK),
             &self.session_keys,
+            &LOOK,
         );
 
         let in_values = matches!(self.mode, Mode::Values | Mode::Typing(Input::SaveValues, _));

@@ -1,8 +1,8 @@
 //! Full-screen terminal views (feature `tui`), and line prompts for when
 //! there is no terminal.
 //!
-//! - [`ui`]: the shared pieces for building a view. The palette (terminal
-//!   foreground plus one accent), [`ui::panel`], [`ui::header`],
+//! - [`ui`]: the shared pieces for building a view, legume-tui's: the
+//!   look ([`ui::LOOK`], terminal foreground plus one accent), [`ui::panel`], [`ui::header`],
 //!   [`ui::help_line`], [`ui::input_line`], the [`ui::Screen`] trait driven by
 //!   [`ui::run_screen`], and histograms: [`ui::Scale`], [`ui::Binning`],
 //!   [`ui::Binned`], [`ui::HistPlot`], and [`ui::MirrorPlot`] for two series
@@ -33,25 +33,14 @@ pub mod sim_tui;
 pub mod stat_tui;
 pub mod ui;
 
-use std::io::{self, IsTerminal};
+/// Whether a full-screen view can run: stdin and stdout are a terminal, and
+/// one that can draw it (`TERM` is not `dumb`).
+pub use legume_tui::view::terminal_available as tui_available;
 
 /// Set, to anything but empty or `0`, to run every command straight through
 /// as `--batch-process` does: for a script or pipeline started from a
 /// terminal, which its commands would otherwise take for the user's.
 pub const BATCH_ENV: &str = "DATA_BEANS_BATCH";
-
-/// Whether a full-screen view can run: stdin and stdout are a terminal, and
-/// one that can draw it (`TERM` is not `dumb`).
-pub fn tui_available() -> bool {
-    can_draw(
-        io::stdin().is_terminal() && io::stdout().is_terminal(),
-        std::env::var("TERM").ok().as_deref(),
-    )
-}
-
-fn can_draw(tty: bool, term: Option<&str>) -> bool {
-    tty && term != Some("dumb")
-}
 
 /// Why a command runs without its view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,12 +130,7 @@ pub const TOOL: legume_tui::Tool = legume_tui::Tool::new("data-beans");
 /// The detach and switch keys for a title bar ([`ui::title_bar`]), each
 /// with what it does in a word (`detach`, `switch`); none when the views
 /// run plain.
-pub fn session_keys() -> Vec<(String, String)> {
-    legume_tui::help_keys()
-        .into_iter()
-        .map(|k| (k.key.to_lowercase(), k.short))
-        .collect()
-}
+pub use legume_tui::view::session_keys;
 
 /// The paragraph a command's long help ends with about its session:
 /// `lead` first, for a command whose view is optional (when it runs as a

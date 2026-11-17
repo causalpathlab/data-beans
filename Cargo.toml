@@ -50,7 +50,7 @@ mcp = ["dep:legume-mcp"]
 # Figures (`data_beans::figure`): the QC and statistics figures `qc` and
 # `stat` write with --figure (PDF and PNG), save from their views, and return
 # to an agent as images.
-figure = ["dep:usvg", "dep:resvg", "dep:svg2pdf", "dep:image"]
+figure = ["dep:legume-tui", "legume-tui/figure", "dep:usvg", "dep:svg2pdf"]
 alg = ["aux"]
 sim = ["alg"]
 # Pulls in libhdf5 — opt-in so installs on hosts without HDF5 headers still
@@ -99,14 +99,13 @@ sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 statrs = { version = "0.18", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 # Detachable sessions for the views.
-legume-tui = { version = "0.3.15", optional = true, default-features = false, features = ["clap", "logs"] }
+legume-tui = { version = "0.4", optional = true, default-features = false, features = ["clap", "logs", "view", "hist"] }
 # Its `tui` view (`data-beans mcp watch`) comes on with data-beans' `tui`.
-legume-mcp = { version = "0.4", optional = true }
-# Figures: one SVG per figure, written as PDF and PNG.
+legume-mcp = { version = "0.6", optional = true }
+# Figures: one SVG per figure, written as PDF (and as PNG through
+# legume-tui's `figure`).
 usvg = { version = "0.45", optional = true }
-resvg = { version = "0.45", optional = true, default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 svg2pdf = { version = "0.13", optional = true, default-features = false, features = ["text"] }
-image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 # The views' figures as terminal images (kitty, iTerm2, sixel); the version
 # legume-tui's `graphics` picks with.
 ratatui-image = { version = "11.1", optional = true, default-features = false, features = ["crossterm"] }
@@ -114,9 +113,9 @@ ratatui-image = { version = "11.1", optional = true, default-features = false, f
 [dev-dependencies]
 # The crate's harness, driving the views through pseudo-terminals in
 # tests/detach_session.rs.
-legume-tui = { version = "0.3.15", default-features = false, features = ["testing"] }
+legume-tui = { version = "0.4", default-features = false, features = ["testing"] }
 # tests/mcp_server.rs follows a server through the watch pane.
-legume-mcp = { version = "0.4", features = ["tui"] }
+legume-mcp = { version = "0.6", features = ["tui"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]

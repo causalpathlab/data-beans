@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use super::ui::{header, help_line, input_line, panel, title_bar, Screen, Tui, DIM, HIGHLIGHT};
+use super::ui::{header, help_line, input_line, panel, title_bar, Screen, Tui, LOOK};
 
 /// A setting's value.
 #[derive(Debug, Clone, PartialEq)]
@@ -251,7 +251,7 @@ impl<'a> PlanView<'a> {
             self.plan
                 .columns
                 .iter()
-                .map(|c| Cell::from(c.clone()).style(DIM)),
+                .map(|c| Cell::from(c.clone()).style(LOOK.hint)),
         );
         let rows: Vec<Row> = self
             .plan
@@ -274,15 +274,16 @@ impl<'a> PlanView<'a> {
                 &format!("{label}: "),
                 text,
                 &[("enter", "set"), ("esc", "back")],
+                &LOOK,
             );
             // A value refused stays to be mended, with why beside it.
             if let Some(s) = &self.status {
-                line.push_span(Span::styled(format!("  {s}"), HIGHLIGHT));
+                line.push_span(Span::styled(format!("  {s}"), LOOK.highlight()));
             }
             return line;
         }
         if let Some(s) = &self.status {
-            return Line::from(Span::styled(format!(" {s}"), HIGHLIGHT));
+            return Line::from(Span::styled(format!(" {s}"), LOOK.highlight()));
         }
         let mut keys: Vec<(String, String)> = vec![("enter".into(), self.verb.into())];
         for c in &self.controls {
@@ -290,7 +291,7 @@ impl<'a> PlanView<'a> {
         }
         keys.push(("q".into(), self.cancel.into()));
         let pairs: Vec<(&str, &str)> = keys.iter().map(|(k, w)| (k.as_str(), w.as_str())).collect();
-        help_line(&pairs)
+        help_line(&pairs, &LOOK)
     }
 }
 
@@ -313,10 +314,11 @@ impl Screen for PlanView<'_> {
         title_bar(
             frame,
             top,
-            header(self.badge, &self.title, &extra),
+            header(self.badge, &self.title, &extra, &LOOK),
             &self.session_keys,
+            &LOOK,
         );
-        let block = panel("plan".into(), true);
+        let block = panel("plan".into(), true, &LOOK);
         let inner = block.inner(table);
         frame.render_widget(block, table);
         frame.render_widget(self.table(), inner);
@@ -329,12 +331,12 @@ impl Screen for PlanView<'_> {
         if let Some(why) = &self.plan.blocked {
             lines.push(Line::from(Span::styled(
                 format!(" ✗ {why}"),
-                HIGHLIGHT.add_modifier(Modifier::BOLD),
+                LOOK.highlight().add_modifier(Modifier::BOLD),
             )));
         }
         frame.render_widget(Paragraph::new(lines), below);
         if settings > 0 {
-            let block = panel("settings".into(), false);
+            let block = panel("settings".into(), false, &LOOK);
             let inner = block.inner(controls);
             frame.render_widget(block, controls);
             let lines: Vec<Line> = self
@@ -343,8 +345,8 @@ impl Screen for PlanView<'_> {
                 .map(|chunk| {
                     let mut spans = Vec::new();
                     for c in chunk {
-                        spans.push(Span::styled(format!(" {} ", c.key), HIGHLIGHT));
-                        spans.push(Span::styled(format!("{} ", c.label), DIM));
+                        spans.push(Span::styled(format!(" {} ", c.key), LOOK.highlight()));
+                        spans.push(Span::styled(format!("{} ", c.label), LOOK.hint));
                         spans.push(Span::raw(format!("{:<12}", c.value.shown())));
                     }
                     Line::from(spans)
