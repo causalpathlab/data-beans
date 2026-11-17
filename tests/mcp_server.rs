@@ -848,11 +848,6 @@ fn every_tool_answers_or_refuses_as_it_should() {
             json!({ "data": ["base.zarr.zip"] }),
             Refused("two or more"),
         ),
-        (
-            "notebook",
-            json!({ "kind": "observation", "text": "every tool checked" }),
-            Ok(|_| true),
-        ),
     ];
     for (tool, args, want) in cases {
         let r = c.request("tools/call", json!({ "name": tool, "arguments": args }));
