@@ -19,9 +19,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
 
-use super::ui::{
-    header, help_line, input_line, panel, title_bar, Screen, Tui, ACCENT, DIM, HIGHLIGHT, PLAIN,
-};
+use super::ui::{header, help_line, input_line, panel, title_bar, Screen, Tui, LOOK};
 use crate::figure::qc::{edge_text, panel as panel_svg, Panel};
 use crate::figure::term::PlotImage;
 use crate::figure::{free_name, save, taken, Axis};
@@ -69,7 +67,14 @@ pub struct QcView {
 }
 
 /// Colours of the text histogram's layers, back to front.
-const LAYERS: [Color; 3] = [Color::DarkGray, Color::Gray, ACCENT];
+const LAYERS: [Color; 3] = [
+    Color::DarkGray,
+    Color::Gray,
+    match LOOK.accent.fg {
+        Some(c) => c,
+        None => Color::Reset,
+    },
+];
 
 impl QcView {
     /// The view of `rules` for data `name`. Enter writes the kept cells to
@@ -179,8 +184,11 @@ impl QcView {
     fn save_figure(&mut self, name: &str) {
         let svg = crate::figure::qc::figure(&self.rules, &self.name);
         self.note = Some(match save(&svg, name) {
-            Ok(paths) => Line::from(Span::styled(format!(" saved {}", paths.join(", ")), DIM)),
-            Err(e) => Line::from(Span::styled(format!(" save failed: {e}"), HIGHLIGHT)),
+            Ok(paths) => Line::from(Span::styled(
+                format!(" saved {}", paths.join(", ")),
+                LOOK.hint,
+            )),
+            Err(e) => Line::from(Span::styled(format!(" save failed: {e}"), LOOK.highlight())),
         });
     }
 
@@ -201,8 +209,8 @@ impl QcView {
             t => t,
         };
         Line::from(vec![
-            Span::styled(" flags: ", DIM),
-            Span::styled(text, PLAIN),
+            Span::styled(" flags: ", LOOK.hint),
+            Span::styled(text, LOOK.page),
         ])
     }
 
@@ -230,7 +238,7 @@ impl QcView {
                     _ => {
                         self.note = Some(Line::from(Span::styled(
                             format!(" not a number: {text}"),
-                            HIGHLIGHT,
+                            LOOK.highlight(),
                         )))
                     }
                 },
@@ -241,7 +249,7 @@ impl QcView {
                         self.typing = Some(Typing::Save(free_name(name)));
                         self.note = Some(Line::from(Span::styled(
                             format!(" {name} is already there; not replacing it"),
-                            HIGHLIGHT,
+                            LOOK.highlight(),
                         )));
                     } else {
                         self.save_figure(name)
@@ -252,13 +260,13 @@ impl QcView {
                     if name.is_empty() {
                         self.note = Some(Line::from(Span::styled(
                             " no output named: Enter again to name one, q to leave",
-                            DIM,
+                            LOOK.hint,
                         )));
                     } else if output_taken(name) {
                         self.typing = Some(Typing::Output(free_output(name)));
                         self.note = Some(Line::from(Span::styled(
                             format!(" {name} is already there; not replacing it"),
-                            HIGHLIGHT,
+                            LOOK.highlight(),
                         )));
                     } else {
                         self.output = Some(name.to_string());
@@ -273,7 +281,7 @@ impl QcView {
     }
 
     fn render_rules(&self, frame: &mut Frame, area: Rect) {
-        let block = panel(" cell QC rules ".into(), true);
+        let block = panel(" cell QC rules ".into(), true, &LOOK);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let mut lines = vec![Line::from(Span::styled(
@@ -281,30 +289,30 @@ impl QcView {
                 "  {:<16}{:>22}{:>9}{:>6}",
                 "rule", "edge", "removes", "only"
             ),
-            DIM,
+            LOOK.hint,
         ))];
         for (i, &rule) in self.rules.rules().iter().enumerate() {
             if rule == Rule::GeneCells {
-                lines.push(Line::from(Span::styled("  genes", DIM)));
+                lines.push(Line::from(Span::styled("  genes", LOOK.hint)));
             }
             let sel = i == self.focus;
             let on = self.rules.is_on(rule);
             let c = self.rules.count(rule);
             let style = if sel {
-                HIGHLIGHT
+                LOOK.highlight()
             } else if on {
-                PLAIN
+                LOOK.page
             } else {
-                DIM
+                LOOK.hint
             };
             let num = |n: usize, w: usize| {
                 Span::styled(
                     format!("{n:>w$}"),
-                    if n > 0 { Style::new().fg(ACCENT) } else { DIM },
+                    if n > 0 { LOOK.accent } else { LOOK.hint },
                 )
             };
             lines.push(Line::from(vec![
-                Span::styled(if sel { "▸ " } else { "  " }, HIGHLIGHT),
+                Span::styled(if sel { "▸ " } else { "  " }, LOOK.highlight()),
                 Span::styled(format!("{:<16}", rule.label()), style),
                 Span::styled(format!("{:>22}", edge_text(&self.rules, rule)), style),
                 num(c.removes, 9),
@@ -317,7 +325,7 @@ impl QcView {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::raw("  kept "),
-            Span::styled(kept.to_string(), HIGHLIGHT),
+            Span::styled(kept.to_string(), LOOK.highlight()),
             Span::raw(format!(
                 " / {cells} cells ({:.1}%)",
                 100.0 * kept as f64 / cells.max(1) as f64
@@ -327,7 +335,7 @@ impl QcView {
         if v.guarded {
             lines.push(Line::from(Span::styled(
                 "  every cell (or gene) fails: QC keeps them all instead",
-                HIGHLIGHT,
+                LOOK.highlight(),
             )));
         }
         // Held to a value, the genes rule is the near-empty floor, which
@@ -335,19 +343,23 @@ impl QcView {
         if self.rules.mode(Rule::Genes) == Mode::Value && self.rules.is_on(Rule::Genes) {
             lines.push(Line::from(Span::styled(
                 "  the bands are fitted on the cells above the genes floor",
-                DIM,
+                LOOK.hint,
             )));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  removes: fails it on its own; only: no other rule removes",
-            DIM,
+            LOOK.hint,
         )));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn render_overlap(&self, frame: &mut Frame, area: Rect) {
-        let block = panel(" removed cells, by the rules they fail ".into(), false);
+        let block = panel(
+            " removed cells, by the rules they fail ".into(),
+            false,
+            &LOOK,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let groups = self.rules.overlap();
@@ -370,11 +382,11 @@ impl QcView {
             lines.push(Line::from(vec![
                 Span::raw(format!("  {name:<label_w$}")),
                 Span::raw(format!("{n:>6} ")),
-                Span::styled(bar, Style::new().fg(ACCENT)),
+                Span::styled(bar, LOOK.accent),
             ]));
         }
         if groups.is_empty() {
-            lines.push(Line::from(Span::styled("  no cell is removed", DIM)));
+            lines.push(Line::from(Span::styled("  no cell is removed", LOOK.hint)));
         }
         frame.render_widget(Paragraph::new(lines), inner);
     }
@@ -386,7 +398,7 @@ impl QcView {
             rule.label(),
             if rule.on_cells() { "cells" } else { "genes" }
         );
-        let block = panel(title, true);
+        let block = panel(title, true, &LOOK);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if let Some(picker) = self.picker.as_ref().filter(|_| self.images) {
@@ -429,7 +441,7 @@ impl QcView {
     }
 
     fn render_joint(&mut self, frame: &mut Frame, area: Rect) {
-        let block = panel(" total counts × detected genes · log ".into(), false);
+        let block = panel(" total counts × detected genes · log ".into(), false, &LOOK);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if let Some(picker) = self.picker.as_ref().filter(|_| self.images) {
@@ -542,12 +554,12 @@ fn layered_text(
             if buf[(x, y)].symbol() == " " {
                 buf[(x, y)]
                     .set_symbol("┊")
-                    .set_style(Style::reset().fg(ACCENT));
+                    .set_style(Style::reset().patch(LOOK.accent));
             }
         }
         buf[(x, axis_y)]
             .set_symbol("▲")
-            .set_style(Style::reset().fg(ACCENT));
+            .set_style(Style::reset().patch(LOOK.accent));
     }
 }
 
@@ -574,7 +586,7 @@ fn braille_scatter(buf: &mut Buffer, area: Rect, rules: &CellRules) {
     if let Some(e) = ge {
         ya = ya.including(e as f64);
     }
-    let accent = Style::reset().fg(ACCENT);
+    let accent = Style::reset().patch(LOOK.accent);
     let dim = Style::reset().add_modifier(ratatui::style::Modifier::DIM);
     // Edges first; dots drawn over them. An edge off the axis (a floor
     // given as `inf`) is drawn at its end.
@@ -685,8 +697,9 @@ impl Screen for QcView {
         title_bar(
             frame,
             top,
-            header("qc", &self.name, &extra),
+            header("qc", &self.name, &extra, &LOOK),
             &super::session_keys(),
+            &LOOK,
         );
         let left_w = (body.width * 2 / 5).clamp(58, 70).min(body.width / 2);
         let [left, right] =
@@ -705,6 +718,7 @@ impl Screen for QcView {
                 &format!("{} edge: ", self.rule().label()),
                 b,
                 &[("Enter", "set"), ("Esc", "back")],
+                &LOOK,
             ),
             Some(Typing::Save(b)) => match &self.note {
                 Some(note) => note.clone(),
@@ -712,6 +726,7 @@ impl Screen for QcView {
                     "save the figure as (.pdf + .png): ",
                     b,
                     &[("Enter", "save"), ("Esc", "back")],
+                    &LOOK,
                 ),
             },
             Some(Typing::Output(b)) => match &self.note {
@@ -720,6 +735,7 @@ impl Screen for QcView {
                     "write the kept cells to: ",
                     b,
                     &[("Enter", "write"), ("Esc", "back")],
+                    &LOOK,
                 ),
             },
             None => match &self.note {
@@ -745,7 +761,7 @@ impl Screen for QcView {
                     };
                     keys.push(("Enter", enter.as_str()));
                     keys.push(("q", "quit"));
-                    help_line(&keys)
+                    help_line(&keys, &LOOK)
                 }
             },
         };
@@ -785,7 +801,7 @@ impl Screen for QcView {
                 } else {
                     self.note = Some(Line::from(Span::styled(
                         format!(" {} has no MAD band; it takes a value", rule.label()),
-                        DIM,
+                        LOOK.hint,
                     )));
                 }
             }
@@ -818,7 +834,7 @@ impl Screen for QcView {
                     true => " copied nothing: these are the defaults".to_string(),
                     false => format!(" copied to the clipboard: {flags}"),
                 };
-                self.note = Some(Line::from(Span::styled(said, DIM)));
+                self.note = Some(Line::from(Span::styled(said, LOOK.hint)));
             }
             KeyCode::Char('i') if self.picker.is_some() => {
                 self.images = !self.images;
@@ -839,6 +855,11 @@ impl Screen for QcView {
 
     fn done(&self) -> bool {
         self.decision.is_some()
+    }
+
+    /// A resized figure is drawn at its new size once the resize settles.
+    fn tick(&mut self) -> bool {
+        self.picker.is_some() && self.plots.iter().any(PlotImage::is_stale)
     }
 
     fn status(&self) -> Option<String> {

@@ -10,11 +10,16 @@ use log::warn;
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 
-// The binary compiles its own copy of this module and reads only part of
-// the axis.
+// The axis every histogram reads values on: legume-tui's with the views
+// (feature `tui`), else a copy of it here. The binary compiles its own copy
+// of this module and reads only part of the axis.
+#[cfg(not(feature = "tui"))]
 #[allow(dead_code)]
 pub mod axis;
+#[cfg(not(feature = "tui"))]
 pub use axis::Axis;
+#[cfg(feature = "tui")]
+pub use legume_tui::hist::Axis;
 
 use rustc_hash::FxHashMap as HashMap;
 

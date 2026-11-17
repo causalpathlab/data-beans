@@ -18,7 +18,6 @@ pub mod stat;
 pub mod term;
 
 use std::fmt::Write as _;
-use std::sync::{Arc, OnceLock};
 
 /// Text and axes.
 pub const INK: &str = "#1a1a1a";
@@ -264,7 +263,7 @@ pub fn short(v: f64) -> String {
     }
 }
 
-pub use crate::qc::axis::Axis;
+pub use crate::qc::Axis;
 
 /// Bins across a panel: about one per 6 points, from 20 to 60.
 pub fn bins_for(width: f64) -> usize {
@@ -500,59 +499,12 @@ pub fn ramp(f: f64) -> &'static str {
     STEPS[((f.clamp(0.0, 1.0) * 5.0) as usize).min(4)]
 }
 
-fn fontdb() -> Arc<usvg::fontdb::Database> {
-    static DB: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
-    DB.get_or_init(|| {
-        let mut db = usvg::fontdb::Database::new();
-        db.load_system_fonts();
-        Arc::new(db)
-    })
-    .clone()
-}
-
-/// SVG parsing options, with the system fonts loaded once.
-fn options() -> usvg::Options<'static> {
-    usvg::Options {
-        fontdb: fontdb(),
-        ..usvg::Options::default()
-    }
-}
-
-/// `tree` rendered at `scale` pixels per point, on white.
-fn pixmap(tree: &usvg::Tree, scale: f32) -> anyhow::Result<resvg::tiny_skia::Pixmap> {
-    let size = tree
-        .size()
-        .to_int_size()
-        .scale_by(scale)
-        .ok_or_else(|| anyhow::anyhow!("figure has no size"))?;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
-        .ok_or_else(|| anyhow::anyhow!("figure too large to rasterise"))?;
-    pixmap.fill(resvg::tiny_skia::Color::WHITE);
-    resvg::render(
-        tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
-    Ok(pixmap)
-}
-
 /// Pixels per point in a saved PNG.
 const PNG_SCALE: f32 = 2.0;
 
-/// `svg` as a PNG, `scale` pixels per point.
-pub fn png(svg: &str, scale: f32) -> anyhow::Result<Vec<u8>> {
-    let tree = usvg::Tree::from_str(svg, &options())?;
-    Ok(pixmap(&tree, scale)?.encode_png()?)
-}
-
-/// `svg` as an RGBA image, `scale` pixels per point.
-pub fn image(svg: &str, scale: f32) -> anyhow::Result<image::RgbaImage> {
-    let tree = usvg::Tree::from_str(svg, &options())?;
-    let pixmap = pixmap(&tree, scale)?;
-    let (w, h) = (pixmap.width(), pixmap.height());
-    image::RgbaImage::from_raw(w, h, pixmap.take())
-        .ok_or_else(|| anyhow::anyhow!("pixel buffer size mismatch"))
-}
+/// `svg` as PNG bytes, `scale` pixels per point, on white.
+pub use legume_tui::graphics::figure::png;
+use legume_tui::graphics::figure::{pixmap, svg_tree};
 
 /// The files a figure saved under `name` is written as: `name` itself when
 /// it ends in `.pdf`, `.png` or `.svg`, else `name.pdf` and `name.png`.
@@ -571,7 +523,7 @@ pub fn save(svg: &str, name: &str) -> anyhow::Result<Vec<String>> {
     if let Some(there) = paths.iter().find(|p| std::path::Path::new(p).exists()) {
         anyhow::bail!("{there} is already there; not replacing it");
     }
-    let tree = usvg::Tree::from_str(svg, &options())?;
+    let tree = svg_tree(svg)?;
     for path in &paths {
         if let Some(dir) = std::path::Path::new(path)
             .parent()

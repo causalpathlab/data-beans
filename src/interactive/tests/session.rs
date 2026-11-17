@@ -1,7 +1,7 @@
 use super::ui::{modes_of, Screen};
 use super::*;
 use legume_tui::{Keyboard, Modes, Mouse};
-use ratatui::crossterm::event::{KeyEvent, KeyboardEnhancementFlags};
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::Frame;
 
 /// A view that asks for the mouse and for chords as told.
@@ -38,10 +38,7 @@ fn a_views_modes_are_the_sessions() {
         chords: true,
     });
     assert_eq!(both.mouse, Mouse::Buttons, "buttons and the wheel only");
-    assert_eq!(
-        both.keyboard_enhancement,
-        Keyboard::On(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    );
+    assert_eq!(both.keyboard_enhancement, Keyboard::DISAMBIGUATE);
     assert!(!both.bracketed_paste && !both.focus);
 }
 
@@ -92,9 +89,6 @@ fn one_rule_decides_every_view() {
     // Else a view where there is a terminal.
     assert_eq!(decide(false, None, true), Ok(()));
     assert_eq!(decide(false, None, false), Err(NoTerminal));
-    // A terminal that cannot draw one is none.
-    assert!(can_draw(true, Some("xterm-256color")) && can_draw(true, None));
-    assert!(!can_draw(true, Some("dumb")) && !can_draw(false, Some("xterm")));
 }
 
 #[test]

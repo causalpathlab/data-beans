@@ -18,7 +18,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use regex::{Regex, RegexBuilder};
 
-use super::ui::{copy, header, help_line, input_line, title_bar, Screen, Tui, DIM, HIGHLIGHT};
+use super::ui::{copy, header, help_line, input_line, title_bar, Screen, Tui, LOOK};
 
 /// One entry: its name, how deep it sits (0 at the top), and a note shown
 /// beside it (an array's shape and type, say).
@@ -347,19 +347,19 @@ impl ListView {
             _ => "",
         };
         let name_style = if at_cursor {
-            HIGHLIGHT.add_modifier(Modifier::REVERSED)
+            LOOK.highlight().add_modifier(Modifier::REVERSED)
         } else if self.marked[i] {
-            HIGHLIGHT
+            LOOK.highlight()
         } else {
             ratatui::style::Style::new()
         };
         let mut spans = vec![
-            Span::styled(mark, HIGHLIGHT),
+            Span::styled(mark, LOOK.highlight()),
             Span::raw(format!("{}{fold}", "  ".repeat(it.depth))),
             Span::styled(it.name.clone(), name_style),
         ];
         if !it.detail.is_empty() {
-            spans.push(Span::styled(format!("  {}", it.detail), DIM));
+            spans.push(Span::styled(format!("  {}", it.detail), LOOK.hint));
         }
         Line::from(spans)
     }
@@ -370,12 +370,16 @@ impl ListView {
                 "filter: ",
                 &self.filter,
                 &[("enter", "keep"), ("esc", "clear")],
+                &LOOK,
             ),
-            Mode::Write(text) => {
-                input_line("write to: ", text, &[("enter", "write"), ("esc", "cancel")])
-            }
+            Mode::Write(text) => input_line(
+                "write to: ",
+                text,
+                &[("enter", "write"), ("esc", "cancel")],
+                &LOOK,
+            ),
             Mode::Browse => match &self.status {
-                Some(s) => Line::from(Span::styled(format!(" {s}"), HIGHLIGHT)),
+                Some(s) => Line::from(Span::styled(format!(" {s}"), LOOK.highlight())),
                 None => {
                     let mut keys = vec![("/", "filter"), ("space", "mark"), ("a", "all")];
                     keys.push(("u", "unmark"));
@@ -383,7 +387,7 @@ impl ListView {
                         keys.push(("enter", "fold"));
                     }
                     keys.extend([("w", "write"), ("y", "copy"), ("q", "quit")]);
-                    help_line(&keys)
+                    help_line(&keys, &LOOK)
                 }
             },
         }
@@ -414,8 +418,9 @@ impl Screen for ListView {
         title_bar(
             frame,
             top,
-            header(self.badge, &self.title, &extra),
+            header(self.badge, &self.title, &extra, &LOOK),
             &self.session_keys,
+            &LOOK,
         );
         self.page = list.height.max(1) as usize;
         if self.cursor < self.offset {
@@ -432,7 +437,7 @@ impl Screen for ListView {
             .map(|(k, &i)| self.row(i, k == self.cursor))
             .collect();
         let lines = if lines.is_empty() {
-            vec![Line::from(Span::styled("  nothing matches", DIM))]
+            vec![Line::from(Span::styled("  nothing matches", LOOK.hint))]
         } else {
             lines
         };
@@ -443,7 +448,7 @@ impl Screen for ListView {
                     self.notes
                         .iter()
                         .take(8)
-                        .map(|n| Line::from(Span::styled(format!(" {n}"), DIM))),
+                        .map(|n| Line::from(Span::styled(format!(" {n}"), LOOK.hint))),
                 )
                 .collect();
             frame.render_widget(Paragraph::new(lines), below);
@@ -474,7 +479,7 @@ impl Screen for ListView {
 
 /// Browse `view` on the screen of `tui` until `q`.
 pub fn browse_in(tui: &mut Tui<'_>, mut view: ListView) -> anyhow::Result<()> {
-    tui.run(&mut view)
+    Ok(tui.run(&mut view)?)
 }
 
 #[cfg(test)]
