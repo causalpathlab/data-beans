@@ -64,6 +64,7 @@ use stats::{
 pub use stats::{resample_and_optimize, CollapsedOut, CollapsedStat};
 mod strata;
 pub use strata::collapse_columns_multilevel_with_strata;
+pub mod group_fold;
 
 pub struct MultilevelCollapseOut {
     pub levels: Vec<CollapsedOut>,

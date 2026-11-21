@@ -288,3 +288,79 @@ impl<'a> CellPairs<'a> {
         write_named_table(file_path, "cell_pair", &row_names, &columns)
     }
 }
+
+/// Split every read of every cell once over its **pair units**: its pairs and
+/// one self-loop.
+///
+/// A cell in `deg(u)` pairs has `deg(u) + 1` units; each of its reads goes to
+/// one of them uniformly (multinomial, by sequential binomials), so the units
+/// together hold every read exactly once — the batch estimate on pairs counts
+/// nothing twice. Returns `(gene, unit, count)` triplets: units
+/// `0..pairs.len()` are the pairs (each summing its two endpoints' shares),
+/// `pairs.len() + c` the self-loop of cell `c`. Counts are rounded to whole
+/// reads. Seeds are drawn fresh (not reproducible by design).
+pub fn split_reads_over_pair_units(
+    cells: &SparseIoVec,
+    pairs: &[(usize, usize)],
+    block_size: Option<usize>,
+) -> anyhow::Result<Vec<(u64, u64, f32)>> {
+    use rand::SeedableRng;
+    use rand_distr::{Binomial, Distribution};
+
+    let n = cells.num_columns();
+    let e = pairs.len();
+    let mut incident: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (k, &(u, v)) in pairs.iter().enumerate() {
+        anyhow::ensure!(u < n && v < n, "pair {k} ({u}, {v}) outside {n} cells");
+        incident[u].push(k);
+        incident[v].push(k);
+    }
+    for (c, inc) in incident.iter_mut().enumerate() {
+        inc.push(e + c);
+    }
+
+    let jobs = generate_minibatch_intervals(n, cells.num_rows(), block_size);
+    let parts: Vec<Vec<(u64, u64, f32)>> = jobs
+        .par_iter()
+        .map(|&(lb, ub)| -> anyhow::Result<Vec<(u64, u64, f32)>> {
+            let mut rng = rand::rngs::SmallRng::seed_from_u64(rand::random());
+            let yy = cells.read_columns_csc(lb..ub)?;
+            let mut out = Vec::new();
+            for (y, c) in yy.col_iter().zip(lb..ub) {
+                let units = &incident[c];
+                for (&g, &x) in y.row_indices().iter().zip(y.values()) {
+                    let mut left = x.round().max(0.0) as u64;
+                    for (j, &unit) in units.iter().enumerate() {
+                        if left == 0 {
+                            break;
+                        }
+                        let rest = (units.len() - j) as f64;
+                        let k = if rest <= 1.0 {
+                            left
+                        } else {
+                            Binomial::new(left, 1.0 / rest)?.sample(&mut rng)
+                        };
+                        if k > 0 {
+                            out.push((g as u64, unit as u64, k as f32));
+                            left -= k;
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    // a pair unit takes shares from both endpoints: merge (gene, unit) repeats
+    let mut trip: Vec<(u64, u64, f32)> = parts.into_iter().flatten().collect();
+    trip.par_sort_unstable_by_key(|&(g, u, _)| (u, g));
+    trip.dedup_by(|next, kept| {
+        if next.0 == kept.0 && next.1 == kept.1 {
+            kept.2 += next.2;
+            true
+        } else {
+            false
+        }
+    });
+    Ok(trip)
+}
