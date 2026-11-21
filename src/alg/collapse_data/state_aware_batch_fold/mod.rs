@@ -22,8 +22,10 @@
 //! batch-spanning cut ([`coarse_group_ward_tree`], coarsening, bottom up), the
 //! nodes refined by local swaps of samples ([`local_swap_refinement`],
 //! uncoarsening, top down), and the fold matched across batches within each
-//! node ([`cross_batch_matched_fold`]), estimated top down along the tree,
-//! each node a residual over its parent's ([`top_down_fold`]).
+//! node ([`cross_batch_matched_fold`]). The samples kind estimates it top down
+//! along the tree, each node a residual over its parent's
+//! ([`top_down_fold`]); the cell-pair kind matches once per pair node (top
+//! down over pair keys did worse on the sims, 2026-11-21).
 //!
 //! If not even the root spans enough batches, every unit keeps δ, with a
 //! warning; the estimate never fails for that reason.

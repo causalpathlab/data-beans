@@ -204,9 +204,9 @@ pub fn estimate_state_aware_batch_fold_over_samples(
     let fold = estimate_fold_top_down(
         &TopDownInputs {
             data,
+            tree: &tree,
             batch,
             coords: &coords,
-            tree: &tree,
             log_delta,
             params,
         },
