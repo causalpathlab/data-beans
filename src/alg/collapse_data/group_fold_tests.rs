@@ -312,3 +312,40 @@ fn graph_ward_matches_exact_on_a_complete_graph_and_splits_clumps() {
         [(0..15).collect::<Vec<_>>(), (15..30).collect::<Vec<_>>()]
     );
 }
+
+/// No neighbours means no counterfactual: refused, not a blown-up fold.
+#[test]
+fn matched_fold_refuses_zero_neighbours() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let x = DMatrix::from_row_slice(1, 2, &[3.0, 4.0]);
+    let data = data_from(dir.path(), "knn0", &x);
+    let params = GroupFoldParams {
+        knn: 0,
+        ..GroupFoldParams::default()
+    };
+    let coords = DMatrix::zeros(1, 2);
+    let r = matched_fold(
+        &data,
+        &[0, 1],
+        &coords,
+        &[Some(0), Some(0)],
+        1,
+        &DMatrix::zeros(1, 2),
+        &params,
+    );
+    assert!(r.is_err());
+}
+
+/// Pairs reaching the root in different rounds are pooled there: together
+/// they span, though neither round's arrivals do alone.
+#[test]
+fn pairs_reaching_the_root_in_different_rounds_are_pooled() {
+    // tree: (((0,1),2),3); root's children are (0,1,2) and 3
+    let pts = DMatrix::from_row_slice(4, 1, &[0.0, 0.1, 1.0, 10.0]);
+    let t = CoarseTree::ward(&pts);
+    // pair (3,3) in batch 0: one climb to (root,root); pair (0,0) in batch 1: three climbs
+    let at = vec![Some((3, 3)), Some((0, 0))];
+    let r = rule(vec![], 2, 2, 1);
+    let (node, _, _) = settle_pair_nodes(&t, at, &[0, 1], &r);
+    assert!(node[0].is_some() && node[0] == node[1], "{node:?}");
+}

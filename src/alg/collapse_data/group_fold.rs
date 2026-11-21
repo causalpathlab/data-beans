@@ -28,7 +28,7 @@
 //! warning; the estimate never fails for that reason.
 
 use crate::sparse_io_vector::SparseIoVec;
-use legume_numeric::matrix::knn::knn_rows;
+use legume_numeric::matrix::knn_graph::{KnnGraph, KnnGraphArgs};
 use legume_numeric::matrix::knn_match::ColumnDict;
 use legume_numeric::matrix::traits::RandomizedAlgs;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
@@ -49,8 +49,6 @@ pub const DEFAULT_MIN_UNITS: usize = 20;
 const COORD_DIM: usize = 30;
 /// Principal components of the group profiles Ward links.
 const PROFILE_DIM: usize = 20;
-/// Queries matched per parallel chunk before their weights are accumulated.
-const QUERY_CHUNK: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub struct GroupFoldParams {
@@ -282,7 +280,8 @@ impl CoarseTree {
     }
 
     /// Ward along a kNN graph of the groups (`knn` neighbours, legume-numeric's
-    /// [`knn_rows`]): clusters merge only along edges, cheapest Ward cost
+    /// [`KnnGraph`], as its layouts and clustering build it; an empty graph
+    /// leaves every group to the exact join): clusters merge only along edges, cheapest Ward cost
     /// first, the cost exact from centroids and sizes; pieces the graph leaves
     /// apart are joined by [`Self::ward_exact`]'s chain over their centroids.
     /// The same tree as exact Ward wherever each merge's partner is a graph
@@ -295,14 +294,24 @@ impl CoarseTree {
         if k <= 1 {
             return Self::finish(k, build);
         }
-        let (nbrs, _) = knn_rows(points, knn.min(k - 1));
+        // the same kNN graph legume-numeric's layouts and clustering build (union edges)
+        let graph = KnnGraph::from_rows(
+            points,
+            KnnGraphArgs {
+                knn: knn.min(k - 1),
+                block_size: 1000,
+                reciprocal: false,
+            },
+        );
         let mut adj: Vec<rustc_hash::FxHashSet<usize>> = vec![Default::default(); k];
-        for (i, ns) in nbrs.iter().enumerate() {
-            for &j in ns {
-                if i != j {
-                    adj[i].insert(j);
-                    adj[j].insert(i);
-                }
+        for &(i, j) in graph
+            .as_ref()
+            .map(|g| g.edges.as_slice())
+            .unwrap_or_default()
+        {
+            if i != j {
+                adj[i].insert(j);
+                adj[j].insert(i);
             }
         }
         let mut centroid: Vec<Vec<f32>> = points
@@ -492,18 +501,33 @@ fn leading_eigenvectors(m: DMatrix<f32>, k: usize) -> DMatrix<f32> {
     DMatrix::from_columns(&cols)
 }
 
-/// Principal-component scores (rows × k) of the rows of `x`, centred.
+/// Groups up to this many get exact principal components (an eigen-
+/// decomposition of their K × K Gram matrix); beyond, a randomized SVD.
+const EXACT_SCORES_MAX_ROWS: usize = 1024;
+
+/// Principal-component scores (rows × k) of the rows of `x`, centred: exact
+/// up to [`EXACT_SCORES_MAX_ROWS`] rows, by randomized SVD beyond
+/// (O(rows · cols · k), not cubic in the rows).
 fn row_scores(x: &DMatrix<f32>, k: usize) -> DMatrix<f32> {
+    let n = x.nrows();
     let mut xc = x.clone();
     for c in 0..x.ncols() {
         let m = x.column(c).mean();
         xc.column_mut(c).add_scalar_mut(-m);
     }
-    let k = k.min(x.nrows()).min(x.ncols());
+    let k = k.min(n).min(x.ncols());
+    if n <= EXACT_SCORES_MAX_ROWS {
+        let eig = SymmetricEigen::new(&xc * xc.transpose());
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| eig.eigenvalues[b].total_cmp(&eig.eigenvalues[a]));
+        return DMatrix::from_fn(n, k, |r, c| {
+            let i = order[c];
+            eig.eigenvectors[(r, i)] * eig.eigenvalues[i].max(0.0).sqrt()
+        });
+    }
     match xc.rsvd(k) {
-        // randomized SVD: O(rows · cols · k), not cubic in the rows
         Ok((u, dv, _)) => DMatrix::from_fn(u.nrows(), u.ncols(), |r, c| u[(r, c)] * dv[c]),
-        Err(_) => DMatrix::zeros(x.nrows(), k),
+        Err(_) => DMatrix::zeros(n, k),
     }
 }
 
@@ -633,6 +657,140 @@ fn adjusted_depths(
     Ok(out)
 }
 
+/// Neighbour weights a query chunk may buffer before they are added up.
+const QUERY_BUDGET: usize = 1 << 22;
+
+/// What every node of one matched fold reads.
+struct FoldCtx<'a> {
+    data: &'a SparseIoVec,
+    batch: &'a [usize],
+    coords: &'a DMatrix<f32>,
+    /// Units with a node, by position.
+    active: &'a [usize],
+    /// δ-adjusted depth of each active unit.
+    depth: &'a [f32],
+    /// 1 / δ, genes × batches.
+    inv: &'a DMatrix<f32>,
+    nb: usize,
+    knn: usize,
+    block_size: Option<usize>,
+}
+
+/// One node's counterfactual weights, `[local unit · nb + b]`: how much each
+/// of its units stands in for batch `b`'s counterfactual (each unit of `b`
+/// draws its `knn` nearest from every other batch, weighted by depth).
+fn node_weights(
+    ctx: &FoldCtx<'_>,
+    mk: &[Vec<usize>],
+    bs: &[usize],
+    units_k: &[usize],
+    local_of: &[usize],
+) -> Vec<f32> {
+    let FoldCtx {
+        coords,
+        active,
+        depth,
+        nb,
+        knn,
+        ..
+    } = *ctx;
+    let m = (bs.len() - 1) as f32;
+    let dicts: HashMap<usize, ColumnDict<usize>> = bs
+        .iter()
+        .map(|&b2| {
+            let pts = DMatrix::from_columns(
+                &mk[b2]
+                    .iter()
+                    .map(|&i| coords.column(active[i]))
+                    .collect::<Vec<_>>(),
+            );
+            (b2, ColumnDict::from_dmatrix(pts, mk[b2].clone()))
+        })
+        .collect();
+    let chunk_len = (QUERY_BUDGET / (knn * bs.len()).max(1)).max(64);
+    let mut weight = vec![0f32; units_k.len() * nb];
+    for &b in bs {
+        for chunk in mk[b].chunks(chunk_len) {
+            let adds: Vec<(usize, f32)> = chunk
+                .par_iter()
+                .flat_map_iter(|&i| {
+                    let q: Vec<f32> = coords.column(active[i]).iter().copied().collect();
+                    let mut out = Vec::new();
+                    for &b2 in bs.iter().filter(|&&b2| b2 != b) {
+                        let kq = knn.min(mk[b2].len());
+                        let Ok((nbrs, _)) = dicts[&b2].search_by_query_data(&q, kq) else {
+                            continue;
+                        };
+                        // normalised by what came back (HNSW returns at most its beam)
+                        let tot: f32 = nbrs.iter().map(|&v| depth[v]).sum();
+                        if tot > 0.0 {
+                            let w = depth[i] / (m * tot);
+                            out.extend(nbrs.into_iter().map(|v| (local_of[v] * nb + b, w)));
+                        }
+                    }
+                    out
+                })
+                .collect();
+            for (slot, w) in adds {
+                weight[slot] += w;
+            }
+        }
+    }
+    weight
+}
+
+/// One node's δ-adjusted sums per batch (`num`, genes × nb) and their
+/// matched counterfactual (`den`), reading only the node's units.
+fn node_sums(
+    ctx: &FoldCtx<'_>,
+    units_k: &[usize],
+    weight: &[f32],
+) -> anyhow::Result<(DMatrix<f32>, DMatrix<f32>)> {
+    let FoldCtx {
+        data,
+        batch,
+        active,
+        inv,
+        nb,
+        block_size,
+        ..
+    } = *ctx;
+    let n_genes = inv.nrows();
+    let acc = Mutex::new((
+        DMatrix::<f32>::zeros(n_genes, nb),
+        DMatrix::<f32>::zeros(n_genes, nb),
+    ));
+    let jobs = generate_minibatch_intervals(units_k.len(), data.num_rows(), block_size);
+    jobs.par_iter()
+        .try_for_each(|&(lb, ub)| -> anyhow::Result<()> {
+            let yy = data.read_columns_csc(units_k[lb..ub].iter().map(|&i| active[i]))?;
+            let mut num_t = Vec::new();
+            let mut den_t = Vec::new();
+            for (y, l) in yy.col_iter().zip(lb..ub) {
+                let b = batch[active[units_k[l]]];
+                let w = &weight[l * nb..(l + 1) * nb];
+                for (&g, &x) in y.row_indices().iter().zip(y.values()) {
+                    let xt = x * inv[(g, b)];
+                    num_t.push((g, b, xt));
+                    for (b2, &wb) in w.iter().enumerate() {
+                        if wb > 0.0 {
+                            den_t.push((g, b2, wb * xt));
+                        }
+                    }
+                }
+            }
+            let mut guard = acc.lock().expect("fold accumulator");
+            for (g, b, v) in num_t {
+                guard.0[(g, b)] += v;
+            }
+            for (g, b, v) in den_t {
+                guard.1[(g, b)] += v;
+            }
+            Ok(())
+        })?;
+    Ok(acc.into_inner().expect("fold accumulator"))
+}
+
 /// The matched-counterfactual fold over nodes (see the module docs).
 ///
 /// * `data`: genes × units; only units with a node are read.
@@ -657,11 +815,9 @@ pub fn matched_fold(
     let n_genes = log_delta.nrows();
     let nb = n_batches;
 
+    anyhow::ensure!(params.knn >= 1, "group fold: knn must be at least 1");
+
     let active: Vec<usize> = (0..n_units).filter(|&u| node[u].is_some()).collect();
-    let mut pos_of = vec![usize::MAX; n_units];
-    for (i, &u) in active.iter().enumerate() {
-        pos_of[u] = i;
-    }
     let depth = adjusted_depths(data, &active, batch, log_delta, params.block_size)?;
 
     // members[k][b]: positions (into `active`) of node k's units in batch b
@@ -672,122 +828,69 @@ pub fn matched_fold(
         }
     }
 
-    // weight[i·nb + b]: how much unit i stands in for batch b's counterfactual in its node
-    let mut weight = vec![0f32; active.len() * nb];
-    for (k, mk) in members.iter().enumerate() {
-        let bs: Vec<usize> = (0..nb).filter(|&b| !mk[b].is_empty()).collect();
-        if bs.len() < 2 {
-            continue;
-        }
-        let m = (bs.len() - 1) as f32;
-        let dicts: HashMap<usize, ColumnDict<usize>> = bs
-            .iter()
-            .map(|&b2| {
-                let pts = DMatrix::from_columns(
-                    &mk[b2]
-                        .iter()
-                        .map(|&i| coords.column(active[i]))
-                        .collect::<Vec<_>>(),
-                );
-                (b2, ColumnDict::from_dmatrix(pts, mk[b2].clone()))
-            })
-            .collect();
-        for &b in &bs {
-            for chunk in mk[b].chunks(QUERY_CHUNK) {
-                let adds: Vec<(usize, f32)> = chunk
-                    .par_iter()
-                    .flat_map_iter(|&i| {
-                        let q: Vec<f32> = coords.column(active[i]).iter().copied().collect();
-                        let mut out = Vec::new();
-                        for &b2 in &bs {
-                            if b2 == b {
-                                continue;
-                            }
-                            let kq = params.knn.min(mk[b2].len());
-                            let Ok((nbrs, _)) = dicts[&b2].search_by_query_data(&q, kq) else {
-                                continue;
-                            };
-                            let tot: f32 = nbrs.iter().map(|&v| depth[v]).sum();
-                            if tot > 0.0 {
-                                let w = depth[i] / (m * tot);
-                                out.extend(nbrs.into_iter().map(|v| (v * nb + b, w)));
-                            }
-                        }
-                        out
-                    })
-                    .collect();
-                for (slot, w) in adds {
-                    weight[slot] += w;
-                }
-            }
-        }
-        log::debug!("group fold: node {k} matched over {} batches", bs.len());
-    }
-
-    // num: δ-adjusted sums per (node, batch); den: their matched counterfactual
-    let n_slots = n_nodes * nb;
     let inv = log_delta.map(|v| (-v).exp());
-    let acc = Mutex::new((
-        DMatrix::<f32>::zeros(n_genes, n_slots),
-        DMatrix::<f32>::zeros(n_genes, n_slots),
-    ));
-    let jobs = generate_minibatch_intervals(active.len(), data.num_rows(), params.block_size);
-    jobs.par_iter()
-        .try_for_each(|&(lb, ub)| -> anyhow::Result<()> {
-            let yy = data.read_columns_csc(active[lb..ub].iter().copied())?;
-            let mut num_t = Vec::new();
-            let mut den_t = Vec::new();
-            for (y, i) in yy.col_iter().zip(lb..ub) {
-                let u = active[i];
-                let (k, b) = (node[u].expect("active unit"), batch[u]);
-                let w = &weight[i * nb..(i + 1) * nb];
-                for (&g, &x) in y.row_indices().iter().zip(y.values()) {
-                    let xt = x * inv[(g, b)];
-                    num_t.push((g, k * nb + b, xt));
-                    for (b2, &wb) in w.iter().enumerate() {
-                        if wb > 0.0 {
-                            den_t.push((g, k * nb + b2, wb * xt));
-                        }
-                    }
-                }
-            }
-            let mut guard = acc.lock().expect("fold accumulator");
-            for (g, s, v) in num_t {
-                guard.0[(g, s)] += v;
-            }
-            for (g, s, v) in den_t {
-                guard.1[(g, s)] += v;
-            }
-            Ok(())
-        })?;
-    let (num, den) = acc.into_inner().expect("fold accumulator");
-
-    let a = params.pseudo_count;
-    let mut log_fold = DMatrix::<f32>::zeros(n_genes, n_slots);
+    let mut log_fold = DMatrix::<f32>::zeros(n_genes, n_nodes * nb);
     for k in 0..n_nodes {
         for b in 0..nb {
             log_fold
                 .column_mut(k * nb + b)
                 .copy_from(&log_delta.column(b));
         }
-        let bs: Vec<usize> = (0..nb).filter(|&b| !members[k][b].is_empty()).collect();
+    }
+    let ctx = FoldCtx {
+        data,
+        batch,
+        coords,
+        active: &active,
+        depth: &depth,
+        inv: &inv,
+        nb,
+        knn: params.knn,
+        block_size: params.block_size,
+    };
+    // a node at a time: memory is bounded by the largest node × batches
+    let mut local_of = vec![usize::MAX; active.len()];
+    for (k, mk) in members.iter().enumerate() {
+        let bs: Vec<usize> = (0..nb).filter(|&b| !mk[b].is_empty()).collect();
         if bs.len() < 2 {
             continue;
         }
+        let units_k: Vec<usize> = bs.iter().flat_map(|&b| mk[b].iter().copied()).collect();
+        for (l, &i) in units_k.iter().enumerate() {
+            local_of[i] = l;
+        }
+        let weight = node_weights(&ctx, mk, &bs, &units_k, &local_of);
+        let (num, den) = node_sums(&ctx, &units_k, &weight)?;
+
+        // a batch whose counterfactual drew no mass has nothing to be read against
+        let matched: Vec<usize> = bs
+            .iter()
+            .copied()
+            .filter(|&b| den.column(b).sum() > 0.0)
+            .collect();
+        if matched.len() < 2 {
+            warn!("group fold: node {k} has fewer than 2 matched batches; it keeps δ");
+            continue;
+        }
+        let a = params.pseudo_count;
         for g in 0..n_genes {
-            let r: Vec<f32> = bs
+            let r: Vec<f32> = matched
                 .iter()
-                .map(|&b| ((num[(g, k * nb + b)] + a) / (den[(g, k * nb + b)] + a)).ln())
+                .map(|&b| ((num[(g, b)] + a) / (den[(g, b)] + a)).ln())
                 .collect();
             // r_b contrasts batch b with the mean of the others: on exact
             // data, centred, it is n/(n−1) · log f_b over a node's n batches.
             // Kept as is: the matching and the pseudo-count shrink it, and
             // the (n−1)/n rescale did worse on the sims (2026-11-21).
             let rm = r.iter().sum::<f32>() / r.len() as f32;
-            for (&b, &rb) in bs.iter().zip(&r) {
+            for (&b, &rb) in matched.iter().zip(&r) {
                 log_fold[(g, k * nb + b)] += rb - rm;
             }
         }
+        log::debug!(
+            "group fold: node {k} matched over {} batches",
+            matched.len()
+        );
     }
 
     Ok(GroupFold {
@@ -948,6 +1051,8 @@ fn settle_pair_nodes(
     let mut node_of_key = NodeOfKey::default();
     let mut pending: Vec<usize> = (0..at.len()).filter(|&p| at[p].is_some()).collect();
     let mut rounds = 0;
+    // pairs that reached the root in any round, pooled and tested once at the end
+    let mut at_root: Vec<usize> = Vec::new();
     while !pending.is_empty() {
         let mut count: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
         for &p in &pending {
@@ -958,11 +1063,14 @@ fn settle_pair_nodes(
         for &p in &pending {
             let (a, b) = at[p].expect("pending pair");
             let k = key((a, b));
-            if rule.spans(&count[&k]) {
+            if let Some(&n) = node_of_key.get(&k) {
+                // a key settled earlier already spans: a later arrival joins it
+                node[p] = Some(n);
+            } else if rule.spans(&count[&k]) {
                 let n = node_of_key.len();
                 node[p] = Some(*node_of_key.entry(k).or_insert(n));
             } else if a == tree.root && b == tree.root {
-                at[p] = None;
+                at_root.push(p);
             } else {
                 at[p] = Some((tree.parent[a], tree.parent[b]));
                 next.push(p);
@@ -970,6 +1078,17 @@ fn settle_pair_nodes(
         }
         pending = next;
         rounds += 1;
+    }
+    let mut root_count = vec![0; rule.n_labels];
+    for &p in &at_root {
+        root_count[label_of_pair[p]] += 1;
+    }
+    if !at_root.is_empty() && rule.spans(&root_count) {
+        let n = node_of_key.len();
+        let n = *node_of_key.entry((tree.root, tree.root)).or_insert(n);
+        for &p in &at_root {
+            node[p] = Some(n);
+        }
     }
     (node, node_of_key, rounds)
 }
