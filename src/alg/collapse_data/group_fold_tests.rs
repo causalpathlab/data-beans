@@ -271,3 +271,44 @@ fn nn_chain_ward_matches_greedy_ward() {
     got.sort();
     assert_eq!(got, want);
 }
+
+/// On a complete graph, Ward along the graph is exact Ward; on a sparse one
+/// it still separates far-apart clumps at the root.
+#[test]
+fn graph_ward_matches_exact_on_a_complete_graph_and_splits_clumps() {
+    let (k, dim) = (30usize, 2usize);
+    let mut s = 777u64;
+    let mut next = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 33) as f32 / (1u64 << 31) as f32
+    };
+    let pts = DMatrix::from_fn(k, dim, |r, _| next() + if r < 15 { 0.0 } else { 50.0 });
+    let clusters = |t: &CoarseTree| {
+        let mut c: Vec<Vec<usize>> = (k..t.parent.len())
+            .map(|nd| {
+                let mut l = t.leaves(nd);
+                l.sort_unstable();
+                l
+            })
+            .collect();
+        c.sort();
+        c
+    };
+    let exact = CoarseTree::ward_exact(&pts);
+    assert_eq!(
+        clusters(&CoarseTree::ward_on_knn_graph(&pts, k - 1)),
+        clusters(&exact)
+    );
+
+    let sparse = CoarseTree::ward_on_knn_graph(&pts, 3);
+    let (a, b) = sparse.children[sparse.root].expect("root splits");
+    let mut sides = [sparse.leaves(a), sparse.leaves(b)];
+    sides.iter_mut().for_each(|x| x.sort_unstable());
+    sides.sort();
+    assert_eq!(
+        sides,
+        [(0..15).collect::<Vec<_>>(), (15..30).collect::<Vec<_>>()]
+    );
+}

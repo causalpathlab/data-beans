@@ -28,6 +28,7 @@
 //! warning; the estimate never fails for that reason.
 
 use crate::sparse_io_vector::SparseIoVec;
+use legume_numeric::matrix::knn::knn_rows;
 use legume_numeric::matrix::knn_match::ColumnDict;
 use legume_numeric::matrix::traits::RandomizedAlgs;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
@@ -114,6 +115,114 @@ impl SpanRule {
 // Ward tree over the coarse groups
 ////////////////////////////////////////////////////////////////////
 
+/// Groups up to this many get exact Ward ([`CoarseTree::ward_exact`]);
+/// beyond, Ward along a kNN graph ([`CoarseTree::ward_on_knn_graph`]).
+pub const EXACT_WARD_MAX_GROUPS: usize = 4096;
+/// Neighbours per group in the graph Ward merges along.
+const WARD_GRAPH_KNN: usize = 15;
+
+/// The merges recorded so far: tree ids `0..k` are the leaves, the rest are
+/// given in merge order.
+struct WardBuild {
+    parent: Vec<usize>,
+    children: Vec<Option<(usize, usize)>>,
+    next_id: usize,
+}
+
+impl WardBuild {
+    fn merge(&mut self, a: usize, b: usize) {
+        let n = self.next_id;
+        self.parent[a] = n;
+        self.parent[b] = n;
+        self.children[n] = Some((a, b));
+        self.next_id += 1;
+    }
+}
+
+/// Ward's merge cost of two clusters: 2·nₐn_b/(nₐ+n_b)·‖c̄ₐ − c̄_b‖² (for
+/// two single points, their squared distance).
+fn ward_cost(ca: &[f32], na: f64, cb: &[f32], nb: f64) -> f64 {
+    let d2: f64 = ca
+        .iter()
+        .zip(cb)
+        .map(|(&x, &y)| f64::from(x - y).powi(2))
+        .sum();
+    2.0 * na * nb / (na + nb) * d2
+}
+
+/// A totally ordered merge cost for the heap.
+#[derive(Clone, Copy, PartialEq)]
+struct Cost(f64);
+impl Eq for Cost {}
+impl PartialOrd for Cost {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Cost {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// Exact Ward over clusters (`centroids`, `sizes`, tree `ids`) by the
+/// nearest-neighbour chain with Lance–Williams updates on Ward costs,
+/// recording every merge in `build`; O(n²) for n clusters.
+fn ward_chain(
+    centroids: &[Vec<f32>],
+    mut size: Vec<f64>,
+    mut id: Vec<usize>,
+    build: &mut WardBuild,
+) {
+    let k = centroids.len();
+    if k <= 1 {
+        return;
+    }
+    let mut d = vec![0f64; k * k];
+    d.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        for (j, dij) in row.iter_mut().enumerate() {
+            *dij = ward_cost(&centroids[i], size[i], &centroids[j], size[j]);
+        }
+    });
+    let mut active: Vec<bool> = vec![true; k];
+    let mut chain: Vec<usize> = Vec::with_capacity(k);
+    let mut n_active = k;
+    while n_active > 1 {
+        if chain.is_empty() {
+            chain.push(active.iter().position(|&a| a).expect("an active cluster"));
+        }
+        let a = *chain.last().expect("chain");
+        let prev = chain.len().checked_sub(2).map(|i| chain[i]);
+        // nearest active to `a`, preferring the previous link on ties so the chain ends
+        let mut best = (usize::MAX, f64::INFINITY);
+        for m in (0..k).filter(|&m| active[m] && m != a) {
+            let v = d[a * k + m];
+            if v < best.1 || (v == best.1 && Some(m) == prev) {
+                best = (m, v);
+            }
+        }
+        let b = best.0;
+        if Some(b) != prev {
+            chain.push(b);
+            continue;
+        }
+        chain.truncate(chain.len() - 2);
+        build.merge(id[a], id[b]);
+        let (na, nb, dab) = (size[a], size[b], d[a * k + b]);
+        for m in (0..k).filter(|&m| active[m] && m != a && m != b) {
+            let nm = size[m];
+            let v =
+                ((na + nm) * d[a * k + m] + (nb + nm) * d[b * k + m] - nm * dab) / (na + nb + nm);
+            d[a * k + m] = v;
+            d[m * k + a] = v;
+        }
+        size[a] = na + nb;
+        id[a] = build.next_id - 1;
+        active[b] = false;
+        n_active -= 1;
+    }
+}
+
 /// A binary tree over `n_groups` leaves (ids `0..n_groups`); internal nodes
 /// take ids `n_groups..2·n_groups-1` in merge order; the root is the last.
 #[derive(Clone, Debug)]
@@ -127,83 +236,136 @@ pub struct CoarseTree {
 }
 
 impl CoarseTree {
-    /// Ward linkage over the rows of `points` (groups × dims), by the
-    /// nearest-neighbour chain with Lance–Williams updates on squared
-    /// distances: the same tree as greedy Ward, in O(K²) time and memory for
-    /// K groups.
+    /// Ward linkage over the rows of `points` (groups × dims): exact up to
+    /// [`EXACT_WARD_MAX_GROUPS`] groups ([`Self::ward_exact`], O(K²)), along a
+    /// kNN graph beyond ([`Self::ward_on_knn_graph`], O(K·k·log K)).
     pub fn ward(points: &DMatrix<f32>) -> Self {
-        let k = points.nrows();
+        if points.nrows() <= EXACT_WARD_MAX_GROUPS {
+            Self::ward_exact(points)
+        } else {
+            Self::ward_on_knn_graph(points, WARD_GRAPH_KNN)
+        }
+    }
+
+    fn leaf_tree(k: usize) -> WardBuild {
         let total = (2 * k).saturating_sub(1).max(1);
-        let mut parent: Vec<usize> = (0..total).collect();
-        let mut children = vec![None; total];
-        if k <= 1 {
-            return Self {
-                n_groups: k,
-                parent,
-                children,
-                root: 0,
-            };
+        WardBuild {
+            parent: (0..total).collect(),
+            children: vec![None; total],
+            next_id: k,
         }
-        let mut d = vec![0f64; k * k];
-        d.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
-            for (j, dij) in row.iter_mut().enumerate() {
-                *dij = (0..points.ncols())
-                    .map(|c| f64::from(points[(i, c)] - points[(j, c)]).powi(2))
-                    .sum();
-            }
-        });
-        let mut size = vec![1f64; k];
-        let mut id: Vec<usize> = (0..k).collect();
-        let mut active: Vec<bool> = vec![true; k];
-        let mut chain: Vec<usize> = Vec::with_capacity(k);
-        let mut next_id = k;
-        let mut n_active = k;
-        while n_active > 1 {
-            if chain.is_empty() {
-                chain.push(active.iter().position(|&a| a).expect("an active group"));
-            }
-            let a = *chain.last().expect("chain");
-            let prev = chain.len().checked_sub(2).map(|i| chain[i]);
-            // nearest active to `a`, preferring the previous link on ties so the chain ends
-            let mut best = (usize::MAX, f64::INFINITY);
-            for m in (0..k).filter(|&m| active[m] && m != a) {
-                let v = d[a * k + m];
-                if v < best.1 || (v == best.1 && Some(m) == prev) {
-                    best = (m, v);
-                }
-            }
-            let b = best.0;
-            if Some(b) != prev {
-                chain.push(b);
-                continue;
-            }
-            chain.truncate(chain.len() - 2);
-            // merge a and b into a's slot
-            parent[id[a]] = next_id;
-            parent[id[b]] = next_id;
-            children[next_id] = Some((id[a], id[b]));
-            let (na, nb, dab) = (size[a], size[b], d[a * k + b]);
-            for m in (0..k).filter(|&m| active[m] && m != a && m != b) {
-                let nm = size[m];
-                let v = ((na + nm) * d[a * k + m] + (nb + nm) * d[b * k + m] - nm * dab)
-                    / (na + nb + nm);
-                d[a * k + m] = v;
-                d[m * k + a] = v;
-            }
-            size[a] = na + nb;
-            id[a] = next_id;
-            active[b] = false;
-            next_id += 1;
-            n_active -= 1;
-        }
-        let root = total - 1;
+    }
+
+    fn finish(k: usize, build: WardBuild) -> Self {
+        let mut parent = build.parent;
+        let root = parent.len() - 1;
         parent[root] = root;
         Self {
             n_groups: k,
             parent,
-            children,
+            children: build.children,
             root,
         }
+    }
+
+    /// Exact Ward by the nearest-neighbour chain with Lance–Williams updates:
+    /// the same tree as greedy Ward, in O(K²) time and memory.
+    pub fn ward_exact(points: &DMatrix<f32>) -> Self {
+        let k = points.nrows();
+        let mut build = Self::leaf_tree(k);
+        let centroids: Vec<Vec<f32>> = points
+            .row_iter()
+            .map(|r| r.iter().copied().collect())
+            .collect();
+        ward_chain(&centroids, vec![1.0; k], (0..k).collect(), &mut build);
+        Self::finish(k, build)
+    }
+
+    /// Ward along a kNN graph of the groups (`knn` neighbours, legume-numeric's
+    /// [`knn_rows`]): clusters merge only along edges, cheapest Ward cost
+    /// first, the cost exact from centroids and sizes; pieces the graph leaves
+    /// apart are joined by [`Self::ward_exact`]'s chain over their centroids.
+    /// The same tree as exact Ward wherever each merge's partner is a graph
+    /// neighbour.
+    pub fn ward_on_knn_graph(points: &DMatrix<f32>, knn: usize) -> Self {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let k = points.nrows();
+        let mut build = Self::leaf_tree(k);
+        if k <= 1 {
+            return Self::finish(k, build);
+        }
+        let (nbrs, _) = knn_rows(points, knn.min(k - 1));
+        let mut adj: Vec<rustc_hash::FxHashSet<usize>> = vec![Default::default(); k];
+        for (i, ns) in nbrs.iter().enumerate() {
+            for &j in ns {
+                if i != j {
+                    adj[i].insert(j);
+                    adj[j].insert(i);
+                }
+            }
+        }
+        let mut centroid: Vec<Vec<f32>> = points
+            .row_iter()
+            .map(|r| r.iter().copied().collect())
+            .collect();
+        let mut size = vec![1f64; k];
+        let mut id: Vec<usize> = (0..k).collect();
+        let mut alive = vec![true; k];
+        let mut stamp = vec![0u32; k];
+        let mut heap = BinaryHeap::new();
+        for a in 0..k {
+            for &b in adj[a].iter().filter(|&&b| b > a) {
+                let c = ward_cost(&centroid[a], size[a], &centroid[b], size[b]);
+                heap.push(Reverse((Cost(c), a, b, 0u32, 0u32)));
+            }
+        }
+        while let Some(Reverse((_, a, b, sa, sb))) = heap.pop() {
+            if !alive[a] || !alive[b] || stamp[a] != sa || stamp[b] != sb {
+                continue;
+            }
+            build.merge(id[a], id[b]);
+            let (na, nb) = (size[a], size[b]);
+            let merged: Vec<f32> = centroid[a]
+                .iter()
+                .zip(&centroid[b])
+                .map(|(&x, &y)| ((f64::from(x) * na + f64::from(y) * nb) / (na + nb)) as f32)
+                .collect();
+            centroid[a] = merged;
+            size[a] = na + nb;
+            id[a] = build.next_id - 1;
+            alive[b] = false;
+            stamp[a] += 1;
+            let nb_of_b = std::mem::take(&mut adj[b]);
+            for m in nb_of_b {
+                adj[m].remove(&b);
+                if m != a {
+                    adj[m].insert(a);
+                    adj[a].insert(m);
+                }
+            }
+            adj[a].remove(&b);
+            adj[a].remove(&a);
+            for &m in &adj[a] {
+                let c = ward_cost(&centroid[a], size[a], &centroid[m], size[m]);
+                let (x, y) = if a < m { (a, m) } else { (m, a) };
+                heap.push(Reverse((Cost(c), x, y, stamp[x], stamp[y])));
+            }
+        }
+        // pieces the graph left apart: join them exactly
+        let rest: Vec<usize> = (0..k).filter(|&i| alive[i]).collect();
+        if rest.len() > 1 {
+            ward_chain(
+                &rest
+                    .iter()
+                    .map(|&i| centroid[i].clone())
+                    .collect::<Vec<_>>(),
+                rest.iter().map(|&i| size[i]).collect(),
+                rest.iter().map(|&i| id[i]).collect(),
+                &mut build,
+            );
+        }
+        Self::finish(k, build)
     }
 
     /// Per tree node, the units of each label below it.
