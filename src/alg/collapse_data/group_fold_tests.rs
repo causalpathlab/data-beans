@@ -213,3 +213,61 @@ fn pair_nodes_climb_until_they_span() {
     assert_eq!(node, vec![None]);
     assert!(keys.is_empty());
 }
+
+/// The nearest-neighbour chain builds the same tree as greedy Ward: the same
+/// clusters (leaf sets) at every internal node.
+#[test]
+fn nn_chain_ward_matches_greedy_ward() {
+    let (k, dim) = (40usize, 3usize);
+    let mut s = 12345u64;
+    let mut next = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 33) as f32 / (1u64 << 31) as f32
+    };
+    let pts = DMatrix::from_fn(k, dim, |_, _| next());
+
+    // greedy Ward, O(K³), as the reference
+    let mut members: Vec<Option<Vec<usize>>> = (0..k).map(|i| Some(vec![i])).collect();
+    let mut want: Vec<Vec<usize>> = Vec::new();
+    let cost = |a: &[usize], b: &[usize]| {
+        let mean = |s: &[usize]| {
+            (0..dim)
+                .map(|c| s.iter().map(|&i| f64::from(pts[(i, c)])).sum::<f64>() / s.len() as f64)
+                .collect::<Vec<_>>()
+        };
+        let (ma, mb) = (mean(a), mean(b));
+        let d2: f64 = ma.iter().zip(&mb).map(|(x, y)| (x - y).powi(2)).sum();
+        2.0 * (a.len() * b.len()) as f64 / (a.len() + b.len()) as f64 * d2
+    };
+    for _ in 0..k - 1 {
+        let live: Vec<usize> = (0..k).filter(|&i| members[i].is_some()).collect();
+        let (mut bi, mut bj, mut best) = (0, 0, f64::INFINITY);
+        for (x, &i) in live.iter().enumerate() {
+            for &j in &live[x + 1..] {
+                let c = cost(members[i].as_ref().unwrap(), members[j].as_ref().unwrap());
+                if c < best {
+                    (bi, bj, best) = (i, j, c);
+                }
+            }
+        }
+        let mut m = members[bi].take().unwrap();
+        m.extend(members[bj].take().unwrap());
+        m.sort_unstable();
+        want.push(m.clone());
+        members[bi] = Some(m);
+    }
+    want.sort();
+
+    let t = CoarseTree::ward(&pts);
+    let mut got: Vec<Vec<usize>> = (k..t.parent.len())
+        .map(|nd| {
+            let mut l = t.leaves(nd);
+            l.sort_unstable();
+            l
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, want);
+}

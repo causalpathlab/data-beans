@@ -29,6 +29,7 @@
 
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::knn_match::ColumnDict;
+use legume_numeric::matrix::traits::RandomizedAlgs;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
 use log::{info, warn};
 use nalgebra::{DMatrix, SymmetricEigen};
@@ -126,8 +127,10 @@ pub struct CoarseTree {
 }
 
 impl CoarseTree {
-    /// Ward linkage (Lance–Williams on squared distances) over the rows of
-    /// `points` (groups × dims). Exact; O(K³) in the number of groups.
+    /// Ward linkage over the rows of `points` (groups × dims), by the
+    /// nearest-neighbour chain with Lance–Williams updates on squared
+    /// distances: the same tree as greedy Ward, in O(K²) time and memory for
+    /// K groups.
     pub fn ward(points: &DMatrix<f32>) -> Self {
         let k = points.nrows();
         let total = (2 * k).saturating_sub(1).max(1);
@@ -141,49 +144,57 @@ impl CoarseTree {
                 root: 0,
             };
         }
-        let mut d = vec![vec![0f64; k]; k];
-        for i in 0..k {
-            for j in (i + 1)..k {
-                let s: f64 = (0..points.ncols())
+        let mut d = vec![0f64; k * k];
+        d.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+            for (j, dij) in row.iter_mut().enumerate() {
+                *dij = (0..points.ncols())
                     .map(|c| f64::from(points[(i, c)] - points[(j, c)]).powi(2))
                     .sum();
-                d[i][j] = s;
-                d[j][i] = s;
             }
-        }
+        });
         let mut size = vec![1f64; k];
         let mut id: Vec<usize> = (0..k).collect();
         let mut active: Vec<bool> = vec![true; k];
-        for step in 0..(k - 1) {
-            let (mut bi, mut bj, mut best) = (0, 0, f64::INFINITY);
-            for i in 0..k {
-                if !active[i] {
-                    continue;
-                }
-                for j in (i + 1)..k {
-                    if active[j] && d[i][j] < best {
-                        (bi, bj, best) = (i, j, d[i][j]);
-                    }
+        let mut chain: Vec<usize> = Vec::with_capacity(k);
+        let mut next_id = k;
+        let mut n_active = k;
+        while n_active > 1 {
+            if chain.is_empty() {
+                chain.push(active.iter().position(|&a| a).expect("an active group"));
+            }
+            let a = *chain.last().expect("chain");
+            let prev = chain.len().checked_sub(2).map(|i| chain[i]);
+            // nearest active to `a`, preferring the previous link on ties so the chain ends
+            let mut best = (usize::MAX, f64::INFINITY);
+            for m in (0..k).filter(|&m| active[m] && m != a) {
+                let v = d[a * k + m];
+                if v < best.1 || (v == best.1 && Some(m) == prev) {
+                    best = (m, v);
                 }
             }
-            let new_id = k + step;
-            parent[id[bi]] = new_id;
-            parent[id[bj]] = new_id;
-            children[new_id] = Some((id[bi], id[bj]));
-            let (ni, nj) = (size[bi], size[bj]);
-            for m in 0..k {
-                if !active[m] || m == bi || m == bj {
-                    continue;
-                }
+            let b = best.0;
+            if Some(b) != prev {
+                chain.push(b);
+                continue;
+            }
+            chain.truncate(chain.len() - 2);
+            // merge a and b into a's slot
+            parent[id[a]] = next_id;
+            parent[id[b]] = next_id;
+            children[next_id] = Some((id[a], id[b]));
+            let (na, nb, dab) = (size[a], size[b], d[a * k + b]);
+            for m in (0..k).filter(|&m| active[m] && m != a && m != b) {
                 let nm = size[m];
-                let v =
-                    ((ni + nm) * d[bi][m] + (nj + nm) * d[bj][m] - nm * d[bi][bj]) / (ni + nj + nm);
-                d[bi][m] = v;
-                d[m][bi] = v;
+                let v = ((na + nm) * d[a * k + m] + (nb + nm) * d[b * k + m] - nm * dab)
+                    / (na + nb + nm);
+                d[a * k + m] = v;
+                d[m * k + a] = v;
             }
-            size[bi] = ni + nj;
-            id[bi] = new_id;
-            active[bj] = false;
+            size[a] = na + nb;
+            id[a] = next_id;
+            active[b] = false;
+            next_id += 1;
+            n_active -= 1;
         }
         let root = total - 1;
         parent[root] = root;
@@ -319,24 +330,19 @@ fn leading_eigenvectors(m: DMatrix<f32>, k: usize) -> DMatrix<f32> {
     DMatrix::from_columns(&cols)
 }
 
-/// Principal-component scores (rows × k) of the rows of `x`, centred, via
-/// the Gram matrix (rows are few, columns many).
+/// Principal-component scores (rows × k) of the rows of `x`, centred.
 fn row_scores(x: &DMatrix<f32>, k: usize) -> DMatrix<f32> {
-    let n = x.nrows();
     let mut xc = x.clone();
     for c in 0..x.ncols() {
         let m = x.column(c).mean();
         xc.column_mut(c).add_scalar_mut(-m);
     }
-    let gram = &xc * xc.transpose();
-    let eig = SymmetricEigen::new(gram);
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| eig.eigenvalues[b].total_cmp(&eig.eigenvalues[a]));
-    let k = k.min(n);
-    DMatrix::from_fn(n, k, |r, c| {
-        let i = order[c];
-        eig.eigenvectors[(r, i)] * eig.eigenvalues[i].max(0.0).sqrt()
-    })
+    let k = k.min(x.nrows()).min(x.ncols());
+    match xc.rsvd(k) {
+        // randomized SVD: O(rows · cols · k), not cubic in the rows
+        Ok((u, dv, _)) => DMatrix::from_fn(u.nrows(), u.ncols(), |r, c| u[(r, c)] * dv[c]),
+        Err(_) => DMatrix::zeros(x.nrows(), k),
+    }
 }
 
 ////////////////////////////////////////////////////////////////////
