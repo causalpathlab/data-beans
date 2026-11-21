@@ -125,15 +125,15 @@ impl StateAwareBatchFold {
     }
 }
 
-/// Per column of `data`: its sum after dividing by δ of its batch.
+/// Per column of `data`: its sum after dividing by its base fold, the column
+/// `base_col[c]` of `inv` (1 / base, genes × (nodes · batches)).
 fn adjusted_depths(
     data: &SparseIoVec,
     cols: &[usize],
-    batch: &[usize],
-    log_delta: &DMatrix<f32>,
+    base_col: &[usize],
+    inv: &DMatrix<f32>,
     block_size: Option<usize>,
 ) -> anyhow::Result<Vec<f32>> {
-    let inv = log_delta.map(|v| (-v).exp());
     let jobs = generate_minibatch_intervals(cols.len(), data.num_rows(), block_size);
     let parts: Vec<(usize, Vec<f32>)> = jobs
         .par_iter()
@@ -143,11 +143,11 @@ fn adjusted_depths(
                 .col_iter()
                 .zip(&cols[lb..ub])
                 .map(|(y, &c)| {
-                    let b = batch[c];
+                    let col = base_col[c];
                     y.row_indices()
                         .iter()
                         .zip(y.values())
-                        .map(|(&g, &x)| x * inv[(g, b)])
+                        .map(|(&g, &x)| x * inv[(g, col)])
                         .sum()
                 })
                 .collect();
@@ -171,9 +171,9 @@ struct FoldCtx<'a> {
     coords: &'a DMatrix<f32>,
     /// Units with a node, by position.
     active: &'a [usize],
-    /// δ-adjusted depth of each active unit.
+    /// Base-adjusted depth of each active unit.
     depth: &'a [f32],
-    /// 1 / δ, genes × batches.
+    /// 1 / base fold, genes × (nodes · batches).
     inv: &'a DMatrix<f32>,
     nb: usize,
     knn: usize,
@@ -247,6 +247,7 @@ fn node_weights(
 /// matched counterfactual (`den`), reading only the node's units.
 fn node_sums(
     ctx: &FoldCtx<'_>,
+    k: usize,
     units_k: &[usize],
     weight: &[f32],
 ) -> anyhow::Result<(DMatrix<f32>, DMatrix<f32>)> {
@@ -274,7 +275,7 @@ fn node_sums(
                 let b = batch[active[units_k[l]]];
                 let w = &weight[l * nb..(l + 1) * nb];
                 for (&g, &x) in y.row_indices().iter().zip(y.values()) {
-                    let xt = x * inv[(g, b)];
+                    let xt = x * inv[(g, k * nb + b)];
                     num_t.push((g, b, xt));
                     for (b2, &wb) in w.iter().enumerate() {
                         if wb > 0.0 {
@@ -295,7 +296,8 @@ fn node_sums(
     Ok(acc.into_inner().expect("fold accumulator"))
 }
 
-/// The matched-counterfactual fold over nodes (see the module docs).
+/// The matched-counterfactual fold over nodes (see the module docs), on top
+/// of δ.
 ///
 /// * `data`: genes × units; only units with a node are read.
 /// * `coords`: components × units, batch-corrected.
@@ -310,19 +312,69 @@ pub fn estimate_fold_by_cross_batch_matching(
     log_delta: &DMatrix<f32>,
     params: &StateAwareBatchFoldParams,
 ) -> anyhow::Result<StateAwareBatchFold> {
+    let nb = log_delta.ncols();
+    let mut base = DMatrix::<f32>::zeros(log_delta.nrows(), n_nodes * nb);
+    for k in 0..n_nodes {
+        base.columns_mut(k * nb, nb).copy_from(log_delta);
+    }
+    estimate_residual_fold_by_cross_batch_matching(
+        data,
+        batch,
+        coords,
+        node,
+        n_nodes,
+        &ResidualBase {
+            base_log_fold: &base,
+            log_delta,
+        },
+        params,
+    )
+}
+
+/// What a residual matched fold reads besides the units: each node's base
+/// fold per batch (log, genes × (nodes · batches)), what the node's own
+/// residual is matched on top of, and δ (for the units without a node).
+pub(crate) struct ResidualBase<'a> {
+    pub base_log_fold: &'a DMatrix<f32>,
+    pub log_delta: &'a DMatrix<f32>,
+}
+
+/// [`estimate_fold_by_cross_batch_matching`] on top of a base fold per
+/// (node, batch) instead of δ: the residual of each node over its base, shrunk
+/// toward it by the pseudo-count where the node has little to match.
+pub(crate) fn estimate_residual_fold_by_cross_batch_matching(
+    data: &SparseIoVec,
+    batch: &[usize],
+    coords: &DMatrix<f32>,
+    node: &[Option<usize>],
+    n_nodes: usize,
+    base: &ResidualBase<'_>,
+    params: &StateAwareBatchFoldParams,
+) -> anyhow::Result<StateAwareBatchFold> {
+    let ResidualBase {
+        base_log_fold,
+        log_delta,
+    } = *base;
     let n_units = node.len();
-    let n_batches = log_delta.ncols();
+    let nb = log_delta.ncols();
     anyhow::ensure!(
         batch.len() == n_units && coords.ncols() == n_units,
         "one batch and coordinate per unit"
     );
+    anyhow::ensure!(
+        base_log_fold.ncols() == n_nodes * nb && base_log_fold.nrows() == log_delta.nrows(),
+        "a base fold per (node, batch)"
+    );
     let n_genes = log_delta.nrows();
-    let nb = n_batches;
-
     anyhow::ensure!(params.knn >= 1, "group fold: knn must be at least 1");
 
     let active: Vec<usize> = (0..n_units).filter(|&u| node[u].is_some()).collect();
-    let depth = adjusted_depths(data, &active, batch, log_delta, params.block_size)?;
+    let inv = base_log_fold.map(|v| (-v).exp());
+    let mut base_col = vec![0usize; n_units];
+    for &u in &active {
+        base_col[u] = node[u].expect("active") * nb + batch[u];
+    }
+    let depth = adjusted_depths(data, &active, &base_col, &inv, params.block_size)?;
 
     // members[k][b]: positions (into `active`) of node k's units in batch b
     let mut members = vec![vec![Vec::<usize>::new(); nb]; n_nodes];
@@ -332,15 +384,7 @@ pub fn estimate_fold_by_cross_batch_matching(
         }
     }
 
-    let inv = log_delta.map(|v| (-v).exp());
-    let mut log_fold = DMatrix::<f32>::zeros(n_genes, n_nodes * nb);
-    for k in 0..n_nodes {
-        for b in 0..nb {
-            log_fold
-                .column_mut(k * nb + b)
-                .copy_from(&log_delta.column(b));
-        }
-    }
+    let mut log_fold = base_log_fold.clone();
     let ctx = FoldCtx {
         data,
         batch,
@@ -364,7 +408,7 @@ pub fn estimate_fold_by_cross_batch_matching(
             local_of[i] = l;
         }
         let weight = node_weights(&ctx, mk, &bs, &units_k, &local_of);
-        let (num, den) = node_sums(&ctx, &units_k, &weight)?;
+        let (num, den) = node_sums(&ctx, k, &units_k, &weight)?;
 
         // a batch whose counterfactual drew no mass has nothing to be read against
         let matched: Vec<usize> = bs

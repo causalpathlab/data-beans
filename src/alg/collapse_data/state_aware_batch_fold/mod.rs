@@ -22,7 +22,8 @@
 //! batch-spanning cut ([`coarse_group_ward_tree`], coarsening, bottom up), the
 //! nodes refined by local swaps of samples ([`local_swap_refinement`],
 //! uncoarsening, top down), and the fold matched across batches within each
-//! node ([`cross_batch_matched_fold`]).
+//! node ([`cross_batch_matched_fold`]), estimated top down along the tree,
+//! each node a residual over its parent's ([`top_down_fold`]).
 //!
 //! If not even the root spans enough batches, every unit keeps δ, with a
 //! warning; the estimate never fails for that reason.
@@ -32,6 +33,7 @@ pub mod coarse_group_ward_tree;
 pub mod cross_batch_matched_fold;
 pub(crate) mod local_swap_refinement;
 pub mod sample_units;
+pub(crate) mod top_down_fold;
 
 pub use cell_pair_units::{
     collapse_cell_pairs_and_estimate_state_aware_batch_fold,

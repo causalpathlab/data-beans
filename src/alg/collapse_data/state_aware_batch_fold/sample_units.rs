@@ -8,6 +8,7 @@ use super::cross_batch_matched_fold::{
     estimate_fold_by_cross_batch_matching, MatchingCoordinates, StateAwareBatchFold,
 };
 use super::local_swap_refinement::{refine_nodes_by_local_swaps, SwapInputs};
+use super::top_down_fold::{estimate_fold_top_down, TopDownInputs};
 use super::{BatchSpanningRule, StateAwareBatchFoldParams, PROFILE_DIM};
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
@@ -189,13 +190,29 @@ pub fn estimate_state_aware_batch_fold_over_samples(
         n_nodes,
         &first_fold,
     )?;
-    let fold = estimate_fold_by_cross_batch_matching(
-        data, batch, &coords, &node, n_nodes, log_delta, params,
-    )?;
     let tree_node_of_unit: Vec<Option<usize>> = node
         .iter()
         .map(|k| k.map(|k| tree_node_of_node[k]))
         .collect();
+    // then the fold top down along the tree, from the root to each refined
+    // node, every node a residual over its parent's (numbered as `node`)
+    let dense_of_final: HashMap<usize, usize> = tree_node_of_node
+        .iter()
+        .enumerate()
+        .map(|(k, &t)| (t, k))
+        .collect();
+    let fold = estimate_fold_top_down(
+        &TopDownInputs {
+            data,
+            batch,
+            coords: &coords,
+            tree: &tree,
+            log_delta,
+            params,
+        },
+        &tree_node_of_unit,
+        &dense_of_final,
+    )?;
 
     let mut node_centroids = DMatrix::<f32>::zeros(coords.nrows(), n_nodes);
     let mut cnt = vec![0f32; n_nodes];
