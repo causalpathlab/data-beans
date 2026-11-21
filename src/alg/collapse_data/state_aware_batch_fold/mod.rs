@@ -19,8 +19,10 @@
 //!   the samples kind's result first.
 //!
 //! Shared by both: the tree over the coarsest sample groups and its
-//! batch-spanning cut ([`coarse_group_ward_tree`]), and the fold matched
-//! across batches within each node ([`cross_batch_matched_fold`]).
+//! batch-spanning cut ([`coarse_group_ward_tree`], coarsening, bottom up), the
+//! nodes refined by local swaps of samples ([`local_swap_refinement`],
+//! uncoarsening, top down), and the fold matched across batches within each
+//! node ([`cross_batch_matched_fold`]).
 //!
 //! If not even the root spans enough batches, every unit keeps δ, with a
 //! warning; the estimate never fails for that reason.
@@ -28,6 +30,7 @@
 pub mod cell_pair_units;
 pub mod coarse_group_ward_tree;
 pub mod cross_batch_matched_fold;
+pub(crate) mod local_swap_refinement;
 pub mod sample_units;
 
 pub use cell_pair_units::{

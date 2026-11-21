@@ -7,6 +7,7 @@ use super::coarse_group_ward_tree::{row_scores, CoarseGroupWardTree};
 use super::cross_batch_matched_fold::{
     estimate_fold_by_cross_batch_matching, MatchingCoordinates, StateAwareBatchFold,
 };
+use super::local_swap_refinement::{refine_nodes_by_local_swaps, SwapInputs};
 use super::{BatchSpanningRule, StateAwareBatchFoldParams, PROFILE_DIM};
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
@@ -151,6 +152,13 @@ pub fn estimate_state_aware_batch_fold_over_samples(
     let tree_node_of_unit: Vec<Option<usize>> =
         coarse_group.iter().map(|&k| node_of_group[k]).collect();
     let (node, n_nodes) = renumber(&tree_node_of_unit);
+    // each dense node's tree node, to keep the refined nodes on the tree
+    let mut tree_node_of_node = vec![0usize; n_nodes];
+    for (k, t) in node.iter().zip(&tree_node_of_unit) {
+        if let (Some(k), Some(t)) = (k, t) {
+            tree_node_of_node[*k] = *t;
+        }
+    }
     if n_nodes == 0 {
         warn!(
             "group fold: no node spans {} of {} labels with {} units each; keeping δ",
@@ -162,9 +170,32 @@ pub fn estimate_state_aware_batch_fold_over_samples(
 
     let coord_map = MatchingCoordinates::fit(proj);
     let coords = coord_map.apply(proj);
+    // coarsened (Ward, bottom up, then the cut): the first fold
+    let first_fold = estimate_fold_by_cross_batch_matching(
+        data, batch, &coords, &node, n_nodes, log_delta, params,
+    )?;
+    // uncoarsened: local swaps between neighbouring nodes, scored by each
+    // node's fold-corrected composition in the sample's own batch; then the
+    // fold again, on the refined nodes
+    let node = refine_nodes_by_local_swaps(
+        &SwapInputs {
+            data,
+            batch,
+            coords: &coords,
+            rule: &rule,
+            block_size: params.block_size,
+        },
+        node,
+        n_nodes,
+        &first_fold,
+    )?;
     let fold = estimate_fold_by_cross_batch_matching(
         data, batch, &coords, &node, n_nodes, log_delta, params,
     )?;
+    let tree_node_of_unit: Vec<Option<usize>> = node
+        .iter()
+        .map(|k| k.map(|k| tree_node_of_node[k]))
+        .collect();
 
     let mut node_centroids = DMatrix::<f32>::zeros(coords.nrows(), n_nodes);
     let mut cnt = vec![0f32; n_nodes];

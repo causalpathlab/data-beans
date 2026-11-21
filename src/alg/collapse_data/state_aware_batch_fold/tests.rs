@@ -365,3 +365,56 @@ fn pairs_reaching_the_root_in_different_rounds_are_pooled() {
     let (node, _, _) = place_cell_pairs_on_sample_tree(&t, at, &[0, 1], &r);
     assert!(node[0].is_some() && node[0] == node[1], "{node:?}");
 }
+
+/// Local swaps: a cell placed in the other state's node moves back to its
+/// own state's node, and nodes keep spanning both batches.
+#[test]
+fn local_swaps_move_a_misplaced_cell_to_its_state() {
+    use super::local_swap_refinement::{refine_nodes_by_local_swaps, SwapInputs};
+    let dir = tempfile::tempdir().expect("tempdir");
+    // state A expresses gene 0, state B gene 1; 6 cells of each, 2 batches
+    let per = 6usize;
+    let mut cols = Vec::new();
+    let (mut batch, mut node, mut xy) = (Vec::new(), Vec::new(), Vec::new());
+    for (state, profile) in [[20.0f32, 1.0], [1.0, 20.0]].iter().enumerate() {
+        for i in 0..per {
+            cols.push(profile.to_vec());
+            batch.push(i % 2);
+            node.push(Some(state));
+            xy.push(state as f32 * 10.0 + i as f32 * 0.01);
+        }
+    }
+    node[0] = Some(1); // a state-A cell placed in B's node
+    let n = cols.len();
+    let x = DMatrix::from_fn(2, n, |r, c| cols[c][r]);
+    let data = data_from(dir.path(), "swap", &x);
+    let coords = DMatrix::from_fn(1, n, |_, c| xy[c]);
+    let rule = BatchSpanningRule {
+        label: batch.clone(),
+        n_labels: 2,
+        min_spans: 2,
+        min_units: 1,
+    };
+    let fold = StateAwareBatchFold {
+        n_batches: 2,
+        n_nodes: 2,
+        log_fold: DMatrix::zeros(2, 4),
+        log_delta: DMatrix::zeros(2, 2),
+        node_of_unit: node.clone(),
+    };
+    let inp = SwapInputs {
+        data: &data,
+        batch: &batch,
+        coords: &coords,
+        rule: &rule,
+        block_size: None,
+    };
+    let refined = refine_nodes_by_local_swaps(&inp, node, 2, &fold).expect("swaps");
+    assert_eq!(
+        refined[0],
+        Some(0),
+        "the misplaced cell returns to its state"
+    );
+    assert!(refined[1..per].iter().all(|k| *k == Some(0)));
+    assert!(refined[per..].iter().all(|k| *k == Some(1)));
+}
