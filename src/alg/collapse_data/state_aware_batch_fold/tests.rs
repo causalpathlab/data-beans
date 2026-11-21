@@ -1,6 +1,10 @@
+use super::cell_pair_units::{
+    place_cell_pairs_on_sample_tree, split_cell_reads_over_pair_units_without_double_counting,
+};
 use super::*;
-use crate::alg::cell_pairs::split_reads_over_pair_units;
 use crate::sparse_io::{create_sparse_from_triplets, SparseIoBackend};
+use crate::sparse_io_vector::SparseIoVec;
+use nalgebra::DMatrix;
 use std::sync::Arc;
 
 fn data_from(dir: &std::path::Path, tag: &str, x: &DMatrix<f32>) -> SparseIoVec {
@@ -35,8 +39,13 @@ fn data_from(dir: &std::path::Path, tag: &str, x: &DMatrix<f32>) -> SparseIoVec 
     v
 }
 
-fn rule(label: Vec<usize>, n_labels: usize, min_spans: usize, min_units: usize) -> SpanRule {
-    SpanRule {
+fn rule(
+    label: Vec<usize>,
+    n_labels: usize,
+    min_spans: usize,
+    min_units: usize,
+) -> BatchSpanningRule {
+    BatchSpanningRule {
         label,
         n_labels,
         min_spans,
@@ -48,7 +57,7 @@ fn rule(label: Vec<usize>, n_labels: usize, min_spans: usize, min_units: usize) 
 #[test]
 fn ward_root_splits_two_clumps() {
     let pts = DMatrix::from_row_slice(5, 1, &[0.0, 0.1, 0.2, 10.0, 10.1]);
-    let t = CoarseTree::ward(&pts);
+    let t = CoarseGroupWardTree::build(&pts);
     let (a, b) = t.children[t.root].expect("root splits");
     let mut sides = [t.leaves(a), t.leaves(b)];
     sides.iter_mut().for_each(|s| s.sort_unstable());
@@ -62,11 +71,11 @@ fn ward_root_splits_two_clumps() {
 #[test]
 fn cut_splits_only_where_both_children_span() {
     let pts = DMatrix::from_row_slice(4, 1, &[0.0, 0.1, 10.0, 10.1]);
-    let t = CoarseTree::ward(&pts);
+    let t = CoarseGroupWardTree::build(&pts);
     // groups 0,1 hold both batches; groups 2,3 only batch 0
     let both = vec![vec![5, 5], vec![5, 5], vec![5, 0], vec![5, 0]];
     let r = rule(vec![], 2, 2, 3);
-    let cut = t.cut(&both, &r);
+    let cut = t.cut_where_both_children_span_batches(&both, &r);
     assert!(
         cut.iter().all(|n| *n == Some(t.root)),
         "one side fails: no split"
@@ -74,13 +83,16 @@ fn cut_splits_only_where_both_children_span() {
 
     // each group alone is too thin, each clump of two spans
     let all = vec![vec![2, 2]; 4];
-    let cut = t.cut(&all, &r);
+    let cut = t.cut_where_both_children_span_batches(&all, &r);
     assert_eq!(cut[0], cut[1]);
     assert_eq!(cut[2], cut[3]);
     assert_ne!(cut[0], cut[2]);
 
     let thin = vec![vec![1, 0]; 4]; // one batch only, even at the root
-    assert!(t.cut(&thin, &r).iter().all(Option::is_none));
+    assert!(t
+        .cut_where_both_children_span_batches(&thin, &r)
+        .iter()
+        .all(Option::is_none));
 }
 
 /// A fold planted per (gene, node, batch) on noiseless data is recovered
@@ -118,12 +130,15 @@ fn matched_fold_recovers_a_planted_fold() {
     let log_delta = DMatrix::<f32>::from_row_slice(g, 2, &[0.1, -0.1, 0.0, 0.0, 0.2, -0.2]);
     let x_raw = DMatrix::from_fn(g, n, |r, c| x[(r, c)] * log_delta[(r, batch[c])].exp());
     let data_raw = data_from(dir.path(), "planted_raw", &x_raw);
-    let params = GroupFoldParams {
+    let params = StateAwareBatchFoldParams {
         pseudo_count: 0.0,
         min_units: 1,
-        ..GroupFoldParams::default()
+        ..StateAwareBatchFoldParams::default()
     };
-    let gf = matched_fold(&data_raw, &batch, &coords, &node, 3, &log_delta, &params).expect("fold");
+    let gf = estimate_fold_by_cross_batch_matching(
+        &data_raw, &batch, &coords, &node, 3, &log_delta, &params,
+    )
+    .expect("fold");
     // a fold is a rate ratio up to the column's scale (the division trait
     // matches it): compare across genes, relative to gene 0
     for (k, fk) in f.iter().enumerate() {
@@ -159,7 +174,8 @@ fn split_conserves_reads_and_keeps_loops_apart() {
     let x = DMatrix::from_row_slice(2, 3, &[5.0, 0.0, 7.0, 3.0, 9.0, 1.0]);
     let pairs = vec![(0, 1), (1, 2), (0, 2)];
     let data = data_from(dir.path(), "split", &x);
-    let trip = split_reads_over_pair_units(&data, &pairs, None).expect("split");
+    let trip = split_cell_reads_over_pair_units_without_double_counting(&data, &pairs, None)
+        .expect("split");
     let mut units = DMatrix::<f32>::zeros(2, pairs.len() + 3);
     for &(g, u, v) in &trip {
         units[(g as usize, u as usize)] += v;
@@ -184,7 +200,7 @@ fn split_conserves_reads_and_keeps_loops_apart() {
 fn pair_nodes_climb_until_they_span() {
     // tree: ((0,1),(2,3))
     let pts = DMatrix::from_row_slice(4, 1, &[0.0, 0.1, 10.0, 10.1]);
-    let t = CoarseTree::ward(&pts);
+    let t = CoarseGroupWardTree::build(&pts);
     let p01 = t.parent[0];
     // 4 pairs (0,0) in batches 0/1 → spans at (0,0); 2 pairs (0,1) in batch 0
     // and 2 pairs (1,1) in batch 1 → each fails, both climb to (p01,p01) and span
@@ -201,7 +217,7 @@ fn pair_nodes_climb_until_they_span() {
     ];
     let label = vec![0, 1, 0, 1, 0, 0, 1, 1, 0];
     let r = rule(vec![], 2, 2, 2);
-    let (node, keys, _) = settle_pair_nodes(&t, at, &label, &r);
+    let (node, keys, _) = place_cell_pairs_on_sample_tree(&t, at, &label, &r);
     assert_eq!(node[0], Some(keys[&(0, 0)]));
     assert!(node[..4].iter().all(|n| *n == node[0]));
     let up = Some(keys[&(p01, p01)]);
@@ -209,7 +225,7 @@ fn pair_nodes_climb_until_they_span() {
     assert_eq!(node[8], None);
 
     // a lone pair never spans: it climbs to the root and keeps δ
-    let (node, keys, _) = settle_pair_nodes(&t, vec![Some((2, 3))], &[0], &r);
+    let (node, keys, _) = place_cell_pairs_on_sample_tree(&t, vec![Some((2, 3))], &[0], &r);
     assert_eq!(node, vec![None]);
     assert!(keys.is_empty());
 }
@@ -260,7 +276,7 @@ fn nn_chain_ward_matches_greedy_ward() {
     }
     want.sort();
 
-    let t = CoarseTree::ward(&pts);
+    let t = CoarseGroupWardTree::build(&pts);
     let mut got: Vec<Vec<usize>> = (k..t.parent.len())
         .map(|nd| {
             let mut l = t.leaves(nd);
@@ -285,7 +301,7 @@ fn graph_ward_matches_exact_on_a_complete_graph_and_splits_clumps() {
         (s >> 33) as f32 / (1u64 << 31) as f32
     };
     let pts = DMatrix::from_fn(k, dim, |r, _| next() + if r < 15 { 0.0 } else { 50.0 });
-    let clusters = |t: &CoarseTree| {
+    let clusters = |t: &CoarseGroupWardTree| {
         let mut c: Vec<Vec<usize>> = (k..t.parent.len())
             .map(|nd| {
                 let mut l = t.leaves(nd);
@@ -296,13 +312,13 @@ fn graph_ward_matches_exact_on_a_complete_graph_and_splits_clumps() {
         c.sort();
         c
     };
-    let exact = CoarseTree::ward_exact(&pts);
+    let exact = CoarseGroupWardTree::build_exact_by_nearest_neighbour_chain(&pts);
     assert_eq!(
-        clusters(&CoarseTree::ward_on_knn_graph(&pts, k - 1)),
+        clusters(&CoarseGroupWardTree::build_along_knn_graph(&pts, k - 1)),
         clusters(&exact)
     );
 
-    let sparse = CoarseTree::ward_on_knn_graph(&pts, 3);
+    let sparse = CoarseGroupWardTree::build_along_knn_graph(&pts, 3);
     let (a, b) = sparse.children[sparse.root].expect("root splits");
     let mut sides = [sparse.leaves(a), sparse.leaves(b)];
     sides.iter_mut().for_each(|x| x.sort_unstable());
@@ -319,12 +335,12 @@ fn matched_fold_refuses_zero_neighbours() {
     let dir = tempfile::tempdir().expect("tempdir");
     let x = DMatrix::from_row_slice(1, 2, &[3.0, 4.0]);
     let data = data_from(dir.path(), "knn0", &x);
-    let params = GroupFoldParams {
+    let params = StateAwareBatchFoldParams {
         knn: 0,
-        ..GroupFoldParams::default()
+        ..StateAwareBatchFoldParams::default()
     };
     let coords = DMatrix::zeros(1, 2);
-    let r = matched_fold(
+    let r = estimate_fold_by_cross_batch_matching(
         &data,
         &[0, 1],
         &coords,
@@ -342,10 +358,10 @@ fn matched_fold_refuses_zero_neighbours() {
 fn pairs_reaching_the_root_in_different_rounds_are_pooled() {
     // tree: (((0,1),2),3); root's children are (0,1,2) and 3
     let pts = DMatrix::from_row_slice(4, 1, &[0.0, 0.1, 1.0, 10.0]);
-    let t = CoarseTree::ward(&pts);
+    let t = CoarseGroupWardTree::build(&pts);
     // pair (3,3) in batch 0: one climb to (root,root); pair (0,0) in batch 1: three climbs
     let at = vec![Some((3, 3)), Some((0, 0))];
     let r = rule(vec![], 2, 2, 1);
-    let (node, _, _) = settle_pair_nodes(&t, at, &[0, 1], &r);
+    let (node, _, _) = place_cell_pairs_on_sample_tree(&t, at, &[0, 1], &r);
     assert!(node[0].is_some() && node[0] == node[1], "{node:?}");
 }
