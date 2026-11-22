@@ -289,9 +289,7 @@ impl CoarseGroupWardTree {
         // internal ids grow in merge order, so children come first
         for node in self.n_groups..self.parent.len() {
             if let Some((a, b)) = self.children[node] {
-                for l in 0..n_labels {
-                    sub[node][l] = sub[a][l] + sub[b][l];
-                }
+                sub[node] = sub[a].iter().zip(&sub[b]).map(|(x, y)| x + y).collect();
             }
         }
         sub
