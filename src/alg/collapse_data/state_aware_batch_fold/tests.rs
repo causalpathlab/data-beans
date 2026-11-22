@@ -491,3 +491,128 @@ fn split_refuses_fractional_counts() {
         split_cell_reads_over_pair_units_without_double_counting(&data, &[(0, 1)], None).is_err()
     );
 }
+
+/// Two link profiles, 2 pb pairs per (profile, batch); each pb its own
+/// coarsest group and its own cell-predicted fold. `planted` multiplies gene
+/// 0 by 2 in profile 0's batch-1 pb pairs only, after the cell part (a
+/// pair-level effect the cells do not predict). Returns the sums already
+/// divided by the cell-predicted fold, and each pb's profile.
+fn link_state_fixture(dir: &std::path::Path, planted: bool) -> (PseudobulkSums, Vec<usize>) {
+    use super::link_state_pair_fold::divide_pb_pairs_by_cell_predicted_fold;
+    let mu = [[20.0f32, 2.0, 5.0], [2.0, 20.0, 5.0]];
+    let (mut cols, mut batch, mut profile, mut xy) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (p, m) in mu.iter().enumerate() {
+        for i in 0..4 {
+            let b = i % 2;
+            let mut c = m.to_vec();
+            if planted && p == 0 && b == 1 {
+                c[0] *= 2.0;
+            }
+            cols.push(c);
+            batch.push(b);
+            profile.push(p);
+            xy.push(p as f32 * 10.0 + i as f32 * 0.01);
+        }
+    }
+    let n = cols.len();
+    // a different cell-predicted log fold per pb, applied to the counts
+    let cell_predicted = DMatrix::from_fn(3, n, |g, c| 0.1 * (g as f32 + 1.0) * (c as f32 - 3.5));
+    let x = DMatrix::from_fn(3, n, |g, c| cols[c][g] * cell_predicted[(g, c)].exp());
+    let data = data_from(dir, if planted { "link_planted" } else { "link_null" }, &x);
+    let coords = DMatrix::from_fn(1, n, |_, c| xy[c]);
+    let mut sums = units_as_pseudobulks(&data, &batch, &coords);
+    divide_pb_pairs_by_cell_predicted_fold(&mut sums, &cell_predicted, &(0..n).collect::<Vec<_>>());
+    (sums, profile)
+}
+
+fn link_state_params() -> StateAwareBatchFoldParams {
+    StateAwareBatchFoldParams {
+        pseudo_count: 0.0,
+        min_pseudobulks: 1,
+        knn: 2,
+        ..StateAwareBatchFoldParams::default()
+    }
+}
+
+/// With no pair-level effect, dividing by the cell-predicted fold leaves
+/// nothing batch-specific: every link state's leftover is 0, and no link
+/// state mixes the two profiles.
+#[test]
+fn link_state_leftover_is_zero_without_a_pair_level_effect() {
+    use super::link_state_pair_fold::link_states_and_leftover_fold;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut sums, profile) = link_state_fixture(dir.path(), false);
+    let (state, n_states, leftover) =
+        link_states_and_leftover_fold(&mut sums, 2, &rule(2, 2, 1), &link_state_params())
+            .expect("link states");
+    assert!(n_states >= 2, "{n_states} link states");
+    for s in 0..n_states {
+        let ps: Vec<usize> = (0..state.len())
+            .filter(|&pb| state[pb] == Some(s))
+            .map(|pb| profile[pb])
+            .collect();
+        assert!(
+            ps.windows(2).all(|w| w[0] == w[1]),
+            "link state {s} mixes profiles: {ps:?}"
+        );
+    }
+    let max = leftover.iter().fold(0f32, |m, v| m.max(v.abs()));
+    assert!(max < 1e-4, "leftover {max}");
+}
+
+/// A pair-level effect the cells do not predict stays in the leftover of its
+/// own link states, and only there.
+#[test]
+fn link_state_leftover_recovers_a_planted_pair_level_effect() {
+    use super::link_state_pair_fold::link_states_and_leftover_fold;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut sums, profile) = link_state_fixture(dir.path(), true);
+    let (state, n_states, leftover) =
+        link_states_and_leftover_fold(&mut sums, 2, &rule(2, 2, 1), &link_state_params())
+            .expect("link states");
+    let mut seen = [false; 2];
+    for s in 0..n_states {
+        let p = profile[(0..state.len())
+            .find(|&pb| state[pb] == Some(s))
+            .expect("member")];
+        seen[p] = true;
+        // gene 0 against gene 2, batch 1 against batch 0: the planted log 2 (× n/(n−1))
+        let col = |b: usize| leftover.column(s * 2 + b);
+        let contrast = (col(1)[0] - col(1)[2]) - (col(0)[0] - col(0)[2]);
+        if p == 0 {
+            assert!(contrast > 0.5, "link state {s} (planted): {contrast}");
+        } else {
+            let max = leftover
+                .columns(s * 2, 2)
+                .iter()
+                .fold(0f32, |m, v| m.max(v.abs()));
+            assert!(max < 1e-4, "link state {s} (not planted): {max}");
+        }
+    }
+    assert_eq!(seen, [true, true], "both profiles have a link state");
+}
+
+/// An unseen pair's fold is its endpoints' cell-predicted fold plus the
+/// nearest link state's leftover.
+#[test]
+fn unseen_pair_takes_the_nearest_link_state() {
+    use super::link_state_pair_fold::LinkStateDecomposition;
+    let cells = StateAwareBatchFold {
+        n_batches: 1,
+        n_nodes: 2,
+        log_fold: DMatrix::from_row_slice(1, 2, &[1.0, 3.0]),
+        log_delta: DMatrix::from_row_slice(1, 1, &[0.0]),
+        node_of_unit: vec![],
+    };
+    let d = LinkStateDecomposition {
+        link_state_of_pair: vec![],
+        n_link_states: 2,
+        leftover_log_fold: DMatrix::from_row_slice(1, 2, &[0.5, -0.5]),
+        link_state_centroids: DMatrix::from_row_slice(1, 2, &[0.0, 10.0]),
+    };
+    let at = nalgebra::DVector::from_vec(vec![9.0f32]);
+    // cell-predicted: (1 + 3) / 2 = 2; nearest link state 1: −0.5
+    let f = d.unseen_pair_log_fold(&cells, Some(0), Some(1), at.as_view(), 0);
+    assert!((f[0] - 1.5).abs() < 1e-6, "{}", f[0]);
+}

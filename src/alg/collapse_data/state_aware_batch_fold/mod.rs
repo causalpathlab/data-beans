@@ -12,9 +12,11 @@
 //!   and pinto's baselines. Entry: [`estimate_state_aware_batch_fold_over_samples`].
 //! * **cell pairs** ([`cell_pair_units`]): pair units built once
 //!   ([`build_cell_pair_units`]: every cell's reads split once over its pairs
-//!   and a self-loop), collapsed on their own for the pair δ, then placed on
-//!   the **samples kind's tree** by their endpoints. For link-based methods,
-//!   where the pair is the unit. Entry:
+//!   and a self-loop), collapsed on their own for the pair δ. A pair's state
+//!   ([`PairStates`]) is its **link state** by default (learned from the
+//!   pair after its cells' fold is divided out, [`link_state_pair_fold`]),
+//!   or its **endpoint states** (placed on the samples kind's tree by its
+//!   endpoints). For link-based methods, where the pair is the unit. Entry:
 //!   [`collapse_cell_pairs_and_estimate_state_aware_batch_fold`]; it needs the
 //!   samples kind's result first.
 //!
@@ -35,6 +37,7 @@
 pub mod cell_pair_units;
 pub mod coarse_group_ward_tree;
 pub mod cross_batch_matched_fold;
+pub mod link_state_pair_fold;
 pub(crate) mod local_swap_refinement;
 pub(crate) mod pseudobulk_sums;
 pub mod sample_units;
@@ -42,11 +45,12 @@ pub(crate) mod top_down_fold;
 
 pub use cell_pair_units::{
     build_cell_pair_units, collapse_cell_pairs_and_estimate_state_aware_batch_fold,
-    split_cell_reads_over_pair_units_without_double_counting, CellPairBatchFold, CellPairUnits,
-    PairNodeOfEndpointNodes,
+    split_cell_reads_over_pair_units_without_double_counting, CellPairBatchFold,
+    CellPairFoldParams, CellPairUnits, PairNodeOfEndpointNodes, PairStates,
 };
 pub use coarse_group_ward_tree::{CoarseGroupWardTree, EXACT_WARD_MAX_GROUPS};
 pub use cross_batch_matched_fold::{MatchingCoordinates, StateAwareBatchFold};
+pub use link_state_pair_fold::{cell_predicted_pair_log_fold, LinkStateDecomposition};
 pub use sample_units::{
     estimate_state_aware_batch_fold_over_samples, SampleBatchFold, UnseenPlacement,
 };
