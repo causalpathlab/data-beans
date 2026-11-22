@@ -129,7 +129,7 @@ fn node_log_compositions_in_batch(
 /// (scored against each node's composition in `b`, the counts as read) or
 /// `None` for one it never saw (scored against `log_mean` alone, the counts
 /// divided by that batch's own δ). `None` for a column with no read.
-pub(crate) fn place_by_composition(
+pub fn place_by_composition(
     counts: &[Vec<(usize, f32)>],
     batch: &[Option<usize>],
     log_mean: &DMatrix<f32>,

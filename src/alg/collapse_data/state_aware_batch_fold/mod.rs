@@ -39,7 +39,7 @@ pub mod coarse_group_ward_tree;
 pub mod cross_batch_matched_fold;
 pub mod link_state_pair_fold;
 pub(crate) mod local_swap_refinement;
-pub(crate) mod node_compositions;
+pub mod node_compositions;
 pub(crate) mod pseudobulk_sums;
 pub mod sample_units;
 pub(crate) mod top_down_fold;
@@ -52,6 +52,7 @@ pub use cell_pair_units::{
 pub use coarse_group_ward_tree::{CoarseGroupWardTree, EXACT_WARD_MAX_GROUPS};
 pub use cross_batch_matched_fold::{MatchingCoordinates, StateAwareBatchFold};
 pub use link_state_pair_fold::{cell_predicted_pair_log_fold, LinkStateDecomposition};
+pub use node_compositions::place_by_composition;
 pub use sample_units::{
     estimate_state_aware_batch_fold_over_samples, SampleBatchFold, UnseenPlacement,
 };
