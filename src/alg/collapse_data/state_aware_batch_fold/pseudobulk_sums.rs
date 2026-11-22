@@ -110,6 +110,10 @@ impl PseudobulkSums {
     pub(crate) fn len(&self) -> usize {
         self.counts.len()
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
 }
 
 use std::ops::AddAssign;

@@ -60,19 +60,20 @@ impl SampleBatchFold {
     /// batch the fit saw (the counts as read; its fold is then the node's
     /// column in `b`), `None` for one it never saw (the counts divided by
     /// that batch's own δ, which is also all it is divided by). `None` for
-    /// a unit with no read.
+    /// a unit with no read. Errors on a length mismatch, a batch or gene
+    /// outside the fit.
     pub fn place_unseen_samples(
         &self,
         counts: &[Vec<(usize, f32)>],
         batch: &[Option<usize>],
-    ) -> Vec<Option<UnseenPlacement>> {
-        place_by_composition(
+    ) -> anyhow::Result<Vec<Option<UnseenPlacement>>> {
+        Ok(place_by_composition(
             counts,
             batch,
             &self.node_log_mean_composition,
             &self.fold.log_fold,
             self.fold.n_batches,
-        )
+        )?
         .into_iter()
         .map(|k| {
             k.map(|k| UnseenPlacement {
@@ -80,7 +81,7 @@ impl SampleBatchFold {
                 tree_node: self.tree_node_of_node[k],
             })
         })
-        .collect()
+        .collect())
     }
 }
 

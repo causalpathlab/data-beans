@@ -289,7 +289,11 @@ pub enum PairStates {
     LinkStates,
     /// The pair of its endpoints' nodes on the samples kind's tree, climbing
     /// while that key does not span batches. A pair's fold = the pair δ + its
-    /// endpoint key's matched fold.
+    /// endpoint key's matched fold. A pair is only as well placed as its
+    /// cells: where a donor's cells sit in a node of their own, its pairs do
+    /// too, and that donor's state is folded away with the batch (pinto's
+    /// donor-confounded sim: cage's donor gap about 0.26, against about 0
+    /// with link states). The 0.13.1 behaviour, kept as an option.
     EndpointStates,
 }
 
@@ -326,6 +330,11 @@ impl CellPairBatchFold {
         a: usize,
         b: usize,
     ) -> Option<usize> {
+        debug_assert_eq!(
+            self.pair_states,
+            PairStates::EndpointStates,
+            "place_unseen_pair is for endpoint states; link states place through LinkStateDecomposition"
+        );
         let mut key = (a.min(b), a.max(b));
         loop {
             if let Some(&k) = self.pair_node_of_endpoint_nodes.get(&key) {

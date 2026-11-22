@@ -616,8 +616,12 @@ fn unseen_units_are_placed_by_composition() {
         &log_mean,
         &log_fold,
         2,
-    );
+    )
+    .expect("placement");
     assert_eq!(placed, vec![Some(0), Some(1), Some(1), Some(0), None]);
+    // a batch the fit never had, or one batch entry short, is refused
+    assert!(place_by_composition(&[vec![(0, 1.0)]], &[Some(2)], &log_mean, &log_fold, 2).is_err());
+    assert!(place_by_composition(&[vec![(0, 1.0)]], &[], &log_mean, &log_fold, 2).is_err());
 }
 
 /// An unseen pair's fold in a batch the fit saw: its endpoints'
@@ -640,9 +644,39 @@ fn unseen_pair_fold_is_cell_predicted_plus_its_link_state_leftover() {
         link_state_log_mean_composition: DMatrix::zeros(1, 2),
     };
     // cell-predicted: (1 + 3) / 2 = 2; link state 1's leftover: −0.5
-    let f = d.unseen_pair_log_fold(&cells, Some(0), Some(1), Some(1), 0);
+    let f = d
+        .unseen_pair_log_fold(&cells, Some(0), Some(1), Some(1), 0)
+        .expect("in the fit");
     assert!((f[0] - 1.5).abs() < 1e-6, "{}", f[0]);
     // no link state: the cell-predicted fold alone; an endpoint without a node: δ
-    let f = d.unseen_pair_log_fold(&cells, None, Some(1), None, 0);
+    let f = d
+        .unseen_pair_log_fold(&cells, None, Some(1), None, 0)
+        .expect("in the fit");
     assert!((f[0] - 1.5).abs() < 1e-6, "{}", f[0]);
+    // a batch past the fit's is refused, not read from the next link state
+    assert!(d
+        .unseen_pair_log_fold(&cells, None, None, Some(0), 1)
+        .is_err());
+}
+
+/// No within-batch pair (every pair crosses batches, or none at all): no link
+/// state, no Ward tree built, no error.
+#[test]
+fn link_states_of_no_pair_are_none() {
+    use super::link_state_pair_fold::link_states_and_leftover_fold;
+    let mut sums = PseudobulkSums {
+        counts: vec![],
+        batch: vec![],
+        span_label: vec![],
+        coarsest: vec![],
+        coords: DMatrix::zeros(1, 0),
+        of_unit: vec![],
+        n_genes: 3,
+    };
+    let (state, n_states, leftover) =
+        link_states_and_leftover_fold(&mut sums, 2, &rule(2, 2, 1), &link_state_params())
+            .expect("no pairs");
+    assert!(state.is_empty());
+    assert_eq!(n_states, 0);
+    assert_eq!(leftover.shape(), (3, 0));
 }

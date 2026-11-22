@@ -135,7 +135,32 @@ pub fn place_by_composition(
     log_mean: &DMatrix<f32>,
     log_fold: &DMatrix<f32>,
     n_batches: usize,
-) -> Vec<Option<usize>> {
+) -> anyhow::Result<Vec<Option<usize>>> {
+    let n_genes = log_mean.nrows();
+    anyhow::ensure!(
+        counts.len() == batch.len(),
+        "placement: {} count columns, {} batch entries",
+        counts.len(),
+        batch.len()
+    );
+    anyhow::ensure!(
+        log_fold.nrows() == n_genes && log_fold.ncols() == log_mean.ncols() * n_batches,
+        "placement: fold {}×{}, compositions {n_genes}×{} over {n_batches} batches",
+        log_fold.nrows(),
+        log_fold.ncols(),
+        log_mean.ncols()
+    );
+    if let Some(b) = batch.iter().flatten().find(|&&b| b >= n_batches) {
+        anyhow::bail!("placement: batch {b}, the fit saw {n_batches}");
+    }
+    if let Some(g) = counts
+        .iter()
+        .flatten()
+        .map(|&(g, _)| g)
+        .find(|&g| g >= n_genes)
+    {
+        anyhow::bail!("placement: gene {g}, the fit has {n_genes}");
+    }
     let mut log_p_of: rustc_hash::FxHashMap<Option<usize>, DMatrix<f32>> = Default::default();
     for &b in batch {
         log_p_of.entry(b).or_insert_with(|| match b {
@@ -143,9 +168,9 @@ pub fn place_by_composition(
             None => log_mean.clone(),
         });
     }
-    counts
+    Ok(counts
         .par_iter()
         .zip(batch)
         .map(|(x, b)| best_column_by_composition(x, &log_p_of[b]))
-        .collect()
+        .collect())
 }

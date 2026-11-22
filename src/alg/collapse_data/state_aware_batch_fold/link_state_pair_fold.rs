@@ -57,15 +57,17 @@ pub struct LinkStateDecomposition {
 impl LinkStateDecomposition {
     /// Each unseen pair's link state, by composition
     /// ([`super::node_compositions`]): `counts[p]`, the pair's pooled counts
-    /// split as the fit split them, divided by its cell-predicted fold
-    /// ([`cell_predicted_pair_log_fold`]). `batch[p]`: `Some(b)` for a batch
-    /// the fit saw, `None` for one it never saw (its counts also divided by
-    /// that batch's own δ). `None` for a pair with no read.
+    /// split as the fit split them. `batch[p]`: `Some(b)` for a batch the fit
+    /// saw, the counts divided by the pair's cell-predicted fold in `b`
+    /// ([`cell_predicted_pair_log_fold`]); `None` for one it never saw, the
+    /// counts divided by that batch's own δ alone (it has no cell-predicted
+    /// fold). `None` for a pair with no read. Errors as
+    /// [`place_by_composition`] does.
     pub fn place_unseen_pairs(
         &self,
         counts: &[Vec<(usize, f32)>],
         batch: &[Option<usize>],
-    ) -> Vec<Option<usize>> {
+    ) -> anyhow::Result<Vec<Option<usize>>> {
         place_by_composition(
             counts,
             batch,
@@ -77,7 +79,8 @@ impl LinkStateDecomposition {
 
     /// An unseen pair's log fold in a batch the fit saw: the cell-predicted
     /// fold of its endpoints' cell nodes `a`, `b` (the samples kind's nodes;
-    /// `None`: δ), plus its link state's leftover (`None`: none).
+    /// `None`: δ), plus its link state's leftover (`None`: none). Errors on a
+    /// batch, node or link state outside the fit.
     pub fn unseen_pair_log_fold(
         &self,
         cells: &StateAwareBatchFold,
@@ -85,12 +88,26 @@ impl LinkStateDecomposition {
         b: Option<usize>,
         link_state: Option<usize>,
         batch: usize,
-    ) -> DVector<f32> {
+    ) -> anyhow::Result<DVector<f32>> {
+        anyhow::ensure!(
+            batch < self.n_batches && cells.n_batches == self.n_batches,
+            "unseen pair: batch {batch}; the link states have {} batches, the cells {}",
+            self.n_batches,
+            cells.n_batches
+        );
+        if let Some(k) = [a, b].into_iter().flatten().find(|&k| k >= cells.n_nodes) {
+            anyhow::bail!("unseen pair: cell node {k}, the fit has {}", cells.n_nodes);
+        }
         let mut f = cell_predicted_pair_log_fold(cells, a, b, batch);
         if let Some(s) = link_state {
+            anyhow::ensure!(
+                s < self.n_link_states,
+                "unseen pair: link state {s}, the fit has {}",
+                self.n_link_states
+            );
             f.add_assign(self.leftover_log_fold.column(s * self.n_batches + batch));
         }
-        f
+        Ok(f)
     }
 }
 
@@ -131,6 +148,9 @@ pub(crate) fn link_states_and_leftover_fold(
     rule: &BatchSpanningRule,
     params: &StateAwareBatchFoldParams,
 ) -> anyhow::Result<(Vec<Option<usize>>, usize, DMatrix<f32>)> {
+    if sums.is_empty() {
+        return Ok((Vec::new(), 0, DMatrix::zeros(sums.n_genes, 0)));
+    }
     let present: Vec<Option<usize>> = sums.coarsest.iter().map(|&g| Some(g)).collect();
     let (dense, distinct) = compact_present(&present);
     sums.coarsest = dense.into_iter().map(|g| g.expect("present")).collect();
@@ -158,7 +178,10 @@ pub(crate) fn link_states_and_leftover_fold(
 /// The fold over pair units already built and collapsed, by link states:
 /// see the module docs. Returns the fold (nodes = (link state, endpoints'
 /// cell nodes), over the kept pairs) and the decomposition (over the kept
-/// pairs; the caller re-indexes it to the given pairs).
+/// pairs; the caller re-indexes it to the given pairs). The fold's
+/// `log_delta` is the pair units' δ, the base of pairs in no node (across
+/// batches); a within-batch pair's base is its cell-predicted fold, where an
+/// endpoint in no cell node carries the cells' δ.
 pub(crate) fn estimate_fold_over_pair_units_by_link_states(
     pu: &CellPairUnits,
     groups: &CollapsePseudobulks<'_>,
