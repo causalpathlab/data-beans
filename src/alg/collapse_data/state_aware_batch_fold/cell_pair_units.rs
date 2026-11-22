@@ -16,7 +16,7 @@ use super::cross_batch_matched_fold::{
     StateAwareBatchFold,
 };
 use super::sample_units::SampleBatchFold;
-use super::{BatchSpanningRule, StateAwareBatchFoldParams};
+use super::{pseudobulks_per_label, BatchSpanningRule, StateAwareBatchFoldParams};
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
 use log::{info, warn};
@@ -109,6 +109,7 @@ pub type PairNodeOfEndpointNodes = HashMap<(usize, usize), usize>;
 pub(crate) fn place_cell_pairs_on_sample_tree(
     tree: &CoarseGroupWardTree,
     mut at: Vec<Option<(usize, usize)>>,
+    pb_pair_of_pair: &[usize],
     label_of_pair: &[usize],
     rule: &BatchSpanningRule,
 ) -> (Vec<Option<usize>>, PairNodeOfEndpointNodes, usize) {
@@ -120,11 +121,21 @@ pub(crate) fn place_cell_pairs_on_sample_tree(
     // pairs that reached the root in any round, pooled and tested once at the end
     let mut at_root: Vec<usize> = Vec::new();
     while !pending.is_empty() {
-        let mut count: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
+        // each key's pb pairs per label
+        let mut pairs_at: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
         for &p in &pending {
-            let k = key(at[p].expect("pending pair"));
-            count.entry(k).or_insert_with(|| vec![0; rule.n_labels])[label_of_pair[p]] += 1;
+            pairs_at
+                .entry(key(at[p].expect("pending pair")))
+                .or_default()
+                .push(p);
         }
+        let count: HashMap<(usize, usize), Vec<usize>> = pairs_at
+            .into_iter()
+            .map(|(k, ps)| {
+                let c = pseudobulks_per_label(ps, pb_pair_of_pair, label_of_pair, rule.n_labels);
+                (k, c)
+            })
+            .collect();
         let mut next = Vec::new();
         for &p in &pending {
             let (a, b) = at[p].expect("pending pair");
@@ -145,10 +156,12 @@ pub(crate) fn place_cell_pairs_on_sample_tree(
         pending = next;
         rounds += 1;
     }
-    let mut root_count = vec![0; rule.n_labels];
-    for &p in &at_root {
-        root_count[label_of_pair[p]] += 1;
-    }
+    let root_count = pseudobulks_per_label(
+        at_root.iter().copied(),
+        pb_pair_of_pair,
+        label_of_pair,
+        rule.n_labels,
+    );
     if !at_root.is_empty() && rule.spans(&root_count) {
         let n = pair_node_of_endpoint_nodes.len();
         let n = *pair_node_of_endpoint_nodes
@@ -325,9 +338,18 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
         .first()
         .ok_or_else(|| anyhow::anyhow!("the pair-unit collapse gave no level"))?
         .clone();
+    // and its coarsest pb pair: a pair node's size is counted in these
+    let coarsest_pb_pair_of_unit = collapsed
+        .cell_to_pb_per_level
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("the pair-unit collapse gave no level"))?
+        .clone();
     let (fold, pair_node_of_endpoint_nodes) = estimate_fold_over_split_pair_units(
         &units,
-        &pb_pair_of_unit,
+        &PairUnitPseudobulks {
+            matched: &pb_pair_of_unit,
+            counted: &coarsest_pb_pair_of_unit,
+        },
         cell_pairs,
         &batch_of_cell,
         sample_fold,
@@ -350,6 +372,13 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
     })
 }
 
+/// Each pair unit's pb pairs: the finest (what the fold matches) and the
+/// coarsest (what a pair node's size is counted in).
+pub(crate) struct PairUnitPseudobulks<'a> {
+    pub matched: &'a [usize],
+    pub counted: &'a [usize],
+}
+
 /// The fold over pair units already split and collapsed: each pair placed on
 /// the samples kind's tree by its endpoints, then matched pair to pair.
 ///
@@ -358,7 +387,7 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
 /// * `log_delta`: δ of the pair-unit collapse, log, genes × batches.
 pub(crate) fn estimate_fold_over_split_pair_units(
     units: &SparseIoVec,
-    pb_pair_of_unit: &[usize],
+    pb_pairs: &PairUnitPseudobulks<'_>,
     pairs: &[(usize, usize)],
     cell_batch: &[usize],
     cells: &SampleBatchFold,
@@ -377,8 +406,13 @@ pub(crate) fn estimate_fold_over_split_pair_units(
         .iter()
         .map(|&(u, v)| Some((cells.tree_node_of_unit[u]?, cells.tree_node_of_unit[v]?)))
         .collect();
-    let (pair_node, pair_node_of_endpoint_nodes, rounds) =
-        place_cell_pairs_on_sample_tree(tree, at, &label_of_pair, &span_pair);
+    let (pair_node, pair_node_of_endpoint_nodes, rounds) = place_cell_pairs_on_sample_tree(
+        tree,
+        at,
+        &pb_pairs.counted[..e],
+        &label_of_pair,
+        &span_pair,
+    );
     let mut node: Vec<Option<usize>> = vec![None; n_units];
     node[..e].copy_from_slice(&pair_node);
     let n_nodes = pair_node_of_endpoint_nodes.len();
@@ -410,7 +444,7 @@ pub(crate) fn estimate_fold_over_split_pair_units(
             n_nodes,
             base_log_fold: &delta_as_base_of_every_node(log_delta, n_nodes),
             log_delta,
-            pseudobulk_of_unit: Some(pb_pair_of_unit),
+            pseudobulk_of_unit: Some(pb_pairs.matched),
         },
         params,
     )?;

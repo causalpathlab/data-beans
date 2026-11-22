@@ -53,8 +53,6 @@ pub use sample_units::{estimate_state_aware_batch_fold_over_samples, SampleBatch
 pub const DEFAULT_FOLD_KNN: usize = 10;
 /// Pseudo-count on both sides of a node's fold ratio (shrinks thin genes to 1).
 pub const DEFAULT_FOLD_PSEUDO_COUNT: f32 = 10.0;
-/// Units a batch (or donor) needs inside a node to count as spanned.
-pub const DEFAULT_MIN_UNITS: usize = 20;
 /// Principal components of the projection the matching runs in.
 pub(crate) const COORD_DIM: usize = 30;
 /// Principal components of the group profiles Ward links.
@@ -64,11 +62,14 @@ pub(crate) const PROFILE_DIM: usize = 20;
 pub struct StateAwareBatchFoldParams {
     pub knn: usize,
     pub pseudo_count: f32,
-    pub min_units: usize,
+    /// Pseudobulks a batch (or donor) needs inside a node to count as
+    /// spanned: the matching's `knn` by default, so every node can draw a
+    /// full match from each batch it spans.
+    pub min_pseudobulks: usize,
     /// Label a node must span, per column of the samples (cells): a donor,
     /// say. `None` spans batches.
     pub span_labels: Option<Vec<usize>>,
-    /// Distinct labels a node must span, each with `min_units` units. `None`:
+    /// Distinct labels a node must span, each with `min_pseudobulks` pseudobulks. `None`:
     /// half the batches (rounded up), or 2 donors when `span_labels` is set.
     pub min_spans: Option<usize>,
     pub block_size: Option<usize>,
@@ -79,7 +80,7 @@ impl Default for StateAwareBatchFoldParams {
         Self {
             knn: DEFAULT_FOLD_KNN,
             pseudo_count: DEFAULT_FOLD_PSEUDO_COUNT,
-            min_units: DEFAULT_MIN_UNITS,
+            min_pseudobulks: DEFAULT_FOLD_KNN,
             span_labels: None,
             min_spans: None,
             block_size: None,
@@ -92,7 +93,7 @@ pub(crate) struct BatchSpanningRule {
     pub(crate) label: Vec<usize>,
     pub(crate) n_labels: usize,
     pub(crate) min_spans: usize,
-    pub(crate) min_units: usize,
+    pub(crate) min_pseudobulks: usize,
 }
 
 impl BatchSpanningRule {
@@ -113,14 +114,34 @@ impl BatchSpanningRule {
             label,
             n_labels,
             min_spans: params.min_spans.unwrap_or(default_min).max(2),
-            min_units: params.min_units,
+            min_pseudobulks: params.min_pseudobulks,
         })
     }
 
-    /// Does a node holding `count[label]` units span enough labels?
+    /// Does a node holding `count[label]` pseudobulks span enough labels?
     pub(crate) fn spans(&self, count: &[usize]) -> bool {
-        count.iter().filter(|&&c| c >= self.min_units).count() >= self.min_spans
+        count.iter().filter(|&&c| c >= self.min_pseudobulks).count() >= self.min_spans
     }
+}
+
+/// Distinct pseudobulks of each label among the units `members`
+/// (`pseudobulk_of_unit[u]`, `label[u]`): what [`BatchSpanningRule::spans`]
+/// reads.
+pub(crate) fn pseudobulks_per_label(
+    members: impl IntoIterator<Item = usize>,
+    pseudobulk_of_unit: &[usize],
+    label: &[usize],
+    n_labels: usize,
+) -> Vec<usize> {
+    let seen: rustc_hash::FxHashSet<(usize, usize)> = members
+        .into_iter()
+        .map(|u| (pseudobulk_of_unit[u], label[u]))
+        .collect();
+    let mut count = vec![0usize; n_labels];
+    for (_, l) in seen {
+        count[l] += 1;
+    }
+    count
 }
 
 #[cfg(test)]

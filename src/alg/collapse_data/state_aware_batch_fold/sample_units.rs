@@ -10,7 +10,7 @@ use super::cross_batch_matched_fold::{
 };
 use super::local_swap_refinement::{refine_nodes_by_local_swaps, SwapInputs};
 use super::top_down_fold::{estimate_fold_top_down, TopDownInputs};
-use super::{BatchSpanningRule, StateAwareBatchFoldParams, PROFILE_DIM};
+use super::{pseudobulks_per_label, BatchSpanningRule, StateAwareBatchFoldParams, PROFILE_DIM};
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
 use log::{info, warn};
@@ -149,10 +149,16 @@ pub fn estimate_state_aware_batch_fold_over_samples(
         &prof,
         PROFILE_DIM.min(n_groups.saturating_sub(1)).max(1),
     ));
-    let mut group_count = vec![vec![0usize; rule.n_labels]; n_groups];
+    // each coarse group's coarsest pseudobulks per label: a node's size is
+    // counted in the collapse's coarsest pseudobulks
+    let mut units_of_group = vec![Vec::new(); n_groups];
     for c in 0..n {
-        group_count[coarse_group[c]][rule.label[c]] += 1;
+        units_of_group[coarse_group[c]].push(c);
     }
+    let group_count: Vec<Vec<usize>> = units_of_group
+        .into_iter()
+        .map(|units| pseudobulks_per_label(units, coarse_group, &rule.label, rule.n_labels))
+        .collect();
     let node_of_group = tree.cut_where_both_children_span_batches(&group_count, &rule);
     let tree_node_of_unit: Vec<Option<usize>> =
         coarse_group.iter().map(|&k| node_of_group[k]).collect();
@@ -166,8 +172,8 @@ pub fn estimate_state_aware_batch_fold_over_samples(
     }
     if n_nodes == 0 {
         warn!(
-            "group fold: no node spans {} of {} labels with {} units each; keeping δ",
-            rule.min_spans, rule.n_labels, rule.min_units
+            "group fold: no node spans {} of {} labels with {} pseudobulks each; keeping δ",
+            rule.min_spans, rule.n_labels, rule.min_pseudobulks
         );
     } else {
         info!("group fold: {n_groups} coarse groups cut into {n_nodes} nodes");
@@ -198,6 +204,7 @@ pub fn estimate_state_aware_batch_fold_over_samples(
             batch,
             coords: &coords,
             rule: &rule,
+            pseudobulk_of_unit: coarse_group,
             block_size: params.block_size,
         },
         node,

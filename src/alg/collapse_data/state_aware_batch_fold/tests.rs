@@ -43,13 +43,13 @@ fn rule(
     label: Vec<usize>,
     n_labels: usize,
     min_spans: usize,
-    min_units: usize,
+    min_pseudobulks: usize,
 ) -> BatchSpanningRule {
     BatchSpanningRule {
         label,
         n_labels,
         min_spans,
-        min_units,
+        min_pseudobulks,
     }
 }
 
@@ -132,7 +132,7 @@ fn matched_fold_recovers_a_planted_fold() {
     let data_raw = data_from(dir.path(), "planted_raw", &x_raw);
     let params = StateAwareBatchFoldParams {
         pseudo_count: 0.0,
-        min_units: 1,
+        min_pseudobulks: 1,
         ..StateAwareBatchFoldParams::default()
     };
     let gf = estimate_fold_by_cross_batch_matching(
@@ -227,7 +227,8 @@ fn pair_nodes_climb_until_they_span() {
     ];
     let label = vec![0, 1, 0, 1, 0, 0, 1, 1, 0];
     let r = rule(vec![], 2, 2, 2);
-    let (node, keys, _) = place_cell_pairs_on_sample_tree(&t, at, &label, &r);
+    let (node, keys, _) =
+        place_cell_pairs_on_sample_tree(&t, at, &(0..9).collect::<Vec<_>>(), &label, &r);
     assert_eq!(node[0], Some(keys[&(0, 0)]));
     assert!(node[..4].iter().all(|n| *n == node[0]));
     let up = Some(keys[&(p01, p01)]);
@@ -235,7 +236,7 @@ fn pair_nodes_climb_until_they_span() {
     assert_eq!(node[8], None);
 
     // a lone pair never spans: it climbs to the root and keeps δ
-    let (node, keys, _) = place_cell_pairs_on_sample_tree(&t, vec![Some((2, 3))], &[0], &r);
+    let (node, keys, _) = place_cell_pairs_on_sample_tree(&t, vec![Some((2, 3))], &[0], &[0], &r);
     assert_eq!(node, vec![None]);
     assert!(keys.is_empty());
 }
@@ -377,7 +378,7 @@ fn pairs_reaching_the_root_in_different_rounds_are_pooled() {
     // pair (3,3) in batch 0: one climb to (root,root); pair (0,0) in batch 1: three climbs
     let at = vec![Some((3, 3)), Some((0, 0))];
     let r = rule(vec![], 2, 2, 1);
-    let (node, _, _) = place_cell_pairs_on_sample_tree(&t, at, &[0, 1], &r);
+    let (node, _, _) = place_cell_pairs_on_sample_tree(&t, at, &[0, 1], &[0, 1], &r);
     assert!(node[0].is_some() && node[0] == node[1], "{node:?}");
 }
 
@@ -408,7 +409,7 @@ fn local_swaps_move_a_misplaced_cell_to_its_state() {
         label: batch.clone(),
         n_labels: 2,
         min_spans: 2,
-        min_units: 1,
+        min_pseudobulks: 1,
     };
     let fold = StateAwareBatchFold {
         n_batches: 2,
@@ -417,11 +418,13 @@ fn local_swaps_move_a_misplaced_cell_to_its_state() {
         log_delta: DMatrix::zeros(2, 2),
         node_of_unit: node.clone(),
     };
+    let own_pseudobulk: Vec<usize> = (0..n).collect();
     let inp = SwapInputs {
         data: &data,
         batch: &batch,
         coords: &coords,
         rule: &rule,
+        pseudobulk_of_unit: &own_pseudobulk,
         block_size: None,
     };
     let refined = refine_nodes_by_local_swaps(&inp, node, 2, &fold).expect("swaps");

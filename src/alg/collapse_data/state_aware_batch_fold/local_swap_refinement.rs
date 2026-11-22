@@ -18,7 +18,7 @@
 //! own.) A move that leaves a node no longer spanning batches is undone.
 
 use super::cross_batch_matched_fold::StateAwareBatchFold;
-use super::BatchSpanningRule;
+use super::{pseudobulks_per_label, BatchSpanningRule};
 use crate::sparse_io_vector::SparseIoVec;
 use legume_numeric::matrix::knn::knn_rows;
 use legume_numeric::matrix::utils::generate_minibatch_intervals;
@@ -41,6 +41,8 @@ pub(crate) struct SwapInputs<'a> {
     /// Matching coordinates, components × samples.
     pub coords: &'a DMatrix<f32>,
     pub rule: &'a BatchSpanningRule,
+    /// Each sample's pseudobulk: nodes must keep spanning in pseudobulks.
+    pub pseudobulk_of_unit: &'a [usize],
     pub block_size: Option<usize>,
 }
 
@@ -178,12 +180,23 @@ pub(crate) fn refine_nodes_by_local_swaps(
         // undo the moves out of every node they would leave not spanning
         let mut undone = 0usize;
         for _ in 0..MAX_REPAIR_ROUNDS {
-            let mut count = vec![vec![0usize; inp.rule.n_labels]; n_nodes];
+            let mut units_of_node = vec![Vec::new(); n_nodes];
             for (u, k) in node.iter().enumerate() {
                 if let Some(k) = *k {
-                    count[k][inp.rule.label[u]] += 1;
+                    units_of_node[k].push(u);
                 }
             }
+            let count: Vec<Vec<usize>> = units_of_node
+                .into_iter()
+                .map(|units| {
+                    pseudobulks_per_label(
+                        units,
+                        inp.pseudobulk_of_unit,
+                        &inp.rule.label,
+                        inp.rule.n_labels,
+                    )
+                })
+                .collect();
             let failing: Vec<bool> = count.iter().map(|c| !inp.rule.spans(c)).collect();
             let mut changed = false;
             for &(u, _) in &moves {
