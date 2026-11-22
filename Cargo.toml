@@ -59,8 +59,8 @@ sim = ["alg"]
 hdf5 = ["dep:hdf5", "ndarray"]
 
 [dependencies]
-legume-numeric = { version = "0.10", default-features = false, features = ["matrix", "param"] }
-legume-genomic-types = "0.6"
+legume-numeric = { version = "0.10.11", default-features = false, features = ["matrix", "param"] }
+legume-genomic-types = "0.6.2"
 
 anyhow = "1.0"
 clap = { version = "4.5.20", features = ["derive"] }
