@@ -15,6 +15,7 @@ use super::cross_batch_matched_fold::{
     StateAwareBatchFold,
 };
 use super::local_swap_refinement::refine_nodes_by_local_swaps;
+use super::node_compositions::{node_log_mean_compositions, place_by_composition};
 use super::pseudobulk_sums::{sum_by_pseudobulk, PseudobulkKeys, PseudobulkSums};
 use super::top_down_fold::estimate_fold_top_down;
 use super::{
@@ -23,7 +24,6 @@ use super::{
 use crate::sparse_io_vector::SparseIoVec;
 use log::{info, warn};
 use nalgebra::DMatrix;
-use std::ops::AddAssign;
 
 /// The samples kind's result: the fold, plus what places an unseen unit.
 #[derive(Clone, Debug)]
@@ -36,9 +36,10 @@ pub struct SampleBatchFold {
     pub coord_map: MatchingCoordinates,
     /// Each unit's matching coordinates (components × units).
     pub coords: DMatrix<f32>,
-    /// components × n_nodes: the mean coordinates of each node's units; an
-    /// unseen unit takes its nearest node.
-    pub node_centroids: DMatrix<f32>,
+    /// genes × n_nodes: each node's fold-corrected composition, log; an
+    /// unseen unit takes the node that explains its counts best
+    /// ([`Self::place_unseen_samples`]).
+    pub node_log_mean_composition: DMatrix<f32>,
     /// Each node's (dense id's) node in `tree`.
     pub tree_node_of_node: Vec<usize>,
 }
@@ -52,26 +53,34 @@ pub struct UnseenPlacement {
 }
 
 impl SampleBatchFold {
-    /// Where unseen units land, from their projections `proj` (dims ×
-    /// units): each takes the nearest node centroid.
-    pub fn place_unseen_samples(&self, proj: &DMatrix<f32>) -> Vec<Option<UnseenPlacement>> {
-        let z = self.coord_map.apply(proj);
-        (0..z.ncols())
-            .map(|c| {
-                (0..self.node_centroids.ncols())
-                    .map(|k| {
-                        (
-                            k,
-                            (z.column(c) - self.node_centroids.column(k)).norm_squared(),
-                        )
-                    })
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(k, _)| UnseenPlacement {
-                        node: k,
-                        tree_node: self.tree_node_of_node[k],
-                    })
+    /// Where unseen units land, by composition
+    /// ([`super::node_compositions`]): each count column (`(gene, count)`
+    /// pairs; a caller may add a unit's spatial neighbours' counts to steady
+    /// it) on the node that explains it best. `batch[c]`: `Some(b)` for a
+    /// batch the fit saw (the counts as read; its fold is then the node's
+    /// column in `b`), `None` for one it never saw (the counts divided by
+    /// that batch's own δ, which is also all it is divided by). `None` for
+    /// a unit with no read.
+    pub fn place_unseen_samples(
+        &self,
+        counts: &[Vec<(usize, f32)>],
+        batch: &[Option<usize>],
+    ) -> Vec<Option<UnseenPlacement>> {
+        place_by_composition(
+            counts,
+            batch,
+            &self.node_log_mean_composition,
+            &self.fold.log_fold,
+            self.fold.n_batches,
+        )
+        .into_iter()
+        .map(|k| {
+            k.map(|k| UnseenPlacement {
+                node: k,
+                tree_node: self.tree_node_of_node[k],
             })
-            .collect()
+        })
+        .collect()
     }
 }
 
@@ -234,17 +243,7 @@ pub fn estimate_state_aware_batch_fold_over_samples(
         .iter()
         .map(|k| k.map(|k| tree_node_of_node[k]))
         .collect();
-    let mut node_centroids = DMatrix::<f32>::zeros(coords.nrows(), n_nodes);
-    let mut cnt = vec![0f32; n_nodes];
-    for (c, k) in node_of_unit.iter().enumerate() {
-        if let Some(k) = *k {
-            node_centroids.column_mut(k).add_assign(coords.column(c));
-            cnt[k] += 1.0;
-        }
-    }
-    for (k, &c) in cnt.iter().enumerate() {
-        node_centroids.column_mut(k).scale_mut(1.0 / c.max(1.0));
-    }
+    let node_log_mean_composition = node_log_mean_compositions(&sums, &node, n_nodes, &log_fold);
 
     Ok(SampleBatchFold {
         fold: StateAwareBatchFold {
@@ -258,7 +257,7 @@ pub fn estimate_state_aware_batch_fold_over_samples(
         tree_node_of_unit,
         coord_map,
         coords,
-        node_centroids,
+        node_log_mean_composition,
         tree_node_of_node,
     })
 }

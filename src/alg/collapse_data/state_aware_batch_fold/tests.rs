@@ -593,10 +593,37 @@ fn link_state_leftover_recovers_a_planted_pair_level_effect() {
     assert_eq!(seen, [true, true], "both profiles have a link state");
 }
 
-/// An unseen pair's fold is its endpoints' cell-predicted fold plus the
-/// nearest link state's leftover.
+/// Placement by composition: a unit lands in the node whose composition
+/// explains it; a batch the fit saw is scored with that batch's fold, one it
+/// never saw against the fold-corrected composition alone; an empty unit
+/// lands nowhere.
 #[test]
-fn unseen_pair_takes_the_nearest_link_state() {
+fn unseen_units_are_placed_by_composition() {
+    use super::node_compositions::place_by_composition;
+    // node 0 expresses gene 0, node 1 gene 1 (fold-corrected, log)
+    let log_mean =
+        DMatrix::from_row_slice(2, 2, &[0.9f32.ln(), 0.1f32.ln(), 0.1f32.ln(), 0.9f32.ln()]);
+    // 2 batches (column node · 2 + batch); in batch 1, node 1's fold
+    // multiplies gene 0 by e^5, so node 1 there is 94 % gene 0 (node 0: 90 %)
+    // and a gene-0-only unit read in batch 1 is better explained by node 1
+    let mut log_fold = DMatrix::<f32>::zeros(2, 4);
+    log_fold[(0, 3)] = 5.0;
+    let heavy0 = vec![(0usize, 10.0f32)];
+    let heavy1 = vec![(0usize, 1.0f32), (1, 9.0)];
+    let placed = place_by_composition(
+        &[heavy0.clone(), heavy1, heavy0.clone(), heavy0, vec![]],
+        &[Some(0), Some(0), Some(1), None, Some(0)],
+        &log_mean,
+        &log_fold,
+        2,
+    );
+    assert_eq!(placed, vec![Some(0), Some(1), Some(1), Some(0), None]);
+}
+
+/// An unseen pair's fold in a batch the fit saw: its endpoints'
+/// cell-predicted fold plus its link state's leftover.
+#[test]
+fn unseen_pair_fold_is_cell_predicted_plus_its_link_state_leftover() {
     use super::link_state_pair_fold::LinkStateDecomposition;
     let cells = StateAwareBatchFold {
         n_batches: 1,
@@ -609,10 +636,13 @@ fn unseen_pair_takes_the_nearest_link_state() {
         link_state_of_pair: vec![],
         n_link_states: 2,
         leftover_log_fold: DMatrix::from_row_slice(1, 2, &[0.5, -0.5]),
-        link_state_centroids: DMatrix::from_row_slice(1, 2, &[0.0, 10.0]),
+        n_batches: 1,
+        link_state_log_mean_composition: DMatrix::zeros(1, 2),
     };
-    let at = nalgebra::DVector::from_vec(vec![9.0f32]);
-    // cell-predicted: (1 + 3) / 2 = 2; nearest link state 1: −0.5
-    let f = d.unseen_pair_log_fold(&cells, Some(0), Some(1), at.as_view(), 0);
+    // cell-predicted: (1 + 3) / 2 = 2; link state 1's leftover: −0.5
+    let f = d.unseen_pair_log_fold(&cells, Some(0), Some(1), Some(1), 0);
+    assert!((f[0] - 1.5).abs() < 1e-6, "{}", f[0]);
+    // no link state: the cell-predicted fold alone; an endpoint without a node: δ
+    let f = d.unseen_pair_log_fold(&cells, None, Some(1), None, 0);
     assert!((f[0] - 1.5).abs() < 1e-6, "{}", f[0]);
 }

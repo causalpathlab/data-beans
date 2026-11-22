@@ -26,13 +26,14 @@
 use super::cell_pair_units::{sum_cell_pairs_into_pseudobulks, CellPairUnits};
 use super::cross_batch_matched_fold::{estimate_fold_on_pseudobulks, StateAwareBatchFold};
 use super::local_swap_refinement::refine_nodes_by_local_swaps;
+use super::node_compositions::{node_log_mean_compositions, place_by_composition};
 use super::pseudobulk_sums::PseudobulkSums;
 use super::sample_units::{
     cut_nodes_from_ward_tree_over_coarsest_groups, NodesCutFromWardTree, SampleBatchFold,
 };
 use super::{compact_present, BatchSpanningRule, CollapsePseudobulks, StateAwareBatchFoldParams};
 use log::{info, warn};
-use nalgebra::{DMatrix, DVector, DVectorView};
+use nalgebra::{DMatrix, DVector};
 use std::ops::AddAssign;
 
 /// The link states' part of a cell-pair fold, for predict and for reading
@@ -46,40 +47,48 @@ pub struct LinkStateDecomposition {
     /// genes × (n_link_states · batches): each link state's leftover log
     /// fold over the cell-predicted fold, centred over its batches.
     pub leftover_log_fold: DMatrix<f32>,
-    /// components × n_link_states: each link state's mean pb-pair matching
-    /// coordinates; an unseen pair takes the nearest.
-    pub link_state_centroids: DMatrix<f32>,
+    pub n_batches: usize,
+    /// genes × n_link_states: each link state's composition, log, on counts
+    /// divided by their cell-predicted fold and their leftover; an unseen
+    /// pair takes the link state that explains its counts best.
+    pub link_state_log_mean_composition: DMatrix<f32>,
 }
 
 impl LinkStateDecomposition {
-    /// The link state nearest an unseen pair at matching coordinates `coords`
-    /// (the mean of its endpoints'); `None` when there is none.
-    pub fn nearest_link_state(&self, coords: DVectorView<'_, f32>) -> Option<usize> {
-        (0..self.n_link_states)
-            .map(|k| {
-                (
-                    k,
-                    (coords - self.link_state_centroids.column(k)).norm_squared(),
-                )
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(k, _)| k)
+    /// Each unseen pair's link state, by composition
+    /// ([`super::node_compositions`]): `counts[p]`, the pair's pooled counts
+    /// split as the fit split them, divided by its cell-predicted fold
+    /// ([`cell_predicted_pair_log_fold`]). `batch[p]`: `Some(b)` for a batch
+    /// the fit saw, `None` for one it never saw (its counts also divided by
+    /// that batch's own δ). `None` for a pair with no read.
+    pub fn place_unseen_pairs(
+        &self,
+        counts: &[Vec<(usize, f32)>],
+        batch: &[Option<usize>],
+    ) -> Vec<Option<usize>> {
+        place_by_composition(
+            counts,
+            batch,
+            &self.link_state_log_mean_composition,
+            &self.leftover_log_fold,
+            self.n_batches,
+        )
     }
 
-    /// An unseen pair's log fold in `batch`: the cell-predicted fold of its
-    /// endpoints' cell nodes `a`, `b` (the samples kind's nodes; `None`: δ)
-    /// plus the leftover of the link state nearest `coords`.
+    /// An unseen pair's log fold in a batch the fit saw: the cell-predicted
+    /// fold of its endpoints' cell nodes `a`, `b` (the samples kind's nodes;
+    /// `None`: δ), plus its link state's leftover (`None`: none).
     pub fn unseen_pair_log_fold(
         &self,
         cells: &StateAwareBatchFold,
         a: Option<usize>,
         b: Option<usize>,
-        coords: DVectorView<'_, f32>,
+        link_state: Option<usize>,
         batch: usize,
     ) -> DVector<f32> {
         let mut f = cell_predicted_pair_log_fold(cells, a, b, batch);
-        if let Some(k) = self.nearest_link_state(coords) {
-            f.add_assign(self.leftover_log_fold.column(k * cells.n_batches + batch));
+        if let Some(s) = link_state {
+            f.add_assign(self.leftover_log_fold.column(s * self.n_batches + batch));
         }
         f
     }
@@ -215,17 +224,8 @@ pub(crate) fn estimate_fold_over_pair_units_by_link_states(
     if n_states == 0 {
         warn!("cell-pair batch fold: no link state spans enough batches; pairs keep their cell-predicted fold");
     }
-    let mut centroids = DMatrix::<f32>::zeros(sums.coords.nrows(), n_states);
-    let mut n_pb = vec![0f32; n_states];
-    for (pb, s) in state_of_pb.iter().enumerate() {
-        if let Some(s) = *s {
-            centroids.column_mut(s).add_assign(sums.coords.column(pb));
-            n_pb[s] += 1.0;
-        }
-    }
-    for (s, &c) in n_pb.iter().enumerate() {
-        centroids.column_mut(s).scale_mut(1.0 / c.max(1.0));
-    }
+    let link_state_log_mean_composition =
+        node_log_mean_compositions(&sums, &state_of_pb, n_states, &leftover);
 
     // the fold's nodes: (link state or none, endpoints' cell nodes)
     let node_key_of_pb: Vec<Option<(Option<usize>, usize)>> = (0..sums.len())
@@ -265,7 +265,8 @@ pub(crate) fn estimate_fold_over_pair_units_by_link_states(
             link_state_of_pair,
             n_link_states: n_states,
             leftover_log_fold: leftover,
-            link_state_centroids: centroids,
+            n_batches: nb,
+            link_state_log_mean_composition,
         },
     ))
 }

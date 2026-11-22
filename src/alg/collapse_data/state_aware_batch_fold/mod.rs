@@ -39,6 +39,7 @@ pub mod coarse_group_ward_tree;
 pub mod cross_batch_matched_fold;
 pub mod link_state_pair_fold;
 pub(crate) mod local_swap_refinement;
+pub(crate) mod node_compositions;
 pub(crate) mod pseudobulk_sums;
 pub mod sample_units;
 pub(crate) mod top_down_fold;
