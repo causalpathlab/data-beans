@@ -15,7 +15,7 @@ use super::coarse_group_ward_tree::CoarseGroupWardTree;
 use super::cross_batch_matched_fold::{
     delta_as_base_of_every_node, estimate_fold_on_pseudobulks, StateAwareBatchFold,
 };
-use super::pseudobulk_sums::{sum_by_pseudobulk, PseudobulkKeys};
+use super::pseudobulk_sums::{sum_by_pseudobulk, PseudobulkKeys, PseudobulkSums};
 use super::sample_units::SampleBatchFold;
 use super::{BatchSpanningRule, CollapsePseudobulks, StateAwareBatchFoldParams};
 use crate::sparse_io_vector::SparseIoVec;
@@ -409,6 +409,56 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
     })
 }
 
+/// The kept pairs' units read once into pb pairs, keyed (finest pair group,
+/// batch, `slot_of_pair[k]`): a pair whose slot is `None` is left out, and so
+/// is every self-loop. Each pb pair carries its pairs' span label
+/// (`label_of_pair`), coarsest pair group and mean matching coordinates (a
+/// pair's: the mean of its endpoints' `cell_coords`, components × cells).
+pub(crate) fn sum_cell_pairs_into_pseudobulks(
+    pu: &CellPairUnits,
+    groups: &CollapsePseudobulks<'_>,
+    batch_of_cell: &[usize],
+    label_of_pair: &[usize],
+    cell_coords: &DMatrix<f32>,
+    slot_of_pair: &[Option<usize>],
+) -> anyhow::Result<PseudobulkSums> {
+    let pairs = &pu.kept_pairs;
+    let e = pairs.len();
+    let n_units = pu.units.num_columns();
+    anyhow::ensure!(
+        label_of_pair.len() == e && slot_of_pair.len() == e,
+        "pb pairs: one label and slot per kept pair"
+    );
+    let mut coords = DMatrix::<f32>::zeros(cell_coords.nrows(), n_units);
+    for (k, &(u, v)) in pairs.iter().enumerate() {
+        coords
+            .column_mut(k)
+            .copy_from(&((cell_coords.column(u) + cell_coords.column(v)) * 0.5));
+    }
+    let batch: Vec<usize> = (0..n_units)
+        .map(|k| if k < e { batch_of_cell[pairs[k].0] } else { 0 })
+        .collect();
+    let span: Vec<usize> = (0..n_units)
+        .map(|k| if k < e { label_of_pair[k] } else { 0 })
+        .collect();
+    let key: Vec<Option<(usize, usize, usize)>> = (0..n_units)
+        .map(|k| {
+            let slot = *slot_of_pair.get(k)?;
+            slot.map(|s| (groups.finest[k], batch[k], s))
+        })
+        .collect();
+    sum_by_pseudobulk(
+        &pu.units,
+        &PseudobulkKeys {
+            key: &key,
+            batch: &batch,
+            span_label: &span,
+            coarsest: groups.coarsest,
+            coords: &coords,
+        },
+    )
+}
+
 /// The fold over pair units already built and collapsed: each kept pair
 /// placed on the samples kind's tree by its endpoints, its pb pairs summed
 /// once, and the fold matched pb pair to pb pair per pair node.
@@ -423,7 +473,6 @@ pub(crate) fn estimate_fold_over_pair_units(
     let nb = log_delta.ncols();
     let pairs = &pu.kept_pairs;
     let e = pairs.len();
-    let n_units = pu.units.num_columns();
     let (label_of_cell, n_labels) = params.span_labels_of_samples(batch_of_cell, nb)?;
     let rule = BatchSpanningRule::new(params, n_labels);
     let label_of_pair: Vec<usize> = pairs.iter().map(|&(u, _)| label_of_cell[u]).collect();
@@ -448,33 +497,13 @@ pub(crate) fn estimate_fold_over_pair_units(
     }
 
     // the pair units read once: pb pairs (finest pair group in one batch and pair node)
-    let mut coords = DMatrix::<f32>::zeros(cells.coords.nrows(), n_units);
-    for (k, &(u, v)) in pairs.iter().enumerate() {
-        coords
-            .column_mut(k)
-            .copy_from(&((cells.coords.column(u) + cells.coords.column(v)) * 0.5));
-    }
-    let batch: Vec<usize> = (0..n_units)
-        .map(|k| if k < e { batch_of_cell[pairs[k].0] } else { 0 })
-        .collect();
-    let span: Vec<usize> = (0..n_units)
-        .map(|k| if k < e { label_of_pair[k] } else { 0 })
-        .collect();
-    let key: Vec<Option<(usize, usize, usize)>> = (0..n_units)
-        .map(|k| {
-            let node = *pair_node.get(k)?;
-            node.map(|n| (groups.finest[k], batch[k], n))
-        })
-        .collect();
-    let sums = sum_by_pseudobulk(
-        &pu.units,
-        &PseudobulkKeys {
-            key: &key,
-            batch: &batch,
-            span_label: &span,
-            coarsest: groups.coarsest,
-            coords: &coords,
-        },
+    let sums = sum_cell_pairs_into_pseudobulks(
+        pu,
+        groups,
+        batch_of_cell,
+        &label_of_pair,
+        &cells.coords,
+        &pair_node,
     )?;
     let mut node_of_pb = vec![None; sums.len()];
     for (k, pb) in sums.of_unit.iter().enumerate() {

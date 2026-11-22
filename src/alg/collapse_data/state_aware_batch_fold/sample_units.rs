@@ -98,6 +98,48 @@ fn delta_adjusted_group_profiles(
     prof
 }
 
+/// The nodes a Ward tree over the coarsest groups is cut into.
+pub(crate) struct NodesCutFromWardTree {
+    pub(crate) tree: CoarseGroupWardTree,
+    /// Each pseudobulk's node (dense id), `None` when its group is in no
+    /// spanning node.
+    pub(crate) node_of_pb: Vec<Option<usize>>,
+    /// Each node's (dense id's) node in `tree`.
+    pub(crate) tree_node_of_node: Vec<usize>,
+}
+
+/// Coarsening, shared by the samples kind and the cell pairs' link states:
+/// Ward over the `n_groups` coarsest groups of `sums` (`sums.coarsest`, ids
+/// `0..n_groups`), on their pooled profiles divided by `log_delta`, cut
+/// where both children span `rule` (counted in each pseudobulk's
+/// `(coarsest group, span label)`).
+pub(crate) fn cut_nodes_from_ward_tree_over_coarsest_groups(
+    sums: &PseudobulkSums,
+    n_groups: usize,
+    log_delta: &DMatrix<f32>,
+    rule: &BatchSpanningRule,
+) -> anyhow::Result<NodesCutFromWardTree> {
+    let prof = delta_adjusted_group_profiles(sums, n_groups, log_delta);
+    let tree = CoarseGroupWardTree::build(&row_scores(
+        &prof,
+        PROFILE_DIM.min(n_groups.saturating_sub(1)).max(1),
+    )?)?;
+    let mut members = vec![Vec::new(); n_groups];
+    for pb in 0..sums.len() {
+        members[sums.coarsest[pb]].push((sums.coarsest[pb], sums.span_label[pb]));
+    }
+    let group_count: Vec<Vec<usize>> = members.into_iter().map(|m| rule.count(m)).collect();
+    let node_of_group = tree.cut_where_both_children_span_batches(&group_count, rule);
+    let tree_node_of_pb: Vec<Option<usize>> =
+        sums.coarsest.iter().map(|&g| node_of_group[g]).collect();
+    let (node_of_pb, tree_node_of_node) = compact_present(&tree_node_of_pb);
+    Ok(NodesCutFromWardTree {
+        tree,
+        node_of_pb,
+        tree_node_of_node,
+    })
+}
+
 /// The samples kind: a fold per (gene × node × batch) over columns as they are.
 ///
 /// * `pseudobulks`: each column's finest and coarsest collapse group
@@ -144,20 +186,11 @@ pub fn estimate_state_aware_batch_fold_over_samples(
 
     // coarsen: Ward over the coarsest groups, cut where both children span
     let n_groups = pseudobulks.coarsest.iter().max().map_or(0, |&m| m + 1);
-    let prof = delta_adjusted_group_profiles(&sums, n_groups, log_delta);
-    let tree = CoarseGroupWardTree::build(&row_scores(
-        &prof,
-        PROFILE_DIM.min(n_groups.saturating_sub(1)).max(1),
-    )?)?;
-    let mut members = vec![Vec::new(); n_groups];
-    for pb in 0..sums.len() {
-        members[sums.coarsest[pb]].push((sums.coarsest[pb], sums.span_label[pb]));
-    }
-    let group_count: Vec<Vec<usize>> = members.into_iter().map(|m| rule.count(m)).collect();
-    let node_of_group = tree.cut_where_both_children_span_batches(&group_count, &rule);
-    let tree_node_of_pb: Vec<Option<usize>> =
-        sums.coarsest.iter().map(|&g| node_of_group[g]).collect();
-    let (node, tree_node_of_node) = compact_present(&tree_node_of_pb);
+    let NodesCutFromWardTree {
+        tree,
+        node_of_pb: node,
+        tree_node_of_node,
+    } = cut_nodes_from_ward_tree_over_coarsest_groups(&sums, n_groups, log_delta, &rule)?;
     let n_nodes = tree_node_of_node.len();
     if n_nodes == 0 {
         warn!(
