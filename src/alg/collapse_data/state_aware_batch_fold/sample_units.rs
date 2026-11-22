@@ -15,6 +15,7 @@ use super::cross_batch_matched_fold::{
     StateAwareBatchFold,
 };
 use super::local_swap_refinement::refine_nodes_by_local_swaps;
+use super::node_compositions::{node_log_mean_compositions, place_by_composition};
 use super::pseudobulk_sums::{sum_by_pseudobulk, PseudobulkKeys, PseudobulkSums};
 use super::top_down_fold::estimate_fold_top_down;
 use super::{
@@ -23,7 +24,6 @@ use super::{
 use crate::sparse_io_vector::SparseIoVec;
 use log::{info, warn};
 use nalgebra::DMatrix;
-use std::ops::AddAssign;
 
 /// The samples kind's result: the fold, plus what places an unseen unit.
 #[derive(Clone, Debug)]
@@ -33,12 +33,12 @@ pub struct SampleBatchFold {
     /// Each unit's node in `tree`, `None` when it keeps δ. The cell-pair kind
     /// reads this for its endpoints.
     pub tree_node_of_unit: Vec<Option<usize>>,
-    pub coord_map: MatchingCoordinates,
     /// Each unit's matching coordinates (components × units).
     pub coords: DMatrix<f32>,
-    /// components × n_nodes: the mean coordinates of each node's units; an
-    /// unseen unit takes its nearest node.
-    pub node_centroids: DMatrix<f32>,
+    /// genes × n_nodes: each node's fold-corrected composition, log; an
+    /// unseen unit takes the node that explains its counts best
+    /// ([`Self::place_unseen_samples`]).
+    pub node_log_mean_composition: DMatrix<f32>,
     /// Each node's (dense id's) node in `tree`.
     pub tree_node_of_node: Vec<usize>,
 }
@@ -52,26 +52,35 @@ pub struct UnseenPlacement {
 }
 
 impl SampleBatchFold {
-    /// Where unseen units land, from their projections `proj` (dims ×
-    /// units): each takes the nearest node centroid.
-    pub fn place_unseen_samples(&self, proj: &DMatrix<f32>) -> Vec<Option<UnseenPlacement>> {
-        let z = self.coord_map.apply(proj);
-        (0..z.ncols())
-            .map(|c| {
-                (0..self.node_centroids.ncols())
-                    .map(|k| {
-                        (
-                            k,
-                            (z.column(c) - self.node_centroids.column(k)).norm_squared(),
-                        )
-                    })
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(k, _)| UnseenPlacement {
-                        node: k,
-                        tree_node: self.tree_node_of_node[k],
-                    })
+    /// Where unseen units land, by composition
+    /// ([`super::node_compositions`]): each count column (`(gene, count)`
+    /// pairs; a caller may add a unit's spatial neighbours' counts to steady
+    /// it) on the node that explains it best. `batch[c]`: `Some(b)` for a
+    /// batch the fit saw (the counts as read; its fold is then the node's
+    /// column in `b`), `None` for one it never saw (the counts divided by
+    /// that batch's own δ, which is also all it is divided by). `None` for
+    /// a unit with no read. Errors on a length mismatch, a batch or gene
+    /// outside the fit.
+    pub fn place_unseen_samples(
+        &self,
+        counts: &[Vec<(usize, f32)>],
+        batch: &[Option<usize>],
+    ) -> anyhow::Result<Vec<Option<UnseenPlacement>>> {
+        Ok(place_by_composition(
+            counts,
+            batch,
+            &self.node_log_mean_composition,
+            &self.fold.log_fold,
+            self.fold.n_batches,
+        )?
+        .into_iter()
+        .map(|k| {
+            k.map(|k| UnseenPlacement {
+                node: k,
+                tree_node: self.tree_node_of_node[k],
             })
-            .collect()
+        })
+        .collect())
     }
 }
 
@@ -96,6 +105,48 @@ fn delta_adjusted_group_profiles(
         }
     }
     prof
+}
+
+/// The nodes a Ward tree over the coarsest groups is cut into.
+pub(crate) struct NodesCutFromWardTree {
+    pub(crate) tree: CoarseGroupWardTree,
+    /// Each pseudobulk's node (dense id), `None` when its group is in no
+    /// spanning node.
+    pub(crate) node_of_pb: Vec<Option<usize>>,
+    /// Each node's (dense id's) node in `tree`.
+    pub(crate) tree_node_of_node: Vec<usize>,
+}
+
+/// Coarsening, shared by the samples kind and the cell pairs' link states:
+/// Ward over the `n_groups` coarsest groups of `sums` (`sums.coarsest`, ids
+/// `0..n_groups`), on their pooled profiles divided by `log_delta`, cut
+/// where both children span `rule` (counted in each pseudobulk's
+/// `(coarsest group, span label)`).
+pub(crate) fn cut_nodes_from_ward_tree_over_coarsest_groups(
+    sums: &PseudobulkSums,
+    n_groups: usize,
+    log_delta: &DMatrix<f32>,
+    rule: &BatchSpanningRule,
+) -> anyhow::Result<NodesCutFromWardTree> {
+    let prof = delta_adjusted_group_profiles(sums, n_groups, log_delta);
+    let tree = CoarseGroupWardTree::build(&row_scores(
+        &prof,
+        PROFILE_DIM.min(n_groups.saturating_sub(1)).max(1),
+    )?)?;
+    let mut members = vec![Vec::new(); n_groups];
+    for pb in 0..sums.len() {
+        members[sums.coarsest[pb]].push((sums.coarsest[pb], sums.span_label[pb]));
+    }
+    let group_count: Vec<Vec<usize>> = members.into_iter().map(|m| rule.count(m)).collect();
+    let node_of_group = tree.cut_where_both_children_span_batches(&group_count, rule);
+    let tree_node_of_pb: Vec<Option<usize>> =
+        sums.coarsest.iter().map(|&g| node_of_group[g]).collect();
+    let (node_of_pb, tree_node_of_node) = compact_present(&tree_node_of_pb);
+    Ok(NodesCutFromWardTree {
+        tree,
+        node_of_pb,
+        tree_node_of_node,
+    })
 }
 
 /// The samples kind: a fold per (gene × node × batch) over columns as they are.
@@ -144,20 +195,11 @@ pub fn estimate_state_aware_batch_fold_over_samples(
 
     // coarsen: Ward over the coarsest groups, cut where both children span
     let n_groups = pseudobulks.coarsest.iter().max().map_or(0, |&m| m + 1);
-    let prof = delta_adjusted_group_profiles(&sums, n_groups, log_delta);
-    let tree = CoarseGroupWardTree::build(&row_scores(
-        &prof,
-        PROFILE_DIM.min(n_groups.saturating_sub(1)).max(1),
-    )?)?;
-    let mut members = vec![Vec::new(); n_groups];
-    for pb in 0..sums.len() {
-        members[sums.coarsest[pb]].push((sums.coarsest[pb], sums.span_label[pb]));
-    }
-    let group_count: Vec<Vec<usize>> = members.into_iter().map(|m| rule.count(m)).collect();
-    let node_of_group = tree.cut_where_both_children_span_batches(&group_count, &rule);
-    let tree_node_of_pb: Vec<Option<usize>> =
-        sums.coarsest.iter().map(|&g| node_of_group[g]).collect();
-    let (node, tree_node_of_node) = compact_present(&tree_node_of_pb);
+    let NodesCutFromWardTree {
+        tree,
+        node_of_pb: node,
+        tree_node_of_node,
+    } = cut_nodes_from_ward_tree_over_coarsest_groups(&sums, n_groups, log_delta, &rule)?;
     let n_nodes = tree_node_of_node.len();
     if n_nodes == 0 {
         warn!(
@@ -201,17 +243,7 @@ pub fn estimate_state_aware_batch_fold_over_samples(
         .iter()
         .map(|k| k.map(|k| tree_node_of_node[k]))
         .collect();
-    let mut node_centroids = DMatrix::<f32>::zeros(coords.nrows(), n_nodes);
-    let mut cnt = vec![0f32; n_nodes];
-    for (c, k) in node_of_unit.iter().enumerate() {
-        if let Some(k) = *k {
-            node_centroids.column_mut(k).add_assign(coords.column(c));
-            cnt[k] += 1.0;
-        }
-    }
-    for (k, &c) in cnt.iter().enumerate() {
-        node_centroids.column_mut(k).scale_mut(1.0 / c.max(1.0));
-    }
+    let node_log_mean_composition = node_log_mean_compositions(&sums, &node, n_nodes, &log_fold);
 
     Ok(SampleBatchFold {
         fold: StateAwareBatchFold {
@@ -223,9 +255,8 @@ pub fn estimate_state_aware_batch_fold_over_samples(
         },
         tree,
         tree_node_of_unit,
-        coord_map,
         coords,
-        node_centroids,
+        node_log_mean_composition,
         tree_node_of_node,
     })
 }

@@ -7,15 +7,23 @@
 //!    out here, its reads going to its cells' other units, and keeps δ.
 //! 2. Those units collapsed on their own (self-loops a stratum of their
 //!    own): the pair δ, and the pb pairs (finest and coarsest groups).
-//! 3. Each pair placed on the **sample** tree ([`super::sample_units`]) by
-//!    its endpoints' nodes; a key that does not span batches moves up.
-//! 4. The fold matched pb pair to pb pair within each pair node, once.
+//! 3. Each pair's state, by [`PairStates`]:
+//!    * [`PairStates::LinkStates`] (default): learned from the pair itself,
+//!      after its cells' fold is divided out
+//!      ([`super::link_state_pair_fold`]);
+//!    * [`PairStates::EndpointStates`]: the pair of its endpoints' nodes on
+//!      the **sample** tree ([`super::sample_units`]); a key that does not
+//!      span batches moves up.
+//! 4. The fold matched pb pair to pb pair within each pair state, once.
 
 use super::coarse_group_ward_tree::CoarseGroupWardTree;
 use super::cross_batch_matched_fold::{
     delta_as_base_of_every_node, estimate_fold_on_pseudobulks, StateAwareBatchFold,
 };
-use super::pseudobulk_sums::{sum_by_pseudobulk, PseudobulkKeys};
+use super::link_state_pair_fold::{
+    estimate_fold_over_pair_units_by_link_states, LinkStateDecomposition,
+};
+use super::pseudobulk_sums::{sum_by_pseudobulk, PseudobulkKeys, PseudobulkSums};
 use super::sample_units::SampleBatchFold;
 use super::{BatchSpanningRule, CollapsePseudobulks, StateAwareBatchFoldParams};
 use crate::sparse_io_vector::SparseIoVec;
@@ -269,46 +277,109 @@ pub fn build_cell_pair_units(
     })
 }
 
+/// Where a cell pair's state (its node, the fold's column) comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PairStates {
+    /// Learned from the pair itself: each pair divided by the fold its two
+    /// cells predict (the mean log of their cell folds), then Ward over the
+    /// coarsest pair groups on what is left, cut where both children span
+    /// batches. A pair's fold = its cell-predicted fold + its link state's
+    /// leftover ([`super::link_state_pair_fold`]).
+    #[default]
+    LinkStates,
+    /// The pair of its endpoints' nodes on the samples kind's tree, climbing
+    /// while that key does not span batches. A pair's fold = the pair δ + its
+    /// endpoint key's matched fold. A pair is only as well placed as its
+    /// cells: where a donor's cells sit in a node of their own, its pairs do
+    /// too, and that donor's state is folded away with the batch (pinto's
+    /// donor-confounded sim: cage's donor gap about 0.26, against about 0
+    /// with link states). The 0.13.1 behaviour, kept as an option.
+    EndpointStates,
+}
+
 /// The cell-pair kind's result.
 pub struct CellPairBatchFold {
     /// The fold of each given pair (`node_of_unit[e]` for pair `e`; a pair
     /// across batches keeps δ).
     pub fold: StateAwareBatchFold,
-    /// Unordered (sample-tree node, sample-tree node) of a pair's endpoints →
-    /// its pair node, for every key a fitted pair settled at.
-    pub pair_node_of_endpoint_nodes: PairNodeOfEndpointNodes,
-    /// The pair-unit collapse's own δ, log, genes × batches (the fold's base).
+    /// The states the fold was matched within, and what places an unseen
+    /// pair on them.
+    pub states: PairStateModel,
+    /// The pair-unit collapse's own δ, log, genes × batches (the endpoint
+    /// states' base; a pair across batches keeps it).
     pub pair_unit_log_delta: DMatrix<f32>,
 }
 
+/// The states a cell-pair fold was matched within ([`PairStates`]).
+#[derive(Clone, Debug)]
+pub enum PairStateModel {
+    /// Unordered (sample-tree node, sample-tree node) of a pair's endpoints →
+    /// its pair node, for every key a fitted pair settled at.
+    EndpointStates(PairNodeOfEndpointNodes),
+    /// The fold's decomposition, cell-predicted + leftover, with each given
+    /// pair's link state.
+    LinkStates(LinkStateDecomposition),
+}
+
 impl CellPairBatchFold {
-    /// The node of an unseen pair whose endpoints sit at sample-tree nodes
-    /// `a` and `b` ([`SampleBatchFold::place_unseen_samples`]'s `tree_node`):
-    /// up its keys as placement walked them, to the first settled one; `None`
-    /// (δ) past the root.
+    pub fn pair_states(&self) -> PairStates {
+        match self.states {
+            PairStateModel::EndpointStates(_) => PairStates::EndpointStates,
+            PairStateModel::LinkStates(_) => PairStates::LinkStates,
+        }
+    }
+
+    /// The link states' decomposition; `None` for endpoint states.
+    pub fn link_states(&self) -> Option<&LinkStateDecomposition> {
+        match &self.states {
+            PairStateModel::LinkStates(d) => Some(d),
+            PairStateModel::EndpointStates(_) => None,
+        }
+    }
+
+    /// [`PairStates::EndpointStates`]: the node of an unseen pair whose
+    /// endpoints sit at sample-tree nodes `a` and `b`
+    /// ([`SampleBatchFold::place_unseen_samples`]'s `tree_node`): up its keys
+    /// as placement walked them, to the first settled one; `None` (δ) past
+    /// the root. Errors for link states, which place an unseen pair through
+    /// [`LinkStateDecomposition::unseen_pair_log_fold`].
     pub fn place_unseen_pair(
         &self,
         tree: &CoarseGroupWardTree,
         a: usize,
         b: usize,
-    ) -> Option<usize> {
+    ) -> anyhow::Result<Option<usize>> {
+        let PairStateModel::EndpointStates(pair_node_of_endpoint_nodes) = &self.states else {
+            anyhow::bail!(
+                "place_unseen_pair is for endpoint states; \
+                 link states place through LinkStateDecomposition"
+            );
+        };
         let mut key = (a.min(b), a.max(b));
         loop {
-            if let Some(&k) = self.pair_node_of_endpoint_nodes.get(&key) {
-                return Some(k);
+            if let Some(&k) = pair_node_of_endpoint_nodes.get(&key) {
+                return Ok(Some(k));
             }
             if key_depth(tree, key) == 0 {
-                return None;
+                return Ok(None);
             }
             key = parent_key(tree, key);
         }
     }
 }
 
+/// The cell-pair kind's settings: which states pairs are matched within, and
+/// the fold's settings (shared with the samples kind).
+#[derive(Clone, Debug, Default)]
+pub struct CellPairFoldParams {
+    pub pair_states: PairStates,
+    pub fold: StateAwareBatchFoldParams,
+}
+
 /// The cell-pair kind, end to end: build the pair units, collapse them
-/// (self-loops their own stratum) for the pair δ and the pb pairs, place each
-/// pair on the samples kind's tree (`sample_fold`, from the same cells), and
-/// match the fold pb pair to pb pair within each pair node.
+/// (self-loops their own stratum) for the pair δ and the pb pairs, find each
+/// pair's state (`pair_params.pair_states`; both build on `sample_fold`, from
+/// the same cells), and match the fold pb pair to pb pair within each state.
 ///
 /// * `cells`: genes × cells, the columns `sample_fold` was estimated on.
 /// * `cell_pairs`: pairs of cell indices.
@@ -322,8 +393,9 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
     sample_fold: &SampleBatchFold,
     pair_unit_collapse: &crate::alg::collapse_data::MultilevelParams,
     proj_dim: usize,
-    params: &StateAwareBatchFoldParams,
+    pair_params: &CellPairFoldParams,
 ) -> anyhow::Result<CellPairBatchFold> {
+    let (pair_states, params) = (pair_params.pair_states, &pair_params.fold);
     use crate::alg::collapse_data::collapse_columns_multilevel_with_strata;
     use crate::alg::random_projection::RandProjOps;
     use legume_numeric::param::traits::Inference;
@@ -386,27 +458,99 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
             .last()
             .ok_or_else(|| anyhow::anyhow!("the pair-unit collapse gave no level"))?,
     };
-    let (kept_fold, pair_node_of_endpoint_nodes) = estimate_fold_over_pair_units(
-        &pu,
-        &groups,
-        &batch_of_cell,
-        sample_fold,
-        &pair_unit_log_delta,
-        params,
-    )?;
-    let node_of_unit: Vec<Option<usize>> = pu
-        .unit_of_pair
-        .iter()
-        .map(|e| e.and_then(|e| kept_fold.node_of_unit[e]))
-        .collect();
+    // estimated over the kept (within-batch) pairs; re-indexed to the given pairs
+    let given = |kept: &[Option<usize>]| -> Vec<Option<usize>> {
+        pu.unit_of_pair
+            .iter()
+            .map(|e| e.and_then(|e| kept[e]))
+            .collect()
+    };
+    let (kept_fold, states) = match pair_states {
+        PairStates::EndpointStates => {
+            let (fold, keys) = estimate_fold_over_pair_units(
+                &pu,
+                &groups,
+                &batch_of_cell,
+                sample_fold,
+                &pair_unit_log_delta,
+                params,
+            )?;
+            (fold, PairStateModel::EndpointStates(keys))
+        }
+        PairStates::LinkStates => {
+            let (fold, decomposition) = estimate_fold_over_pair_units_by_link_states(
+                &pu,
+                &groups,
+                &batch_of_cell,
+                sample_fold,
+                &pair_unit_log_delta,
+                params,
+            )?;
+            let link_states = LinkStateDecomposition {
+                link_state_of_pair: given(&decomposition.link_state_of_pair),
+                ..decomposition
+            };
+            (fold, PairStateModel::LinkStates(link_states))
+        }
+    };
     Ok(CellPairBatchFold {
         fold: StateAwareBatchFold {
-            node_of_unit,
+            node_of_unit: given(&kept_fold.node_of_unit),
             ..kept_fold
         },
-        pair_node_of_endpoint_nodes,
+        states,
         pair_unit_log_delta,
     })
+}
+
+/// The kept pairs' units read once into pb pairs, keyed (finest pair group,
+/// batch, `slot_of_pair[k]`): a pair whose slot is `None` is left out, and so
+/// is every self-loop. Each pb pair carries its pairs' span label
+/// (`label_of_pair`), coarsest pair group and mean matching coordinates (a
+/// pair's: the mean of its endpoints' `cell_coords`, components × cells).
+pub(crate) fn sum_cell_pairs_into_pseudobulks(
+    pu: &CellPairUnits,
+    groups: &CollapsePseudobulks<'_>,
+    batch_of_cell: &[usize],
+    label_of_pair: &[usize],
+    cell_coords: &DMatrix<f32>,
+    slot_of_pair: &[Option<usize>],
+) -> anyhow::Result<PseudobulkSums> {
+    let pairs = &pu.kept_pairs;
+    let e = pairs.len();
+    let n_units = pu.units.num_columns();
+    anyhow::ensure!(
+        label_of_pair.len() == e && slot_of_pair.len() == e,
+        "pb pairs: one label and slot per kept pair"
+    );
+    let mut coords = DMatrix::<f32>::zeros(cell_coords.nrows(), n_units);
+    for (k, &(u, v)) in pairs.iter().enumerate() {
+        coords
+            .column_mut(k)
+            .copy_from(&((cell_coords.column(u) + cell_coords.column(v)) * 0.5));
+    }
+    let batch: Vec<usize> = (0..n_units)
+        .map(|k| if k < e { batch_of_cell[pairs[k].0] } else { 0 })
+        .collect();
+    let span: Vec<usize> = (0..n_units)
+        .map(|k| if k < e { label_of_pair[k] } else { 0 })
+        .collect();
+    let key: Vec<Option<(usize, usize, usize)>> = (0..n_units)
+        .map(|k| {
+            let slot = *slot_of_pair.get(k)?;
+            slot.map(|s| (groups.finest[k], batch[k], s))
+        })
+        .collect();
+    sum_by_pseudobulk(
+        &pu.units,
+        &PseudobulkKeys {
+            key: &key,
+            batch: &batch,
+            span_label: &span,
+            coarsest: groups.coarsest,
+            coords: &coords,
+        },
+    )
 }
 
 /// The fold over pair units already built and collapsed: each kept pair
@@ -423,7 +567,6 @@ pub(crate) fn estimate_fold_over_pair_units(
     let nb = log_delta.ncols();
     let pairs = &pu.kept_pairs;
     let e = pairs.len();
-    let n_units = pu.units.num_columns();
     let (label_of_cell, n_labels) = params.span_labels_of_samples(batch_of_cell, nb)?;
     let rule = BatchSpanningRule::new(params, n_labels);
     let label_of_pair: Vec<usize> = pairs.iter().map(|&(u, _)| label_of_cell[u]).collect();
@@ -448,33 +591,13 @@ pub(crate) fn estimate_fold_over_pair_units(
     }
 
     // the pair units read once: pb pairs (finest pair group in one batch and pair node)
-    let mut coords = DMatrix::<f32>::zeros(cells.coords.nrows(), n_units);
-    for (k, &(u, v)) in pairs.iter().enumerate() {
-        coords
-            .column_mut(k)
-            .copy_from(&((cells.coords.column(u) + cells.coords.column(v)) * 0.5));
-    }
-    let batch: Vec<usize> = (0..n_units)
-        .map(|k| if k < e { batch_of_cell[pairs[k].0] } else { 0 })
-        .collect();
-    let span: Vec<usize> = (0..n_units)
-        .map(|k| if k < e { label_of_pair[k] } else { 0 })
-        .collect();
-    let key: Vec<Option<(usize, usize, usize)>> = (0..n_units)
-        .map(|k| {
-            let node = *pair_node.get(k)?;
-            node.map(|n| (groups.finest[k], batch[k], n))
-        })
-        .collect();
-    let sums = sum_by_pseudobulk(
-        &pu.units,
-        &PseudobulkKeys {
-            key: &key,
-            batch: &batch,
-            span_label: &span,
-            coarsest: groups.coarsest,
-            coords: &coords,
-        },
+    let sums = sum_cell_pairs_into_pseudobulks(
+        pu,
+        groups,
+        batch_of_cell,
+        &label_of_pair,
+        &cells.coords,
+        &pair_node,
     )?;
     let mut node_of_pb = vec![None; sums.len()];
     for (k, pb) in sums.of_unit.iter().enumerate() {

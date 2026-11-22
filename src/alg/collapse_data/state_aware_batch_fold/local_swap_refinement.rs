@@ -18,6 +18,7 @@
 //! donor already carries the shift. A move that leaves a node no longer
 //! spanning batches is undone.
 
+use super::node_compositions::{composition_score, node_log_compositions};
 use super::pseudobulk_sums::PseudobulkSums;
 use super::BatchSpanningRule;
 use legume_numeric::matrix::knn::knn_rows;
@@ -32,41 +33,6 @@ const SWAP_CANDIDATE_KNN: usize = 15;
 /// Rounds of undoing moves that broke a node's batch spanning.
 const MAX_REPAIR_ROUNDS: usize = 10;
 
-/// Each node's composition in each batch, log, genes × (nodes · batches):
-/// `ln normalize(μ_k ⊙ fold_{k,b})`, `μ_k` the node's fold-corrected sum.
-fn node_log_compositions(
-    sums: &PseudobulkSums,
-    node: &[Option<usize>],
-    n_nodes: usize,
-    log_fold: &DMatrix<f32>,
-) -> DMatrix<f32> {
-    let n_genes = sums.n_genes;
-    let nb = log_fold.ncols() / n_nodes;
-    let mut mu = DMatrix::<f32>::zeros(n_genes, n_nodes);
-    for (pb, k) in node.iter().enumerate() {
-        if let Some(k) = *k {
-            let col = k * nb + sums.batch[pb];
-            for &(g, x) in &sums.counts[pb] {
-                mu[(g, k)] += x * (-log_fold[(g, col)]).exp();
-            }
-        }
-    }
-    let cols: Vec<Vec<f32>> = (0..n_nodes * nb)
-        .into_par_iter()
-        .map(|col| {
-            let k = col / nb;
-            // a small floor so a gene the node never showed is unlikely, not impossible
-            let floor = (mu.column(k).sum() / n_genes.max(1) as f32 * 1e-3).max(1e-12);
-            let p: Vec<f32> = (0..n_genes)
-                .map(|g| (mu[(g, k)] + floor) * log_fold[(g, col)].exp())
-                .collect();
-            let tot: f32 = p.iter().sum();
-            p.into_iter().map(|v| (v / tot).ln()).collect()
-        })
-        .collect();
-    DMatrix::from_fn(n_genes, n_nodes * nb, |g, col| cols[col][g])
-}
-
 /// Each pseudobulk's best node among its candidates, when it beats its own.
 fn propose_moves(
     sums: &PseudobulkSums,
@@ -80,13 +46,8 @@ fn propose_moves(
         .filter_map(|pb| {
             let own = node[pb]?;
             let b = sums.batch[pb];
-            let score = |k: usize| -> f32 {
-                let col = k * nb + b;
-                sums.counts[pb]
-                    .iter()
-                    .map(|&(g, x)| x * log_p[(g, col)])
-                    .sum()
-            };
+            let score =
+                |k: usize| composition_score(sums.counts[pb].iter().copied(), log_p, k * nb + b);
             let own_score = score(own);
             let (k, s) = candidates[pb]
                 .iter()

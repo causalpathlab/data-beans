@@ -491,3 +491,191 @@ fn split_refuses_fractional_counts() {
         split_cell_reads_over_pair_units_without_double_counting(&data, &[(0, 1)], None).is_err()
     );
 }
+
+/// Two link profiles, 2 pb pairs per (profile, batch); each pb its own
+/// coarsest group and its own cell-predicted fold. `planted` multiplies gene
+/// 0 by 2 in profile 0's batch-1 pb pairs only, after the cell part (a
+/// pair-level effect the cells do not predict). Returns the sums already
+/// divided by the cell-predicted fold, and each pb's profile.
+fn link_state_fixture(dir: &std::path::Path, planted: bool) -> (PseudobulkSums, Vec<usize>) {
+    use super::link_state_pair_fold::divide_pb_pairs_by_cell_predicted_fold;
+    let mu = [[20.0f32, 2.0, 5.0], [2.0, 20.0, 5.0]];
+    let (mut cols, mut batch, mut profile, mut xy) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (p, m) in mu.iter().enumerate() {
+        for i in 0..4 {
+            let b = i % 2;
+            let mut c = m.to_vec();
+            if planted && p == 0 && b == 1 {
+                c[0] *= 2.0;
+            }
+            cols.push(c);
+            batch.push(b);
+            profile.push(p);
+            xy.push(p as f32 * 10.0 + i as f32 * 0.01);
+        }
+    }
+    let n = cols.len();
+    // a different cell-predicted log fold per pb, applied to the counts
+    let cell_predicted = DMatrix::from_fn(3, n, |g, c| 0.1 * (g as f32 + 1.0) * (c as f32 - 3.5));
+    let x = DMatrix::from_fn(3, n, |g, c| cols[c][g] * cell_predicted[(g, c)].exp());
+    let data = data_from(dir, if planted { "link_planted" } else { "link_null" }, &x);
+    let coords = DMatrix::from_fn(1, n, |_, c| xy[c]);
+    let mut sums = units_as_pseudobulks(&data, &batch, &coords);
+    divide_pb_pairs_by_cell_predicted_fold(&mut sums, &cell_predicted, &(0..n).collect::<Vec<_>>());
+    (sums, profile)
+}
+
+fn link_state_params() -> StateAwareBatchFoldParams {
+    StateAwareBatchFoldParams {
+        pseudo_count: 0.0,
+        min_pseudobulks: 1,
+        knn: 2,
+        ..StateAwareBatchFoldParams::default()
+    }
+}
+
+/// With no pair-level effect, dividing by the cell-predicted fold leaves
+/// nothing batch-specific: every link state's leftover is 0, and no link
+/// state mixes the two profiles.
+#[test]
+fn link_state_leftover_is_zero_without_a_pair_level_effect() {
+    use super::link_state_pair_fold::link_states_and_leftover_fold;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut sums, profile) = link_state_fixture(dir.path(), false);
+    let (state, n_states, leftover) =
+        link_states_and_leftover_fold(&mut sums, 2, &rule(2, 2, 1), &link_state_params())
+            .expect("link states");
+    assert!(n_states >= 2, "{n_states} link states");
+    for s in 0..n_states {
+        let ps: Vec<usize> = (0..state.len())
+            .filter(|&pb| state[pb] == Some(s))
+            .map(|pb| profile[pb])
+            .collect();
+        assert!(
+            ps.windows(2).all(|w| w[0] == w[1]),
+            "link state {s} mixes profiles: {ps:?}"
+        );
+    }
+    let max = leftover.iter().fold(0f32, |m, v| m.max(v.abs()));
+    assert!(max < 1e-4, "leftover {max}");
+}
+
+/// A pair-level effect the cells do not predict stays in the leftover of its
+/// own link states, and only there.
+#[test]
+fn link_state_leftover_recovers_a_planted_pair_level_effect() {
+    use super::link_state_pair_fold::link_states_and_leftover_fold;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut sums, profile) = link_state_fixture(dir.path(), true);
+    let (state, n_states, leftover) =
+        link_states_and_leftover_fold(&mut sums, 2, &rule(2, 2, 1), &link_state_params())
+            .expect("link states");
+    let mut seen = [false; 2];
+    for s in 0..n_states {
+        let p = profile[(0..state.len())
+            .find(|&pb| state[pb] == Some(s))
+            .expect("member")];
+        seen[p] = true;
+        // gene 0 against gene 2, batch 1 against batch 0: the planted log 2 (× n/(n−1))
+        let col = |b: usize| leftover.column(s * 2 + b);
+        let contrast = (col(1)[0] - col(1)[2]) - (col(0)[0] - col(0)[2]);
+        if p == 0 {
+            assert!(contrast > 0.5, "link state {s} (planted): {contrast}");
+        } else {
+            let max = leftover
+                .columns(s * 2, 2)
+                .iter()
+                .fold(0f32, |m, v| m.max(v.abs()));
+            assert!(max < 1e-4, "link state {s} (not planted): {max}");
+        }
+    }
+    assert_eq!(seen, [true, true], "both profiles have a link state");
+}
+
+/// Placement by composition: a unit lands in the node whose composition
+/// explains it; a batch the fit saw is scored with that batch's fold, one it
+/// never saw against the fold-corrected composition alone; an empty unit
+/// lands nowhere.
+#[test]
+fn unseen_units_are_placed_by_composition() {
+    use super::node_compositions::place_by_composition;
+    // node 0 expresses gene 0, node 1 gene 1 (fold-corrected, log)
+    let log_mean =
+        DMatrix::from_row_slice(2, 2, &[0.9f32.ln(), 0.1f32.ln(), 0.1f32.ln(), 0.9f32.ln()]);
+    // 2 batches (column node · 2 + batch); in batch 1, node 1's fold
+    // multiplies gene 0 by e^5, so node 1 there is 94 % gene 0 (node 0: 90 %)
+    // and a gene-0-only unit read in batch 1 is better explained by node 1
+    let mut log_fold = DMatrix::<f32>::zeros(2, 4);
+    log_fold[(0, 3)] = 5.0;
+    let heavy0 = vec![(0usize, 10.0f32)];
+    let heavy1 = vec![(0usize, 1.0f32), (1, 9.0)];
+    let placed = place_by_composition(
+        &[heavy0.clone(), heavy1, heavy0.clone(), heavy0, vec![]],
+        &[Some(0), Some(0), Some(1), None, Some(0)],
+        &log_mean,
+        &log_fold,
+        2,
+    )
+    .expect("placement");
+    assert_eq!(placed, vec![Some(0), Some(1), Some(1), Some(0), None]);
+    // a batch the fit never had, or one batch entry short, is refused
+    assert!(place_by_composition(&[vec![(0, 1.0)]], &[Some(2)], &log_mean, &log_fold, 2).is_err());
+    assert!(place_by_composition(&[vec![(0, 1.0)]], &[], &log_mean, &log_fold, 2).is_err());
+}
+
+/// An unseen pair's fold in a batch the fit saw: its endpoints'
+/// cell-predicted fold plus its link state's leftover.
+#[test]
+fn unseen_pair_fold_is_cell_predicted_plus_its_link_state_leftover() {
+    use super::link_state_pair_fold::LinkStateDecomposition;
+    let cells = StateAwareBatchFold {
+        n_batches: 1,
+        n_nodes: 2,
+        log_fold: DMatrix::from_row_slice(1, 2, &[1.0, 3.0]),
+        log_delta: DMatrix::from_row_slice(1, 1, &[0.0]),
+        node_of_unit: vec![],
+    };
+    let d = LinkStateDecomposition {
+        link_state_of_pair: vec![],
+        leftover_log_fold: DMatrix::from_row_slice(1, 2, &[0.5, -0.5]),
+        n_batches: 1,
+        link_state_log_mean_composition: DMatrix::zeros(1, 2),
+    };
+    // cell-predicted: (1 + 3) / 2 = 2; link state 1's leftover: −0.5
+    let f = d
+        .unseen_pair_log_fold(&cells, Some(0), Some(1), Some(1), 0)
+        .expect("in the fit");
+    assert!((f[0] - 1.5).abs() < 1e-6, "{}", f[0]);
+    // no link state: the cell-predicted fold alone; an endpoint without a node: δ
+    let f = d
+        .unseen_pair_log_fold(&cells, None, Some(1), None, 0)
+        .expect("in the fit");
+    assert!((f[0] - 1.5).abs() < 1e-6, "{}", f[0]);
+    // a batch past the fit's is refused, not read from the next link state
+    assert!(d
+        .unseen_pair_log_fold(&cells, None, None, Some(0), 1)
+        .is_err());
+}
+
+/// No within-batch pair (every pair crosses batches, or none at all): no link
+/// state, no Ward tree built, no error.
+#[test]
+fn link_states_of_no_pair_are_none() {
+    use super::link_state_pair_fold::link_states_and_leftover_fold;
+    let mut sums = PseudobulkSums {
+        counts: vec![],
+        batch: vec![],
+        span_label: vec![],
+        coarsest: vec![],
+        coords: DMatrix::zeros(1, 0),
+        of_unit: vec![],
+        n_genes: 3,
+    };
+    let (state, n_states, leftover) =
+        link_states_and_leftover_fold(&mut sums, 2, &rule(2, 2, 1), &link_state_params())
+            .expect("no pairs");
+    assert!(state.is_empty());
+    assert_eq!(n_states, 0);
+    assert_eq!(leftover.shape(), (3, 0));
+}
