@@ -5,7 +5,8 @@
 
 use super::coarse_group_ward_tree::{row_scores, CoarseGroupWardTree};
 use super::cross_batch_matched_fold::{
-    estimate_fold_by_cross_batch_matching, MatchingCoordinates, StateAwareBatchFold,
+    delta_as_base_of_every_node, estimate_fold_by_cross_batch_matching, MatchedFoldInputs,
+    MatchingCoordinates, StateAwareBatchFold,
 };
 use super::local_swap_refinement::{refine_nodes_by_local_swaps, SwapInputs};
 use super::top_down_fold::{estimate_fold_top_down, TopDownInputs};
@@ -112,6 +113,8 @@ fn delta_adjusted_group_profiles(
 
 /// The samples kind: a fold per (gene × node × batch) over columns as they are.
 ///
+/// * `finest_group`: each column's group at the collapse's finest level: its
+///   pseudobulk, the unit the fold matches (crossed with its batch).
 /// * `coarse_group`: each column's group at the collapse's coarsest level
 ///   (shared across batches), `0..K`.
 /// * `log_delta`: the collapse's δ, log, genes × batches.
@@ -119,6 +122,7 @@ fn delta_adjusted_group_profiles(
 pub fn estimate_state_aware_batch_fold_over_samples(
     data: &SparseIoVec,
     batch: &[usize],
+    finest_group: &[usize],
     coarse_group: &[usize],
     log_delta: &DMatrix<f32>,
     proj: &DMatrix<f32>,
@@ -127,7 +131,7 @@ pub fn estimate_state_aware_batch_fold_over_samples(
     let n = data.num_columns();
     let n_batches = log_delta.ncols();
     anyhow::ensure!(
-        batch.len() == n && coarse_group.len() == n && proj.ncols() == n,
+        batch.len() == n && finest_group.len() == n && coarse_group.len() == n && proj.ncols() == n,
         "group fold: one batch, group and projection column per column"
     );
     let n_groups = coarse_group.iter().max().map_or(0, |&m| m + 1);
@@ -173,7 +177,17 @@ pub fn estimate_state_aware_batch_fold_over_samples(
     let coords = coord_map.apply(proj);
     // coarsened (Ward, bottom up, then the cut): the first fold
     let first_fold = estimate_fold_by_cross_batch_matching(
-        data, batch, &coords, &node, n_nodes, log_delta, params,
+        &MatchedFoldInputs {
+            data,
+            batch,
+            coords: &coords,
+            node: &node,
+            n_nodes,
+            base_log_fold: &delta_as_base_of_every_node(log_delta, n_nodes),
+            log_delta,
+            pseudobulk_of_unit: Some(finest_group),
+        },
+        params,
     )?;
     // uncoarsened: local swaps between neighbouring nodes, scored by each
     // node's fold-corrected composition in the sample's own batch; then the
@@ -208,6 +222,7 @@ pub fn estimate_state_aware_batch_fold_over_samples(
             batch,
             coords: &coords,
             log_delta,
+            pseudobulk_of_unit: finest_group,
             params,
         },
         &tree_node_of_unit,

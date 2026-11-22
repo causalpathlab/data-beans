@@ -136,7 +136,17 @@ fn matched_fold_recovers_a_planted_fold() {
         ..StateAwareBatchFoldParams::default()
     };
     let gf = estimate_fold_by_cross_batch_matching(
-        &data_raw, &batch, &coords, &node, 3, &log_delta, &params,
+        &MatchedFoldInputs {
+            data: &data_raw,
+            batch: &batch,
+            coords: &coords,
+            node: &node,
+            n_nodes: 3,
+            base_log_fold: &delta_as_base_of_every_node(&log_delta, 3),
+            log_delta: &log_delta,
+            pseudobulk_of_unit: None,
+        },
+        &params,
     )
     .expect("fold");
     // a fold is a rate ratio up to the column's scale (the division trait
@@ -340,13 +350,18 @@ fn matched_fold_refuses_zero_neighbours() {
         ..StateAwareBatchFoldParams::default()
     };
     let coords = DMatrix::zeros(1, 2);
+    let log_delta = DMatrix::zeros(1, 2);
     let r = estimate_fold_by_cross_batch_matching(
-        &data,
-        &[0, 1],
-        &coords,
-        &[Some(0), Some(0)],
-        1,
-        &DMatrix::zeros(1, 2),
+        &MatchedFoldInputs {
+            data: &data,
+            batch: &[0, 1],
+            coords: &coords,
+            node: &[Some(0), Some(0)],
+            n_nodes: 1,
+            base_log_fold: &delta_as_base_of_every_node(&log_delta, 1),
+            log_delta: &log_delta,
+            pseudobulk_of_unit: None,
+        },
         &params,
     );
     assert!(r.is_err());

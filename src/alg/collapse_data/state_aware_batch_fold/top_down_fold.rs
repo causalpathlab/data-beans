@@ -10,7 +10,7 @@
 
 use super::coarse_group_ward_tree::CoarseGroupWardTree;
 use super::cross_batch_matched_fold::{
-    estimate_residual_fold_by_cross_batch_matching, ResidualBase, StateAwareBatchFold,
+    estimate_fold_by_cross_batch_matching, MatchedFoldInputs, StateAwareBatchFold,
 };
 use super::StateAwareBatchFoldParams;
 use crate::sparse_io_vector::SparseIoVec;
@@ -45,6 +45,8 @@ pub(crate) struct TopDownInputs<'a> {
     /// Matching coordinates, components × units.
     pub coords: &'a DMatrix<f32>,
     pub log_delta: &'a DMatrix<f32>,
+    /// Each sample's pseudobulk (the collapse's finest group).
+    pub pseudobulk_of_unit: &'a [usize],
     pub params: &'a StateAwareBatchFoldParams,
 }
 
@@ -105,15 +107,16 @@ pub(crate) fn estimate_fold_top_down(
                 .unwrap_or(inp.log_delta);
             base.columns_mut(k * nb, nb).copy_from(parent_fold);
         }
-        let fold = estimate_residual_fold_by_cross_batch_matching(
-            inp.data,
-            inp.batch,
-            inp.coords,
-            &node,
-            n_nodes,
-            &ResidualBase {
+        let fold = estimate_fold_by_cross_batch_matching(
+            &MatchedFoldInputs {
+                data: inp.data,
+                batch: inp.batch,
+                coords: inp.coords,
+                node: &node,
+                n_nodes,
                 base_log_fold: &base,
                 log_delta: inp.log_delta,
+                pseudobulk_of_unit: Some(inp.pseudobulk_of_unit),
             },
             inp.params,
         )?;

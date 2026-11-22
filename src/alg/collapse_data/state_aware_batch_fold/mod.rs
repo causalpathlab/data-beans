@@ -44,7 +44,8 @@ pub use cell_pair_units::{
 };
 pub use coarse_group_ward_tree::{CoarseGroupWardTree, EXACT_WARD_MAX_GROUPS};
 pub use cross_batch_matched_fold::{
-    estimate_fold_by_cross_batch_matching, MatchingCoordinates, StateAwareBatchFold,
+    delta_as_base_of_every_node, estimate_fold_by_cross_batch_matching, MatchedFoldInputs,
+    MatchingCoordinates, StateAwareBatchFold,
 };
 pub use sample_units::{estimate_state_aware_batch_fold_over_samples, SampleBatchFold};
 

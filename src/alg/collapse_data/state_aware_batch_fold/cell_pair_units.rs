@@ -11,7 +11,10 @@
 //! 4. The fold is matched pair to pair within each pair node.
 
 use super::coarse_group_ward_tree::CoarseGroupWardTree;
-use super::cross_batch_matched_fold::{estimate_fold_by_cross_batch_matching, StateAwareBatchFold};
+use super::cross_batch_matched_fold::{
+    delta_as_base_of_every_node, estimate_fold_by_cross_batch_matching, MatchedFoldInputs,
+    StateAwareBatchFold,
+};
 use super::sample_units::SampleBatchFold;
 use super::{BatchSpanningRule, StateAwareBatchFoldParams};
 use crate::sparse_io_vector::SparseIoVec;
@@ -316,8 +319,15 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
         })
         .collect();
 
+    // each pair unit's pb pair: its group at the pair-unit collapse's finest level
+    let pb_pair_of_unit = collapsed
+        .cell_to_pb_per_level
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("the pair-unit collapse gave no level"))?
+        .clone();
     let (fold, pair_node_of_endpoint_nodes) = estimate_fold_over_split_pair_units(
         &units,
+        &pb_pair_of_unit,
         cell_pairs,
         &batch_of_cell,
         sample_fold,
@@ -348,6 +358,7 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
 /// * `log_delta`: δ of the pair-unit collapse, log, genes × batches.
 pub(crate) fn estimate_fold_over_split_pair_units(
     units: &SparseIoVec,
+    pb_pair_of_unit: &[usize],
     pairs: &[(usize, usize)],
     cell_batch: &[usize],
     cells: &SampleBatchFold,
@@ -391,12 +402,16 @@ pub(crate) fn estimate_fold_over_split_pair_units(
             .copy_from(&((cells.coords.column(u) + cells.coords.column(v)) * 0.5));
     }
     let mut fold = estimate_fold_by_cross_batch_matching(
-        units,
-        &pair_batch,
-        &coords,
-        &node,
-        n_nodes,
-        log_delta,
+        &MatchedFoldInputs {
+            data: units,
+            batch: &pair_batch,
+            coords: &coords,
+            node: &node,
+            n_nodes,
+            base_log_fold: &delta_as_base_of_every_node(log_delta, n_nodes),
+            log_delta,
+            pseudobulk_of_unit: Some(pb_pair_of_unit),
+        },
         params,
     )?;
     fold.node_of_unit.truncate(e);
