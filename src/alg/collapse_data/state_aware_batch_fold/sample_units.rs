@@ -1,32 +1,37 @@
 //! Samples kind: the state-aware batch fold over columns as they are (cells,
-//! or carried pseudobulks), from the sample collapse's coarsest groups and δ.
-//! senna, bge and pinto's baselines read this kind; the cell-pair kind
-//! ([`super::cell_pair_units`]) builds its nodes on this kind's tree.
+//! or carried pseudobulks), from the sample collapse's groups and δ. senna,
+//! bge and pinto's baselines read this kind; the cell-pair kind
+//! ([`super::cell_pair_units`]) builds its pair nodes on this kind's tree.
+//!
+//! 1. The data read once, into pb samples (finest group × batch) sums.
+//! 2. Coarsen: Ward over the coarsest groups' δ-adjusted profiles, cut where
+//!    both children span batches in coarsest pseudobulks.
+//! 3. Uncoarsen: local swaps of pb samples between neighbouring nodes.
+//! 4. The fold top down along the tree, pb sample to pb sample.
 
 use super::coarse_group_ward_tree::{row_scores, CoarseGroupWardTree};
 use super::cross_batch_matched_fold::{
-    delta_as_base_of_every_node, estimate_fold_by_cross_batch_matching, MatchedFoldInputs,
-    MatchingCoordinates, StateAwareBatchFold,
+    delta_as_base_of_every_node, estimate_fold_on_pseudobulks, MatchingCoordinates,
+    StateAwareBatchFold,
 };
-use super::local_swap_refinement::{refine_nodes_by_local_swaps, SwapInputs};
-use super::top_down_fold::{estimate_fold_top_down, TopDownInputs};
-use super::{pseudobulks_per_label, BatchSpanningRule, StateAwareBatchFoldParams, PROFILE_DIM};
+use super::local_swap_refinement::refine_nodes_by_local_swaps;
+use super::pseudobulk_sums::{sum_by_pseudobulk, PseudobulkKeys, PseudobulkSums};
+use super::top_down_fold::estimate_fold_top_down;
+use super::{
+    compact_present, BatchSpanningRule, CollapsePseudobulks, StateAwareBatchFoldParams, PROFILE_DIM,
+};
 use crate::sparse_io_vector::SparseIoVec;
-use legume_numeric::matrix::utils::generate_minibatch_intervals;
 use log::{info, warn};
 use nalgebra::DMatrix;
-use rayon::prelude::*;
-use rustc_hash::FxHashMap as HashMap;
 use std::ops::AddAssign;
-use std::sync::Mutex;
 
 /// The samples kind's result: the fold, plus what places an unseen unit.
 #[derive(Clone, Debug)]
 pub struct SampleBatchFold {
     pub fold: StateAwareBatchFold,
     pub tree: CoarseGroupWardTree,
-    /// Each unit's node in `tree` (before the dense node numbering), `None`
-    /// when it keeps δ. The graph kind reads this for its endpoints.
+    /// Each unit's node in `tree`, `None` when it keeps δ. The cell-pair kind
+    /// reads this for its endpoints.
     pub tree_node_of_unit: Vec<Option<usize>>,
     pub coord_map: MatchingCoordinates,
     /// Each unit's matching coordinates (components × units).
@@ -34,12 +39,22 @@ pub struct SampleBatchFold {
     /// components × n_nodes: the mean coordinates of each node's units; an
     /// unseen unit takes its nearest node.
     pub node_centroids: DMatrix<f32>,
+    /// Each node's (dense id's) node in `tree`.
+    pub tree_node_of_node: Vec<usize>,
+}
+
+/// Where an unseen unit lands: its node (the fold's column, with its batch)
+/// and that node's place in the tree (what an unseen pair climbs from).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnseenPlacement {
+    pub node: usize,
+    pub tree_node: usize,
 }
 
 impl SampleBatchFold {
-    /// The node of an unseen unit with projection `proj` (dims): the nearest
-    /// centroid.
-    pub fn place(&self, proj: &DMatrix<f32>) -> Vec<Option<usize>> {
+    /// Where unseen units land, from their projections `proj` (dims ×
+    /// units): each takes the nearest node centroid.
+    pub fn place_unseen_samples(&self, proj: &DMatrix<f32>) -> Vec<Option<UnseenPlacement>> {
         let z = self.coord_map.apply(proj);
         (0..z.ncols())
             .map(|c| {
@@ -51,194 +66,144 @@ impl SampleBatchFold {
                         )
                     })
                     .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(k, _)| k)
+                    .map(|(k, _)| UnseenPlacement {
+                        node: k,
+                        tree_node: self.tree_node_of_node[k],
+                    })
             })
             .collect()
     }
 }
 
-/// Dense numbering of the distinct `Some` values of `tree_node`.
-fn renumber(tree_node: &[Option<usize>]) -> (Vec<Option<usize>>, usize) {
-    let mut ids: HashMap<usize, usize> = HashMap::default();
-    let out = tree_node
-        .iter()
-        .map(|t| {
-            t.map(|t| {
-                let n = ids.len();
-                *ids.entry(t).or_insert(n)
-            })
-        })
-        .collect();
-    (out, ids.len())
-}
-
-/// Each coarse group's δ-adjusted pooled profile, log1p of counts per 10⁴.
+/// Each coarse group's δ-adjusted pooled profile (groups × genes), log1p of
+/// counts per 10⁴, from the pb sample sums.
 fn delta_adjusted_group_profiles(
-    data: &SparseIoVec,
-    batch: &[usize],
-    coarse_group: &[usize],
+    sums: &PseudobulkSums,
     n_groups: usize,
     log_delta: &DMatrix<f32>,
-    block_size: Option<usize>,
-) -> anyhow::Result<DMatrix<f32>> {
-    let n_genes = log_delta.nrows();
-    let inv = log_delta.map(|v| (-v).exp());
-    let acc = Mutex::new(DMatrix::<f32>::zeros(n_groups, n_genes));
-    let jobs = generate_minibatch_intervals(data.num_columns(), data.num_rows(), block_size);
-    jobs.par_iter()
-        .try_for_each(|&(lb, ub)| -> anyhow::Result<()> {
-            let yy = data.read_columns_csc(lb..ub)?;
-            let mut local: Vec<(usize, usize, f32)> = Vec::new();
-            for (y, c) in yy.col_iter().zip(lb..ub) {
-                let b = batch[c];
-                for (&g, &x) in y.row_indices().iter().zip(y.values()) {
-                    local.push((coarse_group[c], g, x * inv[(g, b)]));
-                }
-            }
-            let mut p = acc.lock().expect("profiles");
-            for (k, g, v) in local {
-                p[(k, g)] += v;
-            }
-            Ok(())
-        })?;
-    let mut prof = acc.into_inner().expect("profiles");
+) -> DMatrix<f32> {
+    let mut prof = DMatrix::<f32>::zeros(n_groups, sums.n_genes);
+    for pb in 0..sums.len() {
+        let (k, b) = (sums.coarsest[pb], sums.batch[pb]);
+        for &(g, x) in &sums.counts[pb] {
+            prof[(k, g)] += x * (-log_delta[(g, b)]).exp();
+        }
+    }
     for mut row in prof.row_iter_mut() {
         let tot: f32 = row.sum();
         if tot > 0.0 {
             row.apply(|v| *v = (*v / tot * 1e4).ln_1p());
         }
     }
-    Ok(prof)
+    prof
 }
 
 /// The samples kind: a fold per (gene × node × batch) over columns as they are.
 ///
-/// * `finest_group`: each column's group at the collapse's finest level: its
-///   pseudobulk, the unit the fold matches (crossed with its batch).
-/// * `coarse_group`: each column's group at the collapse's coarsest level
-///   (shared across batches), `0..K`.
+/// * `pseudobulks`: each column's finest and coarsest collapse group
+///   (shared across batches): its pb sample (finest × batch, what the fold
+///   matches) and the tree's leaves (coarsest).
 /// * `log_delta`: the collapse's δ, log, genes × batches.
 /// * `proj`: the batch-corrected projection the collapse ran on (dims × columns).
 pub fn estimate_state_aware_batch_fold_over_samples(
     data: &SparseIoVec,
     batch: &[usize],
-    finest_group: &[usize],
-    coarse_group: &[usize],
+    pseudobulks: &CollapsePseudobulks<'_>,
     log_delta: &DMatrix<f32>,
     proj: &DMatrix<f32>,
     params: &StateAwareBatchFoldParams,
 ) -> anyhow::Result<SampleBatchFold> {
     let n = data.num_columns();
-    let n_batches = log_delta.ncols();
+    let nb = log_delta.ncols();
     anyhow::ensure!(
-        batch.len() == n && finest_group.len() == n && coarse_group.len() == n && proj.ncols() == n,
-        "group fold: one batch, group and projection column per column"
+        batch.len() == n
+            && pseudobulks.finest.len() == n
+            && pseudobulks.coarsest.len() == n
+            && proj.ncols() == n,
+        "batch fold: one batch, group and projection column per column"
     );
-    let n_groups = coarse_group.iter().max().map_or(0, |&m| m + 1);
-    let rule = BatchSpanningRule::new(params, batch, n_batches)?;
+    let (span_label, n_labels) = params.span_labels_of_samples(batch, nb)?;
+    let rule = BatchSpanningRule::new(params, n_labels);
 
-    let prof = delta_adjusted_group_profiles(
+    let coord_map = MatchingCoordinates::fit(proj)?;
+    let coords = coord_map.apply(proj);
+    // the data read once: pb samples (finest group in one batch)
+    let key: Vec<Option<(usize, usize, usize)>> = (0..n)
+        .map(|u| Some((pseudobulks.finest[u], batch[u], 0)))
+        .collect();
+    let sums = sum_by_pseudobulk(
         data,
-        batch,
-        coarse_group,
-        n_groups,
-        log_delta,
-        params.block_size,
+        &PseudobulkKeys {
+            key: &key,
+            batch,
+            span_label: &span_label,
+            coarsest: pseudobulks.coarsest,
+            coords: &coords,
+        },
     )?;
+
+    // coarsen: Ward over the coarsest groups, cut where both children span
+    let n_groups = pseudobulks.coarsest.iter().max().map_or(0, |&m| m + 1);
+    let prof = delta_adjusted_group_profiles(&sums, n_groups, log_delta);
     let tree = CoarseGroupWardTree::build(&row_scores(
         &prof,
         PROFILE_DIM.min(n_groups.saturating_sub(1)).max(1),
-    ));
-    // each coarse group's coarsest pseudobulks per label: a node's size is
-    // counted in the collapse's coarsest pseudobulks
-    let mut units_of_group = vec![Vec::new(); n_groups];
-    for c in 0..n {
-        units_of_group[coarse_group[c]].push(c);
+    )?)?;
+    let mut members = vec![Vec::new(); n_groups];
+    for pb in 0..sums.len() {
+        members[sums.coarsest[pb]].push((sums.coarsest[pb], sums.span_label[pb]));
     }
-    let group_count: Vec<Vec<usize>> = units_of_group
-        .into_iter()
-        .map(|units| pseudobulks_per_label(units, coarse_group, &rule.label, rule.n_labels))
-        .collect();
+    let group_count: Vec<Vec<usize>> = members.into_iter().map(|m| rule.count(m)).collect();
     let node_of_group = tree.cut_where_both_children_span_batches(&group_count, &rule);
-    let tree_node_of_unit: Vec<Option<usize>> =
-        coarse_group.iter().map(|&k| node_of_group[k]).collect();
-    let (node, n_nodes) = renumber(&tree_node_of_unit);
-    // each dense node's tree node, to keep the refined nodes on the tree
-    let mut tree_node_of_node = vec![0usize; n_nodes];
-    for (k, t) in node.iter().zip(&tree_node_of_unit) {
-        if let (Some(k), Some(t)) = (k, t) {
-            tree_node_of_node[*k] = *t;
-        }
-    }
+    let tree_node_of_pb: Vec<Option<usize>> =
+        sums.coarsest.iter().map(|&g| node_of_group[g]).collect();
+    let (node, tree_node_of_node) = compact_present(&tree_node_of_pb);
+    let n_nodes = tree_node_of_node.len();
     if n_nodes == 0 {
         warn!(
-            "group fold: no node spans {} of {} labels with {} pseudobulks each; keeping δ",
+            "batch fold: no node spans {} of {} labels with {} coarsest pseudobulks each; keeping δ",
             rule.min_spans, rule.n_labels, rule.min_pseudobulks
         );
     } else {
-        info!("group fold: {n_groups} coarse groups cut into {n_nodes} nodes");
+        info!("batch fold: {n_groups} coarse groups cut into {n_nodes} nodes");
     }
 
-    let coord_map = MatchingCoordinates::fit(proj);
-    let coords = coord_map.apply(proj);
-    // coarsened (Ward, bottom up, then the cut): the first fold
-    let first_fold = estimate_fold_by_cross_batch_matching(
-        &MatchedFoldInputs {
-            data,
-            batch,
-            coords: &coords,
-            node: &node,
-            n_nodes,
-            base_log_fold: &delta_as_base_of_every_node(log_delta, n_nodes),
-            log_delta,
-            pseudobulk_of_unit: Some(finest_group),
-        },
+    // uncoarsen: a first fold, then local swaps of pb samples under it
+    let first_fold = estimate_fold_on_pseudobulks(
+        &sums,
+        &node,
+        n_nodes,
+        &delta_as_base_of_every_node(log_delta, n_nodes),
         params,
     )?;
-    // uncoarsened: local swaps between neighbouring nodes, scored by each
-    // node's fold-corrected composition in the sample's own batch; then the
-    // fold again, on the refined nodes
-    let node = refine_nodes_by_local_swaps(
-        &SwapInputs {
-            data,
-            batch,
-            coords: &coords,
-            rule: &rule,
-            pseudobulk_of_unit: coarse_group,
-            block_size: params.block_size,
-        },
-        node,
-        n_nodes,
-        &first_fold,
-    )?;
-    let tree_node_of_unit: Vec<Option<usize>> = node
+    let node = refine_nodes_by_local_swaps(&sums, &rule, node, n_nodes, &first_fold);
+
+    // the fold top down along the tree, from the root to each refined node
+    let final_tree_node: Vec<Option<usize>> = node
         .iter()
         .map(|k| k.map(|k| tree_node_of_node[k]))
         .collect();
-    // then the fold top down along the tree, from the root to each refined
-    // node, every node a residual over its parent's (numbered as `node`)
-    let dense_of_final: HashMap<usize, usize> = tree_node_of_node
-        .iter()
-        .enumerate()
-        .map(|(k, &t)| (t, k))
-        .collect();
-    let fold = estimate_fold_top_down(
-        &TopDownInputs {
-            data,
-            tree: &tree,
-            batch,
-            coords: &coords,
-            log_delta,
-            pseudobulk_of_unit: finest_group,
-            params,
-        },
-        &tree_node_of_unit,
-        &dense_of_final,
-    )?;
+    let fold_of = estimate_fold_top_down(&sums, &tree, &final_tree_node, log_delta, params)?;
+    let mut log_fold = DMatrix::<f32>::zeros(log_delta.nrows(), n_nodes * nb);
+    for (k, t) in tree_node_of_node.iter().enumerate() {
+        log_fold
+            .columns_mut(k * nb, nb)
+            .copy_from(fold_of.get(t).unwrap_or(log_delta));
+    }
 
+    // each unit takes its pb sample's node
+    let node_of_unit: Vec<Option<usize>> = sums
+        .of_unit
+        .iter()
+        .map(|pb| pb.and_then(|pb| node[pb]))
+        .collect();
+    let tree_node_of_unit: Vec<Option<usize>> = node_of_unit
+        .iter()
+        .map(|k| k.map(|k| tree_node_of_node[k]))
+        .collect();
     let mut node_centroids = DMatrix::<f32>::zeros(coords.nrows(), n_nodes);
     let mut cnt = vec![0f32; n_nodes];
-    for (c, k) in node.iter().enumerate() {
+    for (c, k) in node_of_unit.iter().enumerate() {
         if let Some(k) = *k {
             node_centroids.column_mut(k).add_assign(coords.column(c));
             cnt[k] += 1.0;
@@ -249,11 +214,18 @@ pub fn estimate_state_aware_batch_fold_over_samples(
     }
 
     Ok(SampleBatchFold {
-        fold,
+        fold: StateAwareBatchFold {
+            n_batches: nb,
+            n_nodes,
+            log_fold,
+            log_delta: log_delta.clone(),
+            node_of_unit,
+        },
         tree,
         tree_node_of_unit,
         coord_map,
         coords,
         node_centroids,
+        tree_node_of_node,
     })
 }

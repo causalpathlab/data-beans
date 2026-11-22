@@ -1,6 +1,8 @@
 use super::cell_pair_units::{
     place_cell_pairs_on_sample_tree, split_cell_reads_over_pair_units_without_double_counting,
 };
+use super::cross_batch_matched_fold::{delta_as_base_of_every_node, estimate_fold_on_pseudobulks};
+use super::pseudobulk_sums::{sum_by_pseudobulk, PseudobulkKeys, PseudobulkSums};
 use super::*;
 use crate::sparse_io::{create_sparse_from_triplets, SparseIoBackend};
 use crate::sparse_io_vector::SparseIoVec;
@@ -39,25 +41,46 @@ fn data_from(dir: &std::path::Path, tag: &str, x: &DMatrix<f32>) -> SparseIoVec 
     v
 }
 
-fn rule(
-    label: Vec<usize>,
-    n_labels: usize,
-    min_spans: usize,
-    min_pseudobulks: usize,
-) -> BatchSpanningRule {
+fn rule(n_labels: usize, min_spans: usize, min_pseudobulks: usize) -> BatchSpanningRule {
     BatchSpanningRule {
-        label,
         n_labels,
         min_spans,
         min_pseudobulks,
     }
 }
 
+/// Every unit its own pseudobulk (in its batch and node), summed from `data`.
+fn units_as_pseudobulks(
+    data: &SparseIoVec,
+    batch: &[usize],
+    coords: &DMatrix<f32>,
+) -> PseudobulkSums {
+    let n = batch.len();
+    let key: Vec<Option<(usize, usize, usize)>> = (0..n).map(|u| Some((u, batch[u], 0))).collect();
+    let own: Vec<usize> = (0..n).collect();
+    sum_by_pseudobulk(
+        data,
+        &PseudobulkKeys {
+            key: &key,
+            batch,
+            span_label: batch,
+            coarsest: &own,
+            coords,
+        },
+    )
+    .expect("sums")
+}
+
+/// Each pair's spanning key: (its pb pair, its label).
+fn count_keys(pb: &[usize], label: &[usize]) -> Vec<(usize, usize)> {
+    pb.iter().copied().zip(label.iter().copied()).collect()
+}
+
 /// Two tight, far-apart clumps: Ward's root splits them.
 #[test]
 fn ward_root_splits_two_clumps() {
     let pts = DMatrix::from_row_slice(5, 1, &[0.0, 0.1, 0.2, 10.0, 10.1]);
-    let t = CoarseGroupWardTree::build(&pts);
+    let t = CoarseGroupWardTree::build(&pts).expect("tree");
     let (a, b) = t.children[t.root].expect("root splits");
     let mut sides = [t.leaves(a), t.leaves(b)];
     sides.iter_mut().for_each(|s| s.sort_unstable());
@@ -71,10 +94,10 @@ fn ward_root_splits_two_clumps() {
 #[test]
 fn cut_splits_only_where_both_children_span() {
     let pts = DMatrix::from_row_slice(4, 1, &[0.0, 0.1, 10.0, 10.1]);
-    let t = CoarseGroupWardTree::build(&pts);
+    let t = CoarseGroupWardTree::build(&pts).expect("tree");
     // groups 0,1 hold both batches; groups 2,3 only batch 0
     let both = vec![vec![5, 5], vec![5, 5], vec![5, 0], vec![5, 0]];
-    let r = rule(vec![], 2, 2, 3);
+    let r = rule(2, 2, 3);
     let cut = t.cut_where_both_children_span_batches(&both, &r);
     assert!(
         cut.iter().all(|n| *n == Some(t.root)),
@@ -135,20 +158,23 @@ fn matched_fold_recovers_a_planted_fold() {
         min_pseudobulks: 1,
         ..StateAwareBatchFoldParams::default()
     };
-    let gf = estimate_fold_by_cross_batch_matching(
-        &MatchedFoldInputs {
-            data: &data_raw,
-            batch: &batch,
-            coords: &coords,
-            node: &node,
-            n_nodes: 3,
-            base_log_fold: &delta_as_base_of_every_node(&log_delta, 3),
-            log_delta: &log_delta,
-            pseudobulk_of_unit: None,
-        },
+    let sums = units_as_pseudobulks(&data_raw, &batch, &coords);
+    let node_of_pb: Vec<Option<usize>> = (0..n).map(|pb| node[pb]).collect();
+    let log_fold = estimate_fold_on_pseudobulks(
+        &sums,
+        &node_of_pb,
+        3,
+        &delta_as_base_of_every_node(&log_delta, 3),
         &params,
     )
     .expect("fold");
+    let gf = StateAwareBatchFold {
+        n_batches: 2,
+        n_nodes: 3,
+        log_fold,
+        log_delta: log_delta.clone(),
+        node_of_unit: node.clone(),
+    };
     // a fold is a rate ratio up to the column's scale (the division trait
     // matches it): compare across genes, relative to gene 0
     for (k, fk) in f.iter().enumerate() {
@@ -210,7 +236,7 @@ fn split_conserves_reads_and_keeps_loops_apart() {
 fn pair_nodes_climb_until_they_span() {
     // tree: ((0,1),(2,3))
     let pts = DMatrix::from_row_slice(4, 1, &[0.0, 0.1, 10.0, 10.1]);
-    let t = CoarseGroupWardTree::build(&pts);
+    let t = CoarseGroupWardTree::build(&pts).expect("tree");
     let p01 = t.parent[0];
     // 4 pairs (0,0) in batches 0/1 → spans at (0,0); 2 pairs (0,1) in batch 0
     // and 2 pairs (1,1) in batch 1 → each fails, both climb to (p01,p01) and span
@@ -226,9 +252,13 @@ fn pair_nodes_climb_until_they_span() {
         None,
     ];
     let label = vec![0, 1, 0, 1, 0, 0, 1, 1, 0];
-    let r = rule(vec![], 2, 2, 2);
-    let (node, keys, _) =
-        place_cell_pairs_on_sample_tree(&t, at, &(0..9).collect::<Vec<_>>(), &label, &r);
+    let r = rule(2, 2, 2);
+    let (node, keys) = place_cell_pairs_on_sample_tree(
+        &t,
+        &at,
+        &count_keys(&(0..9).collect::<Vec<_>>(), &label),
+        &r,
+    );
     assert_eq!(node[0], Some(keys[&(0, 0)]));
     assert!(node[..4].iter().all(|n| *n == node[0]));
     let up = Some(keys[&(p01, p01)]);
@@ -236,7 +266,8 @@ fn pair_nodes_climb_until_they_span() {
     assert_eq!(node[8], None);
 
     // a lone pair never spans: it climbs to the root and keeps δ
-    let (node, keys, _) = place_cell_pairs_on_sample_tree(&t, vec![Some((2, 3))], &[0], &[0], &r);
+    let (node, keys) =
+        place_cell_pairs_on_sample_tree(&t, &[Some((2, 3))], &count_keys(&[0], &[0]), &r);
     assert_eq!(node, vec![None]);
     assert!(keys.is_empty());
 }
@@ -287,7 +318,7 @@ fn nn_chain_ward_matches_greedy_ward() {
     }
     want.sort();
 
-    let t = CoarseGroupWardTree::build(&pts);
+    let t = CoarseGroupWardTree::build(&pts).expect("tree");
     let mut got: Vec<Vec<usize>> = (k..t.parent.len())
         .map(|nd| {
             let mut l = t.leaves(nd);
@@ -325,11 +356,11 @@ fn graph_ward_matches_exact_on_a_complete_graph_and_splits_clumps() {
     };
     let exact = CoarseGroupWardTree::build_exact_by_nearest_neighbour_chain(&pts);
     assert_eq!(
-        clusters(&CoarseGroupWardTree::build_along_knn_graph(&pts, k - 1)),
+        clusters(&CoarseGroupWardTree::build_along_knn_graph(&pts, k - 1).expect("tree")),
         clusters(&exact)
     );
 
-    let sparse = CoarseGroupWardTree::build_along_knn_graph(&pts, 3);
+    let sparse = CoarseGroupWardTree::build_along_knn_graph(&pts, 3).expect("tree");
     let (a, b) = sparse.children[sparse.root].expect("root splits");
     let mut sides = [sparse.leaves(a), sparse.leaves(b)];
     sides.iter_mut().for_each(|x| x.sort_unstable());
@@ -352,17 +383,12 @@ fn matched_fold_refuses_zero_neighbours() {
     };
     let coords = DMatrix::zeros(1, 2);
     let log_delta = DMatrix::zeros(1, 2);
-    let r = estimate_fold_by_cross_batch_matching(
-        &MatchedFoldInputs {
-            data: &data,
-            batch: &[0, 1],
-            coords: &coords,
-            node: &[Some(0), Some(0)],
-            n_nodes: 1,
-            base_log_fold: &delta_as_base_of_every_node(&log_delta, 1),
-            log_delta: &log_delta,
-            pseudobulk_of_unit: None,
-        },
+    let sums = units_as_pseudobulks(&data, &[0, 1], &coords);
+    let r = estimate_fold_on_pseudobulks(
+        &sums,
+        &[Some(0), Some(0)],
+        1,
+        &delta_as_base_of_every_node(&log_delta, 1),
         &params,
     );
     assert!(r.is_err());
@@ -374,11 +400,11 @@ fn matched_fold_refuses_zero_neighbours() {
 fn pairs_reaching_the_root_in_different_rounds_are_pooled() {
     // tree: (((0,1),2),3); root's children are (0,1,2) and 3
     let pts = DMatrix::from_row_slice(4, 1, &[0.0, 0.1, 1.0, 10.0]);
-    let t = CoarseGroupWardTree::build(&pts);
+    let t = CoarseGroupWardTree::build(&pts).expect("tree");
     // pair (3,3) in batch 0: one climb to (root,root); pair (0,0) in batch 1: three climbs
     let at = vec![Some((3, 3)), Some((0, 0))];
-    let r = rule(vec![], 2, 2, 1);
-    let (node, _, _) = place_cell_pairs_on_sample_tree(&t, at, &[0, 1], &[0, 1], &r);
+    let r = rule(2, 2, 1);
+    let (node, _) = place_cell_pairs_on_sample_tree(&t, &at, &count_keys(&[0, 1], &[0, 1]), &r);
     assert!(node[0].is_some() && node[0] == node[1], "{node:?}");
 }
 
@@ -386,7 +412,7 @@ fn pairs_reaching_the_root_in_different_rounds_are_pooled() {
 /// own state's node, and nodes keep spanning both batches.
 #[test]
 fn local_swaps_move_a_misplaced_cell_to_its_state() {
-    use super::local_swap_refinement::{refine_nodes_by_local_swaps, SwapInputs};
+    use super::local_swap_refinement::refine_nodes_by_local_swaps;
     let dir = tempfile::tempdir().expect("tempdir");
     // state A expresses gene 0, state B gene 1; 6 cells of each, 2 batches
     let per = 6usize;
@@ -405,29 +431,9 @@ fn local_swaps_move_a_misplaced_cell_to_its_state() {
     let x = DMatrix::from_fn(2, n, |r, c| cols[c][r]);
     let data = data_from(dir.path(), "swap", &x);
     let coords = DMatrix::from_fn(1, n, |_, c| xy[c]);
-    let rule = BatchSpanningRule {
-        label: batch.clone(),
-        n_labels: 2,
-        min_spans: 2,
-        min_pseudobulks: 1,
-    };
-    let fold = StateAwareBatchFold {
-        n_batches: 2,
-        n_nodes: 2,
-        log_fold: DMatrix::zeros(2, 4),
-        log_delta: DMatrix::zeros(2, 2),
-        node_of_unit: node.clone(),
-    };
-    let own_pseudobulk: Vec<usize> = (0..n).collect();
-    let inp = SwapInputs {
-        data: &data,
-        batch: &batch,
-        coords: &coords,
-        rule: &rule,
-        pseudobulk_of_unit: &own_pseudobulk,
-        block_size: None,
-    };
-    let refined = refine_nodes_by_local_swaps(&inp, node, 2, &fold).expect("swaps");
+    let rule = rule(2, 2, 1);
+    let sums = units_as_pseudobulks(&data, &batch, &coords);
+    let refined = refine_nodes_by_local_swaps(&sums, &rule, node, 2, &DMatrix::zeros(2, 4));
     assert_eq!(
         refined[0],
         Some(0),
@@ -435,4 +441,53 @@ fn local_swaps_move_a_misplaced_cell_to_its_state() {
     );
     assert!(refined[1..per].iter().all(|k| *k == Some(0)));
     assert!(refined[per..].iter().all(|k| *k == Some(1)));
+}
+
+/// Pairs reaching one key from different depths are tested together: in
+/// the tree (((0,1),2),3), pairs (0,2) start at depth 3 and climb to (p01, 2)
+/// at depth 2, where pairs (p01-level) already wait; together they span.
+#[test]
+fn a_key_reached_from_different_depths_is_tested_once_with_every_pair() {
+    let pts = DMatrix::from_row_slice(4, 1, &[0.0, 0.1, 1.0, 10.0]);
+    let t = CoarseGroupWardTree::build(&pts).expect("tree");
+    let p01 = t.parent[0];
+    // key (0,2): depth 3 (leaf 0) — fails alone (batch 0 only) and climbs to (p01,2)
+    // key (p01,2): depth 2 — a pair already there in batch 1; together they span
+    let at = vec![Some((0, 2)), Some((p01, 2))];
+    let r = rule(2, 2, 1);
+    let (node, keys) = place_cell_pairs_on_sample_tree(&t, &at, &count_keys(&[0, 1], &[0, 1]), &r);
+    let k = keys[&(p01.min(2), p01.max(2))];
+    assert_eq!(node, vec![Some(k), Some(k)]);
+}
+
+/// A level's fold keeps each batch's pseudobulk sample apart, and an empty
+/// sample holds δ.
+#[test]
+fn per_level_folds_keep_batches_apart() {
+    let log_delta = DMatrix::from_row_slice(1, 2, &[0.5, -0.5]);
+    let fold = StateAwareBatchFold {
+        n_batches: 2,
+        n_nodes: 1,
+        log_fold: DMatrix::from_row_slice(1, 2, &[1.0, -1.0]),
+        log_delta: log_delta.clone(),
+        node_of_unit: vec![Some(0), Some(0)],
+    };
+    // both units in group 0, one per batch; group 1 has none
+    let lvl = fold.per_level(&[0, 0], &[0, 1], 2);
+    assert_eq!(lvl.ncols(), 4);
+    assert_eq!(lvl[(0, 0)], 1.0);
+    assert_eq!(lvl[(0, 1)], -1.0);
+    assert_eq!(lvl[(0, 2)], 0.5);
+    assert_eq!(lvl[(0, 3)], -0.5);
+}
+
+/// The read split refuses counts that are not whole reads.
+#[test]
+fn split_refuses_fractional_counts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let x = DMatrix::from_row_slice(1, 2, &[0.3, 2.0]);
+    let data = data_from(dir.path(), "frac", &x);
+    assert!(
+        split_cell_reads_over_pair_units_without_double_counting(&data, &[(0, 1)], None).is_err()
+    );
 }

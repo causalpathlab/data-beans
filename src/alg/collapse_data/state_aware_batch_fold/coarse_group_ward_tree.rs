@@ -7,8 +7,9 @@
 
 use super::BatchSpanningRule;
 use legume_numeric::matrix::knn_graph::{KnnGraph, KnnGraphArgs};
-use legume_numeric::matrix::traits::RandomizedAlgs;
-use nalgebra::{DMatrix, SymmetricEigen};
+use legume_numeric::matrix::pca::pc_scores;
+use legume_numeric::matrix::traits::{MatOps, SymmetricTopEigen};
+use nalgebra::DMatrix;
 use rayon::prelude::*;
 
 ////////////////////////////////////////////////////////////////////
@@ -133,15 +134,17 @@ pub struct CoarseGroupWardTree {
     /// `children[node]` for an internal node.
     pub children: Vec<Option<(usize, usize)>>,
     pub root: usize,
+    /// Each node's depth below the root (the root at 0).
+    pub depth: Vec<usize>,
 }
 
 impl CoarseGroupWardTree {
     /// Ward linkage over the rows of `points` (groups × dims): exact up to
     /// [`EXACT_WARD_MAX_GROUPS`] groups ([`Self::build_exact_by_nearest_neighbour_chain`], O(K²)), along a
     /// kNN graph beyond ([`Self::build_along_knn_graph`], O(K·k·log K)).
-    pub fn build(points: &DMatrix<f32>) -> Self {
+    pub fn build(points: &DMatrix<f32>) -> anyhow::Result<Self> {
         if points.nrows() <= EXACT_WARD_MAX_GROUPS {
-            Self::build_exact_by_nearest_neighbour_chain(points)
+            Ok(Self::build_exact_by_nearest_neighbour_chain(points))
         } else {
             Self::build_along_knn_graph(points, WARD_GRAPH_KNN)
         }
@@ -160,11 +163,19 @@ impl CoarseGroupWardTree {
         let mut parent = build.parent;
         let root = parent.len() - 1;
         parent[root] = root;
+        // a parent's id is above its children's: fill depths from the root down
+        let mut depth = vec![0usize; parent.len()];
+        for v in (0..parent.len()).rev() {
+            if v != root {
+                depth[v] = depth[parent[v]] + 1;
+            }
+        }
         Self {
             n_groups: k,
             parent,
             children: build.children,
             root,
+            depth,
         }
     }
 
@@ -173,10 +184,7 @@ impl CoarseGroupWardTree {
     pub fn build_exact_by_nearest_neighbour_chain(points: &DMatrix<f32>) -> Self {
         let k = points.nrows();
         let mut build = Self::leaf_tree(k);
-        let centroids: Vec<Vec<f32>> = points
-            .row_iter()
-            .map(|r| r.iter().copied().collect())
-            .collect();
+        let centroids = rows_as_vectors(points);
         ward_chain(&centroids, vec![1.0; k], (0..k).collect(), &mut build);
         Self::finish(k, build)
     }
@@ -188,13 +196,13 @@ impl CoarseGroupWardTree {
     /// apart are joined by [`Self::build_exact_by_nearest_neighbour_chain`]'s chain over their centroids.
     /// The same tree as exact Ward wherever each merge's partner is a graph
     /// neighbour.
-    pub fn build_along_knn_graph(points: &DMatrix<f32>, knn: usize) -> Self {
+    pub fn build_along_knn_graph(points: &DMatrix<f32>, knn: usize) -> anyhow::Result<Self> {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
         let k = points.nrows();
         let mut build = Self::leaf_tree(k);
         if k <= 1 {
-            return Self::finish(k, build);
+            return Ok(Self::finish(k, build));
         }
         // the same kNN graph legume-numeric's layouts and clustering build (union edges)
         let graph = KnnGraph::from_rows(
@@ -204,22 +212,15 @@ impl CoarseGroupWardTree {
                 block_size: 1000,
                 reciprocal: false,
             },
-        );
+        )?;
         let mut adj: Vec<rustc_hash::FxHashSet<usize>> = vec![Default::default(); k];
-        for &(i, j) in graph
-            .as_ref()
-            .map(|g| g.edges.as_slice())
-            .unwrap_or_default()
-        {
+        for &(i, j) in &graph.edges {
             if i != j {
                 adj[i].insert(j);
                 adj[j].insert(i);
             }
         }
-        let mut centroid: Vec<Vec<f32>> = points
-            .row_iter()
-            .map(|r| r.iter().copied().collect())
-            .collect();
+        let mut centroid = rows_as_vectors(points);
         let mut size = vec![1f64; k];
         let mut id: Vec<usize> = (0..k).collect();
         let mut alive = vec![true; k];
@@ -276,7 +277,7 @@ impl CoarseGroupWardTree {
                 &mut build,
             );
         }
-        Self::finish(k, build)
+        Ok(Self::finish(k, build))
     }
 
     /// Per tree node, the units of each label below it.
@@ -347,27 +348,25 @@ impl CoarseGroupWardTree {
 const EXACT_SCORES_MAX_ROWS: usize = 1024;
 
 /// Principal-component scores (rows × k) of the rows of `x`, centred: exact
-/// up to [`EXACT_SCORES_MAX_ROWS`] rows, by randomized SVD beyond
-/// (O(rows · cols · k), not cubic in the rows).
-pub(super) fn row_scores(x: &DMatrix<f32>, k: usize) -> DMatrix<f32> {
+/// eigenpairs of the Gram matrix up to [`EXACT_SCORES_MAX_ROWS`] rows,
+/// legume-numeric's randomized `pc_scores` beyond (not cubic in the rows).
+pub(super) fn row_scores(x: &DMatrix<f32>, k: usize) -> anyhow::Result<DMatrix<f32>> {
     let n = x.nrows();
-    let mut xc = x.clone();
-    for c in 0..x.ncols() {
-        let m = x.column(c).mean();
-        xc.column_mut(c).add_scalar_mut(-m);
-    }
+    let xc = x.centre_columns();
     let k = k.min(n).min(x.ncols());
     if n <= EXACT_SCORES_MAX_ROWS {
-        let eig = SymmetricEigen::new(&xc * xc.transpose());
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| eig.eigenvalues[b].total_cmp(&eig.eigenvalues[a]));
-        return DMatrix::from_fn(n, k, |r, c| {
-            let i = order[c];
-            eig.eigenvectors[(r, i)] * eig.eigenvalues[i].max(0.0).sqrt()
-        });
+        let eig = (&xc * xc.transpose()).top_eigen(k)?;
+        return Ok(DMatrix::from_fn(n, k, |r, c| {
+            eig.vectors[(r, c)] * eig.values[c].max(0.0).sqrt()
+        }));
     }
-    match xc.rsvd(k) {
-        Ok((u, dv, _)) => DMatrix::from_fn(u.nrows(), u.ncols(), |r, c| u[(r, c)] * dv[c]),
-        Err(_) => DMatrix::zeros(n, k),
-    }
+    pc_scores(&xc, k, 0)
+}
+
+/// The rows of `points` as vectors.
+fn rows_as_vectors(points: &DMatrix<f32>) -> Vec<Vec<f32>> {
+    points
+        .row_iter()
+        .map(|r| r.iter().copied().collect())
+        .collect()
 }
