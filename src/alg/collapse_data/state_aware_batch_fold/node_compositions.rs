@@ -12,6 +12,7 @@
 //! that batch's own δ.
 
 use super::pseudobulk_sums::PseudobulkSums;
+use legume_numeric::matrix::traits::MatOps;
 use nalgebra::DMatrix;
 use rayon::prelude::*;
 
@@ -38,28 +39,11 @@ pub(crate) fn node_log_mean_compositions(
     }
     for mut c in mu.column_iter_mut() {
         let floor = (c.sum() / n_genes.max(1) as f32 * 1e-3).max(1e-12);
-        c.apply(|v| *v += floor);
-        let tot: f32 = c.sum();
-        c.apply(|v| *v = (*v / tot).ln());
+        c.add_scalar_mut(floor);
     }
+    mu.sum_to_one_columns_inplace();
+    mu.apply(|v| *v = v.ln());
     mu
-}
-
-/// A node's composition in one batch, log: `ln normalize(exp(log_mean) ⊙
-/// exp(log_fold))`, from its fold-corrected composition `log_mean` and its
-/// fold in that batch.
-pub(crate) fn log_composition_in_batch(
-    log_mean: nalgebra::DVectorView<'_, f32>,
-    log_fold: nalgebra::DVectorView<'_, f32>,
-) -> Vec<f32> {
-    let s: Vec<f32> = log_mean
-        .iter()
-        .zip(log_fold.iter())
-        .map(|(m, f)| m + f)
-        .collect();
-    let top = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let lse = top + s.iter().map(|v| (v - top).exp()).sum::<f32>().ln();
-    s.into_iter().map(|v| v - lse).collect()
 }
 
 /// Each node's composition in each batch, log, genes × (nodes · batches):
@@ -70,14 +54,26 @@ pub(crate) fn node_log_compositions(
     n_nodes: usize,
     log_fold: &DMatrix<f32>,
 ) -> DMatrix<f32> {
-    let n_genes = sums.n_genes;
     let nb = log_fold.ncols() / n_nodes;
     let log_mean = node_log_mean_compositions(sums, node, n_nodes, log_fold);
-    let cols: Vec<Vec<f32>> = (0..n_nodes * nb)
-        .into_par_iter()
-        .map(|col| log_composition_in_batch(log_mean.column(col / nb), log_fold.column(col)))
+    log_compositions_with_fold(&log_mean, log_fold, (0..n_nodes * nb).map(|col| col / nb))
+}
+
+/// `ln normalize(exp(log_mean[:, k]) ⊙ exp(log_fold[:, col]))` for each
+/// column `col` of `log_fold` taken, `k` its node (`node_of_col`, in the
+/// order taken: column `j` of the result is the `j`-th taken).
+fn log_compositions_with_fold(
+    log_mean: &DMatrix<f32>,
+    log_fold: &DMatrix<f32>,
+    node_of_col: impl Iterator<Item = usize>,
+) -> DMatrix<f32> {
+    let cols: Vec<nalgebra::DVector<f32>> = node_of_col
+        .enumerate()
+        .map(|(col, k)| log_mean.column(k) + log_fold.column(col))
         .collect();
-    DMatrix::from_fn(n_genes, n_nodes * nb, |g, col| cols[col][g])
+    let mut p = DMatrix::from_columns(&cols);
+    p.log_softmax_columns_inplace();
+    p
 }
 
 /// The log likelihood of `counts` (gene, count) under the composition in
@@ -107,28 +103,88 @@ pub(crate) fn best_column_by_composition(
         .map(|(k, _)| k)
 }
 
-/// Each node's composition in batch `b`, log, genes × nodes, from their
-/// fold-corrected compositions `log_mean` (genes × nodes) and their folds
-/// `log_fold` (genes × (nodes · `n_batches`)).
-fn node_log_compositions_in_batch(
-    log_mean: &DMatrix<f32>,
-    log_fold: &DMatrix<f32>,
-    n_batches: usize,
-    b: usize,
-) -> DMatrix<f32> {
-    let cols: Vec<Vec<f32>> = (0..log_mean.ncols())
-        .into_par_iter()
-        .map(|k| log_composition_in_batch(log_mean.column(k), log_fold.column(k * n_batches + b)))
-        .collect();
-    DMatrix::from_fn(log_mean.nrows(), log_mean.ncols(), |g, k| cols[k][g])
+/// Places units the fit never saw, by composition: each node's composition
+/// in each batch, built once, then any number of count columns scored
+/// against them ([`Self::place`]).
+pub struct CompositionPlacer {
+    /// Per batch the fit saw: each node's composition in it, log, genes × nodes.
+    log_p_of_batch: Vec<DMatrix<f32>>,
+    /// Each node's fold-corrected composition, log, genes × nodes: what a
+    /// batch the fit never saw is scored against.
+    log_mean: DMatrix<f32>,
 }
 
-/// Where units the fit never saw land: each count column (`(gene, count)`
-/// pairs) on the node whose composition explains it best
-/// ([`composition_score`]). `batch[c]` is `Some(b)` for a batch the fit saw
-/// (scored against each node's composition in `b`, the counts as read) or
-/// `None` for one it never saw (scored against `log_mean` alone, the counts
-/// divided by that batch's own δ). `None` for a column with no read.
+impl CompositionPlacer {
+    /// From the nodes' fold-corrected compositions `log_mean` (genes ×
+    /// nodes) and their folds `log_fold` (genes × (nodes · `n_batches`)).
+    pub fn new(
+        log_mean: &DMatrix<f32>,
+        log_fold: &DMatrix<f32>,
+        n_batches: usize,
+    ) -> anyhow::Result<Self> {
+        let (n_genes, n_nodes) = log_mean.shape();
+        anyhow::ensure!(
+            log_fold.nrows() == n_genes && log_fold.ncols() == n_nodes * n_batches,
+            "placement: fold {}×{}, compositions {n_genes}×{n_nodes} over {n_batches} batches",
+            log_fold.nrows(),
+            log_fold.ncols(),
+        );
+        let log_p_of_batch = (0..n_batches)
+            .into_par_iter()
+            .map(|b| {
+                let cols: Vec<usize> = (0..n_nodes).map(|k| k * n_batches + b).collect();
+                let fold = log_fold.select_columns(&cols);
+                log_compositions_with_fold(log_mean, &fold, 0..n_nodes)
+            })
+            .collect();
+        Ok(Self {
+            log_p_of_batch,
+            log_mean: log_mean.clone(),
+        })
+    }
+
+    /// Each count column (`(gene, count)` pairs) on the node whose
+    /// composition explains it best ([`composition_score`]). `batch[c]` is
+    /// `Some(b)` for a batch the fit saw (scored against each node's
+    /// composition in `b`, the counts as read) or `None` for one it never
+    /// saw (scored against the fold-corrected compositions alone, the counts
+    /// divided by that batch's own δ). `None` for a column with no read.
+    /// Errors on a length mismatch, a batch or gene outside the fit.
+    pub fn place(
+        &self,
+        counts: &[Vec<(usize, f32)>],
+        batch: &[Option<usize>],
+    ) -> anyhow::Result<Vec<Option<usize>>> {
+        let (n_genes, nb) = (self.log_mean.nrows(), self.log_p_of_batch.len());
+        anyhow::ensure!(
+            counts.len() == batch.len(),
+            "placement: {} count columns, {} batch entries",
+            counts.len(),
+            batch.len()
+        );
+        if let Some(b) = batch.iter().flatten().find(|&&b| b >= nb) {
+            anyhow::bail!("placement: batch {b}, the fit saw {nb}");
+        }
+        if let Some(g) = counts
+            .iter()
+            .flatten()
+            .map(|&(g, _)| g)
+            .find(|&g| g >= n_genes)
+        {
+            anyhow::bail!("placement: gene {g}, the fit has {n_genes}");
+        }
+        Ok(counts
+            .par_iter()
+            .zip(batch)
+            .map(|(x, b)| {
+                let log_p = b.map_or(&self.log_mean, |b| &self.log_p_of_batch[b]);
+                best_column_by_composition(x, log_p)
+            })
+            .collect())
+    }
+}
+
+/// One placement by [`CompositionPlacer`]: built, then used once.
 pub fn place_by_composition(
     counts: &[Vec<(usize, f32)>],
     batch: &[Option<usize>],
@@ -136,41 +192,5 @@ pub fn place_by_composition(
     log_fold: &DMatrix<f32>,
     n_batches: usize,
 ) -> anyhow::Result<Vec<Option<usize>>> {
-    let n_genes = log_mean.nrows();
-    anyhow::ensure!(
-        counts.len() == batch.len(),
-        "placement: {} count columns, {} batch entries",
-        counts.len(),
-        batch.len()
-    );
-    anyhow::ensure!(
-        log_fold.nrows() == n_genes && log_fold.ncols() == log_mean.ncols() * n_batches,
-        "placement: fold {}×{}, compositions {n_genes}×{} over {n_batches} batches",
-        log_fold.nrows(),
-        log_fold.ncols(),
-        log_mean.ncols()
-    );
-    if let Some(b) = batch.iter().flatten().find(|&&b| b >= n_batches) {
-        anyhow::bail!("placement: batch {b}, the fit saw {n_batches}");
-    }
-    if let Some(g) = counts
-        .iter()
-        .flatten()
-        .map(|&(g, _)| g)
-        .find(|&g| g >= n_genes)
-    {
-        anyhow::bail!("placement: gene {g}, the fit has {n_genes}");
-    }
-    let mut log_p_of: rustc_hash::FxHashMap<Option<usize>, DMatrix<f32>> = Default::default();
-    for &b in batch {
-        log_p_of.entry(b).or_insert_with(|| match b {
-            Some(b) => node_log_compositions_in_batch(log_mean, log_fold, n_batches, b),
-            None => log_mean.clone(),
-        });
-    }
-    Ok(counts
-        .par_iter()
-        .zip(batch)
-        .map(|(x, b)| best_column_by_composition(x, &log_p_of[b]))
-        .collect())
+    CompositionPlacer::new(log_mean, log_fold, n_batches)?.place(counts, batch)
 }

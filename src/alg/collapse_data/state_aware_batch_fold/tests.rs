@@ -638,7 +638,6 @@ fn unseen_pair_fold_is_cell_predicted_plus_its_link_state_leftover() {
     };
     let d = LinkStateDecomposition {
         link_state_of_pair: vec![],
-        n_link_states: 2,
         leftover_log_fold: DMatrix::from_row_slice(1, 2, &[0.5, -0.5]),
         n_batches: 1,
         link_state_log_mean_composition: DMatrix::zeros(1, 2),

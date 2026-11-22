@@ -47,12 +47,12 @@ pub(crate) mod top_down_fold;
 pub use cell_pair_units::{
     build_cell_pair_units, collapse_cell_pairs_and_estimate_state_aware_batch_fold,
     split_cell_reads_over_pair_units_without_double_counting, CellPairBatchFold,
-    CellPairFoldParams, CellPairUnits, PairNodeOfEndpointNodes, PairStates,
+    CellPairFoldParams, CellPairUnits, PairNodeOfEndpointNodes, PairStateModel, PairStates,
 };
 pub use coarse_group_ward_tree::{CoarseGroupWardTree, EXACT_WARD_MAX_GROUPS};
 pub use cross_batch_matched_fold::{MatchingCoordinates, StateAwareBatchFold};
 pub use link_state_pair_fold::{cell_predicted_pair_log_fold, LinkStateDecomposition};
-pub use node_compositions::place_by_composition;
+pub use node_compositions::{place_by_composition, CompositionPlacer};
 pub use sample_units::{
     estimate_state_aware_batch_fold_over_samples, SampleBatchFold, UnseenPlacement,
 };

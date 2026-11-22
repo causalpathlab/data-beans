@@ -33,7 +33,6 @@ pub struct SampleBatchFold {
     /// Each unit's node in `tree`, `None` when it keeps δ. The cell-pair kind
     /// reads this for its endpoints.
     pub tree_node_of_unit: Vec<Option<usize>>,
-    pub coord_map: MatchingCoordinates,
     /// Each unit's matching coordinates (components × units).
     pub coords: DMatrix<f32>,
     /// genes × n_nodes: each node's fold-corrected composition, log; an
@@ -256,7 +255,6 @@ pub fn estimate_state_aware_batch_fold_over_samples(
         },
         tree,
         tree_node_of_unit,
-        coord_map,
         coords,
         node_log_mean_composition,
         tree_node_of_node,

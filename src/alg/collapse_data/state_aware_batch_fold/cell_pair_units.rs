@@ -302,46 +302,66 @@ pub struct CellPairBatchFold {
     /// The fold of each given pair (`node_of_unit[e]` for pair `e`; a pair
     /// across batches keeps δ).
     pub fold: StateAwareBatchFold,
-    /// Which states the fold was matched within.
-    pub pair_states: PairStates,
-    /// [`PairStates::EndpointStates`]: unordered (sample-tree node,
-    /// sample-tree node) of a pair's endpoints → its pair node, for every key
-    /// a fitted pair settled at. Empty for link states.
-    pub pair_node_of_endpoint_nodes: PairNodeOfEndpointNodes,
-    /// [`PairStates::LinkStates`]: the fold's decomposition, cell-predicted +
-    /// leftover, with each given pair's link state. `None` for endpoint
-    /// states.
-    pub link_states: Option<LinkStateDecomposition>,
+    /// The states the fold was matched within, and what places an unseen
+    /// pair on them.
+    pub states: PairStateModel,
     /// The pair-unit collapse's own δ, log, genes × batches (the endpoint
     /// states' base; a pair across batches keeps it).
     pub pair_unit_log_delta: DMatrix<f32>,
 }
 
+/// The states a cell-pair fold was matched within ([`PairStates`]).
+#[derive(Clone, Debug)]
+pub enum PairStateModel {
+    /// Unordered (sample-tree node, sample-tree node) of a pair's endpoints →
+    /// its pair node, for every key a fitted pair settled at.
+    EndpointStates(PairNodeOfEndpointNodes),
+    /// The fold's decomposition, cell-predicted + leftover, with each given
+    /// pair's link state.
+    LinkStates(LinkStateDecomposition),
+}
+
 impl CellPairBatchFold {
+    pub fn pair_states(&self) -> PairStates {
+        match self.states {
+            PairStateModel::EndpointStates(_) => PairStates::EndpointStates,
+            PairStateModel::LinkStates(_) => PairStates::LinkStates,
+        }
+    }
+
+    /// The link states' decomposition; `None` for endpoint states.
+    pub fn link_states(&self) -> Option<&LinkStateDecomposition> {
+        match &self.states {
+            PairStateModel::LinkStates(d) => Some(d),
+            PairStateModel::EndpointStates(_) => None,
+        }
+    }
+
     /// [`PairStates::EndpointStates`]: the node of an unseen pair whose
     /// endpoints sit at sample-tree nodes `a` and `b`
     /// ([`SampleBatchFold::place_unseen_samples`]'s `tree_node`): up its keys
     /// as placement walked them, to the first settled one; `None` (δ) past
-    /// the root. Link states place an unseen pair through
+    /// the root. Errors for link states, which place an unseen pair through
     /// [`LinkStateDecomposition::unseen_pair_log_fold`].
     pub fn place_unseen_pair(
         &self,
         tree: &CoarseGroupWardTree,
         a: usize,
         b: usize,
-    ) -> Option<usize> {
-        debug_assert_eq!(
-            self.pair_states,
-            PairStates::EndpointStates,
-            "place_unseen_pair is for endpoint states; link states place through LinkStateDecomposition"
-        );
+    ) -> anyhow::Result<Option<usize>> {
+        let PairStateModel::EndpointStates(pair_node_of_endpoint_nodes) = &self.states else {
+            anyhow::bail!(
+                "place_unseen_pair is for endpoint states; \
+                 link states place through LinkStateDecomposition"
+            );
+        };
         let mut key = (a.min(b), a.max(b));
         loop {
-            if let Some(&k) = self.pair_node_of_endpoint_nodes.get(&key) {
-                return Some(k);
+            if let Some(&k) = pair_node_of_endpoint_nodes.get(&key) {
+                return Ok(Some(k));
             }
             if key_depth(tree, key) == 0 {
-                return None;
+                return Ok(None);
             }
             key = parent_key(tree, key);
         }
@@ -445,7 +465,7 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
             .map(|e| e.and_then(|e| kept[e]))
             .collect()
     };
-    let (kept_fold, pair_node_of_endpoint_nodes, link_states) = match pair_states {
+    let (kept_fold, states) = match pair_states {
         PairStates::EndpointStates => {
             let (fold, keys) = estimate_fold_over_pair_units(
                 &pu,
@@ -455,7 +475,7 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
                 &pair_unit_log_delta,
                 params,
             )?;
-            (fold, keys, None)
+            (fold, PairStateModel::EndpointStates(keys))
         }
         PairStates::LinkStates => {
             let (fold, decomposition) = estimate_fold_over_pair_units_by_link_states(
@@ -470,7 +490,7 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
                 link_state_of_pair: given(&decomposition.link_state_of_pair),
                 ..decomposition
             };
-            (fold, PairNodeOfEndpointNodes::default(), Some(link_states))
+            (fold, PairStateModel::LinkStates(link_states))
         }
     };
     Ok(CellPairBatchFold {
@@ -478,9 +498,7 @@ pub fn collapse_cell_pairs_and_estimate_state_aware_batch_fold(
             node_of_unit: given(&kept_fold.node_of_unit),
             ..kept_fold
         },
-        pair_states,
-        pair_node_of_endpoint_nodes,
-        link_states,
+        states,
         pair_unit_log_delta,
     })
 }

@@ -43,7 +43,6 @@ pub struct LinkStateDecomposition {
     /// Each given pair's link state (`None`: across batches, or in no link
     /// state that spans).
     pub link_state_of_pair: Vec<Option<usize>>,
-    pub n_link_states: usize,
     /// genes × (n_link_states · batches): each link state's leftover log
     /// fold over the cell-predicted fold, centred over its batches.
     pub leftover_log_fold: DMatrix<f32>,
@@ -55,6 +54,10 @@ pub struct LinkStateDecomposition {
 }
 
 impl LinkStateDecomposition {
+    pub fn n_link_states(&self) -> usize {
+        self.link_state_log_mean_composition.ncols()
+    }
+
     /// Each unseen pair's link state, by composition
     /// ([`super::node_compositions`]): `counts[p]`, the pair's pooled counts
     /// split as the fit split them. `batch[p]`: `Some(b)` for a batch the fit
@@ -101,9 +104,9 @@ impl LinkStateDecomposition {
         let mut f = cell_predicted_pair_log_fold(cells, a, b, batch);
         if let Some(s) = link_state {
             anyhow::ensure!(
-                s < self.n_link_states,
+                s < self.n_link_states(),
                 "unseen pair: link state {s}, the fit has {}",
-                self.n_link_states
+                self.n_link_states()
             );
             f.add_assign(self.leftover_log_fold.column(s * self.n_batches + batch));
         }
@@ -130,11 +133,15 @@ pub(crate) fn divide_pb_pairs_by_cell_predicted_fold(
     cell_predicted: &DMatrix<f32>,
     cell_predicted_col_of_pb: &[usize],
 ) {
-    for (counts, &col) in sums.counts.iter_mut().zip(cell_predicted_col_of_pb) {
-        for (g, x) in counts.iter_mut() {
-            *x *= (-cell_predicted[(*g, col)]).exp();
-        }
-    }
+    use rayon::prelude::*;
+    sums.counts
+        .par_iter_mut()
+        .zip(cell_predicted_col_of_pb)
+        .for_each(|(counts, &col)| {
+            for (g, x) in counts.iter_mut() {
+                *x *= (-cell_predicted[(*g, col)]).exp();
+            }
+        });
 }
 
 /// Link states and their leftover folds on pb pairs already divided by the
@@ -151,15 +158,14 @@ pub(crate) fn link_states_and_leftover_fold(
     if sums.is_empty() {
         return Ok((Vec::new(), 0, DMatrix::zeros(sums.n_genes, 0)));
     }
-    let present: Vec<Option<usize>> = sums.coarsest.iter().map(|&g| Some(g)).collect();
-    let (dense, distinct) = compact_present(&present);
-    sums.coarsest = dense.into_iter().map(|g| g.expect("present")).collect();
+    let (dense, n_groups) = crate::alg::dc_poisson::compact_labels(&sums.coarsest);
+    sums.coarsest = dense;
     let no_delta = DMatrix::<f32>::zeros(sums.n_genes, n_batches);
     let NodesCutFromWardTree {
         node_of_pb,
         tree_node_of_node,
         ..
-    } = cut_nodes_from_ward_tree_over_coarsest_groups(sums, distinct.len(), &no_delta, rule)?;
+    } = cut_nodes_from_ward_tree_over_coarsest_groups(sums, n_groups, &no_delta, rule)?;
     let n_states = tree_node_of_node.len();
     if n_states == 0 {
         return Ok((node_of_pb, 0, DMatrix::zeros(sums.n_genes, 0)));
@@ -170,7 +176,7 @@ pub(crate) fn link_states_and_leftover_fold(
     let leftover = estimate_fold_on_pseudobulks(sums, &node_of_pb, n_states, &zero, params)?;
     info!(
         "cell-pair batch fold, link states: {} coarse pair groups cut into {n_states} link states",
-        distinct.len()
+        n_groups
     );
     Ok((node_of_pb, n_states, leftover))
 }
@@ -286,7 +292,6 @@ pub(crate) fn estimate_fold_over_pair_units_by_link_states(
         },
         LinkStateDecomposition {
             link_state_of_pair,
-            n_link_states: n_states,
             leftover_log_fold: leftover,
             n_batches: nb,
             link_state_log_mean_composition,
