@@ -18,7 +18,7 @@ mod sparse_data_visitors;
 mod sparse_io;
 mod sparse_io_vector;
 mod sparse_util;
-mod utilities;
+use data_beans::utilities;
 #[allow(dead_code)]
 mod zarr_io;
 

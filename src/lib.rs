@@ -26,6 +26,9 @@ pub mod aux; // cell annotations, ontology, feature metadata (ex data_beans::aux
 #[cfg(feature = "alg")]
 pub mod alg; // projection, collapse, HVG, etc. (ex data_beans::alg)
 
+#[cfg(feature = "alg")]
+pub mod bipartite_graph_embedding_input; // the cells and pseudobulks a bipartite graph embedding trains on
+
 #[cfg(feature = "sim")]
 pub mod sim; // simulation helpers (ex data-beans-sim)
 
