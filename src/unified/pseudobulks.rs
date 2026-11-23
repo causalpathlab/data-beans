@@ -66,6 +66,8 @@ pub struct EmbeddingPseudobulks {
     pub cell_to_pb_per_level: Vec<Vec<usize>>,
     /// The collapse's batch names, in the column order of its `δ`.
     pub collapse_batch_names: Vec<Box<str>>,
+    /// The features the sketch read ([`EmbeddingPseudobulkArgs::projection_rows`]).
+    pub sketched_rows: Option<Vec<bool>>,
     n_features: usize,
     feature_to_backend: Vec<usize>,
 }
@@ -174,11 +176,21 @@ pub fn build_embedding_pseudobulks(
     // `senna topic` uses the same order, so its curriculum trains coarse first.
     collapsed_levels.reverse();
     cell_to_pb_per_level.reverse();
-    let collapse_batch_names = unified.count_backend().batch_names().unwrap_or_default();
+    let collapse_batch_names = match unified.count_backend().batch_names() {
+        Some(names) => names,
+        None => {
+            anyhow::ensure!(
+                collapsed_levels.iter().all(|c| c.delta.is_none()),
+                "the collapse fit a δ but the backend has no batch names"
+            );
+            Vec::new()
+        }
+    };
     Ok(EmbeddingPseudobulks {
         collapsed_levels,
         cell_to_pb_per_level,
         collapse_batch_names,
+        sketched_rows: args.projection_rows.clone(),
         n_features: unified.n_features(),
         feature_to_backend: unified.feature_to_backend_row.clone(),
     })

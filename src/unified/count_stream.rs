@@ -25,6 +25,11 @@ impl CellCountStream for SparseIoVec {
         cells: Range<usize>,
         f: &mut dyn FnMut(u32, u32, f32),
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            cells.end <= self.num_columns(),
+            "cells {cells:?} past the backend's {} columns",
+            self.num_columns()
+        );
         let slab = cells.len();
         self.for_each_triplet(cells, slab, |row, local, v| f(row as u32, local as u32, v))
             .map(|_| ())
