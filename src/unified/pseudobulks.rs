@@ -14,6 +14,7 @@ use crate::alg::collapse_data::{
 use crate::alg::random_projection::{RandColProjOut, RandProjOps};
 use crate::alg::refine_multilevel::RefineParams;
 use crate::sparse_io_vector::SparseIoVec;
+use legume_cell_pseudobulk::PseudobulkLevels;
 use legume_numeric::param::traits::Inference;
 use log::info;
 use nalgebra::DMatrix;
@@ -59,53 +60,20 @@ pub struct EmbeddingPseudobulkArgs {
 }
 
 /// The collapse, ordered **coarsest → finest**, with each cell's pseudobulk
-/// per level. Read on the unified (compact) feature axis through its methods.
+/// per level. Read on the unified (compact) feature axis, with δ's columns in
+/// the cells' batch-id order, through [`PseudobulkLevels`].
 pub struct EmbeddingPseudobulks {
     pub collapsed_levels: Vec<CollapsedOut>,
     /// `cell_to_pb_per_level[l][c]` is cell `c`'s pseudobulk at level `l`.
     pub cell_to_pb_per_level: Vec<Vec<usize>>,
-    /// The collapse's batch names, in the column order of its `δ`.
-    pub collapse_batch_names: Vec<Box<str>>,
-    /// The features the sketch read ([`EmbeddingPseudobulkArgs::projection_rows`]).
-    pub sketched_rows: Option<Vec<bool>>,
-    n_features: usize,
-    feature_to_backend: Vec<usize>,
+    /// Each compact feature's backend row; `None` when they are the same axis.
+    feature_to_backend: Option<Vec<usize>>,
+    /// Each of the cells' batches' column in the collapse's δ, in batch-id
+    /// order; `None` when that is already δ's own order.
+    delta_col_of_batch: Option<Vec<usize>>,
 }
 
 impl EmbeddingPseudobulks {
-    /// Level `level`'s pseudobulk rates `[n_features × n_pb]` (batch-adjusted
-    /// when the collapse fit a δ, observed otherwise), on the compact feature
-    /// axis: borrowed when it is the backend's own axis, gathered otherwise.
-    #[must_use]
-    pub fn rates(&self, level: usize) -> Cow<'_, DMatrix<f32>> {
-        let collapsed = &self.collapsed_levels[level];
-        let full = match &collapsed.mu_adjusted {
-            Some(adj) => adj.posterior_mean(),
-            None => collapsed.mu_observed.posterior_mean(),
-        };
-        self.on_compact_axis(full)
-    }
-
-    /// The finest level's observed counts `[n_features × n_pb]` on the compact
-    /// feature axis, with each pseudobulk's size.
-    pub fn finest_counts(&self) -> anyhow::Result<(DMatrix<f32>, Vec<f32>)> {
-        let (finest, cell_to_pb) = self.finest_collapse();
-        let (counts, sizes) = finest.observed_counts(cell_to_pb)?;
-        Ok((self.on_compact_axis(&counts).into_owned(), sizes))
-    }
-
-    /// The finest collapse's δ `[n_features × collapse batches]` on the compact
-    /// feature axis, columns in [`Self::collapse_batch_names`] order; `None`
-    /// when the collapse fit none.
-    #[must_use]
-    pub fn finest_delta(&self) -> Option<Cow<'_, DMatrix<f32>>> {
-        let (finest, _) = self.finest_collapse();
-        finest
-            .delta
-            .as_ref()
-            .map(|d| self.on_compact_axis(d.posterior_mean()))
-    }
-
     /// The finest collapse and each cell's pseudobulk in it.
     #[must_use]
     pub fn finest_collapse(&self) -> (&CollapsedOut, &[usize]) {
@@ -116,18 +84,100 @@ impl EmbeddingPseudobulks {
                 .expect("membership per level"),
         )
     }
+}
 
-    fn on_compact_axis<'a>(&self, backend: &'a DMatrix<f32>) -> Cow<'a, DMatrix<f32>> {
-        if backend.nrows() == self.n_features {
-            Cow::Borrowed(backend)
-        } else {
-            Cow::Owned(gather_to_unified_axis(
-                backend,
-                self.n_features,
-                &self.feature_to_backend,
-            ))
-        }
+impl PseudobulkLevels for EmbeddingPseudobulks {
+    fn n_levels(&self) -> usize {
+        self.collapsed_levels.len()
     }
+
+    /// Batch-adjusted when the collapse fit a δ, observed otherwise.
+    fn rates(&self, level: usize) -> Cow<'_, DMatrix<f32>> {
+        let collapsed = &self.collapsed_levels[level];
+        let full = match &collapsed.mu_adjusted {
+            Some(adj) => adj.posterior_mean(),
+            None => collapsed.mu_observed.posterior_mean(),
+        };
+        select(full, self.feature_to_backend.as_deref(), None)
+    }
+
+    fn cell_to_pb(&self, level: usize) -> &[usize] {
+        &self.cell_to_pb_per_level[level]
+    }
+
+    fn finest_counts(&self) -> anyhow::Result<(DMatrix<f32>, Vec<f32>)> {
+        let (finest, cell_to_pb) = self.finest_collapse();
+        let (counts, sizes) = finest.observed_counts(cell_to_pb)?;
+        let counts = match &self.feature_to_backend {
+            Some(rows) => counts.select_rows(rows.iter()),
+            None => counts,
+        };
+        Ok((counts, sizes))
+    }
+
+    fn finest_delta(&self) -> Option<Cow<'_, DMatrix<f32>>> {
+        let (finest, _) = self.finest_collapse();
+        finest.delta.as_ref().map(|d| {
+            select(
+                d.posterior_mean(),
+                self.feature_to_backend.as_deref(),
+                self.delta_col_of_batch.as_deref(),
+            )
+        })
+    }
+}
+
+/// `m` restricted to `rows` and `cols` in that order; borrowed when neither
+/// is given.
+fn select<'a>(
+    m: &'a DMatrix<f32>,
+    rows: Option<&[usize]>,
+    cols: Option<&[usize]>,
+) -> Cow<'a, DMatrix<f32>> {
+    match (rows, cols) {
+        (None, None) => Cow::Borrowed(m),
+        (Some(r), None) => Cow::Owned(m.select_rows(r.iter())),
+        (None, Some(c)) => Cow::Owned(m.select_columns(c.iter())),
+        (Some(r), Some(c)) => Cow::Owned(m.select_rows(r.iter()).select_columns(c.iter())),
+    }
+}
+
+/// Each of `batch_names` (the cells' batch-id order) as a column of a δ whose
+/// columns are `collapse_batch_names`: `None` when the two orders already
+/// agree, an error when a batch has no column.
+fn delta_columns_by_batch(
+    collapse_batch_names: &[Box<str>],
+    batch_names: &[Box<str>],
+) -> anyhow::Result<Option<Vec<usize>>> {
+    if collapse_batch_names == batch_names {
+        return Ok(None);
+    }
+    let col_of: rustc_hash::FxHashMap<&str, usize> = collapse_batch_names
+        .iter()
+        .enumerate()
+        .map(|(c, name)| (name.as_ref(), c))
+        .collect();
+    batch_names
+        .iter()
+        .map(|name| {
+            col_of.get(name.as_ref()).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "batch {name:?} has no δ column in the collapse (collapse batches: {})",
+                    collapse_batch_names.join(", ")
+                )
+            })
+        })
+        .collect::<anyhow::Result<Vec<usize>>>()
+        .map(Some)
+}
+
+/// Each compact feature's backend row, or `None` when the compact axis is the
+/// backend's own.
+fn compact_rows(unified: &UnifiedData) -> Option<Vec<usize>> {
+    let f2b = &unified.feature_to_backend_row;
+    let identity = f2b.len() == unified.count_backend().num_rows()
+        && f2b.iter().enumerate().all(|(i, &r)| i == r);
+    (!identity).then(|| f2b.clone())
 }
 
 /// Project, collapse, and keep the levels coarsest → finest.
@@ -176,23 +226,22 @@ pub fn build_embedding_pseudobulks(
     // `senna topic` uses the same order, so its curriculum trains coarse first.
     collapsed_levels.reverse();
     cell_to_pb_per_level.reverse();
-    let collapse_batch_names = match unified.count_backend().batch_names() {
-        Some(names) => names,
-        None => {
-            anyhow::ensure!(
-                collapsed_levels.iter().all(|c| c.delta.is_none()),
-                "the collapse fit a δ but the backend has no batch names"
-            );
-            Vec::new()
-        }
+    // δ's columns follow the backend's batch order; the cells' batch ids
+    // follow first appearance. Matched by name once, here.
+    let has_delta = collapsed_levels.last().is_some_and(|c| c.delta.is_some());
+    let delta_col_of_batch = if has_delta {
+        let collapse_batch_names = unified.count_backend().batch_names().ok_or_else(|| {
+            anyhow::anyhow!("the collapse fit a δ but the backend has no batch names")
+        })?;
+        delta_columns_by_batch(&collapse_batch_names, &unified.batch_names)?
+    } else {
+        None
     };
     Ok(EmbeddingPseudobulks {
         collapsed_levels,
         cell_to_pb_per_level,
-        collapse_batch_names,
-        sketched_rows: args.projection_rows.clone(),
-        n_features: unified.n_features(),
-        feature_to_backend: unified.feature_to_backend_row.clone(),
+        feature_to_backend: compact_rows(unified),
+        delta_col_of_batch,
     })
 }
 
@@ -285,15 +334,7 @@ fn project(
         }
     };
 
-    let keep = match args.projection_rows.as_deref() {
-        None => None,
-        Some(rows) => Some(projection_row_mask(
-            rows,
-            &unified.feature_to_backend_row,
-            backend.num_rows(),
-        )?),
-    };
-    let Some(keep) = keep else {
+    let Some(rows) = args.projection_rows.as_deref() else {
         return project_backend(
             backend,
             args.proj_dim,
@@ -303,6 +344,7 @@ fn project(
             args.seed,
         );
     };
+    let keep = projection_row_mask(rows, &unified.feature_to_backend_row, backend.num_rows())?;
     info!(
         "Sketching on {} of {} backend rows",
         keep.iter().filter(|&&k| k).count(),
@@ -375,22 +417,6 @@ where
             backend.project_columns_weighted_seeded(proj_dim, block_size, batch_arg, w, seed)
         }
     }
-}
-
-/// Gather a backend-row matrix onto the compact unified feature axis.
-fn gather_to_unified_axis(
-    backend: &DMatrix<f32>,
-    n_features: usize,
-    feature_to_backend: &[usize],
-) -> DMatrix<f32> {
-    let cols = backend.ncols();
-    let mut out = DMatrix::<f32>::zeros(n_features, cols);
-    for (new_i, &old_i) in feature_to_backend.iter().enumerate() {
-        for s in 0..cols {
-            out[(new_i, s)] = backend[(old_i, s)];
-        }
-    }
-    out
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use super::*;
 use crate::sparse_io::{create_sparse_from_triplets, SparseIoBackend};
+use std::borrow::Cow;
 
 /// `rows × 4` planted counts; row `r` of the returned backend holds
 /// `triplets` entries whose row index is `rows_kept[r]` in the full layout, so
@@ -53,11 +54,38 @@ fn the_row_mask_keeps_the_marked_features_backend_rows() {
 }
 
 #[test]
-fn rates_are_gathered_onto_the_compact_axis() {
+fn rows_and_columns_are_selected_and_borrowed_when_neither_is_given() {
+    let m = DMatrix::from_row_slice(3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert!(matches!(select(&m, None, None), Cow::Borrowed(_)));
     // compact feature i is backend row 2 - i
-    let backend = DMatrix::from_row_slice(3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let out = gather_to_unified_axis(&backend, 2, &[2, 0]);
-    assert_eq!(out, DMatrix::from_row_slice(2, 2, &[5.0, 6.0, 1.0, 2.0]));
+    assert_eq!(
+        *select(&m, Some(&[2, 0]), None),
+        DMatrix::from_row_slice(2, 2, &[5.0, 6.0, 1.0, 2.0])
+    );
+    assert_eq!(
+        *select(&m, Some(&[2, 0]), Some(&[1, 0])),
+        DMatrix::from_row_slice(2, 2, &[6.0, 5.0, 2.0, 1.0])
+    );
+}
+
+fn names(v: &[&str]) -> Vec<Box<str>> {
+    v.iter().map(|s| (*s).into()).collect()
+}
+
+/// The backend numbers batches by sorted name, the cells by first appearance:
+/// δ's columns are matched by name, not by position.
+#[test]
+fn delta_columns_follow_the_cells_batch_order() {
+    let cols = delta_columns_by_batch(&names(&["early", "late"]), &names(&["late", "early"]))
+        .expect("both present");
+    assert_eq!(cols, Some(vec![1, 0]));
+    assert_eq!(
+        delta_columns_by_batch(&names(&["a", "b"]), &names(&["a", "b"])).expect("same"),
+        None
+    );
+    let err = delta_columns_by_batch(&names(&["a", "b"]), &names(&["a", "c"]))
+        .expect_err("unknown batch must fail");
+    assert!(err.to_string().contains('c'), "{err}");
 }
 
 #[test]
@@ -186,7 +214,7 @@ fn a_given_partition_must_map_every_backend_column() {
 /// subset, rows outside it are skipped and the kept ones are renumbered.
 #[test]
 fn unified_counts_stream_on_the_compact_axis() {
-    use legume_numeric::matrix::cell_count_stream::CellCountStream;
+    use legume_cell_pseudobulk::CellCountStream;
     let mut unified = UnifiedData::from_sparse_io(
         backend(6, &[0, 1, 2, 3, 4, 5]),
         &vec!["b0".into(); 4],
