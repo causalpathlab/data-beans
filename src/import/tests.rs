@@ -158,6 +158,154 @@ fn a_backend_round_trips_through_h5ad() {
     assert!(dir.path().join("back.cell_metadata.tsv.gz").exists());
 }
 
+/// A CSR group at `path` of `cells_by_genes` (rows cells), as older anndata
+/// wrote one, its format named or (`named` false) left to be inferred.
+#[cfg(feature = "hdf5")]
+fn csr_group(file: &hdf5::File, path: &str, cells_by_genes: &[Vec<f32>], named: bool) {
+    let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0u32]);
+    for row in cells_by_genes {
+        for (j, &v) in row.iter().enumerate().filter(|(_, &v)| v != 0.0) {
+            data.push(v);
+            indices.push(j as u32);
+        }
+        indptr.push(data.len() as u32);
+    }
+    let g = file.create_group(path).unwrap();
+    g.new_dataset_builder()
+        .with_data(&data)
+        .create("data")
+        .unwrap();
+    g.new_dataset_builder()
+        .with_data(&indices)
+        .create("indices")
+        .unwrap();
+    g.new_dataset_builder()
+        .with_data(&indptr)
+        .create("indptr")
+        .unwrap();
+    if !named {
+        return;
+    }
+    crate::export::h5ad::write_str_attr(&g, "h5sparse_format", "csr").unwrap();
+}
+
+/// An h5ad as anndata before 0.7 wrote it (`obs`, `var` compound tables, a
+/// categorical's names in `uns`), with spliced and unspliced layers: read
+/// as `{gene}/count/{layer}` rows, its cells and their clusters named.
+#[cfg(feature = "hdf5")]
+#[test]
+fn an_older_h5ad_reads_its_layers_as_tracks() {
+    use hdf5::types::VarLenUnicode;
+    #[derive(hdf5::H5Type, Clone)]
+    #[repr(C)]
+    struct Obs {
+        index: VarLenUnicode,
+        clusters: u8,
+        score: f32,
+    }
+    #[derive(hdf5::H5Type, Clone)]
+    #[repr(C)]
+    struct Var {
+        index: VarLenUnicode,
+    }
+    let text = |x: &str| crate::export::h5ad::vlu(x).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.h5ad");
+    let file = hdf5::File::create(&path).unwrap();
+    let obs = [
+        Obs {
+            index: text("c1"),
+            clusters: 1,
+            score: 0.5,
+        },
+        Obs {
+            index: text("c2"),
+            clusters: 0,
+            score: -1.0,
+        },
+        // A combining accent, kept as it is.
+        Obs {
+            index: text("c\u{301}3"),
+            clusters: 1,
+            score: 2.0,
+        },
+    ];
+    file.new_dataset_builder()
+        .with_data(&obs)
+        .create("obs")
+        .unwrap();
+    let var = [
+        Var {
+            index: text("Sox9"),
+        },
+        Var {
+            index: text("Ins1"),
+        },
+    ];
+    file.new_dataset_builder()
+        .with_data(&var)
+        .create("var")
+        .unwrap();
+    let uns = file.create_group("uns").unwrap();
+    uns.new_dataset_builder()
+        .with_data(&[text("Ductal"), text("Beta")])
+        .create("clusters_categories")
+        .unwrap();
+    // Cells x genes.
+    let spliced = vec![vec![1.0, 0.0], vec![0.0, 2.0], vec![3.0, 4.0]];
+    let unspliced = vec![vec![0.0, 5.0], vec![6.0, 0.0], vec![0.0, 0.0]];
+    csr_group(&file, "X", &spliced, true);
+    file.create_group("layers").unwrap();
+    csr_group(&file, "layers/spliced", &spliced, true);
+    // No format: told CSR by the cells' count, as the first layer is not.
+    csr_group(&file, "layers/unspliced", &unspliced, false);
+    drop(file);
+
+    let output = dir.path().join("tracks");
+    let back = from_h5ad(
+        &H5adImport {
+            layers: names(&["spliced", " unspliced"]),
+            ..H5adImport::new(path.to_str().unwrap())
+        },
+        &Output::new(output.to_str().unwrap()),
+    )
+    .unwrap();
+    let Contents {
+        counts,
+        rows,
+        columns,
+    } = contents(&back);
+    assert_eq!(
+        rows,
+        names(&[
+            "Sox9/count/spliced",
+            "Ins1/count/spliced",
+            "Sox9/count/unspliced",
+            "Ins1/count/unspliced"
+        ])
+    );
+    assert_eq!(columns, names(&["c1", "c2", "c\u{301}3"]));
+    assert_eq!(
+        counts,
+        vec![
+            vec![1.0, 0.0, 3.0],
+            vec![0.0, 2.0, 4.0],
+            vec![0.0, 6.0, 0.0],
+            vec![5.0, 0.0, 0.0],
+        ]
+    );
+    let meta = legume_numeric::matrix::common_io::read_lines(
+        dir.path()
+            .join("tracks.cell_metadata.tsv.gz")
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(&*meta[0], "barcode\tclusters\tscore");
+    assert_eq!(&*meta[1], "c1\tBeta\t0.5");
+    assert_eq!(&*meta[2], "c2\tDuctal\t-1");
+}
+
 /// Cells read from several files are named as `SparseIoVec` names them.
 #[test]
 fn stacked_cells_are_named_by_their_file_when_there_are_several() {
@@ -184,4 +332,17 @@ fn stacked_cells_are_named_by_their_file_when_there_are_several() {
         .map(|c| stacked_column_name(c, &file, 2).unwrap())
         .collect();
     assert_eq!(stacked.column_names().unwrap(), expected);
+}
+
+/// `--layers` names are trimmed, and an empty or repeated one refused.
+#[cfg(feature = "hdf5")]
+#[test]
+fn layer_names_are_trimmed_and_checked() {
+    use super::h5ad::layer_names;
+    assert_eq!(
+        layer_names(&names(&["spliced", " unspliced "])).unwrap(),
+        names(&["spliced", "unspliced"])
+    );
+    assert!(layer_names(&names(&["spliced", "spliced"])).is_err());
+    assert!(layer_names(&names(&["spliced", " "])).is_err());
 }

@@ -9,7 +9,7 @@ edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
 # QC API independently of the shared utility crates.
-version = "0.14.0"
+version = "0.14.1"
 rust-version = "1.91"
 # Ship only the sources, README and license: nothing else in the working tree
 # (data stores, saved name lists, scratch files) can end up on crates.io.
@@ -56,7 +56,7 @@ sim = ["alg"]
 # Pulls in libhdf5 — opt-in so installs on hosts without HDF5 headers still
 # build. When off, the HDF5 sparse backend and all H5/H5AD readers compile
 # out; .zarr / .zarr.zip remain the supported formats.
-hdf5 = ["dep:hdf5", "ndarray"]
+hdf5 = ["dep:hdf5", "dep:hdf5-sys", "ndarray"]
 
 [dependencies]
 legume-numeric = { version = "0.10.11", default-features = false, features = ["matrix", "param"] }
@@ -69,6 +69,9 @@ rayon = "1.10.0"
 regex = "1"
 
 hdf5 = { package = "hdf5-metno", version = "0.14.1", features = ["blosc"], optional = true }
+# The raw read of a compound dataset (an older AnnData dataframe). The
+# version hdf5-metno links: bump the two together.
+hdf5-sys = { package = "hdf5-metno-sys", version = "0.12", optional = true }
 libz-sys = { version = "1.1", features = ["libc"], default-features = false }
 zarrs = { version = "0.23", default-features = false, features = ["filesystem", "blosc", "crc32c", "gzip", "sharding", "zstd"] }
 

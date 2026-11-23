@@ -240,30 +240,6 @@ pub fn read_h5ad_column(group: &hdf5::Group, col_name: &str) -> anyhow::Result<V
     }
 }
 
-/// Try reading strings from a group by trying each field name in order.
-///
-/// For each field, calls `read_h5ad_column` which handles categorical,
-/// string, numeric, and boolean datasets. Returns `None` if no field
-/// succeeds.
-#[cfg(feature = "hdf5")]
-pub fn resolve_h5ad_field(
-    group: &hdf5::Group,
-    fields: &[Box<str>],
-    label: &str,
-) -> Option<Vec<Box<str>>> {
-    for field in fields {
-        let field = field.trim();
-        if field.is_empty() {
-            continue;
-        }
-        if let Ok(v) = read_h5ad_column(group, field) {
-            log::info!("Using '{}' for {} ({} entries)", field, label, v.len());
-            return Some(v);
-        }
-    }
-    None
-}
-
 /// Read all columns from an AnnData HDF5 DataFrame group (obs or var).
 ///
 /// Uses the `column-order` attribute to discover column names,

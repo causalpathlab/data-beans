@@ -224,6 +224,16 @@ mod hdf5_formats {
 
         #[arg(
             long,
+            value_delimiter = ',',
+            help = "layers/ to read instead of X, as {feature}/count/{layer} rows",
+            long_help = "Comma-separated layers/ to read instead of X, stacked as rows\n\
+                         named {feature}/count/{layer}: `--layers spliced,unspliced` gives the\n\
+                         two tracks RNA velocity reads (`senna ode`). Every layer is on var/."
+        )]
+        pub layers: Vec<Box<str>>,
+
+        #[arg(
+            long,
             default_value_t = false,
             help = "Squeeze sparse rows or columns",
             long_help = "Enable squeezing to remove rows and columns with too few non-zeros."
@@ -267,6 +277,7 @@ mod hdf5_formats {
             col_name_field: args.col_name_field.clone(),
             select_row_type: args.select_row_type.clone(),
             remove_row_type: args.remove_row_type.clone(),
+            layers: args.layers.clone(),
             ..H5adImport::new(&args.h5ad_file)
         };
         let out = output(&args.output, &args.backend, args.zip);
