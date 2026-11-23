@@ -155,7 +155,7 @@ impl QcReport {
     /// Emit-keep indices in the **original** (unmasked) column order: cells
     /// that are neither MAD-dropped nor near-empty. For paths that keep every
     /// cell in training and instead `select_rows` the per-cell outputs
-    /// directly (e.g. bge's `UnifiedData`, which has no `mask_columns`).
+    /// directly (e.g. bge's `BipartiteEmbeddingCells`, which has no `mask_columns`).
     pub fn emit_idx_unmasked(&self) -> Vec<usize> {
         (0..self.train_keep.len())
             .filter(|&c| self.train_keep[c] && !self.near_empty[c])

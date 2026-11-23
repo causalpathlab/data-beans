@@ -6,7 +6,7 @@
 //! to hash cells into the collapse, and the collapse exists only to produce
 //! these levels. None of it touches a model.
 
-use super::UnifiedData;
+use super::BipartiteEmbeddingCells;
 use crate::alg::collapse_data::{
     collapse_columns_multilevel_with_hierarchy, collapse_columns_multilevel_with_partition,
     CollapsedOut, MultilevelCollapseOut, MultilevelParams,
@@ -14,7 +14,6 @@ use crate::alg::collapse_data::{
 use crate::alg::random_projection::{RandColProjOut, RandProjOps};
 use crate::alg::refine_multilevel::RefineParams;
 use crate::sparse_io_vector::SparseIoVec;
-use legume_cell_pseudobulk::PseudobulkLevels;
 use legume_numeric::param::traits::Inference;
 use log::info;
 use nalgebra::DMatrix;
@@ -22,7 +21,7 @@ use std::borrow::Cow;
 
 /// How the pseudobulks are built: the projection, then the collapse.
 #[derive(Clone, Debug)]
-pub struct EmbeddingPseudobulkArgs {
+pub struct BipartiteEmbeddingPseudobulkArgs {
     /// Target rank of the random-projection sketch that seeds batch
     /// correction and the multilevel collapse.
     pub proj_dim: usize,
@@ -61,8 +60,8 @@ pub struct EmbeddingPseudobulkArgs {
 
 /// The collapse, ordered **coarsest → finest**, with each cell's pseudobulk
 /// per level. Read on the unified (compact) feature axis, with δ's columns in
-/// the cells' batch-id order, through [`PseudobulkLevels`].
-pub struct EmbeddingPseudobulks {
+/// the cells' batch-id order.
+pub struct BipartiteEmbeddingPseudobulks {
     pub collapsed_levels: Vec<CollapsedOut>,
     /// `cell_to_pb_per_level[l][c]` is cell `c`'s pseudobulk at level `l`.
     pub cell_to_pb_per_level: Vec<Vec<usize>>,
@@ -73,7 +72,7 @@ pub struct EmbeddingPseudobulks {
     delta_col_of_batch: Option<Vec<usize>>,
 }
 
-impl EmbeddingPseudobulks {
+impl BipartiteEmbeddingPseudobulks {
     /// The finest collapse and each cell's pseudobulk in it.
     #[must_use]
     pub fn finest_collapse(&self) -> (&CollapsedOut, &[usize]) {
@@ -84,15 +83,15 @@ impl EmbeddingPseudobulks {
                 .expect("membership per level"),
         )
     }
-}
 
-impl PseudobulkLevels for EmbeddingPseudobulks {
-    fn n_levels(&self) -> usize {
+    #[must_use]
+    pub fn n_levels(&self) -> usize {
         self.collapsed_levels.len()
     }
 
     /// Batch-adjusted when the collapse fit a δ, observed otherwise.
-    fn rates(&self, level: usize) -> Cow<'_, DMatrix<f32>> {
+    #[must_use]
+    pub fn rates(&self, level: usize) -> Cow<'_, DMatrix<f32>> {
         let collapsed = &self.collapsed_levels[level];
         let full = match &collapsed.mu_adjusted {
             Some(adj) => adj.posterior_mean(),
@@ -101,11 +100,13 @@ impl PseudobulkLevels for EmbeddingPseudobulks {
         select(full, self.feature_to_backend.as_deref(), None)
     }
 
-    fn cell_to_pb(&self, level: usize) -> &[usize] {
+    #[must_use]
+    pub fn cell_to_pb(&self, level: usize) -> &[usize] {
         &self.cell_to_pb_per_level[level]
     }
 
-    fn finest_counts(&self) -> anyhow::Result<(DMatrix<f32>, Vec<f32>)> {
+    /// The finest level's observed counts and each pseudobulk's cell count.
+    pub fn finest_counts(&self) -> anyhow::Result<(DMatrix<f32>, Vec<f32>)> {
         let (finest, cell_to_pb) = self.finest_collapse();
         let (counts, sizes) = finest.observed_counts(cell_to_pb)?;
         let counts = match &self.feature_to_backend {
@@ -115,7 +116,9 @@ impl PseudobulkLevels for EmbeddingPseudobulks {
         Ok((counts, sizes))
     }
 
-    fn finest_delta(&self) -> Option<Cow<'_, DMatrix<f32>>> {
+    /// The finest level's batch δ, columns in the cells' batch-id order.
+    #[must_use]
+    pub fn finest_delta(&self) -> Option<Cow<'_, DMatrix<f32>>> {
         let (finest, _) = self.finest_collapse();
         finest.delta.as_ref().map(|d| {
             select(
@@ -173,7 +176,7 @@ fn delta_columns_by_batch(
 
 /// Each compact feature's backend row, or `None` when the compact axis is the
 /// backend's own.
-fn compact_rows(unified: &UnifiedData) -> Option<Vec<usize>> {
+fn compact_rows(unified: &BipartiteEmbeddingCells) -> Option<Vec<usize>> {
     let f2b = &unified.feature_to_backend_row;
     let identity = f2b.len() == unified.count_backend().num_rows()
         && f2b.iter().enumerate().all(|(i, &r)| i == r);
@@ -181,10 +184,10 @@ fn compact_rows(unified: &UnifiedData) -> Option<Vec<usize>> {
 }
 
 /// Project, collapse, and keep the levels coarsest → finest.
-pub fn build_embedding_pseudobulks(
-    unified: &mut UnifiedData,
-    args: &EmbeddingPseudobulkArgs,
-) -> anyhow::Result<EmbeddingPseudobulks> {
+pub fn build_bipartite_embedding_pseudobulks(
+    unified: &mut BipartiteEmbeddingCells,
+    args: &BipartiteEmbeddingPseudobulkArgs,
+) -> anyhow::Result<BipartiteEmbeddingPseudobulks> {
     let batch_labels: Vec<Box<str>> = unified.batch_labels();
     let proj_out = project(unified, args, &batch_labels)?;
 
@@ -237,7 +240,7 @@ pub fn build_embedding_pseudobulks(
     } else {
         None
     };
-    Ok(EmbeddingPseudobulks {
+    Ok(BipartiteEmbeddingPseudobulks {
         collapsed_levels,
         cell_to_pb_per_level,
         feature_to_backend: compact_rows(unified),
@@ -296,8 +299,8 @@ fn check_partition(partition: &[Vec<usize>], n_cells: usize) -> anyhow::Result<(
 /// itself still runs on the FULL backend with this sketch, so refinement, `mu_adjusted`
 /// and `δ` cover every row.
 fn project(
-    unified: &UnifiedData,
-    args: &EmbeddingPseudobulkArgs,
+    unified: &BipartiteEmbeddingCells,
+    args: &BipartiteEmbeddingPseudobulkArgs,
     batch_labels: &[Box<str>],
 ) -> anyhow::Result<RandColProjOut> {
     info!(

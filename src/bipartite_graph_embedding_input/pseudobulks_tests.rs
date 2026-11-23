@@ -210,12 +210,11 @@ fn a_given_partition_must_map_every_backend_column() {
     assert!(check_partition(&[vec![0; 4], vec![0; 3]], 4).is_err());
 }
 
-/// The unified data streams its counts on the compact feature axis: after a
-/// subset, rows outside it are skipped and the kept ones are renumbered.
+/// The bipartite embedding cells stream their counts on the compact feature axis:
+/// after a subset, rows outside it are skipped and the kept ones are renumbered.
 #[test]
-fn unified_counts_stream_on_the_compact_axis() {
-    use legume_cell_pseudobulk::CellCountStream;
-    let mut unified = UnifiedData::from_sparse_io(
+fn bipartite_embedding_cells_stream_on_the_compact_axis() {
+    let mut unified = BipartiteEmbeddingCells::from_sparse_io(
         backend(6, &[0, 1, 2, 3, 4, 5]),
         &vec!["b0".into(); 4],
         None,
@@ -230,7 +229,7 @@ fn unified_counts_stream_on_the_compact_axis() {
     assert_eq!(all.len(), 12, "6 rows × 2 cells");
 
     unified.subset_features(&[4, 1]);
-    assert_eq!(CellCountStream::n_features(&unified), 2);
+    assert_eq!(unified.n_features(), 2);
     let mut kept = Vec::new();
     unified
         .for_each_count(1..3, &mut |f, c, v| kept.push((f, c, v)))

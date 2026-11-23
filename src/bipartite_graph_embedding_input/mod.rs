@@ -6,13 +6,16 @@
 //! negatives to within-batch.
 //!
 //! Moved here from legume-graph-embedding, which now trains on what this
-//! module hands it ([`UnifiedData`] and [`EmbeddingPseudobulks`] implement the contracts of
-//! `legume-cell-pseudobulk`) and no longer depends on data-beans.
+//! module hands it ([`BipartiteEmbeddingCells::for_each_count`] and [`BipartiteEmbeddingPseudobulks`]; each app
+//! adapts them to its trainer) and no longer depends on data-beans.
 
 mod count_stream;
 mod pseudobulks;
 
-pub use pseudobulks::{build_embedding_pseudobulks, EmbeddingPseudobulkArgs, EmbeddingPseudobulks};
+pub use pseudobulks::{
+    build_bipartite_embedding_pseudobulks, BipartiteEmbeddingPseudobulkArgs,
+    BipartiteEmbeddingPseudobulks,
+};
 
 use crate::aux::data_loading::{read_data_on_shared_rows, ReadSharedRowsArgs};
 use crate::aux::feature_names::FeatureNameKind;
@@ -20,7 +23,7 @@ use crate::sparse_io_vector::{ColumnAlignment, SparseIoVec};
 use log::info;
 use rustc_hash::FxHashMap;
 
-pub struct UnifiedData {
+pub struct BipartiteEmbeddingCells {
     //////////////////
     // cell indices //
     //////////////////
@@ -72,7 +75,7 @@ pub struct UnifiedData {
     pub backend: SparseIoVec,
 }
 
-impl UnifiedData {
+impl BipartiteEmbeddingCells {
     /// Borrow the sparse count backend.
     #[must_use]
     pub fn count_backend(&self) -> &SparseIoVec {
@@ -150,8 +153,8 @@ impl UnifiedData {
         self.feature_modality = new_feature_modality;
     }
 
-    /// Build a `UnifiedData` from a single in-memory `SparseIoVec` plus
-    /// per-cell batch labels. Internal helper for [`load_unified_data`].
+    /// Build a `BipartiteEmbeddingCells` from a single in-memory `SparseIoVec` plus
+    /// per-cell batch labels. Internal helper for [`load_bipartite_embedding_cells`].
     fn from_sparse_io(
         data: SparseIoVec,
         batch_labels: &[Box<str>],
@@ -245,7 +248,7 @@ impl UnifiedData {
         }
 
         let n_features = feature_names.len();
-        Ok(UnifiedData {
+        Ok(BipartiteEmbeddingCells {
             barcodes,
             batch_membership,
             batch_names,
@@ -341,11 +344,11 @@ fn modality_presence_label(mask: u32, n_back: usize) -> Box<str> {
     }
 }
 
-/// Inputs for [`load_unified_data`]. Build with `..Default::default()` and
+/// Inputs for [`load_bipartite_embedding_cells`]. Build with `..Default::default()` and
 /// set only the fields a given flow needs — most callers leave the suffix /
 /// condition axes at their `None` defaults.
 #[derive(Default)]
-pub struct LoadUnifiedArgs {
+pub struct LoadBipartiteEmbeddingCellsArgs {
     /// Sparse data files (prefixes) to load, in order.
     pub data_files: Vec<Box<str>>,
     /// Optional per-cell batch labels. Under [`ColumnAlignment::Union`]
@@ -369,7 +372,7 @@ pub struct LoadUnifiedArgs {
     pub per_file_barcode_suffix: Option<Vec<Option<Box<str>>>>,
 }
 
-/// Load one or more sparse files into a single [`UnifiedData`] by
+/// Load one or more sparse files into a single [`BipartiteEmbeddingCells`] by
 /// delegating to `read_data_on_shared_rows` (the same loader senna's
 /// run-manifest-driven flows use). This guarantees the barcodes stored
 /// in `unified.barcodes` — and therefore the row names in
@@ -382,9 +385,11 @@ pub struct LoadUnifiedArgs {
 /// as **distinct** cells (matching the rest of senna). True multimodal
 /// stacking — different feature schemas per file with shared cells —
 /// is out of scope for this loader.
-pub fn load_unified_data(args: LoadUnifiedArgs) -> anyhow::Result<UnifiedData> {
+pub fn load_bipartite_embedding_cells(
+    args: LoadBipartiteEmbeddingCellsArgs,
+) -> anyhow::Result<BipartiteEmbeddingCells> {
     use legume_numeric::matrix::common_io::read_lines;
-    let LoadUnifiedArgs {
+    let LoadBipartiteEmbeddingCellsArgs {
         data_files,
         batch_files,
         condition_files,
@@ -473,7 +478,7 @@ pub fn load_unified_data(args: LoadUnifiedArgs) -> anyhow::Result<UnifiedData> {
     let auto_modality_batch = matches!(column_alignment, ColumnAlignment::Union)
         && !batch_files_present
         && batch_tags_are_trivial;
-    UnifiedData::from_sparse_io(
+    BipartiteEmbeddingCells::from_sparse_io(
         loaded.data,
         &loaded.batch,
         condition_labels.as_deref(),
