@@ -93,6 +93,7 @@ fn args(h5ad: &Path, output: &Path) -> FromH5adArgs {
         col_name_field: fields(["_index", "cell"]),
         select_row_type: "".into(),
         remove_row_type: "".into(),
+        layers: Vec::new(),
         do_squeeze: false,
         row_nnz_cutoff: 1,
         column_nnz_cutoff: 1,

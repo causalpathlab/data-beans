@@ -27,6 +27,10 @@ pub struct H5adImport {
     pub select_row_type: Box<str>,
     /// Drop features whose biotype contains this; empty drops none.
     pub remove_row_type: Box<str>,
+    /// `layers/` to read instead of `X`, stacked as rows
+    /// `{feature}/count/{layer}` (`spliced,unspliced`: the two tracks RNA
+    /// velocity reads). Empty reads `X`.
+    pub layers: Vec<Box<str>>,
 }
 
 impl H5adImport {
@@ -42,6 +46,7 @@ impl H5adImport {
             col_name_field: fields(&["_index", "cell"]),
             select_row_type: "".into(),
             remove_row_type: "".into(),
+            layers: Vec::new(),
         }
     }
 }
@@ -64,61 +69,86 @@ pub fn stage_h5ad(args: &H5adImport, out: &Output) -> anyhow::Result<Staged> {
     let backend_file = staged.working();
     let effective_output = &staged.effective;
 
-    // Prefer raw/X (raw counts) over X (processed/normalized)
-    let (x_path, var_path) = if file.group("raw/X").is_ok() {
-        info!("Using raw/X (raw counts)");
-        ("raw/X", "raw/var")
+    // The layers asked for, on var/; else raw/X (raw counts, `raw.X` in
+    // older anndata) over X (processed/normalized).
+    let layers = layer_names(&args.layers)?;
+    let layer_paths: Vec<String> = layers.iter().map(|l| format!("layers/{l}")).collect();
+    let (x_paths, var_path): (Vec<&str>, &str) = if !layer_paths.is_empty() {
+        info!("Using layers {layers:?}");
+        (layer_paths.iter().map(String::as_str).collect(), "var")
+    } else if let Some((x, var)) = [("raw/X", "raw/var"), ("raw.X", "raw.var")]
+        .into_iter()
+        .find(|(x, _)| file.group(x).is_ok())
+    {
+        info!("Using {x} (raw counts)");
+        (vec![x], var)
     } else {
         info!("Using X");
-        ("X", "var")
+        (vec!["X"], "var")
     };
+    let x_path = x_paths[0];
 
-    let x_group = file.group(x_path)?;
-    let var_group = file.group(var_path)?;
-    let obs_group = file.group("obs")?;
+    let x_groups = x_paths
+        .iter()
+        .map(|p| match file.group(p) {
+            Ok(g) => Ok(g),
+            Err(_) if file.dataset(p).is_ok() => anyhow::bail!(
+                "{}: {p} is a dense array; only sparse matrices are read",
+                args.h5ad_file
+            ),
+            Err(e) => anyhow::bail!("{}: no {p}: {e}", args.h5ad_file),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let x_group = &x_groups[0];
+    let var_frame = Frame::open(&file, var_path)?;
+    let obs_frame = Frame::open(&file, "obs")?;
 
     // Feature IDs, names and types from var/, barcodes from obs/ (each
     // list of candidates tried in order). Types are var/feature_type or
     // var/feature_types (scanpy, muon), often categorical.
-    let row_ids = resolve_h5ad_field(
-        &var_group,
-        &index_candidates(&var_group, &args.row_id_field),
-        "feature IDs",
-    );
-    let row_names = resolve_h5ad_field(&var_group, &args.row_name_field, "gene symbols");
-    let typed = read_h5ad_column(&var_group, "feature_type")
-        .or_else(|_| read_h5ad_column(&var_group, "feature_types"))
+    let row_ids = var_frame.resolve_index(&args.row_id_field, "feature IDs");
+    let row_names = var_frame.resolve(&args.row_name_field, "gene symbols");
+    let typed = var_frame
+        .column("feature_type")
+        .or_else(|_| var_frame.column("feature_types"))
         .ok();
-    let column_names = resolve_h5ad_field(
-        &obs_group,
-        &index_candidates(&obs_group, &args.col_name_field),
-        "barcodes",
-    );
+    let column_names = obs_frame.resolve_index(&args.col_name_field, "barcodes");
 
     // AnnData stores (obs x var) = (cells x features), but data-beans
     // convention is (features x cells). We swap the pointer type to
     // transpose: CSR -> Column pointers, CSC -> Row pointers.
-    let (n_obs, n_var) = declared_shape(&x_group).unzip();
-    let pointer_type = sparse_pointer_type(
-        &x_group,
-        x_path,
+    // Every matrix (each layer) told CSR from CSC alike: by its own
+    // attributes, else by the first's declared shape or the names' counts.
+    let (n_obs, n_var) = declared_shape(x_group).unzip();
+    let (obs_hint, var_hint) = (
         n_obs.or(column_names.as_ref().map(Vec::len)),
         n_var.or(row_ids.as_ref().map(Vec::len)),
-    )?;
+    );
+
+    let pointer_types = x_groups
+        .iter()
+        .zip(&x_paths)
+        .map(|(g, p)| sparse_pointer_type(g, p, obs_hint, var_hint))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let pointer_type = pointer_types[0];
 
     // Read triplets
-    let CooTripletsShape { triplets, shape } = {
-        let values = x_group.dataset("data")?.read_1d::<f32>()?;
-        let indices = x_group.dataset("indices")?.read_1d::<u64>()?;
-        let indptr = x_group.dataset("indptr")?.read_1d::<u64>()?;
+    let read = |g: &hdf5::Group, pointer_type| -> anyhow::Result<CooTripletsShape> {
+        let values = g.dataset("data")?.read_1d::<f32>()?;
+        let indices = g.dataset("indices")?.read_1d::<u64>()?;
+        let indptr = g.dataset("indptr")?.read_1d::<u64>()?;
         ValuesIndicesPointers {
             values: values.as_slice().expect("values not contiguous"),
             indices: indices.as_slice().expect("indices not contiguous"),
             indptr: indptr.as_slice().expect("indptr not contiguous"),
         }
-        .to_coo(pointer_type)?
+        .to_coo(pointer_type)
     };
-    let nnz = shape.nnz;
+    let CooTripletsShape {
+        mut triplets,
+        shape,
+    } = read(x_group, pointer_type)?;
+    let mut nnz = shape.nnz;
     info!(
         "Read {} non-zero elements reaching {} x {}",
         nnz, shape.nrows, shape.ncols
@@ -179,6 +209,50 @@ pub fn stage_h5ad(args: &H5adImport, out: &Output) -> anyhow::Result<Staged> {
     let mut row_ids = compose_id_name(row_ids, row_names);
     make_names_unique(&mut row_ids);
 
+    // Every further layer's triplets below the first's, and every row
+    // named for its layer: `{feature}/count/{layer}`.
+    let (nrows, row_types) = if layer_paths.is_empty() {
+        (nrows, row_types)
+    } else {
+        // Room for every layer at once: no copy of the first as they grow.
+        let mut all = 0;
+        for g in &x_groups {
+            all += g.dataset("data")?.size();
+        }
+        triplets.reserve(all.saturating_sub(triplets.len()));
+        for (k, (g, p)) in x_groups.iter().zip(&x_paths).enumerate().skip(1) {
+            let more = read(g, pointer_types[k])?;
+            anyhow::ensure!(
+                more.shape.nrows <= nrows && more.shape.ncols <= ncols,
+                "{p} reaches {} x {}, past X's {nrows} x {ncols}",
+                more.shape.nrows,
+                more.shape.ncols
+            );
+            let offset = (k * nrows) as u64;
+            nnz += more.shape.nnz;
+            triplets.extend(
+                more.triplets
+                    .into_iter()
+                    .map(|(r, c, v)| (r + offset, c, v)),
+            );
+        }
+        row_ids = layers
+            .iter()
+            .flat_map(|layer| {
+                // `aux::feature_rows::feature_row(id, COUNT, layer, None)`,
+                // which the importers, built without `aux`, cannot call.
+                row_ids
+                    .iter()
+                    .map(move |id| Box::<str>::from(format!("{id}/count/{layer}")))
+            })
+            .collect();
+        let k = layers.len();
+        (
+            nrows * k,
+            row_types.iter().cloned().cycle().take(nrows * k).collect(),
+        )
+    };
+
     let column_names = column_names.unwrap_or_else(|| {
         warn!("No barcode column found in obs/; using numeric IDs");
         index(ncols)
@@ -210,7 +284,7 @@ pub fn stage_h5ad(args: &H5adImport, out: &Output) -> anyhow::Result<Staged> {
     data.register_row_names_vec(&row_ids);
 
     // Read all obs metadata columns
-    let obs_df = read_h5ad_dataframe(&obs_group)?;
+    let obs_df = obs_frame.into_dataframe()?;
     info!(
         "Read {} obs columns: {:?}",
         obs_df.col_names.len(),
@@ -286,6 +360,239 @@ pub fn stage_h5ad(args: &H5adImport, out: &Output) -> anyhow::Result<Staged> {
 
     drop(data);
     Ok(staged)
+}
+
+/// An AnnData dataframe (`obs`, `var`): a group, as anndata 0.7 and later
+/// write it, or one compound dataset, as older anndata did (its `index`
+/// member the index, every other member a column, a categorical's codes
+/// named through `uns/{column}_categories`).
+enum Frame {
+    Group(hdf5::Group),
+    Table(H5adDataFrame),
+}
+
+impl Frame {
+    fn open(file: &hdf5::File, path: &str) -> anyhow::Result<Self> {
+        if let Ok(group) = file.group(path) {
+            return Ok(Self::Group(group));
+        }
+        let table = file
+            .dataset(path)
+            .map_err(|e| anyhow::anyhow!("{path} is neither a group nor a table: {e}"))?;
+        info!("{path}: an older AnnData table");
+        Ok(Self::Table(read_compound_frame(
+            &table,
+            file.group("uns").ok().as_ref(),
+        )?))
+    }
+
+    /// The column `name`.
+    fn column(&self, name: &str) -> anyhow::Result<Vec<Box<str>>> {
+        match self {
+            Self::Group(g) => read_h5ad_column(g, name),
+            Self::Table(t) => t
+                .col_names
+                .iter()
+                .position(|c| c.as_ref() == name)
+                .map(|j| t.col_data[j].clone())
+                .ok_or_else(|| anyhow::anyhow!("no column {name}")),
+        }
+    }
+
+    /// The first of `fields` there is, logged as `label`.
+    fn resolve(&self, fields: &[Box<str>], label: &str) -> Option<Vec<Box<str>>> {
+        fields
+            .iter()
+            .map(|f| f.trim())
+            .filter(|f| !f.is_empty())
+            .find_map(|f| {
+                let v = self.column(f).ok()?;
+                info!("Using '{f}' for {label} ({} entries)", v.len());
+                Some(v)
+            })
+    }
+
+    /// [`Self::resolve`] with `_index` the dataframe's index: the dataset a
+    /// group's `_index` attribute names, a table's `index` member.
+    fn resolve_index(&self, fields: &[Box<str>], label: &str) -> Option<Vec<Box<str>>> {
+        let fields: Vec<Box<str>> = match self {
+            Self::Group(g) => index_candidates(g, fields),
+            Self::Table(_) => fields
+                .iter()
+                .map(|f| match f.trim() {
+                    "_index" => "index".into(),
+                    _ => f.clone(),
+                })
+                .collect(),
+        };
+        self.resolve(&fields, label)
+    }
+
+    /// Every column but the index.
+    fn into_dataframe(self) -> anyhow::Result<H5adDataFrame> {
+        match self {
+            Self::Group(g) => read_h5ad_dataframe(&g),
+            Self::Table(t) => {
+                let (col_names, col_data) = t
+                    .col_names
+                    .into_iter()
+                    .zip(t.col_data)
+                    .filter(|(n, _)| n.as_ref() != "index")
+                    .unzip();
+                Ok(H5adDataFrame {
+                    col_names,
+                    col_data,
+                })
+            }
+        }
+    }
+}
+
+/// The `--layers` names, trimmed: none empty, none twice.
+pub(super) fn layer_names(layers: &[Box<str>]) -> anyhow::Result<Vec<Box<str>>> {
+    let mut out: Vec<Box<str>> = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let layer = layer.trim();
+        anyhow::ensure!(!layer.is_empty(), "--layers names an empty layer");
+        anyhow::ensure!(
+            !out.iter().any(|l| l.as_ref() == layer),
+            "--layers names {layer} twice"
+        );
+        out.push(layer.into());
+    }
+    Ok(out)
+}
+
+/// An older AnnData dataframe, one compound dataset, as text columns by
+/// member name: strings as they are, numbers printed, an integer member
+/// with `uns/{member}_categories` (and every code in range, `-1` for none)
+/// read as codes into those categories.
+fn read_compound_frame(
+    table: &hdf5::Dataset,
+    uns: Option<&hdf5::Group>,
+) -> anyhow::Result<H5adDataFrame> {
+    use hdf5::types::TypeDescriptor;
+    // In memory at C alignment: the file's records are often packed.
+    let desc = table.dtype()?.to_descriptor()?.to_c_repr();
+    let TypeDescriptor::Compound(compound) = &desc else {
+        anyhow::bail!("{} is not a table: {desc:?}", table.name());
+    };
+    let (n, size) = (table.size(), desc.size());
+    let memory = hdf5::Datatype::from_descriptor(&desc)?;
+    // Words, so every record (a multiple of its alignment, at most 8) and
+    // every member in it are aligned.
+    let mut words = vec![0u64; (n * size).div_ceil(8)];
+    // SAFETY: `words` holds `n` records of the memory type.
+    let status = unsafe {
+        hdf5_sys::h5d::H5Dread(
+            table.id(),
+            memory.id(),
+            hdf5_sys::h5s::H5S_ALL,
+            hdf5_sys::h5s::H5S_ALL,
+            hdf5_sys::h5p::H5P_DEFAULT,
+            words.as_mut_ptr().cast(),
+        )
+    };
+    anyhow::ensure!(status >= 0, "reading {} failed", table.name());
+    // SAFETY: the words' bytes, as H5Dread wrote them.
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), n * size) };
+    let record = |i: usize, offset: usize| &bytes[i * size + offset..];
+
+    let mut names = Vec::with_capacity(compound.fields.len());
+    let mut cols = Vec::with_capacity(compound.fields.len());
+    for field in &compound.fields {
+        let at = |i: usize| record(i, field.offset);
+        let categories = uns
+            .and_then(|u| u.dataset(&format!("{}_categories", field.name)).ok())
+            .and_then(|d| read_hdf5_strings(d).ok());
+        let named = categories.and_then(|categories| {
+            // Codes, `-1` for none; text only when every one is in range.
+            (0..n)
+                .map(|i| {
+                    let code = integer_member(&field.ty, at(i))?;
+                    match usize::try_from(code) {
+                        Ok(c) => categories.get(c).cloned(),
+                        Err(_) => (code == -1).then(|| "".into()),
+                    }
+                })
+                .collect::<Option<Vec<Box<str>>>>()
+        });
+        let col = named.unwrap_or_else(|| (0..n).map(|i| member_text(&field.ty, at(i))).collect());
+        // The variable-length strings H5Dread allocated for this member.
+        if matches!(
+            field.ty,
+            TypeDescriptor::VarLenUnicode | TypeDescriptor::VarLenAscii
+        ) {
+            for i in 0..n {
+                let ptr: *mut std::ffi::c_void = read_member(at(i));
+                if !ptr.is_null() {
+                    // SAFETY: allocated by HDF5 for this read, freed once.
+                    unsafe { hdf5_sys::h5::H5free_memory(ptr) };
+                }
+            }
+        }
+        names.push(field.name.as_str().into());
+        cols.push(col);
+    }
+    Ok(H5adDataFrame {
+        col_names: names,
+        col_data: cols,
+    })
+}
+
+/// A plain value of type `T` at the start of `at`.
+fn read_member<T: Copy>(at: &[u8]) -> T {
+    assert!(at.len() >= std::mem::size_of::<T>());
+    // SAFETY: in bounds, as checked; read unaligned.
+    unsafe { at.as_ptr().cast::<T>().read_unaligned() }
+}
+
+/// An integer member of type `ty` at the start of `at`; `None` for any
+/// other type.
+fn integer_member(ty: &hdf5::types::TypeDescriptor, at: &[u8]) -> Option<i64> {
+    use hdf5::types::{IntSize, TypeDescriptor as T};
+    Some(match *ty {
+        T::Integer(IntSize::U1) => read_member::<i8>(at).into(),
+        T::Integer(IntSize::U2) => read_member::<i16>(at).into(),
+        T::Integer(IntSize::U4) => read_member::<i32>(at).into(),
+        T::Integer(IntSize::U8) => read_member::<i64>(at),
+        T::Unsigned(IntSize::U1) => read_member::<u8>(at).into(),
+        T::Unsigned(IntSize::U2) => read_member::<u16>(at).into(),
+        T::Unsigned(IntSize::U4) => read_member::<u32>(at).into(),
+        T::Unsigned(IntSize::U8) => i64::try_from(read_member::<u64>(at)).ok()?,
+        _ => return None,
+    })
+}
+
+/// A compound member of type `ty` at the start of `at`, as text.
+fn member_text(ty: &hdf5::types::TypeDescriptor, at: &[u8]) -> Box<str> {
+    use hdf5::types::{FloatSize, IntSize, TypeDescriptor as T};
+    match *ty {
+        T::VarLenUnicode | T::VarLenAscii => {
+            let ptr: *const std::ffi::c_char = read_member(at);
+            if ptr.is_null() {
+                "".into()
+            } else {
+                // SAFETY: a NUL-terminated string HDF5 wrote for this read.
+                unsafe { std::ffi::CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .into()
+            }
+        }
+        T::FixedUnicode(len) | T::FixedAscii(len) => {
+            let raw = &at[..len];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(len);
+            String::from_utf8_lossy(&raw[..end]).into()
+        }
+        T::Unsigned(IntSize::U8) => read_member::<u64>(at).to_string().into(),
+        T::Integer(_) | T::Unsigned(_) => integer_member(ty, at)
+            .map_or_else(String::new, |x| x.to_string())
+            .into(),
+        T::Float(FloatSize::U4) => read_member::<f32>(at).to_string().into(),
+        T::Float(FloatSize::U8) => read_member::<f64>(at).to_string().into(),
+        T::Boolean => (at[0] != 0).to_string().into(),
+        _ => "".into(),
+    }
 }
 
 /// A string attribute of an h5ad group, however the writer encoded it.
