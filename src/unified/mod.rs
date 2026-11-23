@@ -6,9 +6,8 @@
 //! negatives to within-batch.
 //!
 //! Moved here from legume-graph-embedding, which now trains on what this
-//! module hands it ([`UnifiedData`] streams its counts through
-//! [`legume_numeric::matrix::cell_count_stream::CellCountStream`]) and no
-//! longer depends on data-beans.
+//! module hands it ([`UnifiedData`] and [`EmbeddingPseudobulks`] implement the contracts of
+//! `legume-cell-pseudobulk`) and no longer depends on data-beans.
 
 mod count_stream;
 mod pseudobulks;
