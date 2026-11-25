@@ -4,7 +4,6 @@ license = "MIT"
 authors = ["Yongjin Park <ypp@stat.ubc.ca>"]
 description = "Sparse genomics data backends, QC, algorithms, and simulation"
 repository = "https://github.com/causalpathlab/data-beans"
-homepage = "https://github.com/causalpathlab/data-beans"
 edition = "2021"
 readme = "README.md"
 # Own version (decoupled from workspace.version): data-beans evolves its CLI /
@@ -52,7 +51,7 @@ mcp = ["dep:legume-mcp"]
 # to an agent as images.
 figure = ["dep:legume-tui", "legume-tui/figure", "dep:usvg", "dep:svg2pdf"]
 alg = ["aux"]
-sim = ["alg"]
+sim = ["alg", "dep:statrs"]
 # Pulls in libhdf5 — opt-in so installs on hosts without HDF5 headers still
 # build. When off, the HDF5 sparse backend and all H5/H5AD readers compile
 # out; .zarr / .zarr.zip remain the supported formats.
@@ -99,7 +98,7 @@ fastobo = "0.15"
 special = "0.13"
 num_cpus = "1.16.0"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
-statrs = { version = "0.18", default-features = false }
+statrs = { version = "0.18", default-features = false, optional = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 # Detachable sessions for the views.
 legume-tui = { version = "0.4", optional = true, default-features = false, features = ["clap", "logs", "view", "hist"] }

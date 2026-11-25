@@ -1040,10 +1040,10 @@ where
     // inherited values is expected when pb-samples spanned multiple
     // source groups (handled by majority).
     let mut cell_to_pb_per_level_out: Vec<Vec<usize>> = Vec::with_capacity(num_levels);
-    for level in 0..num_levels {
+    for groups in refined.pbsamp_to_group.iter().take(num_levels) {
         let mut c2g = vec![0usize; ncols];
         for (pbsamp, cells) in pb_sample_to_cells.iter().enumerate() {
-            let g = refined.pbsamp_to_group[level][pbsamp];
+            let g = groups[pbsamp];
             for &c in cells {
                 c2g[c] = g;
             }

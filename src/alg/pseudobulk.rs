@@ -175,7 +175,7 @@ pub fn collapse_pseudobulk_weighted(
         }
     }
 
-    for ct_idx in 0..n_cell_types {
+    for (ct_idx, ct_name) in membership.cell_type_names.iter().enumerate() {
         let mut count_sum_ct = DMatrix::<f32>::zeros(num_genes, n_individuals);
         let mut weight_ct = DVector::<f32>::zeros(n_individuals);
 
@@ -208,7 +208,7 @@ pub fn collapse_pseudobulk_weighted(
 
         info!(
             "Cell type {}: {} individuals with cells, total weight {:.1}",
-            membership.cell_type_names[ct_idx], n_with_cells, total_weight
+            ct_name, n_with_cells, total_weight
         );
 
         gamma_params.push(gamma);
