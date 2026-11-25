@@ -58,7 +58,7 @@ Results go to stdout and nothing else does: logs, the QC histograms, the skipped
 
 In kitty, iTerm2, WezTerm and Ghostty the plots are the figure itself, drawn as images; other terminals get text plots. `DATA_BEANS_TUI_IMAGES=0` keeps text, `=1` asks any terminal. `--figure` writes the same figure without the view, and the MCP `qc` and `statistics` tools return it to an agent.
 
-Each view runs as a detachable session: Ctrl+Alt+D leaves it running (as does a dropped connection), and `data-beans attach` returns to it; `data-beans sessions` lists them and `data-beans kill` stops one as its quit key does. `--no-detach` runs a view in the terminal only.
+Each view runs as a detachable session: `ctrl+]` leaves it running (as does a dropped connection), and `data-beans attach` returns to it; `data-beans sessions` lists them and `data-beans kill` stops one as its quit key does. `--no-detach` runs a view in the terminal only.
 
 ## Agents (MCP)
 
