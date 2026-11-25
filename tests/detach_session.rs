@@ -12,7 +12,7 @@
 #![cfg(all(unix, feature = "tui"))]
 
 use legume_tui::testing::{alive, Private, Term, PROMPT};
-use legume_tui::Size;
+use legume_tui::{Key, Size};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -120,8 +120,8 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
     // Started in a terminal, it is hosted: this terminal is its first
     // client, and the footer lists the session keys.
     let mut first = term(&dir, &["stat", &data], &[]);
-    first.wait_screen("ctrl+alt+d detach");
-    first.wait_screen("ctrl+alt+s switch");
+    first.wait_screen(&format!("{} detach", Key::DETACH.display()));
+    first.wait_screen(&format!("{} switch", Key::SWITCH.display()));
     assert!(!first.cooked(), "the client's terminal is raw");
     let listed = dir.wait_listed("exploring columns of");
     assert!(listed.contains("data-beans-stat-1\tattached"), "{listed:?}");
@@ -132,9 +132,9 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
         "the program runs apart from its client"
     );
 
-    // Detached (ctrl+alt+d): the client ends, its terminal restored, the
+    // Detached by the detach key: the client ends, its terminal restored, the
     // program runs on; Enter leaves it unnamed.
-    first.type_(b"\x1b\x04");
+    first.type_(&Key::DETACH.bytes());
     first.answer(1, b"\r");
     assert_eq!(first.exit_code(), 0);
     assert!(first.cooked(), "terminal restored after detach");
@@ -146,7 +146,7 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
     // named; dropped at once.
     let mut again = term(&dir, &["stat", &data], &[]);
     again.wait_for("[detached: data-beans-stat-1");
-    again.wait_screen("ctrl+alt+d");
+    again.wait_screen(&Key::DETACH.display());
     let said = dir.run(&["kill", "stat-2"]);
     assert!(said.contains("data-beans-stat-2 stopped"), "{said:?}");
     assert_eq!(again.exit_code(), 0);
@@ -155,7 +155,7 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
     // painted whole there, keys reaching the program.
     let mut second = term(&dir, &["attach", "stat-1"], &[]);
     second.wait_screen("rows (computed on first use)");
-    second.wait_screen("ctrl+alt+d");
+    second.wait_screen(&Key::DETACH.display());
     assert!(second.alternate(), "back in the alternate screen");
     second.type_(b"/");
     second.wait_screen("filter /");
@@ -168,7 +168,7 @@ fn stat_detaches_attaches_and_is_killed_through_its_quit_path() {
     second.type_(b"\t");
     second.wait_for_after(before, "computing rows statistics");
     second.wait_screen("6 rows");
-    second.wait_screen("ctrl+alt+d");
+    second.wait_screen(&Key::DETACH.display());
     assert!(second.alternate(), "the view back after the work");
 
     // The client lost without a word (a dropped connection): it runs on.
@@ -197,7 +197,7 @@ fn a_kill_quits_subset_without_writing() {
     let out = out.to_string_lossy().into_owned();
 
     let mut t = term(&dir, &["subset", &data, "-o", &out], &[]);
-    t.wait_screen("ctrl+alt+d");
+    t.wait_screen(&Key::DETACH.display());
     dir.wait_listed("data-beans-subset-1\tattached");
     let pid = dir.program_pid();
     // Marked, not written: the kill discards it as q would.
@@ -265,7 +265,7 @@ fn a_kill_lets_a_write_under_way_finish() {
     let out_arg = out.to_string_lossy().into_owned();
 
     let mut t = term(&dir, &["-v", "columns", &data, "-o", &out_arg], &[]);
-    t.wait_screen("ctrl+alt+d");
+    t.wait_screen(&Key::DETACH.display());
     dir.wait_listed("data-beans-columns-1\tattached");
     let pid = dir.program_pid();
     t.type_(b" ");
@@ -351,7 +351,10 @@ fn no_detach_and_a_view_inside_a_session_run_plain() {
         assert!(dir
             .run(&["sessions"])
             .contains("no live data-beans sessions"));
-        assert!(!plain.text().contains("ctrl+alt+d"), "no session keys");
+        assert!(
+            !plain.text().contains(&Key::DETACH.display()),
+            "no session keys"
+        );
         assert!(!plain.text().contains(PROMPT));
         plain.type_(b"q");
         assert_eq!(plain.exit_code(), 0);
@@ -378,7 +381,7 @@ fn an_error_that_ends_a_detached_session_waits_for_whoever_attaches() {
     // Enter only once nobody is attached and the error comes then, however
     // fast the write. Enter at the name prompt leaves it unnamed.
     signal(pid, "STOP");
-    t.type_(b"\r\x1b\x04");
+    t.type_(&[b"\r".as_slice(), &Key::DETACH.bytes()].concat());
     t.answer(1, b"\r");
     assert_eq!(t.exit_code(), 0);
     dir.wait_listed("data-beans-qc-1\tdetached");

@@ -432,8 +432,8 @@ fn picking_both_sides_allows_marks_on_one_side_only() {
 /// The session keys a hosted view shows.
 fn hosted_keys() -> Vec<(String, String)> {
     vec![
-        ("ctrl+alt+d".into(), "detach".into()),
-        ("ctrl+alt+s".into(), "switch".into()),
+        (legume_tui::Key::DETACH.display(), "detach".into()),
+        (legume_tui::Key::SWITCH.display(), "switch".into()),
     ]
 }
 
@@ -450,8 +450,9 @@ fn the_session_keys_stay_on_screen_at_80_columns() {
     e.session_keys = hosted_keys();
     let text = screen_text(&mut e, 80, 24);
     let top: String = text.chars().take(80).collect();
-    assert!(top.contains("ctrl+alt+d detach"), "{top:?}");
-    assert!(top.contains("ctrl+alt+s switch"), "{top:?}");
+    for (key, does) in hosted_keys() {
+        assert!(top.contains(&format!("{key} {does}")), "{top:?}");
+    }
     assert!(top.contains("subset"), "the badge is kept: {top:?}");
 }
 

@@ -52,11 +52,12 @@ fn the_session_paragraph_names_the_keys_and_the_subcommands() {
     let more = "The title bar shows the detach and switch keys.";
     let text = session_help(None, more);
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (detach, switch) = (legume_tui::detach_key(), legume_tui::switch_key());
     for said in [
         "detachable session",
         "the command goes on",
-        "ctrl+alt+d",
-        "ctrl+alt+s",
+        &detach,
+        &switch,
         "`data-beans attach` with no name offers the live sessions",
         "--no-detach",
         more,
