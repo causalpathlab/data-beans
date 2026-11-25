@@ -12,6 +12,7 @@
 //! Text is set in the system's Helvetica, Arial or DejaVu Sans; a host with
 //! none of them installed writes figures without their labels.
 
+pub mod panel;
 pub mod qc;
 pub mod stat;
 #[cfg(feature = "tui")]
