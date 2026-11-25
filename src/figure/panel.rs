@@ -116,20 +116,36 @@ fn channels(c: &str) -> Option<[f64; 3]> {
     Some([v(0)?, v(2)?, v(4)?])
 }
 
+/// How far from white the emptiest square of `look.kept` starts: in grays,
+/// where only the depth tells kept from removed, past the removed colour,
+/// so a kept square is always the darker; else as a removed one does.
+fn kept_floor(look: &Look) -> f64 {
+    let grey = |c: &[f64; 3]| c[0] == c[1] && c[1] == c[2];
+    match (channels(&look.kept), channels(&look.removed)) {
+        (Some(k), Some(r)) if grey(&k) && grey(&r) && k[0] < r[0] => {
+            ((255.0 - r[0]) / (255.0 - k[0]) + 0.1).min(1.0)
+        }
+        _ => FLOOR,
+    }
+}
+
+/// How far from white the emptiest removed square starts.
+const FLOOR: f64 = 0.12;
+
 /// The colour of a square holding `kept` and `removed` values, where the
 /// fullest square holds `most`: the majority's colour, mixed from white
 /// deeper as the square holds more (on a log scale).
 pub fn square_colour(look: &Look, kept: usize, removed: usize, most: usize) -> String {
-    let full = if kept >= removed {
-        &look.kept
+    let (full, floor) = if kept >= removed {
+        (&look.kept, kept_floor(look))
     } else {
-        &look.removed
+        (&look.removed, FLOOR)
     };
     let n = kept + removed;
     let Some(rgb) = channels(full).filter(|_| n < most) else {
         return full.clone();
     };
-    let t = 0.12 + 0.88 * (n as f64).ln_1p() / (most as f64).ln_1p();
+    let t = floor + (1.0 - floor) * (n as f64).ln_1p() / (most as f64).ln_1p();
     let mix = |v: f64| (255.0 - t * (255.0 - v)).round() as u8;
     format!("#{:02x}{:02x}{:02x}", mix(rgb[0]), mix(rgb[1]), mix(rgb[2]))
 }
@@ -238,6 +254,14 @@ fn edge(c: &mut Canvas, (x1, y1, x2, y2): Area) {
     c.dashed(x1, y1, x2, y2, INK, 0.8);
 }
 
+/// Where each of `edges` falls on `axis`, 0 to 1, those outside it left
+/// out: drawn at an end they would read as a cut at the end's value.
+fn on_axis<'a>(axis: &'a Axis, edges: &'a [f64]) -> impl Iterator<Item = f64> + 'a {
+    (edges.iter())
+        .map(|&e| axis.frac(e))
+        .filter(|f| (0.0..=1.0).contains(f))
+}
+
 /// A histogram of `values` on `axis` in `bins` bins, kept stacked under
 /// removed, with dashed lines at `edges`. Values that are not finite are
 /// left out: clamp infinities to the axis ends before passing them.
@@ -257,8 +281,13 @@ pub struct HistPanel<'a> {
 
 impl HistPanel<'_> {
     /// The count axis and its ticks for a plot `ph` high.
+    /// Its bins, one at least.
+    fn bins(&self) -> usize {
+        self.bins.max(1)
+    }
+
     fn counts_axis(&self, look: &Look, ph: f64) -> (Axis, Vec<f64>) {
-        let s = stacks(&self.axis, self.bins, self.values, self.kept);
+        let s = stacks(&self.axis, self.bins(), self.values, self.kept);
         let top = s.iter().map(|(k, r)| k + r).max().unwrap_or(0).max(1) as f64;
         let axis = Axis::linear(0.0, top * 1.05);
         let ticks = y_ticks(look, &axis, ph);
@@ -282,7 +311,7 @@ impl HistPanel<'_> {
         look.heading(c, (x, y, w), &self.title, self.kept.is_some());
         let (px, py, pw, ph) = self.plot_area(look, area);
         let (counts, ticks) = self.counts_axis(look, ph);
-        let n = self.bins.max(1);
+        let n = self.bins();
         let bw = pw / n as f64;
         let gap = if bw > 3.0 { 0.1 * bw } else { 0.0 };
         let base = py + ph;
@@ -295,8 +324,8 @@ impl HistPanel<'_> {
             c.rect(bx, base - hk, bw - gap, hk, &look.kept);
             c.rect(bx, base - hk - hr, bw - gap, hr, &look.removed);
         }
-        for &e in &self.edges {
-            let ex = px + self.axis.frac(e).clamp(0.0, 1.0) * pw;
+        for f in on_axis(&self.axis, &self.edges) {
+            let ex = px + f * pw;
             edge(c, (ex, py, ex, base));
         }
         x_axis(c, look, &self.axis, (px, py, pw, ph), &self.x_title);
@@ -441,13 +470,13 @@ impl DensityPanel<'_> {
             }
         }
         let y_top = lay.top.map_or(py, |t| t.1);
-        for &e in &self.x_edges {
-            let ex = px + self.x.frac(e).clamp(0.0, 1.0) * pw;
+        for f in on_axis(&self.x, &self.x_edges) {
+            let ex = px + f * pw;
             edge(c, (ex, y_top, ex, py + ph));
         }
         let x_end = lay.right.map_or(px + pw, |r| r.0 + r.2);
-        for &e in &self.y_edges {
-            let ey = py + ph - self.y.frac(e).clamp(0.0, 1.0) * ph;
+        for f in on_axis(&self.y, &self.y_edges) {
+            let ey = py + ph - f * ph;
             edge(c, (px, ey, x_end, ey));
         }
         x_axis(c, look, &self.x, lay.plot, &self.x_title);

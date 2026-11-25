@@ -532,3 +532,83 @@ fn pdf_keeps_text_as_text() {
         .unwrap()
         .contains(">log10 p</text>"));
 }
+
+/// In grays, where only the depth tells them apart, the lightest kept
+/// square is darker than the darkest removed one: kept dark, removed
+/// light, at any count.
+#[test]
+fn gray_kept_squares_stay_darker_than_removed_ones() {
+    let look = Look::gray();
+    let lightest_kept = rgb(&square_colour(&look, 1, 0, 1000)).0;
+    let darkest_removed = rgb(&square_colour(&look, 0, 1000, 1000)).0;
+    assert!(
+        lightest_kept < darkest_removed,
+        "kept {lightest_kept}, removed {darkest_removed}"
+    );
+    // Still deeper with more sites, both ways.
+    assert!(rgb(&square_colour(&look, 500, 0, 1000)).0 < lightest_kept);
+    let lightest_removed = rgb(&square_colour(&look, 0, 1, 1000)).0;
+    assert!(darkest_removed < lightest_removed);
+}
+
+/// No bins is one bin, in the histogram as in the 2D panel, not a panic.
+#[test]
+fn no_bins_draw_as_one() {
+    let (xs, ys, kept) = sites();
+    let h = HistPanel {
+        bins: 0,
+        ..hist(&xs, Some(&kept))
+    };
+    assert!(h.svg(&Look::default(), 100.0, 100.0).contains("<rect"));
+    let d = DensityPanel {
+        x_bins: 0,
+        y_bins: 0,
+        ..density(&xs, &ys, Some(&kept))
+    };
+    assert!(d.svg(&Look::default(), 100.0, 100.0).contains("<rect"));
+}
+
+/// A threshold outside the axis is not drawn: at the axis end it would
+/// read as a cut at the largest value.
+#[test]
+fn edges_outside_the_axis_are_left_out() {
+    let (xs, ys, kept) = sites();
+    let look = Look::default();
+    let inside_only = hist(&xs, Some(&kept)).svg(&look, 240.0, 180.0);
+    let with_far = HistPanel {
+        edges: vec![3.0, 1e6, -1e6],
+        ..hist(&xs, Some(&kept))
+    }
+    .svg(&look, 240.0, 180.0);
+    assert_eq!(dashes(&with_far).len(), dashes(&inside_only).len());
+    let far = DensityPanel {
+        x_edges: vec![3.0, 1e6],
+        y_edges: vec![10.0, 1e9],
+        ..density(&xs, &ys, Some(&kept))
+    }
+    .svg(&look, 240.0, 220.0);
+    let near = density(&xs, &ys, Some(&kept)).svg(&look, 240.0, 220.0);
+    assert_eq!(dashes(&far).len(), dashes(&near).len());
+}
+
+/// A saved SVG states its size in points, so an editor opens it at the
+/// size asked; the drawing inside is unchanged.
+#[test]
+fn a_saved_svg_is_sized_in_points() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (xs, _, kept) = sites();
+    let svg = hist(&xs, Some(&kept)).svg(&Look::default(), 129.6, 115.2);
+    let path = tmp.path().join("panel.svg");
+    save(&svg, path.to_str().unwrap()).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    let root = written.lines().next().unwrap();
+    assert!(
+        root.contains(r#"width="129.6pt""#) && root.contains(r#"height="115.2pt""#),
+        "{root}"
+    );
+    assert!(root.contains(r#"viewBox="0 0 129.6 115.2""#), "{root}");
+    assert_eq!(
+        written.lines().skip(1).collect::<Vec<_>>(),
+        svg.lines().skip(1).collect::<Vec<_>>()
+    );
+}

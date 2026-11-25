@@ -539,10 +539,32 @@ pub fn save(svg: &str, name: &str) -> anyhow::Result<Vec<String>> {
         } else if path.ends_with(".png") {
             std::fs::write(path, pixmap(&tree, PNG_SCALE)?.encode_png()?)?;
         } else {
-            std::fs::write(path, svg)?;
+            std::fs::write(path, in_points(svg))?;
         }
     }
     Ok(paths)
+}
+
+/// `svg` with its root's width and height in points (`pt`), so an editor
+/// opens it at the size it was drawn for; a bare number there reads as
+/// pixels at 96 per inch, three quarters of the size. The drawing, in its
+/// viewBox, is unchanged.
+fn in_points(svg: &str) -> String {
+    let Some(end) = svg.find('>') else {
+        return svg.to_string();
+    };
+    let (root, rest) = svg.split_at(end);
+    let mut root = root.to_string();
+    for key in [" width=\"", " height=\""] {
+        if let Some(at) = root.find(key).map(|i| i + key.len()) {
+            if let Some(len) = root[at..].find('"') {
+                if root[at..at + len].parse::<f64>().is_ok() {
+                    root.insert_str(at + len, "pt");
+                }
+            }
+        }
+    }
+    root + rest
 }
 
 /// Whether a save under `name` would replace a file already there.
